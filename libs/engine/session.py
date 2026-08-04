@@ -157,6 +157,30 @@ class BrowserSession:
                 time.sleep(random.uniform(1.5, 3.0))
         return False
 
+    def _has_datadome_cookie(self) -> bool:
+        try:
+            return any(c["name"].lower() == "datadome" for c in self._context.cookies())
+        except Exception:
+            return False
+
+    def _settle_datadome(self, timeout: float = 20.0) -> bool:
+        """Wait for DataDome's bd.js challenge to run and set the `datadome` cookie before we POST
+        /login — a POST with an immature cookie gets 'Request could not be processed'."""
+        try:
+            self.page.wait_for_load_state("networkidle", timeout=8000)
+        except Exception:
+            pass
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self._has_datadome_cookie():
+                return True
+            self.page.wait_for_timeout(1000)
+            try:
+                self.page.wait_for_load_state("networkidle", timeout=3000)
+            except Exception:
+                pass
+        return self._has_datadome_cookie()
+
     def _type_credentials(self, username: str, password: str) -> None:
         page = self.page
         try:
@@ -250,6 +274,7 @@ class BrowserSession:
             return {"ok": False, "final_url": self.page.url, "reason": f"solver: {e}"}
 
         self._inject_token(token)
+        dd_ok = self._settle_datadome()   # let bd.js set the datadome cookie before POSTing /login
         final_url, content = self._submit_login(username, password, token, lang)
         has_challenge = "/ch/bd.js" in content
         at_login = final_url.rstrip("/").endswith("/VistosOnline/login")
@@ -257,7 +282,7 @@ class BrowserSession:
         low = content.lower()
         result = {
             "ok": ok, "final_url": final_url, "token_len": len(token), "token_score": solver.score_token(token),
-            "body_len": len(content), "challenge": has_challenge,
+            "body_len": len(content), "challenge": has_challenge, "datadome_cookie": dd_ok,
         }
         if not ok:
             # Classify the post-submit body so we know WHY (WAF re-block vs reCAPTCHA reject vs creds).
