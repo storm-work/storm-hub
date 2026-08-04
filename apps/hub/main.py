@@ -7,8 +7,11 @@ exclusivity). Redis/worker-control and WS log streaming are added later in Phase
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -351,3 +354,23 @@ def attach_identity(
 @app.get("/bookings/{booking_id}/workers", response_model=list[WorkerOut])
 def list_workers(booking_id: str, db: Session = Depends(get_db)) -> list[M.Worker]:
     return list(db.scalars(select(M.Worker).where(M.Worker.booking_id == booking_id)).all())
+
+
+# ── Dashboard (SPA) — served by the Hub on the same origin/port (headless-server friendly) ────
+# Registered LAST so every API route above wins; the SPA fallback serves index.html for client
+# routes. Only active once the dashboard is built (apps/dashboard/dist).
+_DIST = Path(__file__).resolve().parents[1] / "dashboard" / "dist"
+if _DIST.is_dir():
+    app.mount("/assets", StaticFiles(directory=_DIST / "assets"), name="assets")
+
+    @app.get("/", include_in_schema=False)
+    def _spa_root() -> FileResponse:
+        return FileResponse(_DIST / "index.html")
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    def _spa_fallback(full_path: str) -> FileResponse:
+        # unknown non-API GET path -> let the SPA router handle it
+        candidate = _DIST / full_path
+        if candidate.is_file():
+            return FileResponse(candidate)
+        return FileResponse(_DIST / "index.html")
