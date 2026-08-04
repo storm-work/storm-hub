@@ -66,7 +66,8 @@ def main() -> int:
         proxy = conn_url(random.choice(candidates))
 
     print(f"[probe] login {username}  via {pool.upper()}  keys={len(keys)}")
-    s = BrowserSession(proxy=proxy, headless=not headed, field_retries=4).start()
+    s = BrowserSession(proxy=proxy, headless=not headed, field_retries=4,
+                       nav_timeout_scale=3).start()
     try:
         res = s.login(username, password, keys, lang="PT", min_score=0)
         print(f"[probe] RESULT: {res}")

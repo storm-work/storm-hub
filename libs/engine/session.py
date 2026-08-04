@@ -105,13 +105,17 @@ class BrowserSession:
     # ── login (confirmed sequence) ────────────────────────────────────────────
     def _nav_to_login_form(self) -> bool:
         """HOME -> AUTH, re-navigating until the username field is actually visible (slow-portal
-        tolerance, ported from the LOGIN_FIELD_RETRIES fix)."""
-        self.page.goto(HOME_URL, timeout=int(30000 * self.nav_scale), wait_until="domcontentloaded")
+        tolerance, ported from the LOGIN_FIELD_RETRIES fix). Both navs are retried — a slow/dead
+        proxy or a stalled AUTH nav must NOT crash the login; it retries then gives up cleanly."""
+        try:
+            self.page.goto(HOME_URL, timeout=int(30000 * self.nav_scale), wait_until="domcontentloaded")
+        except Exception:
+            pass   # HOME bootstrap is best-effort; AUTH nav below is what matters
         sel = 'input[name="username"], input#username, input[autocomplete="username"]'
         for attempt in range(1, self.field_retries + 1):
-            self.page.goto(AUTH_URL, timeout=int(25000 * self.nav_scale),
-                           wait_until="domcontentloaded", referer=HOME_URL)
             try:
+                self.page.goto(AUTH_URL, timeout=int(25000 * self.nav_scale),
+                               wait_until="domcontentloaded", referer=HOME_URL)
                 self.page.wait_for_selector(sel, timeout=int(15000 * self.nav_scale), state="visible")
                 return True
             except Exception:
