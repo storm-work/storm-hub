@@ -9,7 +9,9 @@ dependencies = [
     "psycopg[binary]",
     "fastapi",
     "uvicorn[standard]",
-    # "redis>=5.0",  # enabled with the worker command bus (Phase 3, later slice)
+    "redis>=5.0",
+    "playwright==1.61.0",   # pinned to the shared chromium build 1228 (matches storm-auto)
+    "primp",                # TLS-fingerprint HTTP client (login/discovery)
 ]
 
 [project.optional-dependencies]
