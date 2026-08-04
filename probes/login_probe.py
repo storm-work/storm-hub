@@ -6,7 +6,10 @@ Uses storm-hub's DB pools + global settings exactly as the engine will:
 
 Usage:
   cd /srv/projects/storm-hub
-  .venv/bin/python probes/login_probe.py <username> <password> [--headed]
+  .venv/bin/python probes/login_probe.py <username> <password> [--pool soax|isp] [--headed]
+
+  --pool  which proxy pool to log in through (default: soax = the login/warmup role).
+          Pass --pool isp to test login on the ISP pool instead.
 
 Makes ONE real login attempt (no booking). Run it yourself — it touches the live portal.
 """
@@ -34,6 +37,9 @@ def main() -> int:
         return 2
     username, password = sys.argv[1], sys.argv[2]
     headed = "--headed" in sys.argv
+    pool = "soax"
+    if "--pool" in sys.argv:
+        pool = sys.argv[sys.argv.index("--pool") + 1].lower()
 
     _load_env()
     from sqlalchemy import create_engine, select
@@ -50,16 +56,16 @@ def main() -> int:
         if not keys:
             print("ERROR: set CAPSOLVER_KEYS in the dashboard (Settings -> Global settings) first")
             return 1
-        soax = db.scalars(
-            select(M.Proxy).where(M.Proxy.provider == "soax", M.Proxy.active.is_(True),
+        candidates = db.scalars(
+            select(M.Proxy).where(M.Proxy.provider == pool, M.Proxy.active.is_(True),
                                   M.Proxy.is_healthy.is_(True))
         ).all()
-        if not soax:
-            print("ERROR: no SOAX proxy in the pool (import one under Proxies)")
+        if not candidates:
+            print(f"ERROR: no healthy {pool.upper()} proxy in the pool (import one under Proxies)")
             return 1
-        proxy = conn_url(random.choice(soax))
+        proxy = conn_url(random.choice(candidates))
 
-    print(f"[probe] login {username}  via SOAX  keys={len(keys)}")
+    print(f"[probe] login {username}  via {pool.upper()}  keys={len(keys)}")
     s = BrowserSession(proxy=proxy, headless=not headed, field_retries=4).start()
     try:
         res = s.login(username, password, keys, lang="PT", min_score=0)
