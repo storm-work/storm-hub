@@ -19,8 +19,11 @@ from libs.domain.enums import SettingsLayer as L
 from libs.domain.rules import RuleViolation, resolve_worker_role
 from libs.domain.settings import CATALOG, settings_for_layer, validate_layer
 
+from libs.domain.enums import HandoverStatus
+
 from .auth import (
     Principal,
+    active_operator,
     current_principal,
     hash_password,
     make_token,
@@ -159,6 +162,83 @@ def list_active_sessions(db: Session = Depends(get_db), me: Principal = Depends(
         out.append({"session_id": s.id, "user": u.username if u else None,
                     "purpose": str(s.purpose), "status": str(s.status)})
     return out
+
+
+# ── Operate-seat handover (§12c) ──────────────────────────────────────────────
+@app.post("/sessions/handover/request")
+def request_handover(db: Session = Depends(get_db), me: Principal = Depends(current_principal)) -> dict:
+    """A paused Operate session asks for the seat. If the seat is free it's granted immediately;
+    otherwise a pending request is created for the current holder to grant/deny."""
+    if me.session.purpose != SessionPurpose.OPERATE:
+        raise HTTPException(400, "log in with purpose=operate before requesting the seat")
+    if me.is_operating:
+        raise HTTPException(400, "you already hold the operate seat")
+    holder = active_operator(db)
+    if holder is None:
+        me.session.status = SessionStatus.ACTIVE
+        db.commit()
+        return {"status": "granted", "note": "seat was free"}
+    req = M.OpsHandoverRequest(operate_session_id=holder.id, requester_user_id=me.user.id)
+    db.add(req)
+    db.commit()
+    db.refresh(req)
+    holder_user = db.get(M.User, holder.user_id)
+    return {"status": "pending", "request_id": req.id,
+            "current_holder": holder_user.username if holder_user else None}
+
+
+@app.post("/sessions/handover/{req_id}/grant")
+def grant_handover(req_id: str, db: Session = Depends(get_db),
+                   op: Principal = Depends(require_operator)) -> dict:
+    req = db.get(M.OpsHandoverRequest, req_id)
+    if not req:
+        raise HTTPException(404, "handover request not found")
+    if req.operate_session_id != op.session.id:
+        raise HTTPException(403, "only the current holder can grant this request")
+    if req.status != HandoverStatus.PENDING:
+        raise HTTPException(409, f"request already {req.status}")
+    # End my seat first, then promote the requester's paused operate session (keeps the single-active index happy).
+    op.session.status = SessionStatus.ENDED
+    db.flush()
+    reqsess = db.scalars(
+        select(M.UserSession).where(
+            M.UserSession.user_id == req.requester_user_id,
+            M.UserSession.purpose == SessionPurpose.OPERATE,
+            M.UserSession.status == SessionStatus.PAUSED,
+        ).order_by(M.UserSession.started_at.desc())
+    ).first()
+    if reqsess:
+        reqsess.status = SessionStatus.ACTIVE
+    req.status = HandoverStatus.GRANTED
+    db.commit()
+    return {"status": "granted", "promoted_session": reqsess.id if reqsess else None}
+
+
+@app.post("/sessions/handover/{req_id}/deny")
+def deny_handover(req_id: str, db: Session = Depends(get_db),
+                  op: Principal = Depends(require_operator)) -> dict:
+    req = db.get(M.OpsHandoverRequest, req_id)
+    if not req:
+        raise HTTPException(404, "handover request not found")
+    if req.operate_session_id != op.session.id:
+        raise HTTPException(403, "only the current holder can deny this request")
+    req.status = HandoverStatus.DENIED
+    db.commit()
+    return {"status": "denied"}
+
+
+@app.post("/sessions/{sid}/force-release")
+def force_release(sid: str, db: Session = Depends(get_db),
+                  me: Principal = Depends(current_principal)) -> dict:
+    """Admin frees a stale operate seat."""
+    if me.user.role != UserRole.ADMIN:
+        raise HTTPException(403, "only admin can force-release")
+    s = db.get(M.UserSession, sid)
+    if not s:
+        raise HTTPException(404, "session not found")
+    s.status = SessionStatus.ENDED
+    db.commit()
+    return {"status": "released", "session_id": sid}
 
 
 # ── Identities ────────────────────────────────────────────────────────────────

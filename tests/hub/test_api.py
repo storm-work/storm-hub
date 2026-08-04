@@ -81,6 +81,33 @@ def test_single_operator_second_login_paused(client):
     assert "handover" in (r.json()["notice"] or "").lower()
 
 
+def test_handover_grant_transfers_the_seat(client):
+    h_admin = _operate_headers(client)  # admin holds the seat
+    # make op2, log in operate -> paused
+    client.post("/auth/users", json={"username": "op2", "password": "p", "role": "operator"}, headers=h_admin)
+    login2 = client.post("/auth/login", json={"username": "op2", "password": "p", "purpose": "operate"}).json()
+    h2 = {"Authorization": f"Bearer {login2['token']}"}
+    assert login2["session_status"] == "paused"
+    # op2 requests handover
+    req = client.post("/sessions/handover/request", headers=h2).json()
+    assert req["status"] == "pending"
+    # op2 cannot mutate yet
+    assert client.post("/identities", json={"full_name": "z", "type": "real"}, headers=h2).status_code == 423
+    # admin grants
+    g = client.post(f"/sessions/handover/{req['request_id']}/grant", headers=h_admin)
+    assert g.status_code == 200 and g.json()["status"] == "granted"
+    # now op2 can mutate; admin can't (seat ended)
+    assert client.post("/identities", json={"full_name": "z", "type": "real"}, headers=h2).status_code == 201
+    assert client.post("/identities", json={"full_name": "q", "type": "real"}, headers=h_admin).status_code == 401
+
+
+def test_admin_force_release(client):
+    h_admin = _operate_headers(client)
+    sessions = client.get("/sessions", headers=h_admin).json()
+    op_sid = next(s["session_id"] for s in sessions if s["status"] == "active")
+    assert client.post(f"/sessions/{op_sid}/force-release", headers=h_admin).status_code == 200
+
+
 def test_viewer_role_cannot_operate(client):
     h = _operate_headers(client)
     client.post("/auth/users", json={"username": "v", "password": "p", "role": "viewer"}, headers=h)
