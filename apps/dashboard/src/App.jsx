@@ -1,10 +1,37 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { api, auth } from "./api.js";
+
+// Live worker status/logs over the Hub WebSocket. Returns a map worker_id -> {substate, logs[]}.
+function useEvents(enabled) {
+  const [live, setLive] = useState({});
+  const ref = useRef(null);
+  useEffect(() => {
+    if (!enabled) return;
+    const proto = location.protocol === "https:" ? "wss" : "ws";
+    const ws = new WebSocket(`${proto}://${location.host}/ws/events`);
+    ref.current = ws;
+    ws.onmessage = (ev) => {
+      const m = JSON.parse(ev.data);
+      if (!m.worker_id) return;
+      setLive((prev) => {
+        const cur = prev[m.worker_id] || { substate: null, logs: [] };
+        const next = { ...cur };
+        if (m.type === "status_change" && m.substate) next.substate = m.substate;
+        if (m.type === "terminal") { next.substate = m.substate || next.substate; next.outcome = m.outcome; }
+        if (m.type === "log_line" && m.text) next.logs = [...cur.logs.slice(-40), m.text];
+        return { ...prev, [m.worker_id]: next };
+      });
+    };
+    return () => ws.close();
+  }, [enabled]);
+  return live;
+}
 
 export default function App() {
   const [me, setMe] = useState(null);
   const [ready, setReady] = useState(false);
   const [page, setPage] = useState("bookings");
+  const events = useEvents(!!me);
 
   async function refreshMe() {
     if (!auth.token) { setMe(null); setReady(true); return; }
@@ -18,7 +45,7 @@ export default function App() {
   if (!me) return <Login onLogin={refreshMe} />;
 
   const pages = {
-    bookings: <Bookings me={me} />,
+    bookings: <Bookings me={me} events={events} />,
     identities: <Identities me={me} />,
     settings: <Settings />,
     sessions: <Sessions me={me} onChange={refreshMe} />,
@@ -109,10 +136,11 @@ function useList(path) {
   return { rows, err, reload };
 }
 
-function Bookings({ me }) {
+function Bookings({ me, events }) {
   const { rows, err, reload } = useList("/bookings");
   const [f, setF] = useState({ name: "", type: "test", posto_id: "2032", nationality: "CPV", residence: "CPV" });
   const [msg, setMsg] = useState("");
+  const [sel, setSel] = useState(null);
   const canOperate = me.is_operating;
 
   async function create() {
@@ -141,13 +169,71 @@ function Bookings({ me }) {
       <div className="card">
         <h2>Bookings ({rows.length})</h2>
         {err && <div className="banner err">{err}</div>}
-        <table><thead><tr><th>Name</th><th>Type</th><th>Posto</th><th>Status</th><th>Created</th></tr></thead>
+        <table><thead><tr><th>Name</th><th>Type</th><th>Posto</th><th>Status</th><th></th></tr></thead>
           <tbody>{rows.map((b) => (
             <tr key={b.id}><td>{b.name}</td><td><span className="pill">{b.type}</span></td><td>{b.posto_id}</td>
-              <td>{b.status}</td><td className="muted">{(b.created_at || "").slice(0, 19).replace("T", " ")}</td></tr>
+              <td>{b.status}</td>
+              <td><button className="btn ghost" onClick={() => setSel(sel === b.id ? null : b.id)}>{sel === b.id ? "Hide" : "Workers"}</button></td></tr>
           ))}</tbody></table>
       </div>
+      {sel && <BookingWorkers me={me} booking={rows.find((b) => b.id === sel)} events={events} />}
     </>
+  );
+}
+
+function BookingWorkers({ me, booking, events }) {
+  const workers = useList(`/bookings/${booking.id}/workers`);
+  const identities = useList("/identities");
+  const [attachId, setAttachId] = useState("");
+  const [role, setRole] = useState("scout");
+  const [msg, setMsg] = useState("");
+  const op = me.is_operating;
+
+  async function run(fn) { setMsg(""); try { await fn(); workers.reload(); } catch (e) { setMsg(e.message); } }
+  const attach = () => run(() => api(`/bookings/${booking.id}/identities`,
+    { method: "POST", body: { identity_id: attachId, assigned_role: booking.type === "test" ? role : undefined } }));
+
+  return (
+    <div className="card">
+      <h2>Workers — {booking.name} <span className="muted">({booking.type} · posto {booking.posto_id})</span></h2>
+      {msg && <div className="banner err">{msg}</div>}
+      <div className="row" style={{ flexWrap: "wrap", marginBottom: 12 }}>
+        <div className="field"><label>Attach identity</label>
+          <select value={attachId} onChange={(e) => setAttachId(e.target.value)}>
+            <option value="">— pick —</option>
+            {identities.rows.filter((i) => booking.type === "real" || i.type === "test").map((i) => (
+              <option key={i.id} value={i.id}>{i.full_name} ({i.type})</option>
+            ))}
+          </select></div>
+        {booking.type === "test" && (
+          <div className="field"><label>Role</label>
+            <select value={role} onChange={(e) => setRole(e.target.value)}>
+              <option value="scout">scout</option><option value="apply">apply</option>
+            </select></div>
+        )}
+        <div className="field" style={{ alignSelf: "end" }}>
+          <button className="btn" disabled={!op || !attachId} onClick={attach}>Attach → worker</button></div>
+      </div>
+      <table><thead><tr><th>Role</th><th>Status</th><th>Live substate</th><th>Actions</th></tr></thead>
+        <tbody>{workers.rows.map((w) => {
+          const live = events[w.id] || {};
+          const substate = live.substate || w.substate || "—";
+          return (
+            <tr key={w.id}>
+              <td><span className="pill">{w.role}</span></td>
+              <td>{w.status}</td>
+              <td className={live.outcome === "booked" ? "ok" : live.outcome === "failed" ? "err" : ""}>
+                {substate}{live.outcome ? ` (${live.outcome})` : ""}
+              </td>
+              <td className="row">
+                <button className="btn" disabled={!op} onClick={() => run(() => api(`/workers/${w.id}/launch`, { method: "POST" }))}>Launch</button>
+                <button className="btn ghost" disabled={!op} onClick={() => run(() => api(`/workers/${w.id}/stop`, { method: "POST" }))}>Stop</button>
+              </td>
+            </tr>
+          );
+        })}</tbody></table>
+      {workers.rows.length === 0 && <div className="muted">No workers yet — attach an identity above.</div>}
+    </div>
   );
 }
 
