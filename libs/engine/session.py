@@ -254,7 +254,16 @@ class BrowserSession:
         has_challenge = "/ch/bd.js" in content
         at_login = final_url.rstrip("/").endswith("/VistosOnline/login")
         ok = at_login and not has_challenge and len(content) < 500
-        return {
-            "ok": ok, "final_url": final_url, "token_len": len(token),
+        low = content.lower()
+        result = {
+            "ok": ok, "final_url": final_url, "token_len": len(token), "token_score": solver.score_token(token),
             "body_len": len(content), "challenge": has_challenge,
         }
+        if not ok:
+            # Classify the post-submit body so we know WHY (WAF re-block vs reCAPTCHA reject vs creds).
+            result["post_markers"] = [m for m in (
+                "request could not be processed", "handheldfriendly", "unexpected_redirect",
+                "datadome", "type=error", "type=success", "terminar", "invalid", "captcha",
+            ) if m in low]
+            result["post_snippet"] = re.sub(r"\s+", " ", content)[:400]
+        return result

@@ -72,7 +72,10 @@ def main() -> int:
         res = s.login(username, password, keys, lang="PT", min_score=0)
         import json as _j
         diag = res.pop("diag", None)
+        snippet = res.pop("post_snippet", None)
         print(f"[probe] RESULT: {res}")
+        if snippet:
+            print(f"[probe] POST /login snippet: {snippet!r}")
         if diag:
             print("[probe] PAGE DIAG:\n" + _j.dumps(diag, indent=2, ensure_ascii=False))
         print("[probe]", "LOGIN OK ✓" if res.get("ok") else "login NOT confirmed")
