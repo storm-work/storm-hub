@@ -401,15 +401,19 @@ def create_proxy(body: ProxyCreate, db: Session = Depends(get_db),
 def import_proxies(body: ProxyImport, db: Session = Depends(get_db),
                    _op: Principal = Depends(require_operator)) -> ImportResult:
     parsed, errors = parse_proxies(body.text)
-    existing = {e for (e,) in db.execute(select(M.Proxy.endpoint)).all()}
+    # dedup on (endpoint, credentials_ref): SOAX shares one endpoint (proxy.soax.com:5000) across
+    # many distinct session strings, so endpoint alone would collapse the whole pool to one row.
+    existing = {(e, c) for (e, c) in
+                db.execute(select(M.Proxy.endpoint, M.Proxy.credentials_ref)).all()}
     created = 0
     for pp in parsed:
-        if pp.endpoint in existing:
-            errors.append(f"skip duplicate endpoint {pp.endpoint}")
+        key = (pp.endpoint, pp.credentials_ref)
+        if key in existing:
+            errors.append(f"skip duplicate {pp.endpoint}")
             continue
         db.add(M.Proxy(provider=body.provider, kind=body.kind, endpoint=pp.endpoint,
                        credentials_ref=pp.credentials_ref, max_sessions=body.max_sessions, active=True))
-        existing.add(pp.endpoint)
+        existing.add(key)
         created += 1
     db.commit()
     return ImportResult(created=created, errors=errors)

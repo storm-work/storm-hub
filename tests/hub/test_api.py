@@ -168,9 +168,12 @@ def test_import_identities_and_proxies(client):
     assert r["created"] == 1 and r["sub_accounts"] == 2
     assert len(client.get("/identities", headers=h).json()) == 1
 
+    # SOAX-style: same endpoint, DIFFERENT session strings -> distinct proxies; exact dup -> skipped
     r = client.post("/proxies/import", json={"provider": "soax", "kind": "datacenter",
-                                             "text": "http://u:p@1.2.3.4:5000\n1.2.3.4:5000"}, headers=h).json()
-    assert r["created"] == 1  # second line is a duplicate endpoint
+                    "text": "http://sess1:x@proxy.soax.com:5000\n"
+                            "http://sess2:x@proxy.soax.com:5000\n"
+                            "http://sess1:x@proxy.soax.com:5000"}, headers=h).json()
+    assert r["created"] == 2  # two distinct sessions; the third is an exact duplicate
     assert client.get("/proxies", headers=h).json()[0]["provider"] == "soax"
 
 
