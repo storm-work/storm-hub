@@ -13,6 +13,7 @@ dependencies = [
     "httpx",                # solver + mail.tm HTTP client
     "playwright==1.61.0",   # pinned to the shared chromium build 1228 (matches storm-auto)
     "primp",                # TLS-fingerprint HTTP client (login/discovery)
+    "requests",              # vendored solver HTTP client
 ]
 
 [project.optional-dependencies]
