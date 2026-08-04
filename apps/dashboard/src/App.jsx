@@ -140,14 +140,19 @@ function useList(path) {
 
 function Bookings({ me, events }) {
   const { rows, err, reload } = useList("/bookings");
-  const [f, setF] = useState({ name: "", type: "test", posto_id: "2032", nationality: "CPV", residence: "CPV" });
+  const [f, setF] = useState({ name: "", type: "test", posto_id: "2032", nationality: "CPV", residence: "CPV",
+                               warmup_start_at: "", slot_open_at: "" });
   const [msg, setMsg] = useState("");
   const [sel, setSel] = useState(null);
   const canOperate = me.is_operating;
 
   async function create() {
     setMsg("");
-    try { await api("/bookings", { method: "POST", body: f }); reload(); }
+    const body = { ...f };
+    // empty datetime-local -> omit (send null)
+    body.warmup_start_at = f.warmup_start_at ? new Date(f.warmup_start_at).toISOString() : null;
+    body.slot_open_at = f.slot_open_at ? new Date(f.slot_open_at).toISOString() : null;
+    try { await api("/bookings", { method: "POST", body }); reload(); }
     catch (e) { setMsg(e.message); }
   }
   return (
@@ -164,9 +169,11 @@ function Bookings({ me, events }) {
           <div className="field"><label>Posto</label><input value={f.posto_id} onChange={(e) => setF({ ...f, posto_id: e.target.value })} style={{ width: 90 }} /></div>
           <div className="field"><label>Nat.</label><input value={f.nationality} onChange={(e) => setF({ ...f, nationality: e.target.value })} style={{ width: 70 }} /></div>
           <div className="field"><label>Res.</label><input value={f.residence} onChange={(e) => setF({ ...f, residence: e.target.value })} style={{ width: 70 }} /></div>
+          <div className="field"><label>Warmup start</label><input type="datetime-local" value={f.warmup_start_at} onChange={(e) => setF({ ...f, warmup_start_at: e.target.value })} /></div>
+          <div className="field"><label>Slot-open</label><input type="datetime-local" value={f.slot_open_at} onChange={(e) => setF({ ...f, slot_open_at: e.target.value })} /></div>
           <div className="field" style={{ alignSelf: "end" }}><button className="btn" disabled={!canOperate} onClick={create}>Create</button></div>
         </div>
-        {!canOperate && <div className="muted">Operate seat required to create.</div>}
+        {!canOperate && <div className="muted">Operate seat required to create. Leave times blank for manual/instant start.</div>}
       </div>
       <div className="card">
         <h2>Bookings ({rows.length})</h2>
@@ -199,13 +206,28 @@ function BookingWorkers({ me, booking, events }) {
       assigned_role: booking.type === "test" ? role : undefined,
       template_id: tplId || undefined } }));
   const startAll = () => run(() => api(`/bookings/${booking.id}/start`, { method: "POST" }));
+  const stopAll = () => run(() => api(`/bookings/${booking.id}/stop`, { method: "POST" }));
+
+  // live counts from the workers table merged with the WS substate
+  const counts = workers.rows.reduce((a, w) => {
+    const live = (events[w.id] || {});
+    const st = live.outcome === "booked" ? "booked" : w.status;
+    a[st] = (a[st] || 0) + 1; return a;
+  }, {});
 
   return (
     <div className="card">
       <div className="row" style={{ marginBottom: 8 }}>
         <h2 style={{ margin: 0 }}>Workers — {booking.name} <span className="muted">({booking.type} · posto {booking.posto_id})</span></h2>
         <span className="grow" />
-        <button className="btn" disabled={!op || workers.rows.length === 0} onClick={startAll}>▶ Start booking (launch all)</button>
+        <button className="btn" disabled={!op || workers.rows.length === 0} onClick={startAll}>▶ Start booking</button>
+        <button className="btn ghost" disabled={!op || workers.rows.length === 0} onClick={stopAll}>■ Stop</button>
+      </div>
+      <div className="row muted" style={{ fontSize: 13, marginBottom: 8, gap: 14 }}>
+        <span>status: <b>{booking.status}</b></span>
+        {Object.entries(counts).map(([k, v]) => <span key={k}>{k}: {v}</span>)}
+        {booking.warmup_start_at && <span>warmup@{(booking.warmup_start_at || "").slice(11, 16)}Z</span>}
+        {booking.slot_open_at && <span>slot-open@{(booking.slot_open_at || "").slice(11, 16)}Z</span>}
       </div>
       {msg && <div className="banner err">{msg}</div>}
       <div className="row" style={{ flexWrap: "wrap", marginBottom: 12 }}>

@@ -57,6 +57,7 @@ from .schemas import (
     AttachIdentity,
     BookingCreate,
     BookingOut,
+    BookingUpdate,
     BootstrapAdmin,
     GenSubAccounts,
     GenTestIdentities,
@@ -549,9 +550,31 @@ def create_booking(
         posto_id=body.posto_id,
         nationality=body.nationality,
         residence=body.residence,
+        warmup_start_at=body.warmup_start_at,
+        slot_open_at=body.slot_open_at,
         settings_json=clean,
     )
     db.add(bk)
+    db.commit()
+    db.refresh(bk)
+    return bk
+
+
+@app.put("/bookings/{booking_id}", response_model=BookingOut)
+def update_booking(booking_id: str, body: BookingUpdate, db: Session = Depends(get_db),
+                   _op: Principal = Depends(require_operator)) -> M.Booking:
+    bk = db.get(M.Booking, booking_id)
+    if not bk:
+        raise HTTPException(404, "booking not found")
+    if body.settings is not None:
+        try:
+            bk.settings_json = validate_layer(L.BOOKING, body.settings)
+        except Exception as e:
+            raise HTTPException(400, f"invalid booking settings: {e}")
+    for field in ("name", "nationality", "residence", "warmup_start_at", "slot_open_at"):
+        val = getattr(body, field)
+        if val is not None:
+            setattr(bk, field, val)
     db.commit()
     db.refresh(bk)
     return bk
@@ -679,6 +702,48 @@ def start_booking(booking_id: str, db: Session = Depends(get_db),
         bk.status = BookingStatus.RUNNING
         db.commit()
     return {"started": len(workers), "booking_status": str(bk.status)}
+
+
+@app.post("/bookings/{booking_id}/stop")
+def stop_booking(booking_id: str, db: Session = Depends(get_db),
+                 _op: Principal = Depends(require_operator)) -> dict:
+    """Stop every running worker in the booking and mark it completed."""
+    bk = db.get(M.Booking, booking_id)
+    if not bk:
+        raise HTTPException(404, "booking not found")
+    running = list(db.scalars(select(M.Worker).where(
+        M.Worker.booking_id == booking_id, M.Worker.status == WorkerStatus.RUNNING)).all())
+    for w in running:
+        _bus.send_command(w.id, "stop")
+        supervisor.stop(w.id)
+        w.status = WorkerStatus.STOPPED
+    if bk.status == BookingStatus.RUNNING:
+        bk.status = BookingStatus.COMPLETED
+    db.commit()
+    return {"stopped": len(running), "booking_status": str(bk.status)}
+
+
+@app.get("/bookings/{booking_id}/summary")
+def booking_summary(booking_id: str, db: Session = Depends(get_db)) -> dict:
+    """Run overview: booking status + worker counts by status/role/substate."""
+    bk = db.get(M.Booking, booking_id)
+    if not bk:
+        raise HTTPException(404, "booking not found")
+    workers = list(db.scalars(select(M.Worker).where(M.Worker.booking_id == booking_id)).all())
+    by_status: dict[str, int] = {}
+    by_role: dict[str, int] = {}
+    booked = 0
+    for w in workers:
+        by_status[str(w.status)] = by_status.get(str(w.status), 0) + 1
+        by_role[str(w.role)] = by_role.get(str(w.role), 0) + 1
+        if str(w.substate) == "booked":
+            booked += 1
+    return {
+        "booking_status": str(bk.status), "workers": len(workers),
+        "by_status": by_status, "by_role": by_role, "booked": booked,
+        "warmup_start_at": bk.warmup_start_at.isoformat() if bk.warmup_start_at else None,
+        "slot_open_at": bk.slot_open_at.isoformat() if bk.slot_open_at else None,
+    }
 
 
 @app.post("/workers/{worker_id}/stop", response_model=WorkerOut)

@@ -84,7 +84,18 @@ class BookingCreate(BaseModel):
     posto_id: str
     nationality: str | None = None
     residence: str | None = None
+    warmup_start_at: datetime | None = None
+    slot_open_at: datetime | None = None
     settings: dict = Field(default_factory=dict)  # BOOKING-layer settings (validated by resolver)
+
+
+class BookingUpdate(BaseModel):
+    name: str | None = None
+    nationality: str | None = None
+    residence: str | None = None
+    warmup_start_at: datetime | None = None
+    slot_open_at: datetime | None = None
+    settings: dict | None = None
 
 
 class BookingOut(BaseModel):
@@ -95,6 +106,8 @@ class BookingOut(BaseModel):
     status: str
     nationality: str | None = None
     residence: str | None = None
+    warmup_start_at: datetime | None = None
+    slot_open_at: datetime | None = None
     settings_json: dict = Field(default_factory=dict)
     created_at: datetime | None = None
 
