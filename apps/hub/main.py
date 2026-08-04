@@ -6,10 +6,11 @@ exclusivity). Redis/worker-control and WS log streaming are added later in Phase
 """
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import func, select, text
@@ -34,7 +35,14 @@ from .auth import (
     require_operator,
     verify_password,
 )
+from libs.bus import Bus, connect
+from libs.domain.enums import WorkerStatus, WorkerSubstate
+from libs.domain.settings import resolve
+
+from .config import settings
 from .db import engine, get_db
+from .events import EventHub
+from .supervisor import Supervisor
 from .schemas import (
     AttachIdentity,
     BookingCreate,
@@ -50,7 +58,20 @@ from .schemas import (
     WorkerOut,
 )
 
-app = FastAPI(title="storm-hub", version="0.1.0")
+supervisor = Supervisor(settings.redis_url)
+event_hub = EventHub(settings.redis_url)
+_bus = Bus(connect(settings.redis_url))
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    event_hub.start()          # background thread tailing the evt stream -> DB + WS
+    yield
+    event_hub.stop()
+    supervisor.shutdown_all()
+
+
+app = FastAPI(title="storm-hub", version="0.1.0", lifespan=lifespan)
 
 
 def _now() -> datetime:
@@ -59,14 +80,13 @@ def _now() -> datetime:
 
 # ── Health & meta ─────────────────────────────────────────────────────────────
 @app.get("/health")
-def health() -> dict:
+def health(db: Session = Depends(get_db)) -> dict:
+    from sqlalchemy import inspect as _inspect
     try:
-        with engine.connect() as c:
-            n = c.execute(
-                text("SELECT count(*) FROM information_schema.tables WHERE table_schema='public'")
-            ).scalar()
-        return {"status": "ok", "db": "ok", "tables": int(n or 0)}
-    except Exception as e:  # pragma: no cover - infra failure path
+        db.execute(text("SELECT 1"))
+        n = len(_inspect(db.get_bind()).get_table_names())
+        return {"status": "ok", "db": "ok", "tables": n}
+    except Exception as e:  # infra failure path (e.g. Postgres down)
         return {"status": "degraded", "db": f"error: {e.__class__.__name__}"}
 
 
@@ -354,6 +374,61 @@ def attach_identity(
 @app.get("/bookings/{booking_id}/workers", response_model=list[WorkerOut])
 def list_workers(booking_id: str, db: Session = Depends(get_db)) -> list[M.Worker]:
     return list(db.scalars(select(M.Worker).where(M.Worker.booking_id == booking_id)).all())
+
+
+# ── Worker control (supervisor + bus) ─────────────────────────────────────────
+@app.post("/workers/{worker_id}/launch", response_model=WorkerOut)
+def launch_worker(worker_id: str, db: Session = Depends(get_db),
+                  _op: Principal = Depends(require_operator)) -> M.Worker:
+    w = db.get(M.Worker, worker_id)
+    if not w:
+        raise HTTPException(404, "worker not found")
+    bk = db.get(M.Booking, w.booking_id)
+    tpl = db.get(M.WorkerTemplate, w.template_id) if w.template_id else None
+    # Resolve + FREEZE the effective settings for this launch (spec §6).
+    layers = {L.BOOKING: (bk.settings_json or {})}
+    if tpl:
+        layers[L.TEMPLATE] = (tpl.settings_json or {})
+    eff = resolve(layers)
+    eff["ROLE"] = str(w.role)                     # role comes from the worker row, not settings
+    w.effective_settings_json = eff
+    w.status = WorkerStatus.RUNNING
+    w.substate = WorkerSubstate.IDLE
+    db.commit()
+    db.refresh(w)
+    # spawn the process, then send the launch command (stream persists — order-independent)
+    supervisor.spawn(worker_id)
+    _bus.send_command(worker_id, "launch", cfg=eff)
+    return w
+
+
+@app.post("/workers/{worker_id}/stop", response_model=WorkerOut)
+def stop_worker(worker_id: str, db: Session = Depends(get_db),
+                _op: Principal = Depends(require_operator)) -> M.Worker:
+    w = db.get(M.Worker, worker_id)
+    if not w:
+        raise HTTPException(404, "worker not found")
+    _bus.send_command(worker_id, "stop")
+    supervisor.stop(worker_id)
+    w.status = WorkerStatus.STOPPED
+    db.commit()
+    db.refresh(w)
+    return w
+
+
+@app.websocket("/ws/events")
+async def ws_events(ws: WebSocket) -> None:
+    """Live worker status/log stream for the dashboard (fanned from the evt Redis stream)."""
+    await ws.accept()
+    q = event_hub.subscribe()
+    try:
+        while True:
+            item = await q.get()
+            await ws.send_json(item)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        event_hub.unsubscribe(q)
 
 
 # ── Dashboard (SPA) — served by the Hub on the same origin/port (headless-server friendly) ────
