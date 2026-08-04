@@ -52,6 +52,7 @@ from .events import EventHub
 from .genaccounts import gen_fake_identities, gen_subaccounts
 from .importers import parse_identities, parse_proxies
 from .settings_store import get_global, set_layer
+from .scheduler import Scheduler
 from .supervisor import Supervisor
 from .schemas import (
     AttachIdentity,
@@ -84,6 +85,33 @@ event_hub = EventHub(settings.redis_url)
 _bus = Bus(connect(settings.redis_url))
 
 
+# ── auto-ops scheduler callbacks ──────────────────────────────────────────────
+def _sched_on_start(db: Session, bk: M.Booking) -> None:
+    for w in db.scalars(select(M.Worker).where(
+            M.Worker.booking_id == bk.id, M.Worker.status == WorkerStatus.READY)).all():
+        _do_launch_worker(db, w)
+    bk.status = BookingStatus.WARMING
+    db.commit()
+
+
+def _sched_on_slot_open(db: Session, bk: M.Booking) -> None:
+    _bus.publish_signal(bk.id, "slot_open")
+    for w in db.scalars(select(M.Worker).where(
+            M.Worker.booking_id == bk.id, M.Worker.status == WorkerStatus.RUNNING)).all():
+        _bus.send_command(w.id, "signal", name="slot_open")
+    bk.status = BookingStatus.RUNNING
+    db.commit()
+
+
+def _sched_on_assign(db: Session, worker: M.Worker, slot: M.Slot) -> None:
+    _bus.send_command(worker.id, "assign",
+                      slot={"id": slot.id, "date": slot.date, "period": slot.period})
+
+
+scheduler = Scheduler(SessionLocal, on_start=_sched_on_start, on_slot_open=_sched_on_slot_open,
+                      on_assign=_sched_on_assign)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
@@ -94,7 +122,9 @@ async def lifespan(app: FastAPI):
     except Exception:
         pass                   # DB may be down at boot; endpoints still report degraded
     event_hub.start()          # background thread tailing the evt stream -> DB + WS
+    scheduler.start()          # auto-ops: scheduled start + slot-open + slot assignment
     yield
+    scheduler.stop()
     event_hub.stop()
     supervisor.shutdown_all()
 
@@ -702,6 +732,24 @@ def start_booking(booking_id: str, db: Session = Depends(get_db),
         bk.status = BookingStatus.RUNNING
         db.commit()
     return {"started": len(workers), "booking_status": str(bk.status)}
+
+
+@app.post("/bookings/{booking_id}/schedule", response_model=BookingOut)
+def schedule_booking(booking_id: str, db: Session = Depends(get_db),
+                     _op: Principal = Depends(require_operator)) -> M.Booking:
+    """Arm the booking for AUTO start — the scheduler launches at warmup_start_at and fires slot-open
+    at slot_open_at with no operator input."""
+    bk = db.get(M.Booking, booking_id)
+    if not bk:
+        raise HTTPException(404, "booking not found")
+    if not bk.warmup_start_at:
+        raise HTTPException(400, "set warmup_start_at before scheduling")
+    if bk.status not in (BookingStatus.DRAFT, BookingStatus.SCHEDULED):
+        raise HTTPException(409, f"cannot schedule a {bk.status} booking")
+    bk.status = BookingStatus.SCHEDULED
+    db.commit()
+    db.refresh(bk)
+    return bk
 
 
 @app.post("/bookings/{booking_id}/stop")

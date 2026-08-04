@@ -207,6 +207,7 @@ function BookingWorkers({ me, booking, events }) {
       template_id: tplId || undefined } }));
   const startAll = () => run(() => api(`/bookings/${booking.id}/start`, { method: "POST" }));
   const stopAll = () => run(() => api(`/bookings/${booking.id}/stop`, { method: "POST" }));
+  const schedule = () => run(() => api(`/bookings/${booking.id}/schedule`, { method: "POST" }));
 
   // live counts from the workers table merged with the WS substate
   const counts = workers.rows.reduce((a, w) => {
@@ -220,7 +221,8 @@ function BookingWorkers({ me, booking, events }) {
       <div className="row" style={{ marginBottom: 8 }}>
         <h2 style={{ margin: 0 }}>Workers — {booking.name} <span className="muted">({booking.type} · posto {booking.posto_id})</span></h2>
         <span className="grow" />
-        <button className="btn" disabled={!op || workers.rows.length === 0} onClick={startAll}>▶ Start booking</button>
+        <button className="btn" disabled={!op || workers.rows.length === 0} onClick={startAll}>▶ Start now</button>
+        <button className="btn ghost" disabled={!op || !booking.warmup_start_at} onClick={schedule} title="auto-start at warmup time">⏱ Scheduled</button>
         <button className="btn ghost" disabled={!op || workers.rows.length === 0} onClick={stopAll}>■ Stop</button>
       </div>
       <div className="row muted" style={{ fontSize: 13, marginBottom: 8, gap: 14 }}>
