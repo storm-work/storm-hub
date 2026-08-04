@@ -35,6 +35,26 @@ def set_config(db: Session, key: str, value: dict) -> dict:
     return value
 
 
+def seed_templates(db: Session) -> list[str]:
+    """Create the two default worker templates (scout, apply) if none exist."""
+    from libs.domain.enums import WorkerRole
+    if db.scalar(select(M.WorkerTemplate)):
+        return []
+    scout = M.WorkerTemplate(
+        name="Default Scout", role=WorkerRole.SCOUT,
+        settings_json={"ROLE": "scout", "CAPTURE_ONLY": True, "KEEPALIVE_NO_RESTORE": True,
+                       "NAV_TIMEOUT_SCALE": 4, "LOGIN_FIELD_RETRIES": 4},
+    )
+    apply = M.WorkerTemplate(
+        name="Default Apply", role=WorkerRole.APPLY,
+        settings_json={"ROLE": "apply", "NAV_TIMEOUT_SCALE": 4, "LOGIN_FIELD_RETRIES": 4,
+                       "KEEPALIVE_NO_RESTORE": True, "STICKY_RETRY_MAX": 3},
+    )
+    db.add_all([scout, apply])
+    db.commit()
+    return ["Default Scout", "Default Apply"]
+
+
 def seed_defaults(db: Session) -> list[str]:
     """Insert form_defaults/quest_steps from config/*.json if the key is absent. Idempotent."""
     seeded = []

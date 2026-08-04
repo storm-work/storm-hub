@@ -105,6 +105,7 @@ class BookingOut(BaseModel):
 class AttachIdentity(BaseModel):
     identity_id: str
     assigned_role: WorkerRole | None = None  # required for TEST bookings; ignored for REAL
+    template_id: str | None = None           # worker template to arm this worker with
 
 
 class WorkerOut(BaseModel):
@@ -170,3 +171,19 @@ class GenTestIdentities(BaseModel):
     count: int = 10               # number of fake test identities
     accounts_per_identity: int = 3
     nationality: str = "CPV"
+
+
+# ── Worker templates ──────────────────────────────────────────────────────────
+class TemplateCreate(BaseModel):
+    name: str
+    role: WorkerRole
+    settings: dict = Field(default_factory=dict)   # TEMPLATE-layer settings (validated)
+
+
+class TemplateOut(BaseModel):
+    id: str
+    name: str
+    role: WorkerRole
+    settings_json: dict = Field(default_factory=dict)
+    logic_snapshot: str = "latest"
+    model_config = {"from_attributes": True}

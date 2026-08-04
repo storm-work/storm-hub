@@ -18,7 +18,13 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from libs.db import models as M
-from libs.domain.enums import BOOKING_ACTIVE_STATUSES, SessionPurpose, SessionStatus, UserRole
+from libs.domain.enums import (
+    BOOKING_ACTIVE_STATUSES,
+    BookingStatus,
+    SessionPurpose,
+    SessionStatus,
+    UserRole,
+)
 from libs.domain.enums import SettingsLayer as L
 from libs.domain.rules import RuleViolation, resolve_worker_role
 from libs.domain.settings import CATALOG, settings_for_layer, validate_layer
@@ -40,7 +46,7 @@ from libs.domain.enums import WorkerStatus, WorkerSubstate
 from libs.domain.settings import resolve
 
 from .config import settings
-from .config_store import get_config, seed_defaults, set_config
+from .config_store import get_config, seed_defaults, seed_templates, set_config
 from .db import SessionLocal, engine, get_db
 from .events import EventHub
 from .genaccounts import gen_fake_identities, gen_subaccounts
@@ -64,6 +70,8 @@ from .schemas import (
     ProxyCreate,
     ProxyImport,
     ProxyOut,
+    TemplateCreate,
+    TemplateOut,
     UserCreate,
     UserOut,
     WhoAmI,
@@ -80,6 +88,7 @@ async def lifespan(app: FastAPI):
     try:
         db = SessionLocal()
         seed_defaults(db)      # form_defaults / quest_steps into the DB if absent
+        seed_templates(db)     # default scout + apply worker templates
         db.close()
     except Exception:
         pass                   # DB may be down at boot; endpoints still report degraded
@@ -450,6 +459,55 @@ def write_global_settings(body: GlobalSettingsPut, db: Session = Depends(get_db)
     return {"saved": sorted(body.values.keys()), "total_stored": len(stored)}
 
 
+# ── Worker templates ──────────────────────────────────────────────────────────
+@app.get("/templates", response_model=list[TemplateOut])
+def list_templates(db: Session = Depends(get_db)) -> list[M.WorkerTemplate]:
+    return list(db.scalars(select(M.WorkerTemplate).order_by(M.WorkerTemplate.created_at.asc())).all())
+
+
+@app.post("/templates", response_model=TemplateOut, status_code=201)
+def create_template(body: TemplateCreate, db: Session = Depends(get_db),
+                    _op: Principal = Depends(require_operator)) -> M.WorkerTemplate:
+    settings_json = dict(body.settings or {})
+    settings_json.setdefault("ROLE", str(body.role))
+    try:
+        validate_layer(L.TEMPLATE, settings_json)
+    except Exception as e:
+        raise HTTPException(400, f"invalid template settings: {e}")
+    tpl = M.WorkerTemplate(name=body.name, role=body.role, settings_json=settings_json)
+    db.add(tpl)
+    db.commit()
+    db.refresh(tpl)
+    return tpl
+
+
+@app.put("/templates/{template_id}", response_model=TemplateOut)
+def update_template(template_id: str, body: TemplateCreate, db: Session = Depends(get_db),
+                    _op: Principal = Depends(require_operator)) -> M.WorkerTemplate:
+    tpl = db.get(M.WorkerTemplate, template_id)
+    if not tpl:
+        raise HTTPException(404, "template not found")
+    settings_json = dict(body.settings or {})
+    settings_json.setdefault("ROLE", str(body.role))
+    try:
+        validate_layer(L.TEMPLATE, settings_json)
+    except Exception as e:
+        raise HTTPException(400, f"invalid template settings: {e}")
+    tpl.name, tpl.role, tpl.settings_json = body.name, body.role, settings_json
+    db.commit()
+    db.refresh(tpl)
+    return tpl
+
+
+@app.delete("/templates/{template_id}", status_code=204)
+def delete_template(template_id: str, db: Session = Depends(get_db),
+                    _op: Principal = Depends(require_operator)) -> None:
+    tpl = db.get(M.WorkerTemplate, template_id)
+    if tpl:
+        db.delete(tpl)
+        db.commit()
+
+
 # ── Editable configs (form_defaults, quest_steps) ─────────────────────────────
 @app.get("/configs")
 def list_configs(db: Session = Depends(get_db), me: Principal = Depends(current_principal)) -> list[str]:
@@ -544,10 +602,23 @@ def attach_identity(
     if any(st in BOOKING_ACTIVE_STATUSES for st in other_active):
         raise HTTPException(409, "identity already allocated to another active booking")
 
+    # Template: default to the first template matching the resolved role if none given.
+    template_id = body.template_id
+    if template_id:
+        tpl = db.get(M.WorkerTemplate, template_id)
+        if not tpl:
+            raise HTTPException(404, "template not found")
+        if tpl.role != role:
+            raise HTTPException(400, f"template role {tpl.role} != worker role {role}")
+    else:
+        tpl = db.scalars(select(M.WorkerTemplate).where(M.WorkerTemplate.role == role)
+                         .order_by(M.WorkerTemplate.created_at.asc())).first()
+        template_id = tpl.id if tpl else None
+
     alloc = M.IdentityAllocation(identity_id=ident.id, booking_id=bk.id, allocated_at=_now())
     db.add(alloc)
     db.add(M.BookingIdentity(booking_id=bk.id, identity_id=ident.id, assigned_role=body.assigned_role))
-    worker = M.Worker(booking_id=bk.id, identity_id=ident.id, role=role)
+    worker = M.Worker(booking_id=bk.id, identity_id=ident.id, role=role, template_id=template_id)
     db.add(worker)
     try:
         db.commit()
@@ -564,15 +635,10 @@ def list_workers(booking_id: str, db: Session = Depends(get_db)) -> list[M.Worke
 
 
 # ── Worker control (supervisor + bus) ─────────────────────────────────────────
-@app.post("/workers/{worker_id}/launch", response_model=WorkerOut)
-def launch_worker(worker_id: str, db: Session = Depends(get_db),
-                  _op: Principal = Depends(require_operator)) -> M.Worker:
-    w = db.get(M.Worker, worker_id)
-    if not w:
-        raise HTTPException(404, "worker not found")
+def _do_launch_worker(db: Session, w: M.Worker) -> None:
+    """Resolve + FREEZE effective settings (global<booking<template), spawn, send launch command."""
     bk = db.get(M.Booking, w.booking_id)
     tpl = db.get(M.WorkerTemplate, w.template_id) if w.template_id else None
-    # Resolve + FREEZE the effective settings for this launch (spec §6): global (DB) < booking < template.
     layers = {L.GLOBAL: get_global(db), L.BOOKING: (bk.settings_json or {})}
     if tpl:
         layers[L.TEMPLATE] = (tpl.settings_json or {})
@@ -582,11 +648,37 @@ def launch_worker(worker_id: str, db: Session = Depends(get_db),
     w.status = WorkerStatus.RUNNING
     w.substate = WorkerSubstate.IDLE
     db.commit()
+    supervisor.spawn(w.id)
+    _bus.send_command(w.id, "launch", cfg=eff)
+
+
+@app.post("/workers/{worker_id}/launch", response_model=WorkerOut)
+def launch_worker(worker_id: str, db: Session = Depends(get_db),
+                  _op: Principal = Depends(require_operator)) -> M.Worker:
+    w = db.get(M.Worker, worker_id)
+    if not w:
+        raise HTTPException(404, "worker not found")
+    _do_launch_worker(db, w)
     db.refresh(w)
-    # spawn the process, then send the launch command (stream persists — order-independent)
-    supervisor.spawn(worker_id)
-    _bus.send_command(worker_id, "launch", cfg=eff)
     return w
+
+
+@app.post("/bookings/{booking_id}/start")
+def start_booking(booking_id: str, db: Session = Depends(get_db),
+                  _op: Principal = Depends(require_operator)) -> dict:
+    """Start Instantly — launch every READY worker in the booking (the run begins)."""
+    bk = db.get(M.Booking, booking_id)
+    if not bk:
+        raise HTTPException(404, "booking not found")
+    workers = list(db.scalars(select(M.Worker).where(
+        M.Worker.booking_id == booking_id, M.Worker.status == WorkerStatus.READY)).all())
+    for w in workers:
+        _do_launch_worker(db, w)
+    if bk.status in (BookingStatus.DRAFT, BookingStatus.SCHEDULED, BookingStatus.WARMING,
+                     BookingStatus.ARMED):
+        bk.status = BookingStatus.RUNNING
+        db.commit()
+    return {"started": len(workers), "booking_status": str(bk.status)}
 
 
 @app.post("/workers/{worker_id}/stop", response_model=WorkerOut)

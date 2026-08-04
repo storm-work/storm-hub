@@ -177,6 +177,37 @@ def test_import_identities_and_proxies(client):
     assert client.get("/proxies", headers=h).json()[0]["provider"] == "soax"
 
 
+def test_templates_crud_and_seed(client):
+    h = _operate_headers(client)
+    # seed defaults via startup isn't run in tests; create explicitly
+    r = client.post("/templates", json={"name": "Scout A", "role": "scout",
+                                        "settings": {"CAPTURE_ONLY": True, "NAV_TIMEOUT_SCALE": 4}}, headers=h)
+    assert r.status_code == 201 and r.json()["role"] == "scout"
+    # wrong-layer setting rejected
+    bad = client.post("/templates", json={"name": "x", "role": "apply", "settings": {"SCOUT_POOL": True}}, headers=h)
+    assert bad.status_code == 400
+    assert any(t["name"] == "Scout A" for t in client.get("/templates").json())
+
+
+def test_arm_with_template_and_start_booking(client):
+    h = _operate_headers(client)
+    tpl = client.post("/templates", json={"name": "Apply A", "role": "apply", "settings": {}}, headers=h).json()
+    iid = client.post("/identities", json={"full_name": "R", "type": "real"}, headers=h).json()["id"]
+    bid = client.post("/bookings", json={"name": "b", "type": "real", "posto_id": "5084"}, headers=h).json()["id"]
+    w = client.post(f"/bookings/{bid}/identities",
+                    json={"identity_id": iid, "template_id": tpl["id"]}, headers=h)
+    assert w.status_code == 201 and w.json()["role"] == "apply"
+    # template role mismatch rejected
+    iid2 = client.post("/identities", json={"full_name": "T", "type": "test"}, headers=h).json()["id"]
+    # (test identity in real booking -> scout; apply template mismatches)
+    bad = client.post(f"/bookings/{bid}/identities",
+                      json={"identity_id": iid2, "template_id": tpl["id"]}, headers=h)
+    assert bad.status_code == 400
+    # start booking launches ready workers (supervisor.spawn will try a subprocess; tolerate)
+    r = client.post(f"/bookings/{bid}/start", headers=h)
+    assert r.status_code == 200 and r.json()["started"] >= 1
+
+
 def test_configs_seed_and_edit(client):
     from apps.hub.config_store import seed_defaults
     from apps.hub.db import get_db as _  # noqa

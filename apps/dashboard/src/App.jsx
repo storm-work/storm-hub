@@ -48,6 +48,7 @@ export default function App() {
     bookings: <Bookings me={me} events={events} />,
     identities: <Identities me={me} />,
     proxies: <Proxies me={me} />,
+    templates: <Templates me={me} />,
     settings: <Settings me={me} />,
     sessions: <Sessions me={me} onChange={refreshMe} />,
   };
@@ -57,7 +58,7 @@ export default function App() {
       <div className="topbar">
         <span className="brand">⛈ storm-hub</span>
         <nav className="nav">
-          {["bookings", "identities", "proxies", "settings", "sessions"].map((p) => (
+          {["bookings", "identities", "proxies", "templates", "settings", "sessions"].map((p) => (
             <button key={p} className={page === p ? "active" : ""} onClick={() => setPage(p)}>
               {p[0].toUpperCase() + p.slice(1)}
             </button>
@@ -185,18 +186,27 @@ function Bookings({ me, events }) {
 function BookingWorkers({ me, booking, events }) {
   const workers = useList(`/bookings/${booking.id}/workers`);
   const identities = useList("/identities");
+  const templates = useList("/templates");
   const [attachId, setAttachId] = useState("");
   const [role, setRole] = useState("scout");
+  const [tplId, setTplId] = useState("");
   const [msg, setMsg] = useState("");
   const op = me.is_operating;
 
   async function run(fn) { setMsg(""); try { await fn(); workers.reload(); } catch (e) { setMsg(e.message); } }
   const attach = () => run(() => api(`/bookings/${booking.id}/identities`,
-    { method: "POST", body: { identity_id: attachId, assigned_role: booking.type === "test" ? role : undefined } }));
+    { method: "POST", body: { identity_id: attachId,
+      assigned_role: booking.type === "test" ? role : undefined,
+      template_id: tplId || undefined } }));
+  const startAll = () => run(() => api(`/bookings/${booking.id}/start`, { method: "POST" }));
 
   return (
     <div className="card">
-      <h2>Workers — {booking.name} <span className="muted">({booking.type} · posto {booking.posto_id})</span></h2>
+      <div className="row" style={{ marginBottom: 8 }}>
+        <h2 style={{ margin: 0 }}>Workers — {booking.name} <span className="muted">({booking.type} · posto {booking.posto_id})</span></h2>
+        <span className="grow" />
+        <button className="btn" disabled={!op || workers.rows.length === 0} onClick={startAll}>▶ Start booking (launch all)</button>
+      </div>
       {msg && <div className="banner err">{msg}</div>}
       <div className="row" style={{ flexWrap: "wrap", marginBottom: 12 }}>
         <div className="field"><label>Attach identity</label>
@@ -212,6 +222,11 @@ function BookingWorkers({ me, booking, events }) {
               <option value="scout">scout</option><option value="apply">apply</option>
             </select></div>
         )}
+        <div className="field"><label>Template</label>
+          <select value={tplId} onChange={(e) => setTplId(e.target.value)}>
+            <option value="">auto (by role)</option>
+            {templates.rows.map((t) => (<option key={t.id} value={t.id}>{t.name} ({t.role})</option>))}
+          </select></div>
         <div className="field" style={{ alignSelf: "end" }}>
           <button className="btn" disabled={!op || !attachId} onClick={attach}>Attach → worker</button></div>
       </div>
@@ -486,6 +501,48 @@ function ConfigJsonEditor({ me, ck }) {
         style={{ width: "100%", fontFamily: "monospace", fontSize: 12, background: "var(--panel2)", color: "var(--text)", border: "1px solid var(--border)", borderRadius: 8, padding: 8 }} />
       <div style={{ marginTop: 8 }}><button className="btn" disabled={!me.is_operating} onClick={save}>Save {ck}</button></div>
     </div>
+  );
+}
+
+function Templates({ me }) {
+  const { rows, err, reload } = useList("/templates");
+  const [f, setF] = useState({ name: "", role: "scout", settings: "{}" });
+  const [msg, setMsg] = useState("");
+  async function create() {
+    setMsg("");
+    let settings;
+    try { settings = JSON.parse(f.settings || "{}"); } catch { setMsg("settings must be valid JSON"); return; }
+    try { await api("/templates", { method: "POST", body: { name: f.name, role: f.role, settings } }); reload(); setF({ ...f, name: "" }); }
+    catch (e) { setMsg(e.message); }
+  }
+  return (
+    <>
+      <div className="card">
+        <h2>New worker template</h2>
+        {msg && <div className="banner err">{msg}</div>}
+        <div className="row" style={{ flexWrap: "wrap", alignItems: "flex-start" }}>
+          <div className="field"><label>Name</label><input value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} /></div>
+          <div className="field"><label>Role</label>
+            <select value={f.role} onChange={(e) => setF({ ...f, role: e.target.value })}>
+              <option value="scout">scout</option><option value="apply">apply</option>
+            </select></div>
+          <div className="field grow"><label>Settings (JSON, template-layer knobs)</label>
+            <textarea value={f.settings} onChange={(e) => setF({ ...f, settings: e.target.value })} rows={3}
+              style={{ width: "100%", fontFamily: "monospace", fontSize: 12, background: "var(--panel2)", color: "var(--text)", border: "1px solid var(--border)", borderRadius: 8, padding: 8 }}
+              placeholder='{"NAV_TIMEOUT_SCALE": 4, "KEEPALIVE_NO_RESTORE": true}' /></div>
+          <div className="field" style={{ alignSelf: "end" }}><button className="btn" disabled={!me.is_operating || !f.name} onClick={create}>Create</button></div>
+        </div>
+      </div>
+      <div className="card">
+        <h2>Templates ({rows.length})</h2>
+        {err && <div className="banner err">{err}</div>}
+        <table><thead><tr><th>Name</th><th>Role</th><th>Settings</th></tr></thead>
+          <tbody>{rows.map((t) => (
+            <tr key={t.id}><td>{t.name}</td><td><span className="pill">{t.role}</span></td>
+              <td className="muted" style={{ fontFamily: "monospace", fontSize: 12 }}>{JSON.stringify(t.settings_json)}</td></tr>
+          ))}</tbody></table>
+      </div>
+    </>
   );
 }
 
