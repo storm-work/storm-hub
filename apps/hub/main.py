@@ -42,7 +42,7 @@ from libs.domain.settings import resolve
 from .config import settings
 from .db import engine, get_db
 from .events import EventHub
-from .importers import parse_identities_csv, parse_proxies
+from .importers import parse_identities, parse_proxies
 from .settings_store import get_global, set_layer
 from .supervisor import Supervisor
 from .schemas import (
@@ -299,13 +299,20 @@ def list_identities(db: Session = Depends(get_db)) -> list[M.Identity]:
 @app.post("/identities/import", response_model=ImportResult)
 def import_identities(body: IdentityImport, db: Session = Depends(get_db),
                       _op: Principal = Depends(require_operator)) -> ImportResult:
-    parsed, errors = parse_identities_csv(body.csv, default_type=str(body.default_type))
+    parsed, errors = parse_identities(body.csv, default_type=str(body.default_type))
     created = subs = 0
     existing = {u for (u,) in db.execute(select(M.SubAccount.username)).all()}
+    known_passports = {p for (p,) in db.execute(
+        select(M.Identity.passport_no).where(M.Identity.passport_no.isnot(None))).all()}
     for pi in parsed:
+        if pi.passport_no and pi.passport_no in known_passports:
+            errors.append(f"skip duplicate passport {pi.passport_no}")
+            continue
         ident = M.Identity(full_name=pi.full_name, type=pi.type, birthdate=pi.birthdate,
                            passport_no=pi.passport_no, gender=pi.gender, nationality=pi.nationality,
                            status="active" if pi.sub_accounts else "empty")
+        if pi.passport_no:
+            known_passports.add(pi.passport_no)
         db.add(ident)
         db.flush()
         created += 1

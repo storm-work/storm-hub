@@ -1,4 +1,4 @@
-from apps.hub.importers import parse_identities_csv, parse_proxies
+from apps.hub.importers import parse_identities, parse_identities_csv, parse_proxies
 
 
 def test_parse_proxies_url_form():
@@ -36,3 +36,34 @@ def test_parse_identities_default_type_and_full_name_column():
     csv = "full_name,username,password\nCarl Doe,carl,pw\n"
     idents, _ = parse_identities_csv(csv, default_type="real")
     assert idents[0].full_name == "Carl Doe" and idents[0].type == "real"
+
+
+PARIA = """=== 1 (1).jpeg ===
+First Name     : ALESSANDRO
+Last Name      : DO CANTO MIRANDA
+Date of Birth  : 30-11-2009
+Gender         : M
+Nationality    : CABO-VERDIANA
+Passport Number: PA443247
+
+=== 1 (2).jpeg ===
+First Name     : AILSA KIRI
+Last Name      : ALFAMA SILVA VAZ DOS SANTOS
+Date of Birth  : 25-08-2010
+Gender         : F
+Nationality    : CABO-VERDIANA
+Passport Number: PA580839
+"""
+
+
+def test_parse_paria_labeled_via_autodetect():
+    idents, errors = parse_identities(PARIA)   # auto-detects labeled format
+    assert not errors
+    assert len(idents) == 2
+    a = idents[0]
+    assert a.full_name == "ALESSANDRO DO CANTO MIRANDA"
+    assert a.passport_no == "PA443247"
+    assert a.birthdate == "2009-11-30"           # DD-MM-YYYY -> ISO
+    assert a.nationality == "CPV"                 # CABO-VERDIANA -> CPV
+    assert a.type == "real"                       # passports -> real identities
+    assert a.sub_accounts == []                   # generated/registered separately

@@ -70,6 +70,82 @@ class ParsedIdentity:
     sub_accounts: list[ParsedSubAccount] = field(default_factory=list)
 
 
+# Nationality label -> ISO-ish code (extend as needed). Falls back to the raw value uppercased.
+_NATIONALITY_MAP = {
+    "CABO-VERDIANA": "CPV", "CABO VERDIANA": "CPV", "CAPE VERDEAN": "CPV",
+    "SENEGALAISE": "SEN", "SENEGALESE": "SEN",
+    "PORTUGUESA": "PRT", "BRASILEIRA": "BRA",
+}
+
+
+def _map_nationality(v: str | None) -> str | None:
+    if not v:
+        return None
+    return _NATIONALITY_MAP.get(v.strip().upper(), v.strip().upper()[:8])
+
+
+def _normalize_dob(v: str | None) -> str | None:
+    """DD-MM-YYYY (paria) -> YYYY-MM-DD; pass through anything already ISO-ish."""
+    if not v:
+        return None
+    v = v.strip()
+    m = re.match(r"^(\d{2})-(\d{2})-(\d{4})$", v)
+    if m:
+        d, mo, y = m.groups()
+        return f"{y}-{mo}-{d}"
+    return v
+
+
+def parse_identities_labeled(text: str, *, default_type: str = "real") -> tuple[list[ParsedIdentity], list[str]]:
+    """Parse the paria labeled-block format (passport OCR):
+
+        === <img>.jpeg ===
+        First Name     : ALESSANDRO
+        Last Name      : DO CANTO MIRANDA
+        Date of Birth  : 30-11-2009
+        Gender         : M
+        Nationality    : CABO-VERDIANA
+        Passport Number: PA443247
+
+    Records are delimited by `=== ... ===` headers (or a new `First Name` line). Yields identities with
+    NO sub-accounts (those are generated + registered separately). Nationality is mapped, DOB normalized.
+    """
+    errors: list[str] = []
+    # split into blocks on the === header; keep content after each header
+    blocks = re.split(r"^===.*?===\s*$", text, flags=re.MULTILINE)
+    out: list[ParsedIdentity] = []
+    for blk in blocks:
+        fields: dict[str, str] = {}
+        for line in blk.splitlines():
+            if ":" in line:
+                k, _, v = line.partition(":")
+                fields[k.strip().lower()] = v.strip()
+        first = fields.get("first name")
+        last = fields.get("last name")
+        if not (first or last):
+            continue
+        name = " ".join(x for x in (first, last) if x)
+        passport = fields.get("passport number")
+        out.append(ParsedIdentity(
+            full_name=name,
+            type=default_type,
+            birthdate=_normalize_dob(fields.get("date of birth")),
+            passport_no=passport or None,
+            gender=(fields.get("gender") or None),
+            nationality=_map_nationality(fields.get("nationality")),
+        ))
+    if not out:
+        errors.append("no labeled identity records found")
+    return out, errors
+
+
+def parse_identities(text: str, *, default_type: str = "test") -> tuple[list[ParsedIdentity], list[str]]:
+    """Auto-detect: labeled paria block (has 'Passport Number:' / '=== ... ===') vs CSV."""
+    if "Passport Number" in text or re.search(r"^===.*===\s*$", text, flags=re.MULTILINE):
+        return parse_identities_labeled(text, default_type=(default_type if default_type == "real" else "real"))
+    return parse_identities_csv(text, default_type=default_type)
+
+
 def _first(row: dict, *keys: str) -> str | None:
     for k in keys:
         v = row.get(k)
