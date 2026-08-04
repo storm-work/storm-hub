@@ -14,18 +14,33 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from libs.db import models as M
-from libs.domain.enums import BOOKING_ACTIVE_STATUSES
+from libs.domain.enums import BOOKING_ACTIVE_STATUSES, SessionPurpose, SessionStatus, UserRole
 from libs.domain.enums import SettingsLayer as L
 from libs.domain.rules import RuleViolation, resolve_worker_role
 from libs.domain.settings import CATALOG, settings_for_layer, validate_layer
 
+from .auth import (
+    Principal,
+    current_principal,
+    hash_password,
+    make_token,
+    open_session,
+    require_operator,
+    verify_password,
+)
 from .db import engine, get_db
 from .schemas import (
     AttachIdentity,
     BookingCreate,
     BookingOut,
+    BootstrapAdmin,
     IdentityCreate,
     IdentityOut,
+    LoginRequest,
+    LoginResponse,
+    UserCreate,
+    UserOut,
+    WhoAmI,
     WorkerOut,
 )
 
@@ -69,9 +84,88 @@ def settings_catalog() -> dict:
     return out
 
 
+# ── Auth & sessions (§12c / R2-C7) ────────────────────────────────────────────
+@app.post("/auth/bootstrap", response_model=UserOut, status_code=201)
+def bootstrap_admin(body: BootstrapAdmin, db: Session = Depends(get_db)) -> M.User:
+    """Create the FIRST admin — only works while the users table is empty (headless bootstrap)."""
+    if db.scalar(select(func.count()).select_from(M.User)):
+        raise HTTPException(409, "already bootstrapped; ask an admin to create users")
+    user = M.User(username=body.username, password_hash=hash_password(body.password), role=UserRole.ADMIN)
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+@app.post("/auth/users", response_model=UserOut, status_code=201)
+def create_user(
+    body: UserCreate, db: Session = Depends(get_db), me: Principal = Depends(current_principal)
+) -> M.User:
+    if me.user.role != UserRole.ADMIN:
+        raise HTTPException(403, "only admin can create users")
+    if db.scalar(select(M.User).where(M.User.username == body.username)):
+        raise HTTPException(409, "username taken")
+    user = M.User(username=body.username, password_hash=hash_password(body.password), role=body.role)
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+@app.post("/auth/login", response_model=LoginResponse)
+def login(body: LoginRequest, db: Session = Depends(get_db)) -> LoginResponse:
+    user = db.scalar(select(M.User).where(M.User.username == body.username))
+    if not user or not verify_password(body.password, user.password_hash):
+        raise HTTPException(401, "bad credentials")
+    sess, notice = open_session(db, user, body.purpose)
+    user.last_login = _now()
+    db.commit()
+    db.refresh(sess)
+    return LoginResponse(
+        token=make_token(user.id, sess.id),
+        user=UserOut.model_validate(user),
+        purpose=sess.purpose,
+        session_status=str(sess.status),
+        notice=notice,
+    )
+
+
+@app.post("/auth/logout")
+def logout(db: Session = Depends(get_db), me: Principal = Depends(current_principal)) -> dict:
+    me.session.status = SessionStatus.ENDED
+    db.commit()
+    return {"status": "logged_out"}
+
+
+@app.get("/auth/whoami", response_model=WhoAmI)
+def whoami(me: Principal = Depends(current_principal)) -> WhoAmI:
+    return WhoAmI(
+        username=me.user.username,
+        role=me.user.role,
+        purpose=me.session.purpose,
+        session_status=str(me.session.status),
+        is_operating=me.is_operating,
+    )
+
+
+@app.get("/sessions")
+def list_active_sessions(db: Session = Depends(get_db), me: Principal = Depends(current_principal)) -> list[dict]:
+    rows = db.scalars(
+        select(M.UserSession).where(M.UserSession.status != SessionStatus.ENDED)
+    ).all()
+    out = []
+    for s in rows:
+        u = db.get(M.User, s.user_id)
+        out.append({"session_id": s.id, "user": u.username if u else None,
+                    "purpose": str(s.purpose), "status": str(s.status)})
+    return out
+
+
 # ── Identities ────────────────────────────────────────────────────────────────
 @app.post("/identities", response_model=IdentityOut, status_code=201)
-def create_identity(body: IdentityCreate, db: Session = Depends(get_db)) -> M.Identity:
+def create_identity(
+    body: IdentityCreate, db: Session = Depends(get_db), _op: Principal = Depends(require_operator)
+) -> M.Identity:
     ident = M.Identity(
         full_name=body.full_name,
         type=body.type,
@@ -93,7 +187,9 @@ def list_identities(db: Session = Depends(get_db)) -> list[M.Identity]:
 
 # ── Bookings ──────────────────────────────────────────────────────────────────
 @app.post("/bookings", response_model=BookingOut, status_code=201)
-def create_booking(body: BookingCreate, db: Session = Depends(get_db)) -> M.Booking:
+def create_booking(
+    body: BookingCreate, db: Session = Depends(get_db), _op: Principal = Depends(require_operator)
+) -> M.Booking:
     # Validate the booking-layer settings against the catalog (no unknown/wrong-layer keys).
     try:
         clean = validate_layer(L.BOOKING, body.settings)
@@ -128,7 +224,10 @@ def get_booking(booking_id: str, db: Session = Depends(get_db)) -> M.Booking:
 
 # ── Attach identity → materialize worker (rules + C2 exclusivity) ─────────────
 @app.post("/bookings/{booking_id}/identities", response_model=WorkerOut, status_code=201)
-def attach_identity(booking_id: str, body: AttachIdentity, db: Session = Depends(get_db)) -> M.Worker:
+def attach_identity(
+    booking_id: str, body: AttachIdentity, db: Session = Depends(get_db),
+    _op: Principal = Depends(require_operator),
+) -> M.Worker:
     bk = db.get(M.Booking, booking_id)
     if not bk:
         raise HTTPException(404, "booking not found")

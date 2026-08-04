@@ -5,7 +5,54 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field
 
-from libs.domain.enums import BookingType, IdentityType, WorkerRole
+from libs.domain.enums import (
+    BookingType,
+    IdentityType,
+    SessionPurpose,
+    UserRole,
+    WorkerRole,
+)
+
+
+# ── Auth / sessions ───────────────────────────────────────────────────────────
+class BootstrapAdmin(BaseModel):
+    username: str
+    password: str
+
+
+class UserCreate(BaseModel):
+    username: str
+    password: str
+    role: UserRole = UserRole.OPERATOR
+
+
+class UserOut(BaseModel):
+    id: str
+    username: str
+    role: UserRole
+    model_config = {"from_attributes": True}
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+    purpose: SessionPurpose = SessionPurpose.VIEW
+
+
+class LoginResponse(BaseModel):
+    token: str
+    user: UserOut
+    purpose: SessionPurpose
+    session_status: str          # active | paused
+    notice: str | None = None
+
+
+class WhoAmI(BaseModel):
+    username: str
+    role: UserRole
+    purpose: SessionPurpose
+    session_status: str
+    is_operating: bool
 
 
 # ── Identities ────────────────────────────────────────────────────────────────

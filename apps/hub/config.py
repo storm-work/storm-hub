@@ -24,6 +24,9 @@ class Settings:
         _load_dotenv()
         self.database_url = os.environ.get("DATABASE_URL", "sqlite:///./_bootstrap.db")
         self.redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+        # dev fallback secret keeps tests running without a .env; prod supplies JWT_SECRET.
+        self.jwt_secret = os.environ.get("JWT_SECRET", "dev-insecure-secret-change-me")
+        self.jwt_ttl_hours = int(os.environ.get("JWT_TTL_HOURS", "12"))
 
 
 settings = Settings()
