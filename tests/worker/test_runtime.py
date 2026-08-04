@@ -25,21 +25,18 @@ def _events(bus):
 
 def test_apply_worker_emits_started_status_and_booked(bus):
     rt = WorkerRuntime(bus, "w1")
-    res = rt.run(_cfg(template={"ROLE": "apply"}), SimEngineOps())
+    res = rt.run(_cfg(template={"ROLE": "apply"}), SimEngineOps(assignment={"date": "d", "period": 3}))
     assert res.outcome == "booked"
     evs = _events(bus)
-    types = [e.type for e in evs]
-    assert types[0] == "started"
-    assert types[-1] == "terminal"
+    assert evs[0].type == "started" and evs[-1].type == "terminal"
     assert evs[-1].payload["outcome"] == "booked"
-    # a status_change reached 'booked'
     substates = [e.payload.get("substate") for e in evs if e.type == "status_change"]
     assert "logging_in" in substates and "booked" in substates
     assert all(e.payload["worker_id"] == "w1" for e in evs)
 
 
 def test_scout_worker_pushes_and_terminal_discovered(bus):
-    ops = SimEngineOps()
+    ops = SimEngineOps(scout_rounds=1)
     res = WorkerRuntime(bus, "s1").run(_cfg(template={"ROLE": "scout"}), ops)
     assert res.outcome == "discovered"
     assert ops.pushed == [{"date": "2026-08-18", "period": 4}]
@@ -48,7 +45,8 @@ def test_scout_worker_pushes_and_terminal_discovered(bus):
 
 def test_no_book_terminal_dry_run(bus):
     res = WorkerRuntime(bus, "w2").run(
-        _cfg(booking={"no_book": True}, template={"ROLE": "apply"}), SimEngineOps()
+        _cfg(booking={"no_book": True}, template={"ROLE": "apply"}),
+        SimEngineOps(assignment={"date": "d", "period": 1}),
     )
     assert res.outcome == "dry_run"
     assert _events(bus)[-1].payload["outcome"] == "dry_run"
