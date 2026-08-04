@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node / dashboard
+node_modules/
+apps/dashboard/dist/
+
+# Secrets & local config — NEVER commit
+.env
+.env.*
+!.env.example
+config/*.local.*
+*.key
+*.pem
+
+# Data / credentials (mirrors storm-auto policy)
+proxies_*.txt
+accounts*.csv
+scout_accounts*.txt
+apply_accounts*.txt
+data/
+logs/
+*.pdf
+
+# OS
+.DS_Store
+
+# alembic bootstrap
+*.db
+_bootstrap.db

@@ -1,0 +1,25 @@
+[project]
+name = "storm-hub"
+version = "0.1.0"
+description = "Control plane for portal-booking automation: dashboard-driven Manager Hub orchestrating one worker per identity."
+requires-python = ">=3.10"
+dependencies = [
+    "sqlalchemy>=2.0",
+    "alembic",
+    "psycopg[binary]",
+    "fastapi",
+    "uvicorn[standard]",
+    # "redis>=5.0",  # enabled with the worker command bus (Phase 3, later slice)
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "httpx"]
+
+# The domain layer (Phase 1) is pure-stdlib and importable as top-level packages.
+[tool.setuptools]
+packages = ["libs"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"

@@ -1,0 +1,166 @@
+"""Canonical enums for storm-hub domain objects.
+
+These mirror the state machines in the approved spec (§4) exactly. Keeping them in one
+place means the DB schema (migrations), the API, and the state-machine transition tables
+all reference a single source of truth.
+"""
+from __future__ import annotations
+
+from enum import Enum
+
+
+class StrEnum(str, Enum):
+    """str-valued Enum (3.10 has no stdlib StrEnum). Value == the wire/db string."""
+
+    def __str__(self) -> str:  # so f"{x}" and json give the bare value
+        return self.value
+
+
+# ── Identity ────────────────────────────────────────────────────────────────
+class IdentityType(StrEnum):
+    TEST = "test"
+    REAL = "real"
+
+
+class IdentityStatus(StrEnum):
+    EMPTY = "empty"        # 0 sub-accounts
+    ACTIVE = "active"      # >=1 sub-account, usable for bookings
+    RETIRED = "retired"    # manually retired
+    BOOKED = "booked"      # a sub-account booked -> auto-retired to booked list
+    ARCHIVED = "archived"  # terminal/hidden
+
+
+# ── Sub-account (C7: `new`, was `generated`) ──────────────────────────────────
+class SubAccountStatus(StrEnum):
+    NEW = "new"
+    REGISTERED = "registered"
+    VERIFIED = "verified"
+    LOGIN_OK = "login_ok"   # durable: passed the reCAPTCHA login wall at least once
+    HELD = "held"
+    BOOKED = "booked"
+    BURNED = "burned"
+
+
+# ── Booking ───────────────────────────────────────────────────────────────────
+class BookingType(StrEnum):
+    TEST = "test"
+    REAL = "real"
+
+
+class BookingStatus(StrEnum):
+    DRAFT = "draft"
+    SCHEDULED = "scheduled"
+    WARMING = "warming"      # auto at warmup_start_at
+    ARMED = "armed"          # all workers warmed + holding
+    RUNNING = "running"      # slot_open fired
+    COMPLETED = "completed"
+    ABORTED = "aborted"
+
+
+# Booking statuses during which an identity is exclusively allocated (C2).
+BOOKING_ACTIVE_STATUSES = frozenset(
+    {BookingStatus.SCHEDULED, BookingStatus.WARMING, BookingStatus.ARMED, BookingStatus.RUNNING}
+)
+
+
+# ── Worker ────────────────────────────────────────────────────────────────────
+class WorkerRole(StrEnum):
+    SCOUT = "scout"
+    APPLY = "apply"
+
+
+class WorkerStatus(StrEnum):
+    READY = "ready"
+    RUNNING = "running"
+    STOPPED = "stopped"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class WorkerSubstate(StrEnum):
+    IDLE = "idle"
+    LOGGING_IN = "logging_in"
+    LOGGED_IN = "logged_in"
+    WARMING_UP = "warming_up"
+    WARMED = "warmed"
+    SWAPPED = "swapped"          # detail carries the ISP exit ip
+    HOLDING = "holding"
+    DISCOVERING = "discovering"
+    POLLING = "polling"
+    APPLYING = "applying"
+    BOOKED = "booked"
+    FAILED = "failed"            # detail carries the failing step
+
+
+# ── Slots (C5) ────────────────────────────────────────────────────────────────
+class SlotStatus(StrEnum):
+    AVAILABLE = "available"
+    LEASED = "leased"
+    CLOSED = "closed"            # reconcile: absent from N consecutive scans
+    TAKEN = "taken"             # exclusive-mode single-capacity booked
+
+
+class SlotLeaseOutcome(StrEnum):
+    BOOKED = "booked"
+    BOUNCED = "bounced"
+    EXPIRED = "expired"
+
+
+# ── Registration jobs (C5) ────────────────────────────────────────────────────
+class RegistrationMode(StrEnum):
+    ITERATIVE = "iterative"
+    PARALLEL = "parallel"
+
+
+class RegistrationStatus(StrEnum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    REGISTERED = "registered"
+    VERIFIED = "verified"
+    FAILED = "failed"
+
+
+# ── Users & sessions (C8 / R2-C7) ─────────────────────────────────────────────
+class UserRole(StrEnum):
+    ADMIN = "admin"
+    OPERATOR = "operator"
+    VIEWER = "viewer"
+
+
+class SessionPurpose(StrEnum):
+    VIEW = "view"
+    OPERATE = "operate"
+
+
+class SessionStatus(StrEnum):
+    ACTIVE = "active"
+    PAUSED = "paused"       # operate seat blocked while another operator holds it
+    ENDED = "ended"
+
+
+class HandoverStatus(StrEnum):
+    PENDING = "pending"
+    GRANTED = "granted"
+    DENIED = "denied"
+
+
+# Roles permitted to hold an OPERATE session (R2-C7).
+OPERATE_ROLES = frozenset({UserRole.ADMIN, UserRole.OPERATOR})
+
+
+# ── Identity run-history events (C6) ──────────────────────────────────────────
+class IdentityEvent(StrEnum):
+    LOGIN_OK = "login_ok"
+    WARMUP_OK = "warmup_ok"
+    HELD = "held"
+    SWAPPED = "swapped"
+    BOOKED = "booked"
+    FAILED = "failed"
+
+
+# ── Settings layers (§6) ──────────────────────────────────────────────────────
+class SettingsLayer(StrEnum):
+    GLOBAL = "global"
+    BOOKING = "booking"
+    TEMPLATE = "template"     # worker template
+    WORKER = "worker"         # worker instance (highest precedence)
