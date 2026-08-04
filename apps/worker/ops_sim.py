@@ -24,6 +24,8 @@ class SimEngineOps(EngineOps):
         apply_outcome: str = "booked",
         scout_rounds: int = 1,            # how many discover/poll loops a scout runs before stopping
         step_delay: float = 0.0,
+        signals=None,                     # BusSignals: block on real slot-open/assign commands
+        emit=None,                        # callable(type, **payload): emit an event (e.g. slots_found)
     ):
         self._login_ok = login_ok
         self._warmup_ok = warmup_ok
@@ -34,6 +36,8 @@ class SimEngineOps(EngineOps):
         self._apply_outcome = apply_outcome
         self._scout_rounds = scout_rounds
         self._delay = step_delay
+        self._signals = signals
+        self._emit = emit
         self.pushed: list[dict] = []
         self._rounds_done = 0
 
@@ -52,6 +56,8 @@ class SimEngineOps(EngineOps):
         self._pause(); return self._swap_ip
 
     def await_slot_open(self) -> str:
+        if self._signals is not None:      # block on the real scheduler-fired signal
+            return self._signals.wait_slot_open()
         self._pause(); return "slot_open"
 
     # scout
@@ -60,6 +66,8 @@ class SimEngineOps(EngineOps):
 
     def push_slots(self, slots: list[dict]) -> None:
         self.pushed.extend(slots)
+        if self._emit is not None:         # -> Hub event consumer writes them to the DB pool
+            self._emit("slots_found", slots=slots)
 
     def scout_should_continue(self) -> bool:
         cont = self._rounds_done < self._scout_rounds
@@ -71,6 +79,8 @@ class SimEngineOps(EngineOps):
 
     # apply
     def await_assignment(self) -> dict | None:
+        if self._signals is not None:      # block until the scheduler assigns a pooled slot
+            return self._signals.wait_assignment()
         self._pause(); return self._assignment
 
     def scouts_invalid(self) -> bool:

@@ -96,6 +96,32 @@ class EventHub:
         finally:
             db.close()
 
+    def _persist_slots(self, worker_id: str, slots: list) -> None:
+        """A scout pushed slots -> upsert into the booking's DB pool (scheduler then assigns them)."""
+        from sqlalchemy import select
+        from libs.domain.enums import SlotStatus
+        db = SessionLocal()
+        try:
+            w = db.get(M.Worker, worker_id)
+            if not w:
+                return
+            bk = db.get(M.Booking, w.booking_id)
+            for s in slots or []:
+                date, period = s.get("date"), s.get("period")
+                if date is None or period is None:
+                    continue
+                exists = db.scalar(select(M.Slot).where(
+                    M.Slot.booking_id == w.booking_id, M.Slot.date == str(date),
+                    M.Slot.period == int(period)))
+                if exists:
+                    continue
+                db.add(M.Slot(booking_id=w.booking_id, posto_id=bk.posto_id if bk else "",
+                              date=str(date), period=int(period), status=SlotStatus.AVAILABLE,
+                              discovered_by=worker_id))
+            db.commit()
+        finally:
+            db.close()
+
     def _consume(self) -> None:
         bus = Bus(connect(self._redis_url))
         last_id = "$"   # only new events from Hub start
@@ -109,6 +135,8 @@ class EventHub:
                 wid = m.payload.get("worker_id")
                 if wid:
                     self._apply_db(wid, map_event_to_update(m.type, m.payload))
+                    if m.type == "slots_found":
+                        self._persist_slots(wid, m.payload.get("slots", []))
                 item = {"id": m.id, "type": m.type, "ts": m.ts, **m.payload}
                 if self._loop is not None:
                     self._loop.call_soon_threadsafe(self._broadcast, item)

@@ -14,6 +14,7 @@ import sys
 from libs.bus import Bus, connect
 from libs.engine.config import EngineConfig
 
+from .bus_signals import BusSignals
 from .ops_sim import SimEngineOps
 from .runtime import WorkerRuntime
 
@@ -25,26 +26,20 @@ def main() -> int:
     worker_id = sys.argv[1]
     redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
     bus = Bus(connect(redis_url))
-    bus.ensure_command_group(worker_id)
-
     consumer = f"worker-{os.getpid()}"
+    signals = BusSignals(bus, worker_id, consumer)
     bus.emit_event(worker_id, "process_up", pid=os.getpid())
 
-    # Wait for the launch command (persisted in the stream, so ordering vs the Hub doesn't matter).
-    cfg_payload = None
-    while cfg_payload is None:
-        for msg in bus.read_commands(worker_id, consumer, block_ms=2000):
-            bus.ack_command(worker_id, msg.id)
-            if msg.type == "launch":
-                cfg_payload = msg.payload.get("cfg", {})
-                break
-            if msg.type in ("stop", "shutdown"):
-                bus.emit_event(worker_id, "terminal", outcome="stopped", detail="stopped before launch")
-                return 0
+    cfg_payload = signals.wait_launch()
+    if cfg_payload is None:
+        bus.emit_event(worker_id, "terminal", outcome="stopped", detail="stopped before launch")
+        return 0
 
     step_delay = float(os.environ.get("SIM_STEP_DELAY", "1.2"))
     cfg = EngineConfig.from_settings(cfg_payload, no_book=bool(cfg_payload.get("no_book", False)))
-    ops = SimEngineOps(step_delay=step_delay)
+    # signals: block on real scheduler slot-open/assign; emit: push found slots as events -> DB pool.
+    ops = SimEngineOps(step_delay=step_delay, scout_rounds=1, signals=signals,
+                       emit=lambda t, **p: bus.emit_event(worker_id, t, **p))
     WorkerRuntime(bus, worker_id).run(cfg, ops)
     return 0
 
