@@ -40,6 +40,9 @@ def main() -> int:
     pool = "soax"
     if "--pool" in sys.argv:
         pool = sys.argv[sys.argv.index("--pool") + 1].lower()
+    tries = 3
+    if "--tries" in sys.argv:
+        tries = int(sys.argv[sys.argv.index("--tries") + 1])
 
     _load_env()
     from sqlalchemy import create_engine, select
@@ -63,25 +66,29 @@ def main() -> int:
         if not candidates:
             print(f"ERROR: no healthy {pool.upper()} proxy in the pool (import one under Proxies)")
             return 1
-        proxy = conn_url(random.choice(candidates))
+        proxies = [conn_url(p) for p in random.sample(candidates, min(tries, len(candidates)))]
 
-    print(f"[probe] login {username}  via {pool.upper()}  keys={len(keys)}")
-    s = BrowserSession(proxy=proxy, headless=not headed, field_retries=4,
-                       nav_timeout_scale=3).start()
-    try:
-        res = s.login(username, password, keys, lang="PT", min_score=0)
-        import json as _j
-        diag = res.pop("diag", None)
-        snippet = res.pop("post_snippet", None)
-        print(f"[probe] RESULT: {res}")
-        if snippet:
-            print(f"[probe] POST /login snippet: {snippet!r}")
-        if diag:
-            print("[probe] PAGE DIAG:\n" + _j.dumps(diag, indent=2, ensure_ascii=False))
-        print("[probe]", "LOGIN OK ✓" if res.get("ok") else "login NOT confirmed")
-        return 0 if res.get("ok") else 1
-    finally:
-        s.close()
+    import json as _j
+    for i, proxy in enumerate(proxies, 1):
+        print(f"[probe] attempt {i}/{len(proxies)}  login {username}  via {pool.upper()} (fresh IP)")
+        s = BrowserSession(proxy=proxy, headless=not headed, field_retries=4,
+                           nav_timeout_scale=3).start()
+        try:
+            res = s.login(username, password, keys, lang="PT", min_score=0)
+            diag = res.pop("diag", None)
+            snippet = res.pop("post_snippet", None)
+            print(f"[probe]   RESULT: {res}")
+            if snippet:
+                print(f"[probe]   POST /login snippet: {snippet!r}")
+            if diag:
+                print("[probe]   PAGE DIAG:\n" + _j.dumps(diag, indent=2, ensure_ascii=False))
+            if res.get("ok"):
+                print("[probe] LOGIN OK ✓")
+                return 0
+        finally:
+            s.close()
+    print("[probe] login NOT confirmed after", len(proxies), "attempts")
+    return 1
 
 
 if __name__ == "__main__":

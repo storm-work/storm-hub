@@ -82,7 +82,19 @@ class BrowserSession:
         )
         self._context.add_init_script(STEALTH_SCRIPT)   # coherent fingerprint (webdriver/UAD/plugins/webgl/…)
         self.page = self._context.new_page()
+        # playwright-stealth (the full library) on top of our script — patches many more surfaces.
+        try:
+            from playwright_stealth import Stealth
+            Stealth().apply_stealth_sync(self.page)
+        except Exception:
+            pass
         return self
+
+    def cookies(self) -> list[str]:
+        try:
+            return sorted({c["name"] for c in self._context.cookies()})
+        except Exception:
+            return []
 
     def close(self) -> None:
         for obj in (self._context, self._browser):
@@ -269,7 +281,8 @@ class BrowserSession:
             reason = ("WAF/DataDome block on auth page (proxy blocked for login)"
                       if blocked else "login form never rendered")
             return {"ok": False, "final_url": self.page.url, "reason": reason,
-                    "waf_blocked": blocked, "diag": diag}
+                    "waf_blocked": blocked, "auth_cookies": _cookie_names,
+                    "auth_bd_js": _bd_present, "diag": diag}
         time.sleep(random.uniform(1.0, 2.0))
         self._type_credentials(username, password)
 
