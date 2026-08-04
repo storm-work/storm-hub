@@ -45,16 +45,21 @@ class PhaseMachine:
     """Sequences a single worker run. Records every substate for observability/testing and validates
     each transition against the domain state machine (illegal hops raise, catching flow bugs early)."""
 
-    def __init__(self, cfg: EngineConfig, ops: EngineOps):
+    def __init__(self, cfg: EngineConfig, ops: EngineOps, on_transition=None):
         self.cfg = cfg
         self.ops = ops
+        # optional callback(substate, detail) fired on every substate change — the worker
+        # runtime uses it to emit live status_change events over the bus.
+        self._on_transition = on_transition
         self._sub = WorkerSubstate.IDLE
         self.visited: list[WorkerSubstate] = [WorkerSubstate.IDLE]
 
-    def _to(self, nxt: WorkerSubstate) -> None:
+    def _to(self, nxt: WorkerSubstate, detail: str = "") -> None:
         worker_substate_transition(self._sub, nxt)   # raises IllegalTransition on a bad hop
         self._sub = nxt
         self.visited.append(nxt)
+        if self._on_transition is not None:
+            self._on_transition(nxt, detail)
 
     def _fail(self, step: str) -> PhaseResult:
         self._to(WorkerSubstate.FAILED)
