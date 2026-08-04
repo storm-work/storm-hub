@@ -18,7 +18,7 @@ import re
 import time
 
 from . import solver
-from .stealth import STEALTH_SCRIPT, sec_ch_ua_headers
+from .stealth import SEC_CH_UA, STEALTH_SCRIPT, USER_AGENT, VIEWPORT, sec_ch_ua_headers
 
 BASE = "https://pedidodevistos.mne.gov.pt"
 HOME_URL = BASE + "/VistosOnline/"
@@ -65,19 +65,15 @@ class BrowserSession:
     def start(self) -> "BrowserSession":
         from playwright.sync_api import sync_playwright
         self._pw = sync_playwright().start()
-        # NEW headless (--headless=new) is far less detectable than old headless, which DataDome
-        # WAF-blocks on the auth page. headless=False + the flag = real render path, no window.
-        args = list(_LAUNCH_ARGS)
-        launch_headless = self.headless
-        if self.headless:
-            launch_headless = False
-            args.append("--headless=new")
+        # OLD headless (headless=True) — matches storm-auto's PROVEN-passing config in the A/B.
+        # The context user_agent override removes the "HeadlessChrome" HTTP-header tell.
         self._browser = self._pw.chromium.launch(
-            headless=launch_headless, args=args, proxy=_split_proxy(self.proxy),
+            headless=self.headless, args=list(_LAUNCH_ARGS), proxy=_split_proxy(self.proxy),
         )
+        # Coherent Chrome-131/Windows identity (UA + sec-ch-ua + userAgentData all agree).
         self._context = self._browser.new_context(
-            user_agent=_UA, locale="en-US", timezone_id="Europe/Lisbon",
-            viewport={"width": 1366, "height": 768}, ignore_https_errors=True,
+            user_agent=USER_AGENT, locale="en-US", timezone_id="Europe/Lisbon",
+            viewport=VIEWPORT, screen=VIEWPORT, ignore_https_errors=True,
             extra_http_headers=sec_ch_ua_headers(),
         )
         self._context.add_init_script(STEALTH_SCRIPT)   # coherent fingerprint (webdriver/UAD/plugins/webgl/…)
