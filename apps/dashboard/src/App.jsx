@@ -436,6 +436,59 @@ function GlobalSettingsEditor({ me }) {
   );
 }
 
+function TravelDatesEditor({ me }) {
+  const [fd, setFd] = useState(null);
+  const [msg, setMsg] = useState("");
+  const load = () => api("/configs/form_defaults").then((r) => setFd(r.value)).catch(() => {});
+  useEffect(() => { load(); }, []);
+  if (!fd) return null;
+  const dyn = fd.dynamic || {};
+  const setDyn = (k, v) => setFd({ ...fd, dynamic: { ...dyn, [k]: v } });
+  async function save() {
+    setMsg("");
+    try { await api("/configs/form_defaults", { method: "PUT", body: { value: fd } }); setMsg("saved"); }
+    catch (e) { setMsg(e.message); }
+  }
+  return (
+    <div className="card">
+      <h2>Booking travel dates <span className="muted">(frequently updated)</span></h2>
+      {msg && <div className={`banner ${msg === "saved" ? "info" : "err"}`}>{msg}</div>}
+      <div className="muted" style={{ fontSize: 12, marginBottom: 8 }}>
+        f30/f31 = arrival/departure (literal <code>YYYY/MM/DD</code>); f16/f17 = passport dates (<code>today±Nyr</code>).
+      </div>
+      <div className="row" style={{ flexWrap: "wrap" }}>
+        {["f30", "f31", "f16", "f17"].map((k) => (
+          <div className="field" key={k}><label>{k}</label>
+            <input value={dyn[k] || ""} onChange={(e) => setDyn(k, e.target.value)} style={{ width: 130 }} /></div>
+        ))}
+        <div className="field" style={{ alignSelf: "end" }}><button className="btn" disabled={!me.is_operating} onClick={save}>Save dates</button></div>
+      </div>
+    </div>
+  );
+}
+
+function ConfigJsonEditor({ me, ck }) {
+  const [text, setText] = useState("");
+  const [msg, setMsg] = useState("");
+  useEffect(() => { api(`/configs/${ck}`).then((r) => setText(JSON.stringify(r.value, null, 2))).catch(() => {}); }, [ck]);
+  async function save() {
+    setMsg("");
+    let value;
+    try { value = JSON.parse(text); } catch { setMsg("invalid JSON"); return; }
+    try { await api(`/configs/${ck}`, { method: "PUT", body: { value } }); setMsg("saved"); }
+    catch (e) { setMsg(e.message); }
+  }
+  return (
+    <div className="card">
+      <h2>{ck} <span className="muted">(raw JSON)</span></h2>
+      {msg && <div className={`banner ${msg === "saved" ? "info" : "err"}`}>{msg}</div>}
+      <textarea value={text} onChange={(e) => setText(e.target.value)} rows={12}
+        style={{ width: "100%", fontFamily: "monospace", fontSize: 12, background: "var(--panel2)", color: "var(--text)", border: "1px solid var(--border)", borderRadius: 8, padding: 8 }} />
+      <div style={{ marginTop: 8 }}><button className="btn" disabled={!me.is_operating} onClick={save}>Save {ck}</button></div>
+    </div>
+  );
+}
+
 function Settings({ me }) {
   const [cat, setCat] = useState(null);
   const [err, setErr] = useState("");
@@ -446,6 +499,9 @@ function Settings({ me }) {
   return (
     <>
       <GlobalSettingsEditor me={me} />
+      <TravelDatesEditor me={me} />
+      <ConfigJsonEditor me={me} ck="form_defaults" />
+      <ConfigJsonEditor me={me} ck="quest_steps" />
       <div className="card"><h2>Settings taxonomy</h2>
         <div className="muted">{cat._meta.total} settings · precedence: {cat._meta.precedence}</div></div>
       {layers.map((l) => (

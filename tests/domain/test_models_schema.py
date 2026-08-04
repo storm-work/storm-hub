@@ -17,7 +17,7 @@ EXPECTED_TABLES = {
     "workers", "worker_runs",
     "slots", "slot_leases",
     "registration_jobs", "booked_appointments", "artifacts",
-    "settings", "audit",
+    "settings", "audit", "configs",
 }
 
 

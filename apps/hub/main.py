@@ -40,7 +40,8 @@ from libs.domain.enums import WorkerStatus, WorkerSubstate
 from libs.domain.settings import resolve
 
 from .config import settings
-from .db import engine, get_db
+from .config_store import get_config, seed_defaults, set_config
+from .db import SessionLocal, engine, get_db
 from .events import EventHub
 from .genaccounts import gen_fake_identities, gen_subaccounts
 from .importers import parse_identities, parse_proxies
@@ -76,6 +77,12 @@ _bus = Bus(connect(settings.redis_url))
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    try:
+        db = SessionLocal()
+        seed_defaults(db)      # form_defaults / quest_steps into the DB if absent
+        db.close()
+    except Exception:
+        pass                   # DB may be down at boot; endpoints still report degraded
     event_hub.start()          # background thread tailing the evt stream -> DB + WS
     yield
     event_hub.stop()
@@ -441,6 +448,31 @@ def write_global_settings(body: GlobalSettingsPut, db: Session = Depends(get_db)
     except Exception as e:
         raise HTTPException(400, f"invalid global settings: {e}")
     return {"saved": sorted(body.values.keys()), "total_stored": len(stored)}
+
+
+# ── Editable configs (form_defaults, quest_steps) ─────────────────────────────
+@app.get("/configs")
+def list_configs(db: Session = Depends(get_db), me: Principal = Depends(current_principal)) -> list[str]:
+    return [r.key for r in db.scalars(select(M.AppConfig)).all()]
+
+
+@app.get("/configs/{key}")
+def read_config(key: str, db: Session = Depends(get_db),
+                me: Principal = Depends(current_principal)) -> dict:
+    val = get_config(db, key)
+    if val is None:
+        raise HTTPException(404, f"config {key} not found")
+    return {"key": key, "value": val}
+
+
+@app.put("/configs/{key}")
+def write_config(key: str, body: dict, db: Session = Depends(get_db),
+                 _op: Principal = Depends(require_operator)) -> dict:
+    value = body.get("value", body)
+    if not isinstance(value, (dict, list)):
+        raise HTTPException(400, "config value must be a JSON object or array")
+    set_config(db, key, value)
+    return {"key": key, "saved": True}
 
 
 # ── Bookings ──────────────────────────────────────────────────────────────────

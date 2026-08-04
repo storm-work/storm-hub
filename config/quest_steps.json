@@ -1,0 +1,56 @@
+{
+  "IRL": [
+    {"id_pergunta": "1",  "valor": "CPV"},
+    {"id_pergunta": "21", "valor": "IRL",   "pais_residencia": "IRL"},
+    {"id_pergunta": "2",  "valor": "01",    "pais_residencia": "IRL", "tipo_passaporte": "01"},
+    {"id_pergunta": "3",  "valor": "SCH",   "pais_residencia": "IRL", "tipo_passaporte": "01"},
+    {"id_pergunta": "5",  "valor": "O",     "pais_residencia": "IRL", "tipo_passaporte": "01"},
+    {"id_pergunta": "6",  "valor": "10",    "pais_residencia": "IRL", "tipo_passaporte": "01"},
+    {"id_pergunta": "16", "valor": "FAM_N", "pais_residencia": "IRL", "tipo_passaporte": "01"}
+  ],
+  "CPV": [
+    {"id_pergunta": "1",  "valor": "CPV"},
+    {"id_pergunta": "21", "valor": "CPV",   "pais_residencia": "CPV"},
+    {"id_pergunta": "2",  "valor": "01",    "pais_residencia": "CPV", "tipo_passaporte": "01"},
+    {"id_pergunta": "3",  "valor": "SCH",   "pais_residencia": "CPV", "tipo_passaporte": "01"},
+    {"id_pergunta": "5",  "valor": "O",     "pais_residencia": "CPV", "tipo_passaporte": "01"},
+    {"id_pergunta": "6",  "valor": "10",    "pais_residencia": "CPV", "tipo_passaporte": "01"},
+    {"id_pergunta": "16", "valor": "FAM_N", "pais_residencia": "CPV", "tipo_passaporte": "01"}
+  ],
+  "CIV": [
+    {"id_pergunta": "1",  "valor": "CIV"},
+    {"id_pergunta": "21", "valor": "CIV",   "pais_residencia": "CIV"},
+    {"id_pergunta": "2",  "valor": "01",    "pais_residencia": "CIV", "tipo_passaporte": "01"},
+    {"id_pergunta": "3",  "valor": "SCH",   "pais_residencia": "CIV", "tipo_passaporte": "01"},
+    {"id_pergunta": "5",  "valor": "O",     "pais_residencia": "CIV", "tipo_passaporte": "01"},
+    {"id_pergunta": "6",  "valor": "10",    "pais_residencia": "CIV", "tipo_passaporte": "01"},
+    {"id_pergunta": "16", "valor": "FAM_N", "pais_residencia": "CIV", "tipo_passaporte": "01"}
+  ],
+  "GNB": [
+    {"id_pergunta": "1",  "valor": "GNB"},
+    {"id_pergunta": "21", "valor": "GNB",   "pais_residencia": "GNB"},
+    {"id_pergunta": "2",  "valor": "01",    "pais_residencia": "GNB", "tipo_passaporte": "01"},
+    {"id_pergunta": "3",  "valor": "SCH",   "pais_residencia": "GNB", "tipo_passaporte": "01"},
+    {"id_pergunta": "5",  "valor": "O",     "pais_residencia": "GNB", "tipo_passaporte": "01"},
+    {"id_pergunta": "6",  "valor": "10",    "pais_residencia": "GNB", "tipo_passaporte": "01"},
+    {"id_pergunta": "16", "valor": "FAM_N", "pais_residencia": "GNB", "tipo_passaporte": "01"}
+  ],
+  "SEN": [
+    {"id_pergunta": "1",  "valor": "SEN"},
+    {"id_pergunta": "21", "valor": "SEN",   "pais_residencia": "SEN"},
+    {"id_pergunta": "2",  "valor": "01",    "pais_residencia": "SEN", "tipo_passaporte": "01"},
+    {"id_pergunta": "3",  "valor": "SCH",   "pais_residencia": "SEN", "tipo_passaporte": "01"},
+    {"id_pergunta": "5",  "valor": "O",     "pais_residencia": "SEN", "tipo_passaporte": "01"},
+    {"id_pergunta": "6",  "valor": "10",    "pais_residencia": "SEN", "tipo_passaporte": "01"},
+    {"id_pergunta": "16", "valor": "FAM_N", "pais_residencia": "SEN", "tipo_passaporte": "01"}
+  ],
+  "FRA": [
+    {"id_pergunta": "1",  "valor": "CPV"},
+    {"id_pergunta": "21", "valor": "FRA",   "pais_residencia": "FRA"},
+    {"id_pergunta": "2",  "valor": "01",    "pais_residencia": "FRA", "tipo_passaporte": "01"},
+    {"id_pergunta": "3",  "valor": "SCH",   "pais_residencia": "FRA", "tipo_passaporte": "01"},
+    {"id_pergunta": "5",  "valor": "O",     "pais_residencia": "FRA", "tipo_passaporte": "01"},
+    {"id_pergunta": "6",  "valor": "10",    "pais_residencia": "FRA", "tipo_passaporte": "01"},
+    {"id_pergunta": "16", "valor": "FAM_N", "pais_residencia": "FRA", "tipo_passaporte": "01"}
+  ]
+}

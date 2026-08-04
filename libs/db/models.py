@@ -20,6 +20,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    func,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -283,6 +284,17 @@ class SettingRow(Base, PKMixin):
     value: Mapped[str | None] = mapped_column(Text)
     __table_args__ = (
         UniqueConstraint("layer", "scope_key", "key", name="uq_setting_scope_key"),
+    )
+
+
+class AppConfig(Base, PKMixin):
+    """Editable JSON config (form_defaults, quest_steps) — seeded from config/*.json, edited via the
+    dashboard. Split conceptually into frequently-updated (travel dates) vs rarely-updated fields."""
+    __tablename__ = "configs"
+    key: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    value: Mapped[dict] = mapped_column(JSON, default=dict)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
 
