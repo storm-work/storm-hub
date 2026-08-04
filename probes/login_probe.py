@@ -70,8 +70,12 @@ def main() -> int:
                        nav_timeout_scale=3).start()
     try:
         res = s.login(username, password, keys, lang="PT", min_score=0)
+        import json as _j
+        diag = res.pop("diag", None)
         print(f"[probe] RESULT: {res}")
-        print("[probe]", "LOGIN OK ✓" if res.get("ok") else "login NOT confirmed — see final_url/body_len/reason")
+        if diag:
+            print("[probe] PAGE DIAG:\n" + _j.dumps(diag, indent=2, ensure_ascii=False))
+        print("[probe]", "LOGIN OK ✓" if res.get("ok") else "login NOT confirmed")
         return 0 if res.get("ok") else 1
     finally:
         s.close()

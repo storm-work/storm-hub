@@ -102,6 +102,34 @@ class BrowserSession:
     def eval(self, js: str):
         return self.page.evaluate(js)
 
+    def page_diag(self) -> dict:
+        """Snapshot of the current page for diagnosing why the login form didn't render."""
+        try:
+            html = self.page.content() or ""
+        except Exception:
+            html = ""
+        low = html.lower()
+        try:
+            title = self.page.title()
+        except Exception:
+            title = ""
+        try:
+            inputs = self.page.evaluate(
+                "() => Array.from(document.querySelectorAll('input,iframe')).map(e => "
+                "({tag:e.tagName, name:e.name||'', type:e.type||'', id:e.id||'', "
+                "title:(e.getAttribute('title')||'').slice(0,40)}))"
+            )
+        except Exception:
+            inputs = []
+        return {
+            "title": title, "html_len": len(html),
+            "markers": [m for m in ("datadome", "/ch/bd.js", "recaptcha", "handheldfriendly",
+                                    "request could not be processed", "authentication.jsp")
+                        if m in low],
+            "fields": inputs[:15],
+            "snippet": re.sub(r"\s+", " ", html)[:400],
+        }
+
     # ── login (confirmed sequence) ────────────────────────────────────────────
     def _nav_to_login_form(self) -> bool:
         """HOME -> AUTH, re-navigating until the username field is actually visible (slow-portal
@@ -196,7 +224,8 @@ class BrowserSession:
         """Full login. Returns {ok, final_url, token_len, body_len}. ok is the HAR-confirmed success
         signature: landed at /login with a small 200 body and no bd.js challenge."""
         if not self._nav_to_login_form():
-            return {"ok": False, "final_url": self.page.url, "reason": "login form never rendered"}
+            return {"ok": False, "final_url": self.page.url, "reason": "login form never rendered",
+                    "diag": self.page_diag()}
         time.sleep(random.uniform(1.0, 2.0))
         self._type_credentials(username, password)
 
