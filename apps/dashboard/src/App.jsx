@@ -242,13 +242,36 @@ function Identities({ me }) {
   const { rows, err, reload } = useList("/identities");
   const [f, setF] = useState({ full_name: "", type: "test", passport_no: "", nationality: "CPV" });
   const [msg, setMsg] = useState("");
+  const [sel, setSel] = useState({});           // id -> bool
+  const [filter, setFilter] = useState("all");  // all | test | real | new
+  const [subCount, setSubCount] = useState(3);
+  const [gt, setGt] = useState({ count: 10, accounts_per_identity: 3, nationality: "CPV" });
+  const op = me.is_operating;
+
   async function create() {
     setMsg("");
     try { await api("/identities", { method: "POST", body: f }); reload(); }
     catch (e) { setMsg(e.message); }
   }
+  const shown = rows.filter((i) =>
+    filter === "all" ? true : filter === "new" ? i.status === "empty" : i.type === filter);
+  const selectedIds = Object.keys(sel).filter((k) => sel[k]);
+  async function act(fn) { setMsg(""); try { await fn(); setSel({}); reload(); } catch (e) { setMsg(e.message); } }
+  const genSubs = () => act(() => api("/identities/gen-subaccounts",
+    { method: "POST", body: { identity_ids: selectedIds, count: Number(subCount) } }));
+  const genTest = () => act(() => api("/identities/gen-test", { method: "POST", body: gt }));
+
   return (
     <>
+      <div className="card">
+        <h2>Generate test identities</h2>
+        <div className="row" style={{ flexWrap: "wrap" }}>
+          <div className="field"><label>Count</label><input type="number" value={gt.count} onChange={(e) => setGt({ ...gt, count: +e.target.value })} style={{ width: 80 }} /></div>
+          <div className="field"><label>Sub-accounts / id</label><input type="number" value={gt.accounts_per_identity} onChange={(e) => setGt({ ...gt, accounts_per_identity: +e.target.value })} style={{ width: 80 }} /></div>
+          <div className="field"><label>Nationality</label><input value={gt.nationality} onChange={(e) => setGt({ ...gt, nationality: e.target.value })} style={{ width: 80 }} /></div>
+          <div className="field" style={{ alignSelf: "end" }}><button className="btn" disabled={!op} onClick={genTest}>Generate</button></div>
+        </div>
+      </div>
       <div className="card">
         <h2>New identity</h2>
         {msg && <div className="banner err">{msg}</div>}
@@ -267,11 +290,36 @@ function Identities({ me }) {
         hint="Columns: identity_id, first_name, last_name, traveldoc/passport_no, nationality, account_type/type, username, password, email, email_pass"
         makeBody={(csv) => ({ csv })} onDone={reload} />
       <div className="card">
-        <h2>Identities ({rows.length})</h2>
+        <div className="row" style={{ marginBottom: 10 }}>
+          <h2 style={{ margin: 0 }}>Identities ({shown.length}/{rows.length})</h2>
+          <span className="grow" />
+          <div className="field" style={{ margin: 0 }}><label>Filter</label>
+            <select value={filter} onChange={(e) => setFilter(e.target.value)}>
+              <option value="all">all</option><option value="test">test</option>
+              <option value="real">real</option><option value="new">new (no sub-accts)</option>
+            </select></div>
+        </div>
+        {msg && <div className="banner err">{msg}</div>}
         {err && <div className="banner err">{err}</div>}
-        <table><thead><tr><th>Name</th><th>Type</th><th>Status</th><th>Passport</th><th>Nat.</th></tr></thead>
-          <tbody>{rows.map((i) => (
-            <tr key={i.id}><td>{i.full_name}</td><td><span className="pill">{i.type}</span></td><td>{i.status}</td>
+        {selectedIds.length > 0 && (
+          <div className="banner info row">
+            <span>{selectedIds.length} selected</span>
+            <span className="grow" />
+            <label style={{ margin: 0 }}>Sub-accounts/id</label>
+            <input type="number" value={subCount} onChange={(e) => setSubCount(e.target.value)} style={{ width: 60 }} />
+            <button className="btn" disabled={!op} onClick={genSubs}>Gen sub-accounts</button>
+          </div>
+        )}
+        <table>
+          <thead><tr>
+            <th><input type="checkbox" checked={shown.length > 0 && shown.every((i) => sel[i.id])}
+              onChange={(e) => { const s = {}; if (e.target.checked) shown.forEach((i) => (s[i.id] = true)); setSel(s); }} /></th>
+            <th>Name</th><th>Type</th><th>Status</th><th>Passport</th><th>Nat.</th>
+          </tr></thead>
+          <tbody>{shown.map((i) => (
+            <tr key={i.id}>
+              <td><input type="checkbox" checked={!!sel[i.id]} onChange={(e) => setSel({ ...sel, [i.id]: e.target.checked })} /></td>
+              <td>{i.full_name}</td><td><span className="pill">{i.type}</span></td><td>{i.status}</td>
               <td className="muted">{i.passport_no || "—"}</td><td>{i.nationality || "—"}</td></tr>
           ))}</tbody></table>
       </div>

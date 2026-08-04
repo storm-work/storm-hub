@@ -42,6 +42,7 @@ from libs.domain.settings import resolve
 from .config import settings
 from .db import engine, get_db
 from .events import EventHub
+from .genaccounts import gen_fake_identities, gen_subaccounts
 from .importers import parse_identities, parse_proxies
 from .settings_store import get_global, set_layer
 from .supervisor import Supervisor
@@ -50,6 +51,8 @@ from .schemas import (
     BookingCreate,
     BookingOut,
     BootstrapAdmin,
+    GenSubAccounts,
+    GenTestIdentities,
     GlobalSettingsPut,
     IdentityCreate,
     IdentityImport,
@@ -326,6 +329,55 @@ def import_identities(body: IdentityImport, db: Session = Depends(get_db),
             subs += 1
     db.commit()
     return ImportResult(created=created, sub_accounts=subs, errors=errors)
+
+
+# ── Sub-account generation ────────────────────────────────────────────────────
+@app.post("/identities/gen-subaccounts", response_model=ImportResult)
+def gen_subaccounts_bulk(body: GenSubAccounts, db: Session = Depends(get_db),
+                         _op: Principal = Depends(require_operator)) -> ImportResult:
+    """Generate `count` sub-accounts for each selected identity (multi-select in the dashboard)."""
+    existing = {u for (u,) in db.execute(select(M.SubAccount.username)).all()}
+    subs = 0
+    errors: list[str] = []
+    for iid in body.identity_ids:
+        ident = db.get(M.Identity, iid)
+        if not ident:
+            errors.append(f"identity {iid} not found")
+            continue
+        first, _, last = (ident.full_name or "x x").partition(" ")
+        for sa in gen_subaccounts(first, last or "x", body.count, existing):
+            db.add(M.SubAccount(identity_id=ident.id, username=sa.username, password=sa.password,
+                                status="new"))
+            subs += 1
+        if ident.status == "empty":
+            ident.status = "active"
+    db.commit()
+    return ImportResult(created=len(body.identity_ids), sub_accounts=subs, errors=errors)
+
+
+@app.post("/identities/gen-test", response_model=ImportResult)
+def gen_test_identities(body: GenTestIdentities, db: Session = Depends(get_db),
+                        _op: Principal = Depends(require_operator)) -> ImportResult:
+    """Generate N fake TEST identities, each with sub-accounts."""
+    existing_u = {u for (u,) in db.execute(select(M.SubAccount.username)).all()}
+    existing_p = {p for (p,) in db.execute(
+        select(M.Identity.passport_no).where(M.Identity.passport_no.isnot(None))).all()}
+    gen = gen_fake_identities(body.count, body.accounts_per_identity,
+                              existing_usernames=existing_u, existing_passports=existing_p,
+                              nationality=body.nationality)
+    subs = 0
+    for gi in gen:
+        ident = M.Identity(full_name=gi.full_name, type="test", birthdate=gi.birthdate,
+                           passport_no=gi.passport_no, gender=gi.gender, nationality=gi.nationality,
+                           status="active" if gi.sub_accounts else "empty")
+        db.add(ident)
+        db.flush()
+        for sa in gi.sub_accounts:
+            db.add(M.SubAccount(identity_id=ident.id, username=sa.username, password=sa.password,
+                                status="new"))
+            subs += 1
+    db.commit()
+    return ImportResult(created=len(gen), sub_accounts=subs)
 
 
 # ── Proxy pool (DB-backed) ────────────────────────────────────────────────────

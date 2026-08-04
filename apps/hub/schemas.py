@@ -159,3 +159,14 @@ class ImportResult(BaseModel):
 
 class GlobalSettingsPut(BaseModel):
     values: dict
+
+
+class GenSubAccounts(BaseModel):
+    identity_ids: list[str]
+    count: int = 3                # sub-accounts per identity
+
+
+class GenTestIdentities(BaseModel):
+    count: int = 10               # number of fake test identities
+    accounts_per_identity: int = 3
+    nationality: str = "CPV"

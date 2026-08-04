@@ -174,6 +174,18 @@ def test_import_identities_and_proxies(client):
     assert client.get("/proxies", headers=h).json()[0]["provider"] == "soax"
 
 
+def test_gen_test_identities_and_subaccounts(client):
+    h = _operate_headers(client)
+    r = client.post("/identities/gen-test", json={"count": 4, "accounts_per_identity": 2}, headers=h).json()
+    assert r["created"] == 4 and r["sub_accounts"] == 8
+    ids = client.get("/identities", headers=h).json()
+    assert len([i for i in ids if i["type"] == "test"]) == 4
+    # gen more sub-accounts for an existing identity
+    iid = ids[0]["id"]
+    r2 = client.post("/identities/gen-subaccounts", json={"identity_ids": [iid], "count": 3}, headers=h).json()
+    assert r2["sub_accounts"] == 3
+
+
 def test_global_settings_roundtrip_and_masking(client):
     h = _operate_headers(client)
     # wrong-layer key rejected
