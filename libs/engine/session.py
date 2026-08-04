@@ -254,7 +254,15 @@ class BrowserSession:
               lang: str = "PT", min_score: int = 0, solve_proxy: bool = False) -> dict:
         """Full login. Returns {ok, final_url, token_len, body_len}. ok is the HAR-confirmed success
         signature: landed at /login with a small 200 body and no bd.js challenge."""
-        if not self._nav_to_login_form():
+        ok_form = self._nav_to_login_form()
+        # Capture the real pre-submit state (cookie names, bd.js presence) — stop guessing cookie names.
+        try:
+            _auth_html = self.page.content() or ""
+            _cookie_names = sorted({c["name"] for c in self._context.cookies()})
+        except Exception:
+            _auth_html, _cookie_names = "", []
+        _bd_present = "/ch/bd.js" in _auth_html or "bd.js" in _auth_html
+        if not ok_form:
             diag = self.page_diag()
             blocked = any(m in diag["markers"] for m in
                           ("handheldfriendly", "request could not be processed", "datadome"))
@@ -283,6 +291,8 @@ class BrowserSession:
         result = {
             "ok": ok, "final_url": final_url, "token_len": len(token), "token_score": solver.score_token(token),
             "body_len": len(content), "challenge": has_challenge, "datadome_cookie": dd_ok,
+            "auth_cookies": _cookie_names, "auth_bd_js": _bd_present,
+            "post_cookies": sorted({c["name"] for c in self._context.cookies()}),
         }
         if not ok:
             # Classify the post-submit body so we know WHY (WAF re-block vs reCAPTCHA reject vs creds).
