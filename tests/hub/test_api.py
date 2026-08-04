@@ -158,3 +158,29 @@ def test_booking_settings_layer_validation(client):
     r = client.post("/bookings", json={"name": "y", "type": "test", "posto_id": "2032",
                                        "settings": {"SCOUT_POOL": True}}, headers=h)
     assert r.status_code == 201
+
+
+def test_import_identities_and_proxies(client):
+    h = _operate_headers(client)
+    csv = ("identity_id,first_name,last_name,account_type,username,password\n"
+           "ID1,Ana,Silva,test,ana1,pw1\nID1,Ana,Silva,test,ana2,pw2\n")
+    r = client.post("/identities/import", json={"csv": csv}, headers=h).json()
+    assert r["created"] == 1 and r["sub_accounts"] == 2
+    assert len(client.get("/identities", headers=h).json()) == 1
+
+    r = client.post("/proxies/import", json={"provider": "soax", "kind": "datacenter",
+                                             "text": "http://u:p@1.2.3.4:5000\n1.2.3.4:5000"}, headers=h).json()
+    assert r["created"] == 1  # second line is a duplicate endpoint
+    assert client.get("/proxies", headers=h).json()[0]["provider"] == "soax"
+
+
+def test_global_settings_roundtrip_and_masking(client):
+    h = _operate_headers(client)
+    # wrong-layer key rejected
+    assert client.put("/settings/global", json={"values": {"SCOUT_POOL": True}}, headers=h).status_code == 400
+    # valid global keys stored; secret masked on read
+    assert client.put("/settings/global",
+                      json={"values": {"CAPSOLVER_KEYS": "abc123", "HOST_SESSION_CAP": 200}},
+                      headers=h).status_code == 200
+    got = client.get("/settings/global", headers=h).json()
+    assert got["CAPSOLVER_KEYS"] == "•••set" and got["HOST_SESSION_CAP"] == "200"

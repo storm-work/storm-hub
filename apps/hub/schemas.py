@@ -116,3 +116,46 @@ class WorkerOut(BaseModel):
     substate: str | None = None
 
     model_config = {"from_attributes": True}
+
+
+# ── Proxies + imports + global settings ───────────────────────────────────────
+class ProxyOut(BaseModel):
+    id: str
+    provider: str
+    kind: str
+    endpoint: str
+    active: bool
+    health: str | None = None
+    max_sessions: int
+    model_config = {"from_attributes": True}
+
+
+class ProxyCreate(BaseModel):
+    provider: str = "isp"
+    kind: str = "static_res"
+    endpoint: str
+    credentials_ref: str | None = None
+    max_sessions: int = 2
+
+
+class ProxyImport(BaseModel):
+    provider: str = "isp"
+    kind: str = "static_res"
+    max_sessions: int = 2
+    text: str                    # newline-separated proxy lines
+
+
+class IdentityImport(BaseModel):
+    csv: str
+    default_type: IdentityType = IdentityType.TEST
+
+
+class ImportResult(BaseModel):
+    created: int
+    sub_accounts: int = 0
+    skipped: int = 0
+    errors: list[str] = Field(default_factory=list)
+
+
+class GlobalSettingsPut(BaseModel):
+    values: dict

@@ -42,16 +42,24 @@ from libs.domain.settings import resolve
 from .config import settings
 from .db import engine, get_db
 from .events import EventHub
+from .importers import parse_identities_csv, parse_proxies
+from .settings_store import get_global, set_layer
 from .supervisor import Supervisor
 from .schemas import (
     AttachIdentity,
     BookingCreate,
     BookingOut,
     BootstrapAdmin,
+    GlobalSettingsPut,
     IdentityCreate,
+    IdentityImport,
     IdentityOut,
+    ImportResult,
     LoginRequest,
     LoginResponse,
+    ProxyCreate,
+    ProxyImport,
+    ProxyOut,
     UserCreate,
     UserOut,
     WhoAmI,
@@ -288,6 +296,90 @@ def list_identities(db: Session = Depends(get_db)) -> list[M.Identity]:
     return list(db.scalars(select(M.Identity).order_by(M.Identity.created_at.desc())).all())
 
 
+@app.post("/identities/import", response_model=ImportResult)
+def import_identities(body: IdentityImport, db: Session = Depends(get_db),
+                      _op: Principal = Depends(require_operator)) -> ImportResult:
+    parsed, errors = parse_identities_csv(body.csv, default_type=str(body.default_type))
+    created = subs = 0
+    existing = {u for (u,) in db.execute(select(M.SubAccount.username)).all()}
+    for pi in parsed:
+        ident = M.Identity(full_name=pi.full_name, type=pi.type, birthdate=pi.birthdate,
+                           passport_no=pi.passport_no, gender=pi.gender, nationality=pi.nationality,
+                           status="active" if pi.sub_accounts else "empty")
+        db.add(ident)
+        db.flush()
+        created += 1
+        for sa in pi.sub_accounts:
+            if sa.username in existing:
+                errors.append(f"skip duplicate username {sa.username}")
+                continue
+            db.add(M.SubAccount(identity_id=ident.id, username=sa.username, password=sa.password,
+                                email=sa.email, email_pass=sa.email_pass, status=sa.status))
+            existing.add(sa.username)
+            subs += 1
+    db.commit()
+    return ImportResult(created=created, sub_accounts=subs, errors=errors)
+
+
+# ── Proxy pool (DB-backed) ────────────────────────────────────────────────────
+@app.get("/proxies", response_model=list[ProxyOut])
+def list_proxies(db: Session = Depends(get_db)) -> list[M.Proxy]:
+    return list(db.scalars(select(M.Proxy).order_by(M.Proxy.created_at.desc())).all())
+
+
+@app.post("/proxies", response_model=ProxyOut, status_code=201)
+def create_proxy(body: ProxyCreate, db: Session = Depends(get_db),
+                 _op: Principal = Depends(require_operator)) -> M.Proxy:
+    p = M.Proxy(provider=body.provider, kind=body.kind, endpoint=body.endpoint,
+                credentials_ref=body.credentials_ref, max_sessions=body.max_sessions, active=True)
+    db.add(p)
+    db.commit()
+    db.refresh(p)
+    return p
+
+
+@app.post("/proxies/import", response_model=ImportResult)
+def import_proxies(body: ProxyImport, db: Session = Depends(get_db),
+                   _op: Principal = Depends(require_operator)) -> ImportResult:
+    parsed, errors = parse_proxies(body.text)
+    existing = {e for (e,) in db.execute(select(M.Proxy.endpoint)).all()}
+    created = 0
+    for pp in parsed:
+        if pp.endpoint in existing:
+            errors.append(f"skip duplicate endpoint {pp.endpoint}")
+            continue
+        db.add(M.Proxy(provider=body.provider, kind=body.kind, endpoint=pp.endpoint,
+                       credentials_ref=pp.credentials_ref, max_sessions=body.max_sessions, active=True))
+        existing.add(pp.endpoint)
+        created += 1
+    db.commit()
+    return ImportResult(created=created, errors=errors)
+
+
+# ── Global settings (capsolver keys, browser/solver defaults) ─────────────────
+_SECRET_HINTS = ("KEY", "TOKEN", "SECRET", "PASS")
+
+
+@app.get("/settings/global")
+def read_global_settings(db: Session = Depends(get_db),
+                         me: Principal = Depends(current_principal)) -> dict:
+    """Return stored global settings; secret-looking values are masked."""
+    out = {}
+    for k, v in get_global(db).items():
+        out[k] = "•••set" if v and any(h in k.upper() for h in _SECRET_HINTS) else v
+    return out
+
+
+@app.put("/settings/global")
+def write_global_settings(body: GlobalSettingsPut, db: Session = Depends(get_db),
+                          _op: Principal = Depends(require_operator)) -> dict:
+    try:
+        stored = set_layer(db, L.GLOBAL, body.values)
+    except Exception as e:
+        raise HTTPException(400, f"invalid global settings: {e}")
+    return {"saved": sorted(body.values.keys()), "total_stored": len(stored)}
+
+
 # ── Bookings ──────────────────────────────────────────────────────────────────
 @app.post("/bookings", response_model=BookingOut, status_code=201)
 def create_booking(
@@ -385,8 +477,8 @@ def launch_worker(worker_id: str, db: Session = Depends(get_db),
         raise HTTPException(404, "worker not found")
     bk = db.get(M.Booking, w.booking_id)
     tpl = db.get(M.WorkerTemplate, w.template_id) if w.template_id else None
-    # Resolve + FREEZE the effective settings for this launch (spec §6).
-    layers = {L.BOOKING: (bk.settings_json or {})}
+    # Resolve + FREEZE the effective settings for this launch (spec §6): global (DB) < booking < template.
+    layers = {L.GLOBAL: get_global(db), L.BOOKING: (bk.settings_json or {})}
     if tpl:
         layers[L.TEMPLATE] = (tpl.settings_json or {})
     eff = resolve(layers)

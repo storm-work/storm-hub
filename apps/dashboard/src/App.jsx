@@ -47,7 +47,8 @@ export default function App() {
   const pages = {
     bookings: <Bookings me={me} events={events} />,
     identities: <Identities me={me} />,
-    settings: <Settings />,
+    proxies: <Proxies me={me} />,
+    settings: <Settings me={me} />,
     sessions: <Sessions me={me} onChange={refreshMe} />,
   };
 
@@ -56,7 +57,7 @@ export default function App() {
       <div className="topbar">
         <span className="brand">⛈ storm-hub</span>
         <nav className="nav">
-          {["bookings", "identities", "settings", "sessions"].map((p) => (
+          {["bookings", "identities", "proxies", "settings", "sessions"].map((p) => (
             <button key={p} className={page === p ? "active" : ""} onClick={() => setPage(p)}>
               {p[0].toUpperCase() + p.slice(1)}
             </button>
@@ -262,6 +263,9 @@ function Identities({ me }) {
           <div className="field" style={{ alignSelf: "end" }}><button className="btn" disabled={!me.is_operating} onClick={create}>Create</button></div>
         </div>
       </div>
+      <ImportCsv me={me} path="/identities/import" label="Import identities CSV"
+        hint="Columns: identity_id, first_name, last_name, traveldoc/passport_no, nationality, account_type/type, username, password, email, email_pass"
+        makeBody={(csv) => ({ csv })} onDone={reload} />
       <div className="card">
         <h2>Identities ({rows.length})</h2>
         {err && <div className="banner err">{err}</div>}
@@ -275,7 +279,116 @@ function Identities({ me }) {
   );
 }
 
-function Settings() {
+function ImportCsv({ me, path, label, hint, makeBody, onDone }) {
+  const [text, setText] = useState("");
+  const [res, setRes] = useState(null);
+  const [err, setErr] = useState("");
+  async function go() {
+    setErr(""); setRes(null);
+    try { setRes(await api(path, { method: "POST", body: makeBody(text) })); onDone && onDone(); }
+    catch (e) { setErr(e.message); }
+  }
+  return (
+    <div className="card">
+      <h2>{label}</h2>
+      {err && <div className="banner err">{err}</div>}
+      {res && <div className="banner info">Created {res.created}{res.sub_accounts != null ? ` (+${res.sub_accounts} sub-accounts)` : ""}. {res.errors?.length ? `${res.errors.length} skipped/errors.` : ""}</div>}
+      <div className="muted" style={{ marginBottom: 6, fontSize: 12 }}>{hint}</div>
+      <textarea value={text} onChange={(e) => setText(e.target.value)} rows={6}
+        style={{ width: "100%", fontFamily: "monospace", fontSize: 12, background: "var(--panel2)", color: "var(--text)", border: "1px solid var(--border)", borderRadius: 8, padding: 8 }}
+        placeholder="paste CSV / lines here" />
+      <div style={{ marginTop: 8 }}><button className="btn" disabled={!me.is_operating || !text.trim()} onClick={go}>Import</button></div>
+    </div>
+  );
+}
+
+function Proxies({ me }) {
+  const { rows, err, reload } = useList("/proxies");
+  const [prov, setProv] = useState("isp");
+  const [kind, setKind] = useState("static_res");
+  return (
+    <>
+      <div className="card">
+        <h2>Import proxies</h2>
+        <div className="row" style={{ marginBottom: 8 }}>
+          <div className="field"><label>Provider</label>
+            <select value={prov} onChange={(e) => setProv(e.target.value)}>
+              <option value="isp">isp</option><option value="soax">soax</option>
+            </select></div>
+          <div className="field"><label>Kind</label>
+            <select value={kind} onChange={(e) => setKind(e.target.value)}>
+              <option value="static_res">static_res</option><option value="datacenter">datacenter</option><option value="mobile">mobile</option>
+            </select></div>
+        </div>
+        <ImportInline me={me} makeBody={(text) => ({ provider: prov, kind, text })} onDone={reload} />
+      </div>
+      <div className="card">
+        <h2>Proxies ({rows.length})</h2>
+        {err && <div className="banner err">{err}</div>}
+        <table><thead><tr><th>Provider</th><th>Kind</th><th>Endpoint</th><th>Active</th><th>Max/IP</th></tr></thead>
+          <tbody>{rows.map((p) => (
+            <tr key={p.id}><td><span className="pill">{p.provider}</span></td><td>{p.kind}</td>
+              <td className="muted">{p.endpoint}</td><td className={p.active ? "ok" : "muted"}>{String(p.active)}</td><td>{p.max_sessions}</td></tr>
+          ))}</tbody></table>
+      </div>
+    </>
+  );
+}
+
+function ImportInline({ me, makeBody, onDone }) {
+  const [text, setText] = useState("");
+  const [res, setRes] = useState(null);
+  const [err, setErr] = useState("");
+  async function go() {
+    setErr(""); setRes(null);
+    try { setRes(await api("/proxies/import", { method: "POST", body: makeBody(text) })); onDone && onDone(); }
+    catch (e) { setErr(e.message); }
+  }
+  return (
+    <>
+      {err && <div className="banner err">{err}</div>}
+      {res && <div className="banner info">Imported {res.created}. {res.errors?.length ? `${res.errors.length} skipped.` : ""}</div>}
+      <div className="muted" style={{ fontSize: 12, marginBottom: 6 }}>One per line: <code>http://user:pass@host:port</code> or <code>host:port:user:pass</code></div>
+      <textarea value={text} onChange={(e) => setText(e.target.value)} rows={6}
+        style={{ width: "100%", fontFamily: "monospace", fontSize: 12, background: "var(--panel2)", color: "var(--text)", border: "1px solid var(--border)", borderRadius: 8, padding: 8 }} />
+      <div style={{ marginTop: 8 }}><button className="btn" disabled={!me.is_operating || !text.trim()} onClick={go}>Import</button></div>
+    </>
+  );
+}
+
+function GlobalSettingsEditor({ me }) {
+  const [current, setCurrent] = useState({});
+  const [key, setKey] = useState("CAPSOLVER_KEYS");
+  const [val, setVal] = useState("");
+  const [msg, setMsg] = useState("");
+  const reload = () => api("/settings/global").then(setCurrent).catch(() => {});
+  useEffect(() => { reload(); }, []);
+  async function save() {
+    setMsg("");
+    try { await api("/settings/global", { method: "PUT", body: { values: { [key]: val } } }); setVal(""); reload(); setMsg("saved"); }
+    catch (e) { setMsg(e.message); }
+  }
+  return (
+    <div className="card">
+      <h2>Global settings</h2>
+      {msg && <div className={`banner ${msg === "saved" ? "info" : "err"}`}>{msg}</div>}
+      <div className="muted" style={{ fontSize: 12, marginBottom: 8 }}>
+        Stored in the DB (not env). Set <code>CAPSOLVER_KEYS</code> here; secret values are masked on read.
+      </div>
+      <div className="row" style={{ marginBottom: 10 }}>
+        <div className="field"><label>Key</label><input value={key} onChange={(e) => setKey(e.target.value)} style={{ width: 240 }} /></div>
+        <div className="field grow"><label>Value</label><input value={val} onChange={(e) => setVal(e.target.value)} style={{ width: "100%" }} placeholder="value" /></div>
+        <div className="field" style={{ alignSelf: "end" }}><button className="btn" disabled={!me.is_operating || !key || !val} onClick={save}>Save</button></div>
+      </div>
+      <table><thead><tr><th>Key</th><th>Value</th></tr></thead>
+        <tbody>{Object.entries(current).map(([k, v]) => (
+          <tr key={k}><td><code>{k}</code></td><td className="muted">{String(v)}</td></tr>
+        ))}{Object.keys(current).length === 0 && <tr><td colSpan={2} className="muted">none set</td></tr>}</tbody></table>
+    </div>
+  );
+}
+
+function Settings({ me }) {
   const [cat, setCat] = useState(null);
   const [err, setErr] = useState("");
   useEffect(() => { api("/settings/catalog").then(setCat).catch((e) => setErr(e.message)); }, []);
@@ -284,6 +397,7 @@ function Settings() {
   const layers = ["global", "booking", "template"];
   return (
     <>
+      <GlobalSettingsEditor me={me} />
       <div className="card"><h2>Settings taxonomy</h2>
         <div className="muted">{cat._meta.total} settings · precedence: {cat._meta.precedence}</div></div>
       {layers.map((l) => (

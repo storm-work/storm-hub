@@ -1,0 +1,38 @@
+from apps.hub.importers import parse_identities_csv, parse_proxies
+
+
+def test_parse_proxies_url_form():
+    text = "http://user:pw@1.2.3.4:8080\nhttps://u2:p2@proxy.soax.com:5000\n"
+    parsed, errors = parse_proxies(text)
+    assert not errors
+    assert parsed[0].endpoint == "1.2.3.4:8080" and parsed[0].credentials_ref == "user:pw"
+    assert parsed[1].endpoint == "proxy.soax.com:5000"
+
+
+def test_parse_proxies_colon_and_bare():
+    parsed, errors = parse_proxies("5.6.7.8:9000:bob:secret\n9.9.9.9:1234\n# comment\nnonsense")
+    assert parsed[0].endpoint == "5.6.7.8:9000" and parsed[0].credentials_ref == "bob:secret"
+    assert parsed[1].endpoint == "9.9.9.9:1234" and parsed[1].credentials_ref is None
+    assert errors == ["nonsense"]
+
+
+def test_parse_identities_groups_subaccounts():
+    csv = (
+        "identity_id,first_name,last_name,traveldoc,nationality,account_type,username,password,email\n"
+        "ID1,Ana,Silva,PA100,CPV,test,ana1,pw1,ana1@x.com\n"
+        "ID1,Ana,Silva,PA100,CPV,test,ana2,pw2,ana2@x.com\n"
+        "ID2,Bob,Jones,PA200,CPV,real,bob1,pw3,\n"
+    )
+    idents, errors = parse_identities_csv(csv)
+    assert not errors
+    assert len(idents) == 2
+    ana = idents[0]
+    assert ana.full_name == "Ana Silva" and ana.passport_no == "PA100" and ana.type == "test"
+    assert [s.username for s in ana.sub_accounts] == ["ana1", "ana2"]
+    assert idents[1].type == "real" and idents[1].sub_accounts[0].username == "bob1"
+
+
+def test_parse_identities_default_type_and_full_name_column():
+    csv = "full_name,username,password\nCarl Doe,carl,pw\n"
+    idents, _ = parse_identities_csv(csv, default_type="real")
+    assert idents[0].full_name == "Carl Doe" and idents[0].type == "real"
