@@ -193,6 +193,80 @@ class BrowserSession:
                 pass
         return self._has_datadome_cookie()
 
+    def _human_warm(self) -> None:
+        """Human-like activity before the form: mouse moves + scroll + dwell. Builds the reCAPTCHA
+        behavioral score and avoids the 'cold browser hits /login instantly' bot tell."""
+        page = self.page
+        try:
+            for _ in range(random.randint(3, 6)):
+                page.mouse.move(random.randint(80, 1200), random.randint(80, 600),
+                                steps=random.randint(6, 18))
+                time.sleep(random.uniform(0.15, 0.5))
+            page.mouse.wheel(0, random.randint(120, 480))
+            time.sleep(random.uniform(0.4, 1.2))
+            page.mouse.wheel(0, -random.randint(60, 200))
+            time.sleep(random.uniform(0.3, 0.9))
+        except Exception:
+            pass
+
+    def _native_recaptcha_token(self, wait_s: int = 22) -> str:
+        """Try the in-browser auto-pass token (highest quality — scored on OUR session/IP).
+        Move to the widget, click the checkbox, poll for grecaptcha.getResponse(). Returns "" if an
+        image challenge appears (browser not trusted enough) or it times out → caller uses capsolver."""
+        page = self.page
+        try:
+            box = page.locator('iframe[title*="reCAPTCHA"]').first.bounding_box(timeout=5000)
+            if box:
+                page.mouse.move(box["x"] + box["width"] * 0.3, box["y"] + box["height"] * 0.5,
+                                steps=random.randint(10, 20))
+                time.sleep(random.uniform(0.5, 1.6))
+        except Exception:
+            pass
+        clicked = False
+        for sel_frame, sel_box in (('iframe[title*="reCAPTCHA"]', "#recaptcha-anchor"),
+                                   ('iframe[src*="recaptcha"]', ".recaptcha-checkbox")):
+            try:
+                page.frame_locator(sel_frame).first.locator(sel_box).click(timeout=8000)
+                clicked = True
+                break
+            except Exception:
+                continue
+        if not clicked:
+            return ""
+        for _ in range(wait_s):
+            time.sleep(1)
+            try:
+                tok = page.evaluate("grecaptcha.enterprise.getResponse()") or ""
+                if tok:
+                    return tok
+            except Exception:
+                pass
+            try:
+                if page.locator('iframe[title*="recaptcha challenge"], iframe[src*="bframe"]').is_visible(timeout=300):
+                    return ""   # image challenge => not trusted enough for auto-pass
+            except Exception:
+                pass
+        return ""
+
+    def _acquire_token(self, keys: list[str], min_score: int, solve_proxy: bool, native_first: bool) -> tuple[str, str]:
+        """Return (token, source). native auto-pass first (best), then capsolver gated on min_score."""
+        if native_first:
+            native = self._native_recaptcha_token()
+            if native:
+                return native, "native"
+        proxy_info = solver.parse_proxy_for_capsolver(self.proxy) if solve_proxy else None
+        best = ""
+        for _ in range(3):   # re-solve until a token clears min_score, else keep the best
+            try:
+                tok = solver.solve(keys, action="LOGIN_EVISA", proxy_info=proxy_info, min_score=min_score)
+            except solver.SolverError:
+                break
+            if solver.score_token(tok) >= min_score:
+                return tok, "capsolver"
+            if solver.score_token(tok) > solver.score_token(best):
+                best = tok
+        return best, "capsolver"
+
     def _type_credentials(self, username: str, password: str) -> None:
         page = self.page
         try:
@@ -263,7 +337,8 @@ class BrowserSession:
         return self.page.url, content
 
     def login(self, username: str, password: str, capsolver_keys: list[str], *,
-              lang: str = "PT", min_score: int = 0, solve_proxy: bool = False) -> dict:
+              lang: str = "PT", min_score: int = 0, solve_proxy: bool = False,
+              native_first: bool = True) -> dict:
         """Full login. Returns {ok, final_url, token_len, body_len}. ok is the HAR-confirmed success
         signature: landed at /login with a small 200 body and no bd.js challenge."""
         ok_form = self._nav_to_login_form()
@@ -283,16 +358,15 @@ class BrowserSession:
             return {"ok": False, "final_url": self.page.url, "reason": reason,
                     "waf_blocked": blocked, "auth_cookies": _cookie_names,
                     "auth_bd_js": _bd_present, "diag": diag}
-        time.sleep(random.uniform(1.0, 2.0))
+        self._human_warm()                         # behavioral warm-up before touching the form
+        time.sleep(random.uniform(0.8, 1.6))
         self._type_credentials(username, password)
 
-        proxy_info = solver.parse_proxy_for_capsolver(self.proxy) if solve_proxy else None
-        token = ""
-        try:
-            token = solver.solve(capsolver_keys, action="LOGIN_EVISA",
-                                 proxy_info=proxy_info, min_score=min_score)
-        except solver.SolverError as e:
-            return {"ok": False, "final_url": self.page.url, "reason": f"solver: {e}"}
+        token, tok_source = self._acquire_token(capsolver_keys, min_score, solve_proxy,
+                                                native_first=native_first)
+        if not token:
+            return {"ok": False, "final_url": self.page.url, "reason": "no reCAPTCHA token",
+                    "auth_cookies": _cookie_names, "auth_bd_js": _bd_present}
 
         self._inject_token(token)
         dd_ok = self._settle_datadome()   # let bd.js set the datadome cookie before POSTing /login
