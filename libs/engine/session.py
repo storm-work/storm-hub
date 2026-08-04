@@ -224,8 +224,13 @@ class BrowserSession:
         """Full login. Returns {ok, final_url, token_len, body_len}. ok is the HAR-confirmed success
         signature: landed at /login with a small 200 body and no bd.js challenge."""
         if not self._nav_to_login_form():
-            return {"ok": False, "final_url": self.page.url, "reason": "login form never rendered",
-                    "diag": self.page_diag()}
+            diag = self.page_diag()
+            blocked = any(m in diag["markers"] for m in
+                          ("handheldfriendly", "request could not be processed", "datadome"))
+            reason = ("WAF/DataDome block on auth page (proxy blocked for login)"
+                      if blocked else "login form never rendered")
+            return {"ok": False, "final_url": self.page.url, "reason": reason,
+                    "waf_blocked": blocked, "diag": diag}
         time.sleep(random.uniform(1.0, 2.0))
         self._type_credentials(username, password)
 
