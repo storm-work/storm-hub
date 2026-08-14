@@ -175,3 +175,31 @@ def test_rediscovery_never_disturbs_a_leased_or_taken_slot(slots_db):
     got = {(s.date, str(s.status)) for s in db.scalars(select(M.Slot)).all()}
     assert got == {("2026-09-01", "taken"), ("2026-09-02", "leased")}
     db.close()
+
+
+def test_slot_released_frees_the_lease_and_reopens_the_slot(slots_db):
+    """A worker that keeps its warm session after a bounce (phases.py's apply loop) must also hand
+    the slot back -- otherwise _assign_slots' one-active-lease rule leaves it warm and idle until
+    SLOT_LEASE_TTL reclaims it minutes later."""
+    from sqlalchemy import select
+
+    import apps.hub.events as ev
+    from libs.db import models as M
+    from libs.domain.enums import SlotLeaseOutcome, SlotStatus
+
+    bid, wid = _seed_scout(slots_db)
+    db = slots_db()
+    slot = M.Slot(booking_id=bid, posto_id="5084", date="2026-09-03", period=3,
+                  status=SlotStatus.LEASED)
+    db.add(slot); db.commit()
+    db.add(M.SlotLease(slot_id=slot.id, worker_id=wid)); db.commit()
+    db.close()
+
+    ev.EventHub.__new__(ev.EventHub)._release_slot_lease(wid, {"date": "2026-09-03", "period": 3})
+
+    db = slots_db()
+    lease = db.scalars(select(M.SlotLease)).one()
+    assert lease.released_at is not None
+    assert lease.outcome == SlotLeaseOutcome.BOUNCED
+    assert db.scalars(select(M.Slot)).one().status == SlotStatus.AVAILABLE
+    db.close()

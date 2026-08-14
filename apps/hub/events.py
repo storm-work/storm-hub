@@ -328,6 +328,34 @@ class EventHub:
         finally:
             db.close()
 
+    def _release_slot_lease(self, worker_id: str, slot: dict) -> None:
+        """An apply worker bounced: release its lease and reopen the slot if it now has room.
+
+        Without this a worker that keeps its warm session after a bounce (phases.py's apply loop)
+        would also keep the lease, so _assign_slots' one-active-lease rule would never hand it
+        another slot -- it would sit warm and idle until SLOT_LEASE_TTL reclaimed it minutes later."""
+        from sqlalchemy import select
+
+        from libs.domain.enums import SlotLeaseOutcome, SlotStatus
+        db = SessionLocal()
+        try:
+            now = datetime.now(timezone.utc)
+            leases = db.scalars(select(M.SlotLease).where(
+                M.SlotLease.worker_id == worker_id, M.SlotLease.released_at.is_(None))).all()
+            if not leases:
+                return
+            slot_ids = {le.slot_id for le in leases}
+            for le in leases:
+                le.released_at = now
+                le.outcome = SlotLeaseOutcome.BOUNCED
+            db.flush()
+            for s in db.scalars(select(M.Slot).where(M.Slot.id.in_(slot_ids))).all():
+                if s.status == SlotStatus.LEASED:
+                    s.status = SlotStatus.AVAILABLE   # freed a unit -- bookable again
+            db.commit()
+        finally:
+            db.close()
+
     def _persist_booked_pdf(self, worker_id: str, pdf_path: str, slot: dict | None) -> None:
         """A live apply confirmed a booking and saved its PDF to disk (Phase: dashboard "open pdf"
         feature) -- create the Artifact + BookedAppointment rows the schema already had (models.py's
@@ -450,6 +478,8 @@ class EventHub:
                             self._handle_proxy_request, wid, m.payload.get("phase", "warmup"), bus)
                     if m.type == "dates_reported":
                         self.dates_reported.setdefault(wid, []).append(m.payload.get("outcomes", []))
+                    if m.type == "slot_released":
+                        self._release_slot_lease(wid, m.payload.get("slot") or {})
                     if m.type == "gettime_result":
                         self._cache_gettime(wid, m.payload.get("special_days", {}))
                 item = {"id": m.id, "type": m.type, "ts": m.ts, **m.payload}

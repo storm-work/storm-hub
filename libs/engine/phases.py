@@ -80,6 +80,10 @@ class EngineOps(Protocol):
     # mid-run skip the slot_open wait it has already missed -- see _run_apply.
     def slot_found_seen(self) -> bool: ...
     def do_apply(self, slot: dict) -> str: ...      # 'booked' | 'bounced'
+    # Tell the orchestrator this slot was not booked, so it releases the lease and can hand the
+    # worker a different one. Without it a bounced worker keeps its lease and stays unassignable
+    # until the scheduler's SLOT_LEASE_TTL reclaim notices.
+    def release_slot(self, slot: dict) -> None: ...
 
     # ── lifecycle ─────────────────────────────────────────────────────────────
     def is_stopped(self) -> bool: ...  # True if the last wait ended because of an explicit stop --
@@ -198,27 +202,49 @@ class PhaseMachine:
         if not self.ops.slot_found_seen():
             if self.ops.await_slot_open() == "stop":
                 return PhaseResult("stopped", self._sub, "stopped before slot_open", self.visited)
-        slot = self.ops.await_assignment()
-        if slot is None and self.ops.is_stopped():
-            return PhaseResult("stopped", self._sub, "stopped while awaiting assignment", self.visited)
-        if slot is None and self.ops.scouts_invalid():
-            # FALLBACK: no valid scouts -> apply self-discovers over its own configured date window
-            self._to(WorkerSubstate.DISCOVERING)
-            d = self.cfg.discovery
-            dates = pool_manager.default_date_window(
-                start_date=d.start_date, end_date=d.end_date, num_days=d.num_days, today=date.today()
-            )
-            found = _flatten_found(self.ops.do_discover(dates))
-            slot = found[0] if found else None
-        if slot is None:
-            return PhaseResult("held", self._sub, "no slot assigned", self.visited)
-        self._to(WorkerSubstate.APPLYING)
-        if self.cfg.no_book:
+        # A bounce must NOT end the run. Confirmed live 2026-08-14 (DANYA ISABEL VIEIRA SILVA):
+        # 90s to log in, 59s to warm, held 4.5 minutes, applied once, bounced back to `questionario`
+        # -- and the process exited, so hold-respawn had to pay the whole login+warmup again for the
+        # next single attempt. A bounced worker still holds a valid warm session; the login wall and
+        # the CAPTCHA solve are the scarce resources, not portal traffic. Loop back to awaiting an
+        # assignment instead, bounded by APPLY_MAX_ATTEMPTS -- which has sat in the settings catalog
+        # since it was written, read by nothing, describing exactly this.
+        max_attempts = max(1, int(self.cfg.raw.get("APPLY_MAX_ATTEMPTS", 5)))
+        attempts = 0
+        while True:
+            slot = self.ops.await_assignment()
+            if slot is None and self.ops.is_stopped():
+                return PhaseResult("stopped", self._sub, "stopped while awaiting assignment",
+                                   self.visited)
+            if slot is None and self.ops.scouts_invalid():
+                # FALLBACK: no valid scouts -> apply self-discovers over its own configured window
+                self._to(WorkerSubstate.DISCOVERING)
+                d = self.cfg.discovery
+                dates = pool_manager.default_date_window(
+                    start_date=d.start_date, end_date=d.end_date, num_days=d.num_days,
+                    today=date.today(),
+                )
+                found = _flatten_found(self.ops.do_discover(dates))
+                slot = found[0] if found else None
+            if slot is None:
+                detail = (f"no slot assigned after {attempts} apply attempt(s)" if attempts
+                          else "no slot assigned")
+                return PhaseResult("held", self._sub, detail, self.visited)
+
+            self._to(WorkerSubstate.APPLYING)
+            if self.cfg.no_book:
+                self._to(WorkerSubstate.HOLDING)
+                return PhaseResult("dry_run", self._sub, "no_book: not submitted", self.visited)
+            attempts += 1
+            outcome = self.ops.do_apply(slot)
+            if outcome == "booked":
+                self._to(WorkerSubstate.BOOKED)
+                return PhaseResult("booked", self._sub, str(slot), self.visited)
+
+            # Hand the slot back so another worker can try it, and so the orchestrator will assign
+            # this one something new -- it still holds the lease until told otherwise.
+            self.ops.release_slot(slot)
             self._to(WorkerSubstate.HOLDING)
-            return PhaseResult("dry_run", self._sub, "no_book: not submitted", self.visited)
-        outcome = self.ops.do_apply(slot)
-        if outcome == "booked":
-            self._to(WorkerSubstate.BOOKED)
-            return PhaseResult("booked", self._sub, str(slot), self.visited)
-        self._to(WorkerSubstate.HOLDING)
-        return PhaseResult("held", self._sub, "apply bounced", self.visited)
+            if attempts >= max_attempts:
+                return PhaseResult("held", self._sub,
+                                   f"apply bounced {attempts}x (APPLY_MAX_ATTEMPTS)", self.visited)

@@ -869,6 +869,12 @@ class LiveEngineOps(EngineOps):
                 out.append({"date": d, "outcome": "empty"})
         return out
 
+    def release_slot(self, slot: dict) -> None:
+        """Hand a bounced slot back to the pool. The worker has no DB access, so this rides the same
+        event bus everything else does; apps/hub/events.py releases the lease and reopens the slot."""
+        if self._emit is not None:
+            self._emit("slot_released", slot=slot)
+
     def push_slots(self, slots: list[dict]) -> None:
         if self._emit is not None:
             self._emit("slots_found", slots=slots)

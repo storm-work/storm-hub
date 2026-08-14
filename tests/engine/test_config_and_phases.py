@@ -194,3 +194,35 @@ def test_swap_records_swapped_substate():
 def test_login_failure_terminal():
     res = PhaseMachine(_cfg(ROLE="apply"), SimEngineOps(login_ok=False)).run()
     assert res.outcome == "failed" and res.detail == "login"
+
+
+# ── an apply worker must not burn its warm session on ONE attempt (2026-08-14) ─
+def test_apply_retries_on_the_same_warm_session_after_a_bounce():
+    """Confirmed live (DANYA ISABEL VIEIRA SILVA): 90s to log in, 59s to warm, held 4.5 minutes,
+    applied once, bounced back to `questionario` -- and the process EXITED, so hold-respawn paid the
+    whole login+warmup again for the next single attempt. The login wall and the CAPTCHA solve are
+    the scarce resources; portal traffic is not. A bounced worker still holds a valid warm session
+    and must go back for another assignment."""
+    ops = SimEngineOps(assignment={"date": "d1", "period": 3}, apply_outcome="bounced")
+    res = PhaseMachine(_cfg(booking={"APPLY_MAX_ATTEMPTS": 3}, ROLE="apply"), ops).run()
+
+    assert res.outcome == "held"
+    assert "3x" in res.detail                    # spent the whole budget...
+    assert ops.applied == 3                      # ...on three real attempts, one login
+    assert ops.released == 3                     # each bounce hands the slot back
+
+
+def test_apply_stops_at_the_first_booking():
+    ops = SimEngineOps(assignment={"date": "d1", "period": 3}, apply_outcome="booked")
+    res = PhaseMachine(_cfg(booking={"APPLY_MAX_ATTEMPTS": 5}, ROLE="apply"), ops).run()
+    assert res.outcome == "booked"
+    assert ops.applied == 1
+    assert ops.released == 0                     # a booked slot is never handed back
+
+
+def test_apply_bounce_releases_the_slot_so_the_worker_stays_assignable():
+    """The lease must be handed back on each bounce -- otherwise _assign_slots' one-active-lease
+    rule leaves the worker warm and idle until SLOT_LEASE_TTL reclaims it minutes later."""
+    ops = SimEngineOps(assignment={"date": "d1", "period": 3}, apply_outcome="bounced")
+    PhaseMachine(_cfg(booking={"APPLY_MAX_ATTEMPTS": 1}, ROLE="apply"), ops).run()
+    assert ops.released == 1

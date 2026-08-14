@@ -43,6 +43,10 @@ class SimEngineOps(EngineOps):
         self._assignment = assignment
         self._scouts_invalid = scouts_invalid
         self._apply_outcome = apply_outcome
+        # Counters for the apply-retry loop (phases.py): a bounced worker keeps its warm session
+        # and comes back for another assignment, so 'how many attempts did one login buy' matters.
+        self.applied = 0
+        self.released = 0
         self._delay = step_delay
         self._signals = signals
         self._emit = emit
@@ -122,6 +126,12 @@ class SimEngineOps(EngineOps):
             if self._emit is not None:
                 self._emit("log_line", text="keepalive: sim heartbeat (await_assignment)")
 
+    def release_slot(self, slot: dict) -> None:
+        self._pause()
+        self.released += 1
+        if self._emit is not None:
+            self._emit("slot_released", slot=slot)
+
     def slot_found_seen(self) -> bool:
         return self._signals is not None and getattr(self._signals, "slot_found_seen", False)
 
@@ -132,4 +142,6 @@ class SimEngineOps(EngineOps):
         return self._signals is not None and self._signals.stopped
 
     def do_apply(self, slot: dict) -> str:
-        self._pause(); return self._apply_outcome
+        self._pause()
+        self.applied += 1
+        return self._apply_outcome
