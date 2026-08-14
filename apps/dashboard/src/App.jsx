@@ -485,8 +485,23 @@ function BookingOverview({ me, booking, events, onBookingChanged, onDeleted }) {
     });
   }, [booking.id]);
 
-  async function act(fn) { setMsg(""); try { await fn(); onBookingChanged(); } catch (e) { setMsg(e.message); } }
-  const startAll = () => act(() => api(`/bookings/${booking.id}/start`, { method: "POST" }));
+  // `busy` disables every control while a mutation is in flight. Without it the Start button gave
+  // no feedback at all: a live fleet launch used to run inline in the request (minutes of real
+  // per-proxy browser probes), so the click just hung, and the operator reasonably clicked again --
+  // eight times, each one stacking another concurrent fleet launch. The backend is idempotent now
+  // (_begin_fleet_launch), but the UI should never look dead in the first place.
+  const [busy, setBusy] = useState("");
+  async function act(fn, label = "working") {
+    setMsg(""); setBusy(label);
+    try { await fn(); onBookingChanged(); }
+    catch (e) { setMsg(e.message); }
+    finally { setBusy(""); }
+  }
+  const startAll = () => act(async () => {
+    const r = await api(`/bookings/${booking.id}/start`, { method: "POST" });
+    if (r && r.already_launching) setMsg("A fleet launch is already running for this booking — leave it be.");
+    else if (r && r.started) setMsg(`Launching ${r.started} worker(s) in the background — this takes a few minutes.`);
+  }, "starting");
   const stopAll = () => act(() => api(`/bookings/${booking.id}/stop`, { method: "POST" }));
   const schedule = () => act(() => api(`/bookings/${booking.id}/schedule`, { method: "POST" }));
   const fireSlotOpen = () => act(() => api(`/bookings/${booking.id}/fire-slot-open`, { method: "POST" }));
@@ -548,14 +563,16 @@ function BookingOverview({ me, booking, events, onBookingChanged, onDeleted }) {
           </h2>
         )}
         <span className="grow" />
-        <button className="btn" disabled={!op || !canStart} onClick={startAll} title={!canStart ? `booking is ${booking.status}` : "launch ready workers now"}>▶ Start now</button>
-        <button className="btn ghost" disabled={!op || !canSchedule} onClick={schedule}
+        <button className="btn" disabled={!op || !canStart || !!busy} onClick={startAll}
+          title={!canStart ? `booking is ${booking.status}` : "launch ready workers now"}>
+          {busy === "starting" ? "Starting…" : "▶ Start now"}</button>
+        <button className="btn ghost" disabled={!op || !canSchedule || !!busy} onClick={schedule}
           title={!booking.warmup_start_at ? "set a warmup start time first" : "auto-start at warmup time"}>⏱ Scheduled</button>
-        <button className="btn ghost" disabled={!op || !canFireSlotOpen} onClick={fireSlotOpen}
+        <button className="btn ghost" disabled={!op || !canFireSlotOpen || !!busy} onClick={fireSlotOpen}
           title={booking.slot_open_fired_at ? "already fired" : "manually fire slot-open now"}>⚡ Fire slot-open</button>
-        <button className="btn ghost" disabled={!op || !canFireSlotFound} onClick={fireSlotFound}
+        <button className="btn ghost" disabled={!op || !canFireSlotFound || !!busy} onClick={fireSlotFound}
           title={booking.slot_found_fired_at ? "already fired" : !booking.slot_open_fired_at ? "fire slot-open first" : "manually fire slot-found now"}>🔔 Fire slot-found</button>
-        <button className="btn ghost" disabled={!op || !canStop} onClick={stopAll} title={!canStop ? `booking is ${booking.status}` : "stop all running workers"}>■ Stop</button>
+        <button className="btn ghost" disabled={!op || !canStop || !!busy} onClick={stopAll} title={!canStop ? `booking is ${booking.status}` : "stop all running workers"}>■ Stop</button>
         <button className="btn ghost" disabled={!op} onClick={deleteBooking} title="permanently delete this booking and everything on it">🗑 Delete</button>
       </div>
       <div className="row muted" style={{ fontSize: 13, marginBottom: 6, gap: 14, flexWrap: "wrap" }}>

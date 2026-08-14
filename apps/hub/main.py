@@ -6,8 +6,10 @@ exclusivity). Redis/worker-control and WS log streaming are added later in Phase
 """
 from __future__ import annotations
 
+import logging
 import random
 import re
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -102,6 +104,8 @@ from .schemas import (
     WorkerOut,
 )
 
+logger = logging.getLogger(__name__)
+
 supervisor = Supervisor(settings.redis_url)
 event_hub = EventHub(settings.redis_url)
 _bus = Bus(connect(settings.redis_url))
@@ -122,6 +126,50 @@ def _resolve_booking_setting(db: Session, bk: M.Booking, key: str, default):
     global<booking<template resolution, but needs a template per-worker -- this is booking-only)."""
     eff = resolve({L.GLOBAL: get_global(db), L.BOOKING: (bk.settings_json or {})})
     return eff.get(key, default)
+
+
+# Bookings with a fleet launch currently in flight. A live-mode launch is SLOW -- each worker's
+# proxy lease runs real browser health probes against the portal (libs/proxies/health.py), up to
+# max_probes candidates, twice over when HOLD_SWAP_AFTER_FOUND is on -- so a six-worker fleet takes
+# minutes of wall clock, not milliseconds.
+#
+# Confirmed live 2026-08-14 ("start button doesn't work"): /bookings/{id}/start ran that fleet
+# launch INLINE, so the HTTP request simply never came back. The operator clicked Start eight more
+# times; every click started ANOTHER full fleet launch, each spawning its own probe browsers
+# (observed: 234 concurrent chrome processes, 8.5GB, for a 6-worker booking). The scheduler's own
+# auto-start path had the same shape and was worse -- it blocked the whole tick thread, so the
+# booking's status never advanced past SCHEDULED and plan_booking_actions re-fired "start" on the
+# next tick, forever.
+_launching: set[str] = set()
+_launching_lock = threading.Lock()
+
+
+def _begin_fleet_launch(booking_id: str, worker_ids: list[str], *, jitter_secs: float = 0.0) -> bool:
+    """Kick off a fleet launch on a background thread. Returns False (and does nothing) if one is
+    already in flight for this booking -- that idempotence is what makes the Start button safe to
+    click twice, and what stops the scheduler stacking a launch per tick."""
+    if not worker_ids:
+        return False
+    with _launching_lock:
+        if booking_id in _launching:
+            return False
+        _launching.add(booking_id)
+
+    def _run() -> None:
+        try:
+            _launch_worker_fleet(worker_ids, jitter_secs=jitter_secs)
+        except Exception:
+            # _launch_worker_fleet already isolates per-worker failures, so reaching here means
+            # something broke around the whole fleet. Swallow it: an exception escaping a daemon
+            # thread kills the thread silently and would leave `_launching` set forever without the
+            # finally below -- and there is no caller left to hand it to.
+            logger.exception("fleet launch failed for booking %s", booking_id)
+        finally:
+            with _launching_lock:
+                _launching.discard(booking_id)
+
+    threading.Thread(target=_run, name=f"launch-{booking_id[:8]}", daemon=True).start()
+    return True
 
 
 def _launch_worker_fleet(worker_ids: list[str], *, jitter_secs: float = 0.0) -> list[str]:
@@ -174,7 +222,10 @@ def _sched_on_start(db: Session, bk: M.Booking) -> None:
     worker_ids = [w.id for w in db.scalars(select(M.Worker).where(
         M.Worker.booking_id == bk.id, M.Worker.status == WorkerStatus.READY)).all()]
     jitter = float(_resolve_booking_setting(db, bk, "WARMUP_START_JITTER", 0.0) or 0.0)
-    _launch_worker_fleet(worker_ids, jitter_secs=jitter)
+    # Backgrounded: this used to run inline and block the scheduler's whole tick thread for the
+    # minutes a live fleet launch takes -- during which the status transition below never ran, so
+    # plan_booking_actions saw SCHEDULED again next tick and re-fired "start" indefinitely.
+    _begin_fleet_launch(bk.id, worker_ids, jitter_secs=jitter)
     try:
         bk.status = booking_transition(bk.status, BookingStatus.WARMING)
     except IllegalTransition:
@@ -1633,7 +1684,10 @@ def start_booking(booking_id: str, db: Session = Depends(get_db),
     workers = list(db.scalars(select(M.Worker).where(
         M.Worker.booking_id == booking_id, M.Worker.status == WorkerStatus.READY)).all())
     jitter = float(_resolve_booking_setting(db, bk, "WARMUP_START_JITTER", 0.0) or 0.0)
-    _launch_worker_fleet([w.id for w in workers], jitter_secs=jitter)
+    # Returns immediately -- see _begin_fleet_launch. A live fleet launch takes minutes (real
+    # per-proxy browser health probes), and running it inline here meant this request never came
+    # back and every impatient re-click stacked another concurrent fleet launch on top.
+    launching = _begin_fleet_launch(booking_id, [w.id for w in workers], jitter_secs=jitter)
     if bk.status in (BookingStatus.DRAFT, BookingStatus.SCHEDULED, BookingStatus.STOPPED):
         # Fresh run: re-anchor the booking timeout and clear the signal latch (both timestamps AND
         # the per-worker "already notified" sets, which are keyed by booking+signal in Redis) so
@@ -1652,7 +1706,11 @@ def start_booking(booking_id: str, db: Session = Depends(get_db),
         except IllegalTransition as e:
             raise HTTPException(409, str(e))
     db.commit()
-    return {"started": len(workers), "booking_status": str(bk.status)}
+    # `launching` False with workers queued means a fleet launch for this booking was ALREADY in
+    # flight -- the click was a no-op, not a failure. The dashboard surfaces that rather than
+    # leaving the operator to guess (and click again).
+    return {"started": len(workers), "booking_status": str(bk.status),
+            "launching": launching, "already_launching": bool(workers) and not launching}
 
 
 @app.post("/bookings/{booking_id}/fire-slot-open")

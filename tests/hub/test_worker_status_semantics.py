@@ -20,6 +20,8 @@ Worker.substate, the WS live substate, and the WS terminal outcome) with no sing
 4. The dashboard's row and bulk buttons each invented their own enablement rule. They now share
    WORKER_ACTION_STATUSES with the endpoints; this file pins the backend half.
 """
+import time
+
 import fakeredis
 import pytest
 from sqlalchemy import create_engine, select, text
@@ -32,6 +34,22 @@ from libs.db import metadata
 from libs.db import models as M
 from libs.domain.enums import WorkerStatus, WorkerSubstate
 from libs.domain.state_machines import can_worker_action
+
+
+# Captured at import time, BEFORE conftest's autouse _launch_fleet_synchronously patches it out.
+# (Deliberately not importlib.reload(hub_main) to get it back: reloading re-executes module-level
+# code and would build fresh supervisor/_bus/scheduler singletons mid-session, which every other
+# test is still holding references to.)
+from apps.hub.main import _begin_fleet_launch as _REAL_BEGIN_FLEET_LAUNCH  # noqa: E402
+
+
+@pytest.fixture()
+def _real_background_launch(monkeypatch):
+    """Undo conftest's synchronous-launch fixture for the two tests that exercise the real
+    background dispatch. Safe here because both stub _launch_worker_fleet itself, so no thread ever
+    touches the SQLite connection."""
+    import apps.hub.main as hub_main
+    monkeypatch.setattr(hub_main, "_begin_fleet_launch", _REAL_BEGIN_FLEET_LAUNCH)
 
 
 @pytest.fixture()
@@ -104,6 +122,18 @@ def _row(client, worker_id):
         db.close()
 
 
+def _await_status(client, worker_id, status, timeout=5.0):
+    """The fleet launch is backgrounded now (_begin_fleet_launch), so /start returns before the
+    worker is actually RUNNING -- poll instead of asserting on a race."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _row(client, worker_id)["status"] == status:
+            return
+        time.sleep(0.05)
+    raise AssertionError(f"worker {worker_id} never reached {status} "
+                         f"(still {_row(client, worker_id)['status']})")
+
+
 # ── the capability table itself (pure) ────────────────────────────────────────
 def test_completed_worker_can_never_be_launched_or_restarted():
     assert can_worker_action("launch", WorkerStatus.COMPLETED) is False
@@ -159,7 +189,7 @@ def test_launch_on_running_worker_is_rejected_and_leases_nothing(client):
     h = _operate_headers(client)
     bid, wid = _bk_with_worker(client, h)
     client.post(f"/bookings/{bid}/start", headers=h)
-    assert _row(client, wid)["status"] == WorkerStatus.RUNNING
+    _await_status(client, wid, WorkerStatus.RUNNING)
 
     r = client.post(f"/workers/{wid}/launch", headers=h)
     assert r.status_code == 409 and "cannot launch" in r.json()["detail"]
@@ -193,6 +223,7 @@ def test_stop_worker_clears_the_in_flight_substate(client):
     h = _operate_headers(client)
     bid, wid = _bk_with_worker(client, h)
     client.post(f"/bookings/{bid}/start", headers=h)
+    _await_status(client, wid, WorkerStatus.RUNNING)
     _force(client, wid, substate=WorkerSubstate.HOLDING)
 
     client.post(f"/workers/{wid}/stop", headers=h)
@@ -206,6 +237,7 @@ def test_stop_booking_clears_the_in_flight_substate(client):
     h = _operate_headers(client)
     bid, wid = _bk_with_worker(client, h)
     client.post(f"/bookings/{bid}/start", headers=h)
+    _await_status(client, wid, WorkerStatus.RUNNING)
     _force(client, wid, substate=WorkerSubstate.DISCOVERING)
 
     client.post(f"/bookings/{bid}/stop", headers=h)
@@ -218,14 +250,14 @@ def test_start_booking_requeue_clears_a_stale_substate(client):
     h = _operate_headers(client)
     bid, wid = _bk_with_worker(client, h)
     client.post(f"/bookings/{bid}/start", headers=h)
+    _await_status(client, wid, WorkerStatus.RUNNING)
     client.post(f"/workers/{wid}/stop", headers=h)
     _force(client, wid, status=WorkerStatus.FAILED, substate=WorkerSubstate.HOLDING)
 
     client.post(f"/bookings/{bid}/start", headers=h)
+    _await_status(client, wid, WorkerStatus.RUNNING)   # requeued READY, then launched
 
-    row = _row(client, wid)
-    assert row["status"] == WorkerStatus.RUNNING      # requeued READY, then launched
-    assert row["substate"] is None                    # the worker's own `started` event repopulates it
+    assert _row(client, wid)["substate"] is None                    # the worker's own `started` event repopulates it
 
 
 def test_start_booking_also_requeues_held_workers(client):
@@ -233,9 +265,70 @@ def test_start_booking_also_requeues_held_workers(client):
     h = _operate_headers(client)
     bid, wid = _bk_with_worker(client, h)
     client.post(f"/bookings/{bid}/start", headers=h)
+    _await_status(client, wid, WorkerStatus.RUNNING)
     _force(client, wid, status=WorkerStatus.HELD, substate=None)
 
     r = client.post(f"/bookings/{bid}/start", headers=h)
 
     assert r.json()["started"] == 1
-    assert _row(client, wid)["status"] == WorkerStatus.RUNNING
+    _await_status(client, wid, WorkerStatus.RUNNING)
+
+
+# ── /start must not block on the fleet launch (confirmed live 2026-08-14) ──────
+@pytest.mark.usefixtures("_real_background_launch")
+def test_start_returns_immediately_and_is_idempotent_while_launching(client, monkeypatch):
+    """"Start button doesn't work": /bookings/{id}/start ran _launch_worker_fleet INLINE, and a live
+    launch is minutes of real per-proxy browser probes -- so the request never came back. The
+    operator clicked eight more times and each click started ANOTHER concurrent fleet launch (234
+    chrome processes observed for a 6-worker booking). Must return at once, and a second click
+    while one is in flight must be a no-op."""
+    import threading
+
+    import apps.hub.main as hub_main
+
+    h = _operate_headers(client)
+    bid, wid = _bk_with_worker(client, h)
+
+    release = threading.Event()
+    calls: list[list[str]] = []
+
+    def _slow_fleet(worker_ids, *, jitter_secs=0.0):
+        calls.append(list(worker_ids))
+        release.wait(timeout=5)      # stand in for the minutes a real launch takes
+        return []
+
+    monkeypatch.setattr(hub_main, "_launch_worker_fleet", _slow_fleet)
+
+    try:
+        r1 = client.post(f"/bookings/{bid}/start", headers=h)   # returns despite the slow launch
+        assert r1.status_code == 200
+        assert r1.json()["launching"] is True
+
+        r2 = client.post(f"/bookings/{bid}/start", headers=h)   # second click, launch still running
+        assert r2.status_code == 200
+        assert r2.json()["already_launching"] is True
+    finally:
+        release.set()
+
+    assert len(calls) == 1   # exactly ONE fleet launch, not one per click
+
+
+@pytest.mark.usefixtures("_real_background_launch")
+def test_start_clears_the_in_flight_flag_even_if_the_launch_raises(client, monkeypatch):
+    """A launch that blows up must not wedge the booking into permanently 'already launching'."""
+    import apps.hub.main as hub_main
+
+    h = _operate_headers(client)
+    bid, wid = _bk_with_worker(client, h)
+
+    def _boom(worker_ids, *, jitter_secs=0.0):
+        raise RuntimeError("pool exhausted")
+
+    monkeypatch.setattr(hub_main, "_launch_worker_fleet", _boom)
+    client.post(f"/bookings/{bid}/start", headers=h)
+
+    for _ in range(50):
+        if bid not in hub_main._launching:
+            break
+        time.sleep(0.05)
+    assert bid not in hub_main._launching
