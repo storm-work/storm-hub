@@ -465,3 +465,49 @@ def test_launch_aborts_when_the_worker_itself_was_stopped_mid_flight(db_session,
 
     main._do_launch_worker(db, w)
     assert spawned == []
+
+
+def test_start_launches_only_after_the_booking_transition_is_committed(client, monkeypatch):
+    """CONFIRMED LIVE 2026-08-14. start_booking called _begin_fleet_launch BEFORE the commit that
+    moved the booking out of STOPPED. The fleet launch runs on its own thread with its own DB
+    session, so that session read the booking as still STOPPED and _do_launch_worker's stop-guard
+    correctly refused all six workers -- while the endpoint reported a successful start and the
+    dashboard sat on "Launching 6 worker(s)" with nothing running for ten minutes.
+
+    Pins the ordering: by the time a launch is requested, the status the launch thread will read
+    must already be persisted."""
+    import apps.hub.main as main
+    from libs.db import models as M
+    from libs.domain.enums import BookingStatus
+
+    h = _operate_headers(client)
+    iid = client.post("/identities", json={"full_name": "Order Test", "type": "real"},
+                      headers=h).json()["id"]
+    bid = client.post("/bookings", json={"name": "OrderB", "type": "test", "posto_id": "3018",
+                                         "nationality": "CPV", "residence": "FRA"},
+                      headers=h).json()["id"]
+    client.post(f"/bookings/{bid}/attach-identities", json={"identity_ids": [iid]}, headers=h)
+
+    db = main.SessionLocal()
+    bk = db.get(M.Booking, bid)
+    bk.status = BookingStatus.STOPPED
+    db.commit(); db.close()
+
+    seen = {}
+
+    def _spy(booking_id, worker_ids, *, jitter_secs=0.0):
+        # Read through a FRESH session, exactly as the real launch thread does.
+        db2 = main.SessionLocal()
+        try:
+            seen["status"] = db2.get(M.Booking, booking_id).status
+        finally:
+            db2.close()
+        return True
+
+    monkeypatch.setattr(main, "_begin_fleet_launch", _spy)
+    client.post(f"/bookings/{bid}/start", headers=h)
+
+    assert "status" in seen, "no launch was requested at all"
+    assert seen["status"] != BookingStatus.STOPPED, (
+        "the launch thread would read STOPPED -- _do_launch_worker's stop-guard refuses that, "
+        "which is exactly the silent no-op seen live")

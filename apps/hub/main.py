@@ -246,12 +246,14 @@ def _sched_on_start(db: Session, bk: M.Booking) -> None:
     # Backgrounded: this used to run inline and block the scheduler's whole tick thread for the
     # minutes a live fleet launch takes -- during which the status transition below never ran, so
     # plan_booking_actions saw SCHEDULED again next tick and re-fired "start" indefinitely.
-    _begin_fleet_launch(bk.id, worker_ids, jitter_secs=jitter)
     try:
         bk.status = booking_transition(bk.status, BookingStatus.WARMING)
     except IllegalTransition:
         pass
     db.commit()
+    # After the commit, for the same reason as start_booking: the launch thread uses its own
+    # session, so it must not be able to read the booking in its pre-start status.
+    _begin_fleet_launch(bk.id, worker_ids, jitter_secs=jitter)
 
 
 def _sched_on_slot_open(db: Session, bk: M.Booking) -> None:
@@ -1680,11 +1682,12 @@ def _do_launch_worker(db: Session, w: M.Worker) -> None:
     # This is the single choke point every launch path goes through -- fleet launch, relaunch,
     # hold-respawn -- so the check belongs here rather than in each caller.
     if bk is None or bk.status in _LAUNCH_BLOCKED_BOOKING_STATUSES:
-        logger.info("launch aborted for worker %s: booking is %s",
-                    w.id, bk.status if bk else "missing")
+        logger.warning("launch aborted for worker %s: booking is %s",
+                       w.id, bk.status if bk else "missing")
         return
     if w.status == WorkerStatus.STOPPED:
-        logger.info("launch aborted for worker %s: it was stopped while the launch was in flight", w.id)
+        logger.warning("launch aborted for worker %s: it was stopped while the launch was in flight",
+                       w.id)
         return
     tpl = db.get(M.WorkerTemplate, w.template_id) if w.template_id else None
     layers = {L.GLOBAL: get_global(db), L.BOOKING: (bk.settings_json or {})}
@@ -1858,10 +1861,6 @@ def start_booking(booking_id: str, db: Session = Depends(get_db),
     workers = list(db.scalars(select(M.Worker).where(
         M.Worker.booking_id == booking_id, M.Worker.status == WorkerStatus.READY)).all())
     jitter = float(_resolve_booking_setting(db, bk, "WARMUP_START_JITTER", 0.0) or 0.0)
-    # Returns immediately -- see _begin_fleet_launch. A live fleet launch takes minutes (real
-    # per-proxy browser health probes), and running it inline here meant this request never came
-    # back and every impatient re-click stacked another concurrent fleet launch on top.
-    launching = _begin_fleet_launch(booking_id, [w.id for w in workers], jitter_secs=jitter)
     if bk.status in (BookingStatus.DRAFT, BookingStatus.SCHEDULED, BookingStatus.STOPPED):
         # Fresh run: re-anchor the booking timeout and clear the signal latch (both timestamps AND
         # the per-worker "already notified" sets, which are keyed by booking+signal in Redis) so
@@ -1900,6 +1899,15 @@ def start_booking(booking_id: str, db: Session = Depends(get_db),
         except IllegalTransition as e:
             raise HTTPException(409, str(e))
     db.commit()
+    # Launch only AFTER the transition above is COMMITTED. The fleet launch runs on its own thread
+    # with its own DB session, so starting it earlier means that session reads the booking in its
+    # PRE-start status -- confirmed live 2026-08-14: Start was clicked on a STOPPED booking, the
+    # thread saw STOPPED, and _do_launch_worker's stop-guard correctly refused all six workers while
+    # the endpoint went on to report a successful start. The UI sat on "Launching 6 workers" with
+    # nothing running. Returns immediately -- a live fleet launch takes minutes (real per-proxy
+    # browser health probes), and running it inline meant the request never came back and every
+    # impatient re-click stacked another concurrent fleet launch on top.
+    launching = _begin_fleet_launch(booking_id, [w.id for w in workers], jitter_secs=jitter)
     # `launching` False with workers queued means a fleet launch for this booking was ALREADY in
     # flight -- the click was a no-op, not a failure. The dashboard surfaces that rather than
     # leaving the operator to guess (and click again).
