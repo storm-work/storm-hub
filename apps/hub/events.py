@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 
 from libs.bus import Bus, connect
@@ -281,7 +282,21 @@ class EventHub:
             db.close()
 
     def _persist_slots(self, worker_id: str, slots: list) -> None:
-        """A scout pushed slots -> upsert into the booking's DB pool (scheduler then assigns them)."""
+        """A scout pushed slots -> upsert into the booking's DB pool (scheduler then assigns them).
+
+        A REDISCOVERY of an existing row must reopen it, not be discarded. SlotStatus.CLOSED means
+        "absent from N consecutive scans" and the transition table has said CLOSED -> AVAILABLE
+        ("reappearance reopens") from the start -- but this method simply `continue`d on any existing
+        row, so nothing ever performed that transition.
+
+        Harmless while slots were only ever created, and fatal once /start began retiring the
+        previous run's slots to CLOSED (2026-08-14). Confirmed live on booking Test2: a scout pushed
+        24 slots at 09:21 and again at 09:23, every one of them matching a CLOSED row from the
+        earlier run -- all 48 pushes were dropped, slot_found never fired, and the apply workers sat
+        holding with nothing to do while the pool showed "24 slots, all closed".
+
+        LEASED and TAKEN are left alone: a slot being worked or already booked is not something a
+        discovery report should reset."""
         from sqlalchemy import select
         from libs.domain.enums import SlotStatus
         db = SessionLocal()
@@ -290,6 +305,7 @@ class EventHub:
             if not w:
                 return
             bk = db.get(M.Booking, w.booking_id)
+            now = datetime.now(timezone.utc)
             for s in slots or []:
                 date, period = s.get("date"), s.get("period")
                 if date is None or period is None:
@@ -297,11 +313,17 @@ class EventHub:
                 exists = db.scalar(select(M.Slot).where(
                     M.Slot.booking_id == w.booking_id, M.Slot.date == str(date),
                     M.Slot.period == int(period)))
-                if exists:
+                if exists is not None:
+                    if exists.status == SlotStatus.CLOSED:
+                        exists.status = SlotStatus.AVAILABLE
+                        exists.discovered_by = worker_id
+                        exists.miss_count = 0
+                    if exists.status == SlotStatus.AVAILABLE:
+                        exists.last_seen = now      # keep a live slot's freshness current
                     continue
                 db.add(M.Slot(booking_id=w.booking_id, posto_id=bk.posto_id if bk else "",
                               date=str(date), period=int(period), status=SlotStatus.AVAILABLE,
-                              discovered_by=worker_id))
+                              discovered_by=worker_id, first_seen=now, last_seen=now))
             db.commit()
         finally:
             db.close()
