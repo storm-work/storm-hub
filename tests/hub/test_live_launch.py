@@ -340,6 +340,9 @@ def test_launch_worker_fleet_runs_concurrently_and_isolates_one_workers_failure(
         def get(self, _model, worker_id):
             return rows.get(worker_id)
 
+        def commit(self) -> None:   # the failure path records a reason on the row
+            pass
+
         def close(self) -> None:
             pass
 
@@ -350,6 +353,10 @@ def test_launch_worker_fleet_runs_concurrently_and_isolates_one_workers_failure(
 
     assert failed == ["bad"]
     assert set(calls) == {"good", "bad"}   # both were attempted, regardless of "bad"'s failure
+    # and the failure is RECORDED, not merely counted -- a worker left behind by a failed launch
+    # must be able to say why (2026-08-14)
+    assert "boom" in rows["bad"].substate_detail
+    assert not hasattr(rows["good"], "substate_detail")
 
 
 def test_launch_worker_fleet_jitter_delays_each_worker_before_launch(monkeypatch):
