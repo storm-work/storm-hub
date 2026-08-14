@@ -80,9 +80,13 @@ def ensure_awakened(state: ScoutPoolState, scout_ids: list[str], limit: int) -> 
 
 
 def on_slots_found(state: ScoutPoolState) -> None:
-    """First slot found for this booking -> switch SINGLE to SPLIT mode (irreversible per booking)."""
+    """First slot found for this booking -> switch SINGLE to SPLIT mode (irreversible per booking).
+
+    Clears the per-date miss counts: strikes accrued before this moment describe a portal that had
+    not released its slots yet, and must not count toward retiring a date now that it has."""
     state.slot_found = True
     state.mode = "split"
+    state.date_miss_counts.clear()
 
 
 def on_dates_reported(state: ScoutPoolState, scout_id: str, outcomes: list[dict], *,
@@ -95,6 +99,15 @@ def on_dates_reported(state: ScoutPoolState, scout_id: str, outcomes: list[dict]
     on/off toggle: "when off, never retire any date"). Returns the retired dates for the caller to
     persist/log."""
     state.busy_scouts.discard(scout_id)
+    # Retirement is a SLOT-FOUND-phase feature only (operator, 2026-08-14). Before slot-found the
+    # scouts are probing a portal that has not released its slots yet, so `empty` is the expected
+    # answer for every date and says nothing about whether that date is worth scanning later.
+    # Counting those strikes was actively destructive: with the default threshold of 3, three
+    # single-mode probe rounds put EVERY date in the window at the limit, and the first split-mode
+    # report -- the instant discovery actually starts mattering -- retired the entire range and left
+    # the scouts with empty slices.
+    if state.mode != "split":
+        return []
     parsed = [pool_manager.DateOutcome(o["date"], o["outcome"]) for o in outcomes]
     pool_manager.update_date_miss_counts(parsed, state.date_miss_counts)
     remaining = state.remaining_by_scout.get(scout_id, [])

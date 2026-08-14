@@ -1085,3 +1085,30 @@ def test_reclaim_never_touches_a_worker_that_is_actually_applying(db):
     db.refresh(slot)
     assert slot.status == SlotStatus.LEASED
     assert len(db.scalars(select(M.SlotLease).where(M.SlotLease.released_at.is_(None))).all()) == 1
+
+
+def test_drive_scouts_does_not_retire_dates_before_slot_found(db):
+    """End-to-end phase scoping: during the slot-open phase the portal has not released its slots,
+    so every date reports empty -- and none of it may count toward retirement. Before this was
+    scoped, three single-mode rounds at the default threshold retired the entire window the moment
+    split mode began."""
+    bus = _FakeBus()
+    hub = _FakeEventHub()
+    sched = _scheduler(bus=bus, event_hub=hub)
+    bk = _make_booking(db, settings_json={"DATE_RETIRE_AFTER_MISSES": 1})   # NO slot_found_fired_at
+    ident = _make_identity(db)
+    s1 = _make_worker(db, bk, ident, role=WorkerRole.SCOUT)
+
+    for _ in range(4):
+        hub.dates_reported[s1.id] = [[{"date": d, "outcome": "empty"} for d in ("d1", "d2", "d3")]]
+        sched._drive_scouts(db, bk, sample_dates=["d1", "d2", "d3"])
+
+    state = sched._scout_pools[bk.id]
+    assert state.mode == "single"
+    assert state.date_miss_counts == {}          # nothing accrued in the slot-open phase
+
+    # now slots are found -- the full range must still be available to scan
+    bk.slot_found_fired_at = NOW
+    db.commit()
+    sched._drive_scouts(db, bk, sample_dates=["d1", "d2", "d3"])
+    assert sorted(sum(sched._scout_pools[bk.id].remaining_by_scout.values(), [])) == ["d1", "d2", "d3"]

@@ -51,6 +51,7 @@ def test_on_dates_reported_does_not_prune_on_a_single_empty_report():
     """Multi-strike retirement (default threshold 3, operator spec 2026-08-14): a lone empty report
     must not prune the date anymore -- that was the old (too-eager) single-report behavior."""
     state = orch.ScoutPoolState(remaining_by_scout={"s1": ["found_d", "empty_d", "failed_d"]})
+    orch.on_slots_found(state)   # retirement only applies in the slot-found phase
     retired = orch.on_dates_reported(state, "s1", [
         {"date": "found_d", "outcome": "found"},
         {"date": "empty_d", "outcome": "empty"},
@@ -62,6 +63,7 @@ def test_on_dates_reported_does_not_prune_on_a_single_empty_report():
 
 def test_on_dates_reported_retires_after_enough_consecutive_misses():
     state = orch.ScoutPoolState(remaining_by_scout={"s1": ["d1"]})
+    orch.on_slots_found(state)
     for _ in range(2):
         retired = orch.on_dates_reported(state, "s1", [{"date": "d1", "outcome": "empty"}],
                                           retire_after_misses=3)
@@ -74,6 +76,7 @@ def test_on_dates_reported_retires_after_enough_consecutive_misses():
 
 def test_on_dates_reported_zero_threshold_never_retires():
     state = orch.ScoutPoolState(remaining_by_scout={"s1": ["d1"]})
+    orch.on_slots_found(state)
     for _ in range(10):
         retired = orch.on_dates_reported(state, "s1", [{"date": "d1", "outcome": "empty"}],
                                           retire_after_misses=0)
@@ -83,6 +86,7 @@ def test_on_dates_reported_zero_threshold_never_retires():
 
 def test_on_dates_reported_found_resets_the_miss_streak():
     state = orch.ScoutPoolState(remaining_by_scout={"s1": ["d1"]})
+    orch.on_slots_found(state)
     orch.on_dates_reported(state, "s1", [{"date": "d1", "outcome": "empty"}], retire_after_misses=3)
     orch.on_dates_reported(state, "s1", [{"date": "d1", "outcome": "empty"}], retire_after_misses=3)
     orch.on_dates_reported(state, "s1", [{"date": "d1", "outcome": "found"}], retire_after_misses=3)
@@ -120,3 +124,53 @@ def test_should_send_assign_dedups_outstanding():
     outstanding = {"w1"}
     assert orch.should_send_assign("w1", outstanding) is False
     assert orch.should_send_assign("w2", outstanding) is True
+
+
+# ── retirement is a SLOT-FOUND-phase feature only (operator, 2026-08-14) ──────
+def test_pre_slot_open_empties_never_accrue_retirement_strikes():
+    """Before slot-found the scouts probe a portal that has not released its slots yet, so `empty`
+    is the expected answer for every date and says nothing about whether it is worth scanning
+    later. Counting those strikes was destructive: at the default threshold of 3, three single-mode
+    probe rounds put EVERY date at the limit, and the first split-mode report -- the instant
+    discovery starts mattering -- retired the whole range and left the scouts with empty slices."""
+    state = orch.ScoutPoolState()
+    dates = ["d1", "d2", "d3"]
+    for _ in range(5):
+        retired = orch.on_dates_reported(
+            state, "s1", [{"date": d, "outcome": "empty"} for d in dates], retire_after_misses=3)
+        assert retired == []
+    assert state.date_miss_counts == {}
+
+
+def test_slot_found_clears_strikes_carried_from_the_single_mode_phase():
+    """Belt to the braces above: even if a strike were recorded before the transition, entering the
+    slot-found phase starts retirement accounting from zero."""
+    state = orch.ScoutPoolState()
+    state.date_miss_counts.update({"d1": 9, "d2": 9})
+    orch.on_slots_found(state)
+    assert state.date_miss_counts == {}
+
+
+def test_retirement_takes_full_threshold_after_slot_found():
+    state = orch.ScoutPoolState()
+    dates = ["d1", "d2"]
+    for _ in range(4):                      # pre-slot-open: ignored entirely
+        orch.on_dates_reported(state, "s1", [{"date": d, "outcome": "empty"} for d in dates],
+                               retire_after_misses=3)
+    orch.on_slots_found(state)
+    state.remaining_by_scout = {"s1": list(dates)}
+
+    assert orch.on_dates_reported(state, "s1", [{"date": d, "outcome": "empty"} for d in dates],
+                                  retire_after_misses=3) == []
+    assert orch.on_dates_reported(state, "s1", [{"date": d, "outcome": "empty"} for d in dates],
+                                  retire_after_misses=3) == []
+    assert orch.on_dates_reported(state, "s1", [{"date": d, "outcome": "empty"} for d in dates],
+                                  retire_after_misses=3) == ["d1", "d2"]
+
+
+def test_busy_scouts_is_still_cleared_in_single_mode():
+    """The early return must not skip the concurrency-window bookkeeping -- a scout that reported
+    still has to be marked not-busy, or split mode would start with a poisoned window."""
+    state = orch.ScoutPoolState(busy_scouts={"s1", "s2"})
+    orch.on_dates_reported(state, "s1", [{"date": "d1", "outcome": "empty"}])
+    assert state.busy_scouts == {"s2"}
