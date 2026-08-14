@@ -47,6 +47,13 @@ class BusSignals:
         # Set by an `inactivate` signal (the Hub's false-slot-open revert). Passively observed in
         # _drain like slot_found_seen, so whichever wait_* call happens to see the batch records it.
         self.inactivated = False
+        # An `assign` that arrives while some OTHER wait_* is blocked. _drain acks the whole batch,
+        # so a command not matched by the currently-running wait used to be acked and dropped on the
+        # floor. Confirmed live 2026-08-14: the scheduler assigns a slot (creating a SlotLease) to
+        # any HOLDING apply worker -- including one still sitting in await_slot_open after a respawn
+        # -- and that assign was silently discarded, stranding its lease forever. One worker
+        # accumulated 120 stranded leases, consuming every slot in the booking.
+        self.pending_assignment = TIMEOUT   # TIMEOUT = "nothing stashed" (None is a legal slot)
         bus.ensure_command_group(worker_id)
 
     def _drain(self, block_ms: int = 2000) -> list:
@@ -65,6 +72,12 @@ class BusSignals:
             self.bus.ack_command(self.wid, m.id)
             if m.type == "signal" and m.payload.get("name") == "slot_found":
                 self.slot_found_seen = True
+            if m.type == "assign":
+                # Stash rather than drop -- wait_assignment consumes it. Keeping the newest is
+                # correct: the scheduler only ever has one outstanding assignment per worker now
+                # (Phase F2's one-active-lease rule, enforced in _assign_slots).
+                self.pending_assignment = m.payload.get("slot")
+                self._last_scouts_invalid = bool(m.payload.get("scouts_invalid", False))
             if m.type == "signal" and m.payload.get("name") == "inactivate":
                 self.inactivated = True
                 # A re-fired slot_open is a genuinely new window -- clear the stale slot_found so a
@@ -115,12 +128,18 @@ class BusSignals:
         real `dict | None` for an actual `assign` command (None is legitimate there -- the
         self-scout fallback signal) or `None` for stop. Callers distinguish stop from a real
         null-slot assign via `self.stopped` after the call."""
+        # An assignment that landed while a different wait_* was running is already stashed by
+        # _drain -- take it before blocking, or it would be waited for a second time and the
+        # scheduler would have to issue (and lease) another one.
+        if self.pending_assignment is not TIMEOUT:
+            slot, self.pending_assignment = self.pending_assignment, TIMEOUT
+            return slot
         deadline = time.time() + timeout
         while time.time() < deadline and not self.stopped:
             for m in self._drain():
                 if m.type == "assign":
-                    self._last_scouts_invalid = bool(m.payload.get("scouts_invalid", False))
-                    return m.payload.get("slot")
+                    slot, self.pending_assignment = self.pending_assignment, TIMEOUT
+                    return slot
                 if m.type in ("stop", "shutdown"):
                     self.stopped = True
                     return None

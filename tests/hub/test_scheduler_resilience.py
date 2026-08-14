@@ -1005,3 +1005,83 @@ def test_drive_scouts_falls_back_to_a_default_window_when_unset(db):
 
     dates = [p["dates"] for _wid, t, p in bus.sent if t == "discover"][0]
     assert len(dates) == 20         # CAL_NUM_DAYS default
+
+
+# ── one active slot lease per worker (confirmed live 2026-08-14) ──────────────
+def test_assign_slots_never_gives_a_worker_a_second_active_lease(db):
+    """Phase F2's enforce_single_lease invariant, which was built, unit-tested, and then called
+    from nowhere. On booking Test2 one worker (ERNESTO PIRES) accumulated 120 active leases -- 5 per
+    slot across all 24 slots, the whole pool -- because a HOLDING worker with no pending command is
+    re-assignable on EVERY 5s tick. Once consumed, every slot read LEASED, `avail` came back empty,
+    and no worker could be assigned again: deadlock with one worker owning everything."""
+    bus = _FakeBus()
+    sched = _scheduler(bus=bus)
+    bk = _make_booking(db, settings_json={"SLOT_CAPACITY_PER_PERIOD": "5"})
+    ident = _make_identity(db)
+    w = _make_worker(db, bk, ident, role=WorkerRole.APPLY, substate=WorkerSubstate.HOLDING)
+    for period in (1, 2, 3):
+        db.add(M.Slot(booking_id=bk.id, posto_id="5084", date="2026-09-01", period=period,
+                      status=SlotStatus.AVAILABLE))
+    db.commit()
+
+    for _ in range(5):            # five scheduler ticks, worker never leaves HOLDING
+        sched._assign_slots(db, bk)
+
+    active = db.scalars(select(M.SlotLease).where(
+        M.SlotLease.worker_id == w.id, M.SlotLease.released_at.is_(None))).all()
+    assert len(active) == 1       # not 5, and certainly not one per slot-capacity-unit
+
+
+# ── stale lease reclaim ───────────────────────────────────────────────────────
+def test_reclaim_returns_a_slot_held_by_a_worker_that_is_no_longer_running(db):
+    sched = _scheduler(bus=_FakeBus())
+    bk = _make_booking(db, settings_json={"SLOT_CAPACITY_PER_PERIOD": "1"})
+    ident = _make_identity(db)
+    dead = _make_worker(db, bk, ident, role=WorkerRole.APPLY, status=WorkerStatus.FAILED)
+    slot = M.Slot(booking_id=bk.id, posto_id="5084", date="2026-09-01", period=1,
+                  status=SlotStatus.LEASED)
+    db.add(slot); db.commit()
+    db.add(M.SlotLease(slot_id=slot.id, worker_id=dead.id, leased_at=NOW))
+    db.commit()
+
+    sched._reclaim_stale_slot_leases(db, bk, NOW)
+
+    db.refresh(slot)
+    assert slot.status == SlotStatus.AVAILABLE
+    assert db.scalars(select(M.SlotLease).where(M.SlotLease.released_at.is_(None))).all() == []
+
+
+def test_reclaim_expires_a_lease_the_holder_never_converted(db):
+    sched = _scheduler(bus=_FakeBus())
+    bk = _make_booking(db, settings_json={"SLOT_LEASE_TTL": 180.0, "SLOT_CAPACITY_PER_PERIOD": "1"})
+    ident = _make_identity(db)
+    w = _make_worker(db, bk, ident, role=WorkerRole.APPLY, substate=WorkerSubstate.HOLDING)
+    slot = M.Slot(booking_id=bk.id, posto_id="5084", date="2026-09-01", period=1,
+                  status=SlotStatus.LEASED)
+    db.add(slot); db.commit()
+    db.add(M.SlotLease(slot_id=slot.id, worker_id=w.id, leased_at=NOW - timedelta(seconds=600)))
+    db.commit()
+
+    sched._reclaim_stale_slot_leases(db, bk, NOW)
+
+    db.refresh(slot)
+    assert slot.status == SlotStatus.AVAILABLE
+
+
+def test_reclaim_never_touches_a_worker_that_is_actually_applying(db):
+    """However long a real booking attempt takes, its slot is not up for grabs."""
+    sched = _scheduler(bus=_FakeBus())
+    bk = _make_booking(db, settings_json={"SLOT_LEASE_TTL": 1.0})
+    ident = _make_identity(db)
+    w = _make_worker(db, bk, ident, role=WorkerRole.APPLY, substate=WorkerSubstate.APPLYING)
+    slot = M.Slot(booking_id=bk.id, posto_id="5084", date="2026-09-01", period=1,
+                  status=SlotStatus.LEASED)
+    db.add(slot); db.commit()
+    db.add(M.SlotLease(slot_id=slot.id, worker_id=w.id, leased_at=NOW - timedelta(seconds=9999)))
+    db.commit()
+
+    sched._reclaim_stale_slot_leases(db, bk, NOW)
+
+    db.refresh(slot)
+    assert slot.status == SlotStatus.LEASED
+    assert len(db.scalars(select(M.SlotLease).where(M.SlotLease.released_at.is_(None))).all()) == 1

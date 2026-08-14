@@ -76,6 +76,9 @@ class EngineOps(Protocol):
     # ── apply ─────────────────────────────────────────────────────────────────
     def await_assignment(self) -> dict | None: ...  # block until a pooled slot is assigned (None = none)
     def scouts_invalid(self) -> bool: ...           # True when all scouts dead -> apply must self-scout
+    # True once a slot_found signal has been observed for this booking. Lets a worker that respawns
+    # mid-run skip the slot_open wait it has already missed -- see _run_apply.
+    def slot_found_seen(self) -> bool: ...
     def do_apply(self, slot: dict) -> str: ...      # 'booked' | 'bounced'
 
     # ── lifecycle ─────────────────────────────────────────────────────────────
@@ -183,8 +186,18 @@ class PhaseMachine:
         # apply holds through slot-open, awaiting assignment. See _run_scout's comment above --
         # "stopped" (-> WorkerStatus.STOPPED) must never be reported as "held" (-> FAILED, which
         # hold-respawn then relaunches, undoing the operator's stop).
-        if self.ops.await_slot_open() == "stop":
-            return PhaseResult("stopped", self._sub, "stopped before slot_open", self.visited)
+        #
+        # ...unless the booking is ALREADY past slot-found. A worker that respawns mid-run (a
+        # bounced apply, a hold-respawn) has re-warmed into a booking where slots are actively being
+        # discovered and assigned; making it sit through another slot_open handshake wastes a warm
+        # session on a signal that has already happened. Confirmed live 2026-08-14: appliers cycled
+        # failed -> rewarm -> WARMED -> HOLDING and stalled there while the booking was in the
+        # slot-found phase with slots waiting. The scheduler does re-latch slot_open to relaunched
+        # workers, so this was a delay rather than a permanent hang -- but it is a phase the worker
+        # provably no longer needs to be in.
+        if not self.ops.slot_found_seen():
+            if self.ops.await_slot_open() == "stop":
+                return PhaseResult("stopped", self._sub, "stopped before slot_open", self.visited)
         slot = self.ops.await_assignment()
         if slot is None and self.ops.is_stopped():
             return PhaseResult("stopped", self._sub, "stopped while awaiting assignment", self.visited)

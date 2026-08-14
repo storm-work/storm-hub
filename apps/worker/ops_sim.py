@@ -122,6 +122,9 @@ class SimEngineOps(EngineOps):
             if self._emit is not None:
                 self._emit("log_line", text="keepalive: sim heartbeat (await_assignment)")
 
+    def slot_found_seen(self) -> bool:
+        return self._signals is not None and getattr(self._signals, "slot_found_seen", False)
+
     def scouts_invalid(self) -> bool:
         return self._scouts_invalid
 

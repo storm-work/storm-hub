@@ -175,6 +175,12 @@ _BOOKING = [
             "of grinding discovery (which risks portal rate-limiting/detection for nothing). "
             "Slot-open can then be re-fired, manually or on schedule. 0 disables the guard entirely; "
             "never fires once slot_found has fired (there ARE slots -- the open was real)."),
+    _s("SLOT_LEASE_TTL", L.BOOKING, float, 180.0, group="discovery",
+       note="seconds a worker may hold a slot lease without converting it into an apply before the "
+            "scheduler reclaims it and returns the slot to the pool. A lease is a promise to attempt "
+            "a booking within seconds; a worker that dies, hangs, or bounces without emitting a "
+            "terminal event would otherwise sterilise those units forever. A worker actually in "
+            "APPLYING/BOOKED is never reclaimed, however long it takes. 0 disables reclaim."),
     _s("SLOT_CAPACITY_PER_PERIOD", L.BOOKING, str, "auto", group="discovery",
        note="how many concurrent apply-worker leases one (date, period) slot can absorb before "
             "it's exhausted -- 'auto' falls back to a per-slot Slot.capacity_estimate if the "

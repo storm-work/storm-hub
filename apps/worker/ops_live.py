@@ -636,6 +636,12 @@ class LiveEngineOps(EngineOps):
     def _slot_found_seen(self) -> bool:
         return self._signals is not None and getattr(self._signals, "slot_found_seen", False)
 
+    def slot_found_seen(self) -> bool:
+        """EngineOps surface for the same flag the keepalive loop reads privately. PhaseMachine uses
+        it so an apply worker that respawns mid-run skips a slot_open handshake that already
+        happened -- see _run_apply."""
+        return self._slot_found_seen()
+
     def _do_keepalive(self, context: str) -> None:
         if self.cfg.keepalive.off:
             return

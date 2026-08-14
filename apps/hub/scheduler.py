@@ -24,7 +24,9 @@ from sqlalchemy import func, select
 
 from libs.db import models as M
 from libs.bus.names import notified_key
-from libs.domain.enums import BookingStatus, SlotStatus, WorkerRole, WorkerStatus, WorkerSubstate
+from libs.domain.enums import (
+    BookingStatus, SlotLeaseOutcome, SlotStatus, WorkerRole, WorkerStatus, WorkerSubstate,
+)
 from libs.engine import orchestration, pool_manager
 
 
@@ -111,6 +113,7 @@ class Scheduler:
                     continue
 
                 if bk.status == BookingStatus.RUNNING:
+                    self._reclaim_stale_slot_leases(db, bk, now)
                     self._fire_slot_found_if_new(db, bk, now)
                     if self._maybe_inactivate_slot_open(db, bk, now):
                         continue   # reverted to WARMING -- no discovery/assignment work this tick
@@ -554,6 +557,67 @@ class Scheduler:
             else:
                 self._bus.send_command(worker_id, "discover", dates=chunk)
 
+    def _reclaim_stale_slot_leases(self, db, bk: M.Booking, now: datetime) -> None:
+        """Return a slot to the pool when the worker holding it never converted it into an apply.
+
+        A lease is a promise to attempt a booking within seconds. If the holder is no longer RUNNING,
+        or has been sitting on it past SLOT_LEASE_TTL without reaching APPLYING/BOOKED, the promise
+        is broken and the slot must become bookable by somebody else -- otherwise a single stuck
+        worker can sterilise the pool, which is exactly what happened on booking Test2 (one worker
+        holding all 120 lease units across all 24 slots, every slot reading LEASED, no assignment
+        possible for anyone). Mirrors storm-auto's proven SlotManager lease auto-expiry.
+
+        Belt to _assign_slots's one-lease-per-worker braces: that stops the accumulation, this
+        recovers a pool that has already lost units to a worker that died, hung, or bounced without
+        emitting a terminal event."""
+        ttl = float(self._effective_booking_setting(db, bk, "SLOT_LEASE_TTL", 180.0))
+        if ttl <= 0:
+            return
+        rows = db.execute(
+            select(M.SlotLease, M.Worker)
+            .join(M.Slot, M.Slot.id == M.SlotLease.slot_id)
+            .outerjoin(M.Worker, M.Worker.id == M.SlotLease.worker_id)
+            .where(M.Slot.booking_id == bk.id, M.SlotLease.released_at.is_(None))
+        ).all()
+        reclaimed: set[str] = set()
+        for lease, worker in rows:
+            # Normalise before comparing: SQLite hands back naive datetimes even for a
+            # DateTime(timezone=True) column, and the scheduler tick swallows exceptions -- so a raw
+            # subtraction here would raise "can't subtract offset-naive and offset-aware datetimes"
+            # and kill the whole tick silently, for every booking, forever.
+            leased_at = lease.leased_at
+            if leased_at is not None and leased_at.tzinfo is None:
+                leased_at = leased_at.replace(tzinfo=timezone.utc)
+            aged_out = leased_at is not None and (now - leased_at).total_seconds() > ttl
+            gone = worker is None or worker.status != WorkerStatus.RUNNING
+            # A worker that is genuinely mid-booking keeps its slot no matter how long it takes.
+            busy = worker is not None and worker.substate in (WorkerSubstate.APPLYING,
+                                                              WorkerSubstate.BOOKED)
+            if busy or not (gone or aged_out):
+                continue
+            lease.released_at = now
+            lease.outcome = SlotLeaseOutcome.EXPIRED
+            reclaimed.add(lease.slot_id)
+        if not reclaimed:
+            return
+        # Explicit: the release flags above are ORM-level until flushed, and SessionLocal is built
+        # with autoflush=False -- so the capacity count below would otherwise still see the leases
+        # this method just released and decline to reopen the slot.
+        db.flush()
+        # Reopen any slot that now has room again. Recomputed from live lease counts rather than
+        # assumed, since multi-capacity means a slot can be partly leased.
+        for slot in db.scalars(select(M.Slot).where(M.Slot.id.in_(reclaimed))).all():
+            if slot.status == SlotStatus.TAKEN:
+                continue          # genuinely booked -- never reopen
+            active = db.scalar(select(func.count()).select_from(M.SlotLease).where(
+                M.SlotLease.slot_id == slot.id, M.SlotLease.released_at.is_(None))) or 0
+            cap = pool_manager.resolve_slot_capacity(
+                str(self._effective_booking_setting(db, bk, "SLOT_CAPACITY_PER_PERIOD", "auto")),
+                slot.capacity_estimate)
+            if active < cap:
+                slot.status = SlotStatus.AVAILABLE
+        db.commit()
+
     # ── assignment ─────────────────────────────────────────────────────────────
     def _assign_slots(self, db, bk: M.Booking) -> None:
         """Same Phase F2 dedup as _drive_scouts: a HOLDING worker that was already sent an `assign`
@@ -590,6 +654,24 @@ class Scheduler:
             M.Worker.substate == WorkerSubstate.HOLDING)).all()
         if self._bus is not None:
             holding = [w for w in holding if not self._bus.has_pending_commands(w.id)]
+
+        # ONE active lease per worker (Phase F2's enforce_single_lease invariant, which was built
+        # and unit-tested and then called from nowhere). Confirmed live 2026-08-14 on booking Test2:
+        # ERNESTO PIRES alone accumulated 120 active leases -- 5 per slot across all 24 slots, the
+        # entire pool -- because a HOLDING worker with no pending command is re-assignable on EVERY
+        # 5s tick and nothing checked whether it already held one. Once the pool was consumed every
+        # slot read LEASED, `avail` came back empty, and NO worker could be assigned again: the
+        # booking deadlocked with one worker owning everything and nobody applying.
+        # Multi-capacity leasing turned a bounded version of this bug (one lease per slot, since a
+        # slot flipped LEASED on first assignment) into an unbounded one.
+        already_leased = {
+            wid for (wid,) in db.execute(
+                select(M.SlotLease.worker_id).where(
+                    M.SlotLease.worker_id.in_([w.id for w in holding] or [""]),
+                    M.SlotLease.released_at.is_(None))
+            ).all()
+        }
+        holding = [w for w in holding if w.id not in already_leased]
         for wid, sid in pool_manager.plan_slot_assignments(slots_with_room, [w.id for w in holding]):
             worker = db.get(M.Worker, wid)
             slot = slot_by_id[sid]
