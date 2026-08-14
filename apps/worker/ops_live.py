@@ -82,6 +82,25 @@ _BOUNCE_KEYWORDS = ("questionario", "getslots", "captchadiv", "authentication.js
 _MAX_KEEPALIVE_RESTORE_ATTEMPTS = 3
 
 
+def _submit_bounce_reason(html: str) -> str:
+    """Why _classify_submit_response rejected a SubmeterVistoCriaPDF response.
+
+    Kept separate from the classifier so that function's booked/bounced contract (and its tests)
+    stay untouched -- this only explains the verdict, and is only ever called on the failure path."""
+    low = (html or "").lower()
+    if not low.strip():
+        return "empty response body"
+    hits = [k for k in _BOUNCE_KEYWORDS if k in low]
+    errs = [k for k in _ERROR_KEYWORDS if k in low]
+    if errs:
+        return f"portal error marker(s) {errs}"
+    if hits:
+        return f"bounced back to {hits} (session/form state lost, or the slot was taken)"
+    if "mostrarpdf" not in low:
+        return f"no MostrarPdf confirmation form; {len(html)}B response, head={html[:160]!r}"
+    return f"unclassified; {len(html)}B response, head={html[:160]!r}"
+
+
 def _login_reject_reason(result: object) -> str:
     """The portal's rejection reason, WITHOUT the CAPTCHA token.
 
@@ -825,6 +844,13 @@ class LiveEngineOps(EngineOps):
 
             outcome = self._classify_submit_response(html)
             if outcome != "booked":
+                # Confirmed live 2026-08-14: this returned silently. A holding applier went
+                # `-> applying` then `-> holding` 43s later with terminal "apply bounced" and NOT ONE
+                # log line in between, so there was no way to tell a rejected slot from a bounced
+                # session from a WAF page. The submit response is the single most important thing
+                # this worker does; its rejection must always say why.
+                self._log(f"do_apply: submit NOT confirmed -- {_submit_bounce_reason(html)} "
+                          f"| slot={slot} | final_url={_final_url}")
                 return "bounced"
 
             try:

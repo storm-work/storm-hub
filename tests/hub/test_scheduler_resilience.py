@@ -970,3 +970,38 @@ def test_assign_slots_respects_already_active_leases_when_computing_remaining_ca
     assert len(leases) == 2   # the pre-existing lease + exactly 1 new one (room for only 1 more)
     new_worker_ids = {le.worker_id for le in leases} - {other_worker.id}
     assert new_worker_ids == {w1.id}   # w1 assigned first (in query order), w2 left unpaired
+
+
+def test_drive_scouts_uses_the_bookings_own_calendar_window(db):
+    """Confirmed live 2026-08-14: _drive_scouts hardcoded start=""/end=""/num_days=20, so
+    CAL_START_DATE/CAL_END_DATE/CAL_NUM_DAYS -- set per booking, validated by the resolver, parsed
+    into EngineConfig.discovery -- were read by nothing on this path. A booking configured for
+    2026-09-01..09-20 discovered 2026-08-28..09-11 instead."""
+    bus = _FakeBus()
+    sched = _scheduler(bus=bus)
+    bk = _make_booking(db, settings_json={"CAL_START_DATE": "2026-09-01",
+                                          "CAL_END_DATE": "2026-09-04",
+                                          "CAL_NUM_DAYS": 20})
+    ident = _make_identity(db)
+    _make_worker(db, bk, ident, role=WorkerRole.SCOUT)
+
+    sched._drive_scouts(db, bk)   # no sample_dates -- exercise the real window computation
+
+    sent = [p["dates"] for _wid, t, p in bus.sent if t == "discover"]
+    assert sent, "no discover command was sent"
+    dates = sent[0]
+    assert min(dates) >= "2026-09-01"
+    assert max(dates) <= "2026-09-04"
+
+
+def test_drive_scouts_falls_back_to_a_default_window_when_unset(db):
+    bus = _FakeBus()
+    sched = _scheduler(bus=bus)
+    bk = _make_booking(db)          # no CAL_* settings at all
+    ident = _make_identity(db)
+    _make_worker(db, bk, ident, role=WorkerRole.SCOUT)
+
+    sched._drive_scouts(db, bk)
+
+    dates = [p["dates"] for _wid, t, p in bus.sent if t == "discover"][0]
+    assert len(dates) == 20         # CAL_NUM_DAYS default

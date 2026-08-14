@@ -461,3 +461,38 @@ def test_hub_applies_vendor_env_for_its_own_proxy_probes():
     exported = vendor_env.apply({"NAV_TIMEOUT_SCALE": 4.0, "STEALTH_HARDEN": True, "IGNORED": "x"})
     assert exported == {"NAV_TIMEOUT_SCALE": "4", "STEALTH_HARDEN": "1"}
     assert os.environ["NAV_TIMEOUT_SCALE"] == "4"
+
+
+# ── partial settings updates must not clobber (confirmed live 2026-08-14) ─────
+def test_patch_settings_merges_instead_of_replacing(client):
+    """Two panels both PUT the WHOLE settings object from their own page-load snapshot, so the
+    overview's proxy/swap shortcut silently wiped the Settings tab's calendar window. Confirmed on
+    booking Test2: CAL_START_DATE/CAL_END_DATE were configured and came back absent."""
+    h = _operate_headers(client)
+    bid = client.post("/bookings", json={
+        "name": "cal", "type": "real", "posto_id": "5084",
+        "settings": {"CAL_START_DATE": "2026-09-01", "CAL_END_DATE": "2026-09-20"},
+    }, headers=h).json()["id"]
+
+    r = client.patch(f"/bookings/{bid}/settings",
+                     json={"PROXY_PROVIDER": "soax", "HOLD_SWAP_AFTER_FOUND": True}, headers=h)
+    assert r.status_code == 200
+    got = r.json()["settings_json"]
+    assert got["CAL_START_DATE"] == "2026-09-01"     # untouched by an unrelated panel
+    assert got["CAL_END_DATE"] == "2026-09-20"
+    assert got["PROXY_PROVIDER"] == "soax" and got["HOLD_SWAP_AFTER_FOUND"] is True
+
+
+def test_put_settings_still_replaces_wholesale(client):
+    """The full Settings panel relies on replace semantics -- an absent key means "clear this
+    override" -- so PUT must NOT quietly become a merge."""
+    h = _operate_headers(client)
+    bid = client.post("/bookings", json={
+        "name": "cal2", "type": "real", "posto_id": "5084",
+        "settings": {"CAL_START_DATE": "2026-09-01", "PROXY_PROVIDER": "soax"},
+    }, headers=h).json()["id"]
+
+    client.put(f"/bookings/{bid}", json={"settings": {"PROXY_PROVIDER": "webshare"}}, headers=h)
+
+    got = client.get(f"/bookings/{bid}", headers=h).json()["settings_json"]
+    assert got == {"PROXY_PROVIDER": "webshare"}     # CAL_START_DATE deliberately cleared

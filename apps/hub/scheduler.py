@@ -501,8 +501,17 @@ class Scheduler:
         if not available:
             return
 
+        # The booking's OWN discovery window. Confirmed live 2026-08-14: start/end were hardcoded
+        # empty with num_days=20, so CAL_START_DATE/CAL_END_DATE/CAL_NUM_DAYS -- which the operator
+        # sets per booking, which the resolver validates, and which EngineConfig.discovery faithfully
+        # parses -- were read by nothing on this path. A booking configured for 2026-09-01..09-20
+        # discovered 2026-08-28..09-11 instead: the default 20 weekdays from tomorrow, ignoring both
+        # ends of the window that was actually asked for.
         dates = sample_dates or pool_manager.default_date_window(
-            start_date="", end_date="", num_days=20, today=datetime.now(timezone.utc).date()
+            start_date=str(self._effective_booking_setting(db, bk, "CAL_START_DATE", "") or ""),
+            end_date=str(self._effective_booking_setting(db, bk, "CAL_END_DATE", "") or ""),
+            num_days=int(self._effective_booking_setting(db, bk, "CAL_NUM_DAYS", 20) or 20),
+            today=datetime.now(timezone.utc).date(),
         )
 
         if state.mode == "single":

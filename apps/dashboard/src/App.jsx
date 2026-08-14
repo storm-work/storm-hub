@@ -243,13 +243,14 @@ function Login({ onLogin }) {
 function useList(path, { pollMs = 0 } = {}) {
   const [rows, setRows] = useState([]);
   const [err, setErr] = useState("");
-  const reload = () => api(path).then(setRows).catch((e) => setErr(e.message));
+  const reload = () => { if (!path) return; api(path).then(setRows).catch((e) => setErr(e.message)); };
   // `pollMs`: re-fetch on a timer. Worker/booking STATUS comes from REST -- only the live substate
   // arrives over the WS -- so without this the page froze on whatever it loaded with. Confirmed
   // 2026-08-14: after clicking Start, the fleet launch correctly ran in the background for several
   // minutes while the table kept showing the pre-launch snapshot ("0 of 6 workers running,
   // failed: 5"), so a launch that was working looked like a launch that did nothing.
   useEffect(() => {
+    if (!path) { setRows([]); return undefined; }
     reload();
     if (!pollMs) return undefined;
     const t = setInterval(reload, pollMs);
@@ -264,6 +265,10 @@ function Bookings({ me, events, setLeftPanel, setRightPanel }) {
   const [selectedId, setSelectedId] = useState(null);
   const [showCreate, setShowCreate] = useState(false);
   const booking = rows.find((b) => b.id === selectedId) || null;
+  // ONE fetch, shared by the overview's run summary and the Workers tab. They each used to poll
+  // /bookings/{id}/workers on their own 5s timer, started at different moments -- so the two panels
+  // could legitimately disagree by up to a full poll interval, which read as a status bug.
+  const workers = useList(booking ? `/bookings/${booking.id}/workers` : null, { pollMs: 5000 });
 
   // The booking list is permanent page navigation (like Proxies' pool tree), not an on-demand
   // action panel -- foldable via SidePanel's collapse toggle, but never auto-dismissed.
@@ -288,9 +293,9 @@ function Bookings({ me, events, setLeftPanel, setRightPanel }) {
       )}
       {booking ? (
         <>
-          <BookingOverview me={me} booking={booking} events={events} onBookingChanged={reload}
-            onDeleted={() => { setSelectedId(null); reload(); }} />
-          <BookingOpsTabs me={me} booking={booking} events={events}
+          <BookingOverview me={me} booking={booking} events={events} workers={workers}
+            onBookingChanged={reload} onDeleted={() => { setSelectedId(null); reload(); }} />
+          <BookingOpsTabs me={me} booking={booking} events={events} workers={workers}
             setRightPanel={setRightPanel} onBookingChanged={reload} />
         </>
       ) : (
@@ -449,8 +454,8 @@ const RUN_SUMMARY_SUBSTATES = [
   ["holding", "failed"],
 ];
 
-function BookingRunSummary({ booking, events }) {
-  const { rows } = useList(`/bookings/${booking.id}/workers`, { pollMs: 5000 });
+function BookingRunSummary({ workers, events }) {
+  const rows = workers.rows;
   // Only RUNNING workers have a substate (workerView), so this can no longer report "holding: 12"
   // for a fleet that is entirely stopped -- which is exactly what it did when first added.
   const counts = rows.reduce((a, w) => {
@@ -479,7 +484,7 @@ function BookingRunSummary({ booking, events }) {
   );
 }
 
-function BookingOverview({ me, booking, events, onBookingChanged, onDeleted }) {
+function BookingOverview({ me, booking, events, workers, onBookingChanged, onDeleted }) {
   const op = me.is_operating;
   const [msg, setMsg] = useState("");
   const [editing, setEditing] = useState(false);
@@ -601,7 +606,7 @@ function BookingOverview({ me, booking, events, onBookingChanged, onDeleted }) {
           <span className="pill ok">slot-found fired @{booking.slot_found_fired_at.slice(0, 16).replace("T", " ")}Z</span>
         )}
       </div>
-      <BookingRunSummary booking={booking} events={events} />
+      <BookingRunSummary workers={workers} events={events} />
       {msg && <div className="banner err">{msg}</div>}
       <BookingShortcutSettings me={me} booking={booking} onSaved={onBookingChanged} />
     </div>
@@ -642,12 +647,18 @@ function BookingShortcutSettings({ me, booking, onSaved }) {
   const holdValue = poolValue(settings.HOLD_PROXY_PROVIDER ?? "soax", settings.HOLD_PROXY_KIND ?? "");
   const swapOn = !!settings.HOLD_SWAP_AFTER_FOUND;
 
+  // PATCH, not PUT. This panel owns a handful of proxy/swap fields; it used to write back its own
+  // snapshot of the WHOLE settings object, taken when the page loaded -- so toggling a proxy pool
+  // silently wiped anything the full Settings tab had added since (confirmed 2026-08-14: a booking's
+  // CAL_START_DATE/CAL_END_DATE vanished exactly this way). Send only the keys we actually own.
   async function saveFields(patch) {
     setMsg("");
-    const next = { ...settings, ...patch };
-    setSettings(next);
-    try { await api(`/bookings/${booking.id}`, { method: "PUT", body: { settings: next } }); onSaved(); }
-    catch (e) { setMsg(e.message); }
+    setSettings((prev) => ({ ...prev, ...patch }));
+    try {
+      const bk = await api(`/bookings/${booking.id}/settings`, { method: "PATCH", body: patch });
+      setSettings({ ...(bk.settings_json || {}) });   // re-sync with what the server actually kept
+      onSaved();
+    } catch (e) { setMsg(e.message); }
   }
   function onPoolChange(providerKey, kindKey, value) {
     const [provider, kind] = value.split("|");
@@ -680,7 +691,7 @@ function BookingShortcutSettings({ me, booking, onSaved }) {
   );
 }
 
-function BookingOpsTabs({ me, booking, events, setRightPanel, onBookingChanged }) {
+function BookingOpsTabs({ me, booking, events, workers, setRightPanel, onBookingChanged }) {
   const [tab, setTab] = useState("workers");
   return (
     <div className="card">
@@ -690,7 +701,7 @@ function BookingOpsTabs({ me, booking, events, setRightPanel, onBookingChanged }
         <button className={tab === "appointments" ? "active" : ""} onClick={() => setTab("appointments")}>Appointments</button>
         <button className={tab === "settings" ? "active" : ""} onClick={() => setTab("settings")}>Settings</button>
       </div>
-      {tab === "workers" && <BookingWorkers me={me} booking={booking} events={events} setRightPanel={setRightPanel} />}
+      {tab === "workers" && <BookingWorkers me={me} booking={booking} events={events} workers={workers} setRightPanel={setRightPanel} />}
       {tab === "slots" && <BookingSlots booking={booking} />}
       {tab === "appointments" && <BookingAppointments booking={booking} />}
       {tab === "settings" && <BookingFullSettingsPanel me={me} booking={booking} onSaved={onBookingChanged} />}
@@ -883,8 +894,7 @@ function BookingFullSettingsPanel({ me, booking, onSaved }) {
   );
 }
 
-function BookingWorkers({ me, booking, events, setRightPanel }) {
-  const workers = useList(`/bookings/${booking.id}/workers`, { pollMs: 5000 });
+function BookingWorkers({ me, booking, events, workers, setRightPanel }) {
   const identities = useList("/identities");
   const templates = useList("/templates");
   const appointments = useList(`/bookings/${booking.id}/appointments`);

@@ -1412,6 +1412,33 @@ def delete_booking(booking_id: str, db: Session = Depends(get_db),
 
 
 # ── Attach identity → materialize worker (rules + C2 exclusivity) ─────────────
+@app.patch("/bookings/{booking_id}/settings", response_model=BookingOut)
+def patch_booking_settings(booking_id: str, body: dict, db: Session = Depends(get_db),
+                           _op: Principal = Depends(require_operator)) -> M.Booking:
+    """MERGE keys into a booking's settings, leaving every other key alone.
+
+    PUT /bookings/{id} replaces settings_json wholesale, which the full Settings panel needs (an
+    absent key there means "clear this override"). But the overview's shortcut panel only owns a
+    handful of proxy/swap fields, and it was PUTting its own snapshot of the WHOLE object -- taken
+    when the page loaded. Confirmed live 2026-08-14: a booking configured with
+    CAL_START_DATE/CAL_END_DATE came back with only the three keys the shortcut panel knows about,
+    because toggling a proxy pool wrote back a stale copy that had never heard of the calendar
+    window. Two panels, both authoritative over the same object, last-write-wins.
+
+    Partial updates go through here instead, so the two can't destroy each other's work."""
+    bk = db.get(M.Booking, booking_id)
+    if not bk:
+        raise HTTPException(404, "booking not found")
+    merged = {**(bk.settings_json or {}), **body}
+    try:
+        bk.settings_json = validate_layer(L.BOOKING, merged)
+    except Exception as e:
+        raise HTTPException(400, f"invalid booking settings: {e}")
+    db.commit()
+    db.refresh(bk)
+    return bk
+
+
 @app.post("/bookings/{booking_id}/identities", response_model=WorkerOut, status_code=201)
 def attach_identity(
     booking_id: str, body: AttachIdentity, db: Session = Depends(get_db),
