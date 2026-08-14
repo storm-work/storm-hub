@@ -365,7 +365,22 @@ class EventHub:
         finally:
             db.close()
 
-    def _persist_booked_pdf(self, worker_id: str, pdf_path: str, slot: dict | None) -> None:
+    def _persist_booking(self, worker_id: str, slot: dict | None,
+                         pdf_path: str | None = None) -> None:
+        """Record a confirmed booking. The PDF is an ARTIFACT, not the proof.
+
+        This used to be reachable only via `booked_pdf`, so a real appointment whose PDF retrieval
+        failed -- or returned a non-PDF, which do_apply deliberately refuses to save -- produced NO
+        BookedAppointment at all. do_apply's own log said "booking IS confirmed, PDF missing" and
+        then the Hub recorded nothing: the one artefact this whole system exists to produce, lost to
+        a failed follow-up fetch. Found by the full-flow sim, where a sim booking (which has no PDF
+        by construction) left the appointments table empty.
+
+        Idempotent: `booked` and `booked_pdf` both land for a healthy live booking, and the second
+        must attach the artifact to the first's row rather than insert a duplicate."""
+        return self._persist_booked_pdf(worker_id, pdf_path, slot)
+
+    def _persist_booked_pdf(self, worker_id: str, pdf_path: str | None, slot: dict | None) -> None:
         """A live apply confirmed a booking and saved its PDF to disk (Phase: dashboard "open pdf"
         feature) -- create the Artifact + BookedAppointment rows the schema already had (models.py's
         Artifact/BookedAppointment) but that nothing wrote to before this."""
@@ -380,9 +395,11 @@ class EventHub:
             w = db.get(M.Worker, worker_id)
             if not w:
                 return
-            artifact = M.Artifact(worker_id=worker_id, kind="pdf", path=pdf_path)
-            db.add(artifact)
-            db.flush()
+            artifact = None
+            if pdf_path:
+                artifact = M.Artifact(worker_id=worker_id, kind="pdf", path=pdf_path)
+                db.add(artifact)
+                db.flush()
             slot_id = None
             if slot and slot.get("date") is not None and slot.get("period") is not None:
                 slot_row = db.scalar(select(M.Slot).where(
@@ -410,10 +427,23 @@ class EventHub:
             sub_account_id = (w.effective_settings_json or {}).get("_sub_account_id")
             if not sub_account_id:
                 return  # sim-engine or pre-upgrade worker with no recorded sub-account; nothing to link
-            db.add(M.BookedAppointment(
-                booking_id=w.booking_id, identity_id=w.identity_id, sub_account_id=sub_account_id,
-                slot_id=slot_id, pdf_artifact_id=artifact.id, booked_at=datetime.now(timezone.utc),
-            ))
+            existing = db.scalar(select(M.BookedAppointment).where(
+                M.BookedAppointment.booking_id == w.booking_id,
+                M.BookedAppointment.identity_id == w.identity_id))
+            if existing is not None:
+                # Second event for the same booking (the `booked_pdf` following a `booked`):
+                # attach what it adds, never insert a duplicate appointment.
+                if artifact is not None and existing.pdf_artifact_id is None:
+                    existing.pdf_artifact_id = artifact.id
+                if existing.slot_id is None:
+                    existing.slot_id = slot_id
+            else:
+                db.add(M.BookedAppointment(
+                    booking_id=w.booking_id, identity_id=w.identity_id,
+                    sub_account_id=sub_account_id, slot_id=slot_id,
+                    pdf_artifact_id=artifact.id if artifact is not None else None,
+                    booked_at=datetime.now(timezone.utc),
+                ))
             db.commit()
         finally:
             db.close()
@@ -505,6 +535,8 @@ class EventHub:
                     _step("apply_db", self._apply_db, wid, map_event_to_update(m.type, m.payload))
                     if m.type == "slots_found":
                         _step("persist_slots", self._persist_slots, wid, m.payload.get("slots", []))
+                    if m.type == "booked":
+                        _step("persist_booking", self._persist_booking, wid, m.payload.get("slot"))
                     if m.type == "booked_pdf" and m.payload.get("pdf_path"):
                         _step("persist_booked_pdf", self._persist_booked_pdf,
                               wid, m.payload["pdf_path"], m.payload.get("slot"))

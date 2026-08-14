@@ -33,6 +33,18 @@ from libs.engine import orchestration, pool_manager
 
 logger = logging.getLogger(__name__)
 
+
+def _aware(dt: datetime | None) -> datetime | None:
+    """Normalize a datetime read back from the DB to UTC-aware.
+
+    Not every backend round-trips tzinfo (SQLite drops it), and every comparison in this file is
+    against an aware `now`. Mixing the two raises TypeError -- which, inside the tick's catch-all,
+    used to mean the ENTIRE scheduler tick died silently for EVERY booking, forever, with nothing
+    logged. Found by the full-flow sim (tests/hub/test_full_flow_sim.py)."""
+    if dt is not None and dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
 # The statuses in which a booking is actively driving workers. STOPPED is deliberately absent: it is
 # resumable (a restart moves it back to WARMING/RUNNING), but while it is stopped nothing may
 # relaunch, re-signal, or otherwise resurrect its workers.
@@ -107,7 +119,10 @@ class Scheduler:
             try:
                 self._tick_once()
             except Exception:
-                pass
+                # NEVER silent. A persistent fault here (a naive datetime, a bad column, anything)
+                # stops scheduling for EVERY booking on EVERY tick, and swallowing it meant the
+                # only symptom was "nothing happens" -- indistinguishable from an idle system.
+                logger.exception("scheduler tick failed")
             self._stop.wait(self._tick)
 
     def _tick_once(self) -> None:
@@ -447,7 +462,7 @@ class Scheduler:
         limit = int(self._effective_booking_setting(db, bk, "FALSE_SLOT_BOUNCE_LIMIT", 12))
         if limit <= 0:
             return False
-        since = bk.slot_found_fired_at
+        since = _aware(bk.slot_found_fired_at)
 
         # Anything actually booked in this window means the slots were real -- never revert.
         booked = db.scalar(select(M.BookedAppointment.id)
@@ -530,7 +545,7 @@ class Scheduler:
         after = float(self._effective_booking_setting(db, bk, "SLOT_OPEN_INACTIVATE_AFTER", 1200.0))
         if after <= 0:
             return False
-        if (now - bk.slot_open_fired_at).total_seconds() < after:
+        if (now - _aware(bk.slot_open_fired_at)).total_seconds() < after:
             return False
         # A slot found but not yet latched into slot_found_fired_at still counts as a REAL open --
         # _fire_slot_found_if_new runs earlier in the same tick, so this is belt-and-braces against
@@ -732,8 +747,7 @@ class Scheduler:
             # subtraction here would raise "can't subtract offset-naive and offset-aware datetimes"
             # and kill the whole tick silently, for every booking, forever.
             leased_at = lease.leased_at
-            if leased_at is not None and leased_at.tzinfo is None:
-                leased_at = leased_at.replace(tzinfo=timezone.utc)
+            leased_at = _aware(leased_at)
             aged_out = leased_at is not None and (now - leased_at).total_seconds() > ttl
             gone = worker is None or worker.status != WorkerStatus.RUNNING
             # A worker that is genuinely mid-booking keeps its slot no matter how long it takes.

@@ -92,6 +92,8 @@ class SimEngineOps(EngineOps):
             result = self._signals.wait_slot_open()
             if result in ("slot_open", "stop"):
                 return result
+            if self.is_stopped():
+                return "stop"      # same reason as await_assignment: a flag stop must break out too
             if self._emit is not None:
                 self._emit("log_line", text="keepalive: sim heartbeat (await_slot_open)")
 
@@ -140,6 +142,11 @@ class SimEngineOps(EngineOps):
             result = self._signals.wait_assignment()
             if result is not TIMEOUT:
                 return result
+            if self.is_stopped():
+                # A stop that arrives as a flag rather than as a `stop` COMMAND (the Hub sends the
+                # command, but a supervisor/test can set the flag) must still break this loop --
+                # otherwise the worker spins on the bus forever, alive and unstoppable.
+                return None
             if self._emit is not None:
                 self._emit("log_line", text="keepalive: sim heartbeat (await_assignment)")
 
@@ -166,4 +173,9 @@ class SimEngineOps(EngineOps):
         self.applied += 1
         # Scripted sequence: consume in order, then repeat the last entry forever.
         i = min(self.applied - 1, len(self._apply_outcomes) - 1)
-        return self._apply_outcomes[i]
+        outcome = self._apply_outcomes[i]
+        if outcome == "booked" and self._emit is not None:
+            # Same event the live ops emits on confirmation, so the sim exercises the real
+            # Hub-side booking record rather than a path only live code reaches.
+            self._emit("booked", slot=slot)
+        return outcome

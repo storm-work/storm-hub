@@ -349,3 +349,61 @@ def test_a_failing_side_effect_never_swallows_the_rest_of_the_event(monkeypatch,
 
     assert calls == ["terminal"], "a failing handler swallowed the terminal status update"
     assert any("apply_db" in r.message for r in caplog.records), "the failure was not logged"
+
+
+def test_a_confirmed_booking_is_recorded_even_when_the_pdf_never_arrives(slots_db):
+    """The appointment is real the moment the portal confirms it; the PDF is an ARTIFACT, not the
+    proof. Recording used to be reachable only via `booked_pdf`, so a real booking whose PDF fetch
+    failed -- or returned a non-PDF, which do_apply deliberately refuses to save -- produced NO
+    BookedAppointment. do_apply's own log said "booking IS confirmed, PDF missing" and the Hub then
+    recorded nothing: the one artefact this system exists to produce, lost to a failed follow-up
+    fetch. Found by the full-flow sim."""
+    from sqlalchemy import select
+
+    import apps.hub.events as ev
+    from libs.db import models as M
+    from libs.domain.enums import SlotStatus
+
+    bid, wid = _seed_apply_worker(slots_db)
+    db = slots_db()
+    db.add(M.Slot(booking_id=bid, posto_id="3018", date="2026-09-10", period=7,
+                  status=SlotStatus.LEASED))
+    db.commit(); db.close()
+
+    ev.EventHub.__new__(ev.EventHub)._persist_booking(
+        wid, {"date": "2026-09-10", "period": 7})       # no pdf_path at all
+
+    db = slots_db()
+    appt = db.scalars(select(M.BookedAppointment)).one()
+    assert appt.pdf_artifact_id is None
+    assert db.get(M.Slot, appt.slot_id).status == SlotStatus.TAKEN
+    assert db.scalars(select(M.Artifact)).all() == []
+    db.close()
+
+
+def test_the_pdf_event_attaches_to_the_existing_appointment_not_a_duplicate(slots_db):
+    """`booked` and `booked_pdf` both land for a healthy live booking. The second must attach what
+    it adds to the first's row -- two appointment rows for one real appointment would be worse than
+    the missing artifact."""
+    from sqlalchemy import select
+
+    import apps.hub.events as ev
+    from libs.db import models as M
+    from libs.domain.enums import SlotStatus
+
+    bid, wid = _seed_apply_worker(slots_db)
+    db = slots_db()
+    db.add(M.Slot(booking_id=bid, posto_id="3018", date="2026-09-10", period=7,
+                  status=SlotStatus.LEASED))
+    db.commit(); db.close()
+
+    hub = ev.EventHub.__new__(ev.EventHub)
+    slot = {"date": "2026-09-10", "period": 7}
+    hub._persist_booking(wid, slot)
+    hub._persist_booked_pdf(wid, "/var/artifacts/x.pdf", slot)
+
+    db = slots_db()
+    appt = db.scalars(select(M.BookedAppointment)).one()      # exactly one
+    art = db.scalars(select(M.Artifact)).one()
+    assert appt.pdf_artifact_id == art.id
+    db.close()

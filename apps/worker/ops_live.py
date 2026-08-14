@@ -1085,6 +1085,7 @@ class LiveEngineOps(EngineOps):
                 if pdf_body[:4] == b"%PDF":
                     self._log(f"do_apply: BOOKED -- verified PDF ({len(pdf_body)}B) at {_final_url}")
                     if self._emit is not None:
+                        self._emit("booked", slot=slot)
                         self._emit("booked_pdf", pdf_path=self._save_pdf(pdf_body), slot=slot)
                     if self._breaker is not None:
                         self._breaker.record_success()
@@ -1108,6 +1109,11 @@ class LiveEngineOps(EngineOps):
                 return outcome
 
             self._log(f"do_apply: BOOKED slot={slot} | final_url={_final_url}")
+            # Announce the booking BEFORE going after the PDF. The appointment is real the moment
+            # the portal confirms it; the PDF is an artifact that may or may not come back, and
+            # making the Hub's record depend on it lost real bookings.
+            if self._emit is not None:
+                self._emit("booked", slot=slot)
             try:
                 pdf = self.session.submit_form_binary(action_contains="MostrarPdf", timeout=45)
                 self._log(f"MostrarPdf: status={pdf.get('status')} ct={pdf.get('content_type')} "
