@@ -328,8 +328,13 @@ class EventHub:
         finally:
             db.close()
 
-    def _release_slot_lease(self, worker_id: str, slot: dict) -> None:
-        """An apply worker bounced: release its lease and reopen the slot if it now has room.
+    def _release_slot_lease(self, worker_id: str, slot: dict, reason: str = "bounce") -> None:
+        """An apply worker handed a slot back: release its lease and reopen the slot.
+
+        `reason` carries storm-auto's two-tier penalty. "form_stale" means OUR form-state expired
+        and the slot is still real, so it is recorded as FORM_STALE rather than BOUNCED and never
+        counts against the slot -- the false-slot revert must be driven by evidence the POOL is
+        phantom, not by our own sessions lapsing.
 
         Without this a worker that keeps its warm session after a bounce (phases.py's apply loop)
         would also keep the lease, so _assign_slots' one-active-lease rule would never hand it
@@ -347,7 +352,8 @@ class EventHub:
             slot_ids = {le.slot_id for le in leases}
             for le in leases:
                 le.released_at = now
-                le.outcome = SlotLeaseOutcome.BOUNCED
+                le.outcome = (SlotLeaseOutcome.FORM_STALE if reason == "form_stale"
+                              else SlotLeaseOutcome.BOUNCED)
             db.flush()
             for s in db.scalars(select(M.Slot).where(M.Slot.id.in_(slot_ids))).all():
                 if s.status == SlotStatus.LEASED:
@@ -479,7 +485,8 @@ class EventHub:
                     if m.type == "dates_reported":
                         self.dates_reported.setdefault(wid, []).append(m.payload.get("outcomes", []))
                     if m.type == "slot_released":
-                        self._release_slot_lease(wid, m.payload.get("slot") or {})
+                        self._release_slot_lease(wid, m.payload.get("slot") or {},
+                                                 m.payload.get("reason", "bounce"))
                     if m.type == "gettime_result":
                         self._cache_gettime(wid, m.payload.get("special_days", {}))
                 item = {"id": m.id, "type": m.type, "ts": m.ts, **m.payload}

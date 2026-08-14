@@ -1220,3 +1220,26 @@ def test_false_slot_found_disabled_by_zero_setting(db):
     _bounced_pool(db, bk, w, n_bounces=50, since=found_at)
 
     assert sched._maybe_revert_false_slot_found(db, bk, NOW) is False
+
+
+def test_false_slot_revert_ignores_form_stale_releases(db):
+    """The false-slot verdict must rest on evidence the POOL is phantom. form_stale releases are
+    evidence our own sessions lapsed -- counting them would let a run of bad logins condemn a
+    perfectly real slot pool and send the scouts back to square one."""
+    from libs.domain.enums import SlotLeaseOutcome
+    sched = _scheduler(bus=_FakeBus())
+    found_at = NOW - timedelta(minutes=10)
+    bk = _make_booking(db, slot_found_fired_at=found_at,
+                       settings_json={"FALSE_SLOT_BOUNCE_LIMIT": 5})
+    w = _make_worker(db, bk, _make_identity(db))
+    slots = _bounced_pool(db, bk, w, n_bounces=0, since=found_at)
+    for i in range(20):
+        s = M.Slot(booking_id=bk.id, posto_id="5084", date=f"2026-10-{i + 1:02d}", period=1,
+                   status=SlotStatus.AVAILABLE)
+        db.add(s); db.commit()
+        db.add(M.SlotLease(slot_id=s.id, worker_id=w.id, leased_at=found_at,
+                           released_at=found_at + timedelta(seconds=10 + i),
+                           outcome=SlotLeaseOutcome.FORM_STALE))
+    db.commit()
+
+    assert sched._maybe_revert_false_slot_found(db, bk, NOW) is False

@@ -203,3 +203,31 @@ def test_slot_released_frees_the_lease_and_reopens_the_slot(slots_db):
     assert lease.outcome == SlotLeaseOutcome.BOUNCED
     assert db.scalars(select(M.Slot)).one().status == SlotStatus.AVAILABLE
     db.close()
+
+
+def test_form_stale_release_is_recorded_distinctly_from_a_bounce(slots_db):
+    """storm-auto's two-tier release (slot_manager.release(lease, "form_stale") vs "bounce"): a
+    form_stale means OUR form-state expired, so it must never count against the slot -- neither
+    toward retiring it nor toward the Hub's false-slot verdict, which has to be evidence the POOL is
+    phantom rather than evidence our sessions keep lapsing."""
+    from sqlalchemy import select
+
+    import apps.hub.events as ev
+    from libs.db import models as M
+    from libs.domain.enums import SlotLeaseOutcome, SlotStatus
+
+    bid, wid = _seed_scout(slots_db)
+    db = slots_db()
+    slot = M.Slot(booking_id=bid, posto_id="5084", date="2026-09-05", period=2,
+                  status=SlotStatus.LEASED)
+    db.add(slot); db.commit()
+    db.add(M.SlotLease(slot_id=slot.id, worker_id=wid)); db.commit()
+    db.close()
+
+    ev.EventHub.__new__(ev.EventHub)._release_slot_lease(
+        wid, {"date": "2026-09-05", "period": 2}, "form_stale")
+
+    db = slots_db()
+    assert db.scalars(select(M.SlotLease)).one().outcome == SlotLeaseOutcome.FORM_STALE
+    assert db.scalars(select(M.Slot)).one().status == SlotStatus.AVAILABLE   # still freed
+    db.close()

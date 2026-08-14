@@ -82,8 +82,22 @@ _BOUNCE_KEYWORDS = ("questionario", "getslots", "captchadiv", "authentication.js
 #                 RE-WARM (and, if that keeps failing, a fresh login) and then retry the SAME slot.
 #   no_slot    -- landed back on the schedule form / slots page. Somebody else took it, or every
 #                 period is leased. The session is fine; ask for a different slot.
-_FORM_STALE_MARKERS = ("questionario", "authentication.jsp")
-_NO_SLOT_MARKERS = ("getslots", "captchadiv")
+# storm-auto's confirmed two-flavour bounce, read verbatim from batch_apply.apply_book (the code
+# behind 113 real bookings). BOTH flavours are "bounced_back"; what separates them is WHERE:
+#   (a) back to the schedule/questionario FORM (questionario / getslots / captchadiv / auth page)
+#       = the slot was taken, or the submit was rejected mid-flight. Session is FINE.
+#       -> "no_slot": soft-release and try a different slot.
+#   (b) all the way out to the logged-in HOME dashboard = the booking form-state expired. The slot
+#       is NOT gone, our context is. -> "form_stale": release without penalty and RE-WARM.
+#
+# I had this exactly backwards: I classified `questionario` as form_stale, which is flavour (a) in
+# storm-auto. That is why worker e5dfc1b1 clung to one slot and paid five full login+warmup cycles
+# on it instead of soft-releasing and moving to the next slot.
+_BOUNCE_KEYWORDS = ("questionario", "getslots", "captchadiv", "authentication.jsp")
+# Flavour (b) is identified positively, by the home dashboard's own nav text AND the absence of any
+# schedule marker -- never by a single keyword.
+_HOME_MARKERS = ("solicitar pedido de visto", "consultar pedidos")
+_SCHEDULE_MARKERS = ("getperiodosocupados", "cmbperiodo", "getslots")
 
 # storm-auto bounds its equivalent restore<->re-warm chain with MAX_WARMUP_RESTORES=3 ("a session
 # whose re-warm keeps bouncing to home can't churn fresh proxies forever"). Mirrored here as the
@@ -878,11 +892,17 @@ class LiveEngineOps(EngineOps):
                 out.append({"date": d, "outcome": "empty"})
         return out
 
-    def release_slot(self, slot: dict) -> None:
-        """Hand a bounced slot back to the pool. The worker has no DB access, so this rides the same
-        event bus everything else does; apps/hub/events.py releases the lease and reopens the slot."""
+    def release_slot(self, slot: dict, reason: str = "bounce") -> None:
+        """Hand a slot back to the pool. The worker has no DB access, so this rides the same event
+        bus everything else does; apps/hub/events.py releases the lease and reopens the slot.
+
+        `reason` carries storm-auto's two-tier penalty (slot_manager.release(lease, ...)):
+          "bounce"     -- the slot may genuinely be gone; counts against it.
+          "form_stale" -- OUR form-state expired, the slot is still real. Released WITHOUT penalty,
+                          so a stale-form loop can't retire good slots (and can't fool the Hub's
+                          false-slot revert into condemning a real pool)."""
         if self._emit is not None:
-            self._emit("slot_released", slot=slot)
+            self._emit("slot_released", slot=slot, reason=reason)
 
     def push_slots(self, slots: list[dict]) -> None:
         if self._emit is not None:
@@ -955,6 +975,21 @@ class LiveEngineOps(EngineOps):
                 _final_url, html = self.session.browser_form_post(submit_url, body, timeout=100)
             except Exception as e:
                 self._log(f"do_apply: SubmeterVistoCriaPDF POST failed: {e}")
+                if self._breaker is not None:
+                    self._breaker.record_portal_down()
+                return "bounced"
+
+            # storm-auto guards the submit response before classifying it, because a blank
+            # chrome-error page or a DataDome interstitial is not a portal answer at all -- it
+            # falls back to a primp POST there. We have no primp path, so the honest outcome is
+            # "the portal never answered": report it as a bounce and let the breaker see it,
+            # rather than mis-reading an interstitial as a rejection of the slot.
+            _snip = (html or "")[:300]
+            _blank = (html or "").strip() in ("", "<html><head></head><body></body></html>")
+            _blocked = "body{margin:0;background:#fff}" in _snip or "datadome" in _snip.lower()
+            if _blank or _blocked:
+                why = "blank/chrome-error page" if _blank else "DataDome interstitial"
+                self._log(f"do_apply: submit response is a {why} -- not a portal answer | slot={slot}")
                 if self._breaker is not None:
                     self._breaker.record_portal_down()
                 return "bounced"
@@ -1043,35 +1078,31 @@ class LiveEngineOps(EngineOps):
         'comprovativo' is only a secondary positive, gated by no bounce/error markers."""
         low = (html or "").lower()
         url_low = (final_url or "").lower()
-        # Reaching MostrarPdf is NOT by itself a booking. Checked against the portal 2026-08-14:
-        # worker e5dfc1b1 ended at final_url=.../MostrarPdf? with Chrome's pdf-viewer shell, and the
-        # account holds NO appointment. An empty query string and an empty shell <body> are what a
-        # "nothing to show" render looks like. storm-auto carries the matching scar from the other
-        # direction -- a ~58KB HTML fallback page once accepted as a PDF (the josand5837
-        # false-positive) -- and its rule is deliberately strict: %PDF magic bytes or an
-        # application/pdf content-type, nothing else.
-        #
-        # So the URL only tells us we OVERSHOT the intermediate auto-submit page (browser_form_post
-        # waits for navigation to settle; storm-auto reads the page before the JS fires). That makes
-        # the response unclassifiable from the body alone -- do_apply must go prove it by fetching
-        # the actual bytes. Never guess "booked" from a URL.
+
+        # Reaching MostrarPdf is NOT by itself a booking -- checked against the portal 2026-08-14:
+        # worker e5dfc1b1 ended there with Chrome's pdf-viewer shell and the account holds NO
+        # appointment. It only means browser_form_post OVERSHOT the intermediate auto-submit page
+        # (it waits for navigation to settle; storm-auto reads that page before the JS fires), which
+        # leaves the response unclassifiable from the body. The caller must prove it on the bytes.
         overshot_to_pdf = "mostrarpdf" in url_low or "pdf_embedder" in low
+
         has_pdf_form = "mostrarpdf" in low
         has_confirm = "comprovativo" in low
         has_error_kw = any(kw in low for kw in _ERROR_KEYWORDS)
         bounced_back = any(kw in low for kw in _BOUNCE_KEYWORDS)
+        # The MostrarPdf auto-submit form IS a confirmation, DECISIVELY -- a stray bounce/error
+        # keyword elsewhere on that page must not override it (that would drop a real booking).
         confirmed = has_pdf_form or (has_confirm and not bounced_back and not has_error_kw)
         if confirmed:
             return "booked"
         if overshot_to_pdf:
-            # "I can't tell from here" -- the caller must verify the PDF bytes.
-            return "verify_pdf"
-        # Which KIND of bounce -- the caller's next move depends entirely on this.
-        if any(kw in low for kw in _FORM_STALE_MARKERS):
-            return "form_stale"
-        if any(kw in low for kw in _NO_SLOT_MARKERS):
-            return "no_slot"
-        return "bounced"      # unclassified: treated as no_slot by the caller, but logged as-is
+            return "verify_pdf"      # "I can't tell from here" -- go read the actual PDF bytes
+        if has_error_kw or bounced_back:
+            home_dashboard = (all(m in low for m in _HOME_MARKERS)
+                              and not any(m in low for m in _SCHEDULE_MARKERS))
+            return "form_stale" if home_dashboard else "no_slot"
+        # No confirmation marker and no bounce marker at all: genuinely unexpected, not a bounce.
+        return "error"
 
     def _save_pdf(self, body: bytes) -> str:
         """Persist a confirmed booking's PDF to local disk (same var/ convention as checkpoints --

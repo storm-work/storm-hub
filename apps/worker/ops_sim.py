@@ -60,6 +60,7 @@ class SimEngineOps(EngineOps):
         # is that it costs warmups, not process restarts and not new logins.
         self.logins = 0
         self.warmups = 0
+        self.release_reasons: list[str] = []
         self._delay = step_delay
         self._signals = signals
         self._emit = emit
@@ -142,11 +143,12 @@ class SimEngineOps(EngineOps):
             if self._emit is not None:
                 self._emit("log_line", text="keepalive: sim heartbeat (await_assignment)")
 
-    def release_slot(self, slot: dict) -> None:
+    def release_slot(self, slot: dict, reason: str = "bounce") -> None:
         self._pause()
         self.released += 1
+        self.release_reasons.append(reason)
         if self._emit is not None:
-            self._emit("slot_released", slot=slot)
+            self._emit("slot_released", slot=slot, reason=reason)
 
     def slot_found_seen(self) -> bool:
         return self._signals is not None and getattr(self._signals, "slot_found_seen", False)

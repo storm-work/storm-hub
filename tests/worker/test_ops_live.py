@@ -434,32 +434,40 @@ def test_classify_submit_response_comprovativo_without_bounce_is_booked():
     assert LiveEngineOps._classify_submit_response(html) == "booked"
 
 
-def test_classify_submit_response_bounced_to_questionario_is_form_stale_not_booked():
-    """Even with "comprovativo" somewhere, a bounce-back marker means NOT confirmed -- and WHICH
-    bounce it is decides the caller's next move. A questionnaire bounce is storm-auto's `form_stale`:
-    the server-side workflow anchor lapsed but THE SLOT IS STILL REAL, so the worker must re-warm and
-    retry the same slot rather than release it (which would poison the pool and wrongly feed the
-    Hub's false-slot counter). Confirmed live 2026-08-14 -- this is the single most common bounce."""
-    html = "<html>questionario comprovativo</html>"
-    assert LiveEngineOps._classify_submit_response(html) == "form_stale"
+# storm-auto's apply_book distinguishes the two bounce flavours by WHERE the portal put us, and
+# both are gated behind the same bounce keywords. Read verbatim from the code behind 113 real
+# bookings -- an earlier version of this file had these exactly backwards.
+_HOME_DASHBOARD = ('<html><body><a href="Questionario.jsp">Solicitar Pedido de Visto</a>'
+                   '<a href="c.jsp">Consultar Pedidos</a></body></html>')
 
 
-def test_classify_submit_response_bounced_to_slots_page_is_no_slot():
-    """The other bounce: back on the schedule/slots page means someone took it (or it was never
-    real). The session is fine -- hand the slot back and ask for another."""
-    assert LiveEngineOps._classify_submit_response("<html>getSlots</html>") == "no_slot"
-    assert LiveEngineOps._classify_submit_response("<html>captchaDiv</html>") == "no_slot"
+def test_bounce_to_the_questionario_schedule_form_is_no_slot():
+    """Flavour (a): back on the schedule/questionario FORM = the slot was taken or the submit was
+    rejected. The SESSION IS FINE -- soft-release and try a different slot. Classifying this as
+    form_stale (as this file previously did) is what made worker e5dfc1b1 cling to one slot and pay
+    five full login+warmup cycles on it."""
+    html = "<html>questionario comprovativo <select id='cmbPeriodo'></select></html>"
+    assert LiveEngineOps._classify_submit_response(html) == "no_slot"
 
 
-def test_classify_submit_response_unrecognised_bounce_stays_generic():
-    """An unclassified non-confirmation must not be silently promoted to form_stale -- that would
-    make the worker cling to a slot it has no evidence is real."""
-    assert LiveEngineOps._classify_submit_response("<html>something else</html>") == "bounced"
+def test_bounce_all_the_way_to_the_home_dashboard_is_form_stale():
+    """Flavour (b): out to the logged-in HOME dashboard = our booking form-state expired. The slot
+    is NOT gone, our context is. Identified positively -- both nav strings present AND every
+    schedule marker absent -- never by a single keyword."""
+    assert LiveEngineOps._classify_submit_response(_HOME_DASHBOARD) == "form_stale"
 
 
-def test_classify_submit_response_error_keyword_is_not_booked():
-    html = "<html>servico indisponivel comprovativo</html>"
-    assert LiveEngineOps._classify_submit_response(html) == "bounced"
+def test_home_markers_with_a_schedule_marker_present_is_not_form_stale():
+    """The absence of schedule markers is load-bearing: a page carrying both is the schedule page,
+    not the dashboard, and re-warming for it would be the wrong recovery."""
+    html = _HOME_DASHBOARD.replace("</body>", "getSlots</body>")
+    assert LiveEngineOps._classify_submit_response(html) == "no_slot"
+
+
+def test_a_response_with_no_confirmation_and_no_bounce_marker_is_an_error():
+    """apply_book returns "error" here, not a bounce -- it is an unexpected response, and calling it
+    a bounce would silently blame the slot for something unexplained."""
+    assert LiveEngineOps._classify_submit_response("<html>something else</html>") == "error"
 
 
 def test_classify_submit_response_pdf_form_wins_over_stray_bounce_keyword():
@@ -470,8 +478,9 @@ def test_classify_submit_response_pdf_form_wins_over_stray_bounce_keyword():
 
 
 def test_classify_submit_response_plain_200_no_markers_is_not_booked():
+    # Never "booked" -- and per apply_book it is "error" (unexplained), not a bounce.
     html = "<html><body>some unrelated page</body></html>"
-    assert LiveEngineOps._classify_submit_response(html) == "bounced"
+    assert LiveEngineOps._classify_submit_response(html) == "error"
 
 
 # ── _is_login_success (regression: browser_login always returns HTTP 200 for every
@@ -988,9 +997,9 @@ def test_storm_autos_original_signal_still_wins():
 def test_a_bounce_is_still_a_bounce_when_the_url_is_not_the_pdf():
     """The URL check must not turn genuine bounces into phantom bookings."""
     home = "https://pedidodevistos.mne.gov.pt/VistosOnline/"
-    assert LiveEngineOps._classify_submit_response("<html>questionario</html>", home) == "form_stale"
+    assert LiveEngineOps._classify_submit_response("<html>questionario</html>", home) == "no_slot"
     assert LiveEngineOps._classify_submit_response("<html>getSlots</html>", home) == "no_slot"
-    assert LiveEngineOps._classify_submit_response("<html>servico indisponivel</html>", home) == "bounced"
+    assert LiveEngineOps._classify_submit_response(_HOME_DASHBOARD, home) == "form_stale"
 
 
 # ── verify_pdf resolution: only real %PDF bytes may promote a bounce to a booking ─────────────
@@ -1040,3 +1049,41 @@ def test_overshoot_with_an_html_page_instead_of_a_pdf_is_not_a_booking():
     ops = _apply_ops(b"<!DOCTYPE html><html>" + b"x" * 60000, events)
     assert ops.do_apply({"date": "2026-09-01", "period": 4}) != "booked"
     assert not any(t == "booked_pdf" for t, _ in events)
+
+
+# ── the submit response must be a portal answer at all (storm-auto guards this before classifying,
+# then falls back to a primp POST; we have no primp path, so we must at least not misread it) ────
+class _SubmitBodySession(_FakeSession):
+    def __init__(self, body, url="https://x/VistosOnline/"):
+        super().__init__()
+        self._body, self._url = body, url
+
+    def browser_form_post(self, url, data, timeout=100):
+        return (self._url, self._body)
+
+
+def _ops_with_submit(body, url="https://x/VistosOnline/"):
+    ops = _make_ops(emit=lambda t, **p: None)
+    ops.session = _SubmitBodySession(body, url)
+    ops._run_warmup_steps = lambda: True
+    return ops
+
+
+def test_blank_chrome_error_page_is_not_read_as_a_slot_rejection():
+    """A blank/chrome-error page is not the portal answering -- blaming the slot for it would
+    soft-release a perfectly good slot and feed the Hub's false-slot counter with noise."""
+    ops = _ops_with_submit("<html><head></head><body></body></html>")
+    assert ops.do_apply({"date": "2026-09-01", "period": 4}) == "bounced"
+
+
+def test_datadome_interstitial_is_not_read_as_a_slot_rejection():
+    ops = _ops_with_submit("<html><head>datadome challenge</head><body>x</body></html>")
+    assert ops.do_apply({"date": "2026-09-01", "period": 4}) == "bounced"
+
+
+def test_release_slot_carries_the_penalty_tier():
+    events = []
+    ops = _make_ops(emit=lambda t, **p: events.append((t, p)))
+    ops.release_slot({"date": "d", "period": 1})                    # default
+    ops.release_slot({"date": "d", "period": 1}, "form_stale")
+    assert [p["reason"] for _, p in events] == ["bounce", "form_stale"]

@@ -211,13 +211,6 @@ _BOOKING = [
     # pool. Operator's call 2026-08-14: "even when there are some slots found - they may be false
     # positive. if applying keeps being failed then regard the slots as false, and revert to hold."
     _s("FALSE_SLOT_BOUNCE_LIMIT", L.BOOKING, int, 12, group="guards"),
-    # How many times one worker will rebuild its session and retry THE SAME slot on a form_stale
-    # bounce before it stops believing that slot is real. storm-auto's form_stale contract says the
-    # slot survives a lapsed anchor -- but confirmed live 2026-08-14, worker e5dfc1b1 bounced the
-    # same slot 5x, each time from a session warmed SEVEN SECONDS earlier, which no lapsed-anchor
-    # story explains. Past this cap the slot is released, which is also what lets the Hub's
-    # FALSE_SLOT_BOUNCE_LIMIT counter see the failure at all.
-    _s("FORM_STALE_MAX_PER_SLOT", L.BOOKING, int, 3, group="guards"),
     # Consecutive fully-failed discovery rounds after which a scout rebuilds its session in place.
     # Confirmed live 2026-08-14: scout 062e6dd6 logged in fine, then every gettime died with
     # "Execution context was destroyed" -- 631 failures over 53 minutes at 0.6s per round (a real

@@ -88,7 +88,7 @@ class EngineOps(Protocol):
     # Tell the orchestrator this slot was not booked, so it releases the lease and can hand the
     # worker a different one. Without it a bounced worker keeps its lease and stays unassignable
     # until the scheduler's SLOT_LEASE_TTL reclaim notices.
-    def release_slot(self, slot: dict) -> None: ...
+    def release_slot(self, slot: dict, reason: str = "bounce") -> None: ...
 
     # ── lifecycle ─────────────────────────────────────────────────────────────
     def is_stopped(self) -> bool: ...  # True if the last wait ended because of an explicit stop --
@@ -289,18 +289,15 @@ class PhaseMachine:
         # single degraded session must not be able to manufacture the bounce volume that convinces
         # the Hub its genuinely-real slots are false.
         max_bounces = max(1, int(self.cfg.raw.get("APPLY_MAX_ATTEMPTS", 5)))
-        max_stale_per_slot = max(1, int(self.cfg.raw.get("FORM_STALE_MAX_PER_SLOT", 3)))
         attempts = 0
         stale_streak = 0
         bounce_streak = 0
-        slot_stale = 0                   # form_stale bounces against the CURRENT slot
         slot = None                      # a form_stale retry KEEPS its slot across iterations
         while True:
             if self.ops.is_stopped():
                 return PhaseResult("stopped", self._sub, "stopped while holding", self.visited)
             if slot is None:
                 slot = self.ops.await_assignment()
-                slot_stale = 0
             if slot is None and self.ops.is_stopped():
                 return PhaseResult("stopped", self._sub, "stopped while awaiting assignment",
                                    self.visited)
@@ -332,62 +329,38 @@ class PhaseMachine:
                 return PhaseResult("booked", self._sub, str(slot), self.visited)
 
             if outcome == "form_stale":
-                # The slot is still real -- keep it and rebuild the session around it.
-                #
-                # Note what this branch does NOT do: it does not re-warm. do_apply already runs the
-                # questionnaire->Formulario->ScheduleController->Schedule.jsp chain at the top of
-                # every attempt, so simply retrying the same slot IS the re-warm -- one warm per
-                # attempt, exactly like storm-auto's outer loop + _ensure_form_state(). Adding an
-                # explicit warm here would replay steps 2-6 twice per retry, which is the very
-                # sequence abc5 showed yields Formulario "Session lost" en masse.
-                #
-                # What the loop CAN do that do_apply can't is escalate: past REWARM_MAX_ATTEMPTS a
-                # re-warm demonstrably isn't rebuilding the anchor and only a fresh login will.
+                # storm-auto releases the lease here too -- with a DIFFERENT penalty, not by
+                # hoarding it. My previous version kept the slot to avoid "poisoning the pool";
+                # apply_book shows the real mechanism is the penalty tier: release(lease,
+                # "form_stale") doesn't count toward retiring the slot, release(lease, "bounce")
+                # does. Holding the lease just starved this worker of new assignments while it
+                # re-logged in, and hid the failure from the Hub entirely.
                 bounce_streak = 0
                 stale_streak += 1
-                slot_stale += 1
-                if slot_stale >= max_stale_per_slot:
-                    # This slot has now resisted `max_stale_per_slot` freshly-rebuilt sessions.
-                    # "The slot is still real" is no longer a defensible reading, so hand it back --
-                    # which also, crucially, is the only way the Hub's false-slot counter ever sees
-                    # a form_stale failure. Without this the revert can never fire on the exact
-                    # phantom-slot case it was built for.
-                    self._log_release(slot, f"{slot_stale} form_stale bounces despite re-login")
-                    self.ops.release_slot(slot)
-                    slot = None
-                    slot_stale = 0
-                    stale_streak = 0
-                    bounce_streak += 1
-                    self._to(WorkerSubstate.HOLDING, detail="slot abandoned: repeated form_stale")
-                    if bounce_streak >= max_bounces:
-                        bounce_streak = 0
-                        self._park(f"{max_bounces} consecutive bounces")
-                    self.ops.poll_gap()
-                    continue
+                self.ops.release_slot(slot, "form_stale")
+                slot = None
                 if stale_streak >= max_rewarms:
+                    # Re-warm alone has stopped rebuilding the anchor (storm-auto abc5); only a
+                    # fresh login will. In-process: same worker, same proxy.
                     stale_streak = 0
                     self._to(WorkerSubstate.HOLDING,
                              detail="form_stale: re-login in place (re-warm not rebuilding anchor)")
                     self._to(WorkerSubstate.LOGGING_IN)
                     if not self.ops.do_login():
-                        # Even here the slot is handed back rather than hoarded -- this session is
-                        # done, but the slot may still be good for somebody else.
-                        self.ops.release_slot(slot)
                         return self._fail("form_stale re-login")
                     self._to(WorkerSubstate.LOGGED_IN)
                     self._to(WorkerSubstate.WARMING_UP)
                     if not self.ops.do_warmup():
-                        self.ops.release_slot(slot)
                         return self._fail("form_stale re-warm after re-login")
                     self._to(WorkerSubstate.WARMED)
-                self._to(WorkerSubstate.HOLDING, detail=f"form_stale: retrying slot {slot}")
+                self._to(WorkerSubstate.HOLDING, detail=f"form_stale x{stale_streak}: re-warming")
                 self.ops.poll_gap()
-                continue             # retry the SAME slot -- do_apply re-warms on the way in
+                continue          # do_apply re-warms on the way into the next attempt
 
             # no_slot / bounced: hand the lease back so another worker can try it and so the
             # orchestrator will assign this one something new. The Hub counts these releases -- past
             # FALSE_SLOT_BOUNCE_LIMIT it stops believing the pool and reverts the whole booking.
-            self.ops.release_slot(slot)
+            self.ops.release_slot(slot, "bounce")
             slot = None
             stale_streak = 0
             bounce_streak += 1

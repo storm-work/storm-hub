@@ -117,6 +117,11 @@ class SlotLeaseOutcome(StrEnum):
     BOOKED = "booked"
     BOUNCED = "bounced"
     EXPIRED = "expired"
+    # storm-auto's second release tier (slot_manager.release(lease, "form_stale")): OUR booking
+    # form-state expired, so the slot itself is still real. Recorded distinctly from BOUNCED so it
+    # never counts against the slot -- neither toward retiring it nor toward the Hub's false-slot
+    # verdict, which must be evidence that the POOL is phantom, not that our session lapsed.
+    FORM_STALE = "form_stale"
 
 
 # ── Registration jobs (C5) ────────────────────────────────────────────────────

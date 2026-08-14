@@ -216,35 +216,44 @@ def test_apply_retries_on_the_same_warm_session_after_a_bounce():
     assert ops.released == ops.applied           # every bounce hands its slot back
 
 
-def test_apply_form_stale_rewarms_in_process_and_keeps_the_same_slot():
-    """storm-auto's confirmed contract: a bounce to the questionnaire/home page means the workflow
-    anchor lapsed, NOT that the slot is gone. Re-POSTing is futile -- re-warm and retry the SAME
-    slot. Critically the slot is NOT released: it is still real, so handing it back would poison
-    the pool and feed the Hub's false-slot counter with a session-level problem."""
+def test_apply_form_stale_releases_with_the_no_penalty_reason_and_rewarms():
+    """storm-auto's apply_book releases the lease on form_stale too -- with a DIFFERENT penalty, not
+    by hoarding it: slot_manager.release(lease, "form_stale") doesn't count toward retiring the slot,
+    release(lease, "bounce") does. An earlier version of this file kept the slot to "avoid poisoning
+    the pool", which only starved the worker of new assignments while it re-logged in, and hid the
+    failure from the Hub completely."""
     ops = SimEngineOps(assignment={"date": "d1", "period": 3},
-                       apply_outcome=["form_stale", "booked"], stop_after_polls=6)
+                       apply_outcome=["form_stale", "booked"], stop_after_polls=8)
     res = PhaseMachine(_cfg(ROLE="apply", REWARM_MAX_ATTEMPTS=2), ops).run()
 
     assert res.outcome == "booked"
-    assert ops.applied == 2                      # bounced once, retried, booked on the retry
-    assert ops.released == 0                     # the real slot was never handed back
-    assert ops.logins == 1                       # and it cost NO new login
-    # No extra warm here on purpose: LiveEngineOps.do_apply re-warms at the top of every attempt, so
-    # the retry IS the re-warm. Warming again in the loop would replay steps 2-6 twice (abc5).
+    assert ops.applied == 2
+    assert ops.release_reasons == ["form_stale"]   # released, and NOT as a bounce
+    assert ops.logins == 1                          # cost no new login below the re-warm cap
+    # No extra warm in the loop: do_apply re-warms at the top of every attempt (abc5 -- warming
+    # again here would replay steps 2-6 twice).
     assert ops.warmups == 1
 
 
 def test_apply_form_stale_escalates_to_a_fresh_login_in_process():
-    """Past REWARM_MAX_ATTEMPTS a re-warm alone has stopped working and only a fresh login rebuilds
-    the server-side anchor (storm-auto abc5). That re-login happens IN-PROCESS -- same worker, same
-    proxy, same slot -- and is still not a process exit."""
+    """Past REWARM_MAX_ATTEMPTS only a fresh login rebuilds the anchor (abc5). In-process: same
+    worker, same proxy -- never a process exit."""
     ops = SimEngineOps(assignment={"date": "d1", "period": 3},
-                       apply_outcome=["form_stale", "booked"], stop_after_polls=6)
+                       apply_outcome=["form_stale", "booked"], stop_after_polls=8)
     res = PhaseMachine(_cfg(ROLE="apply", REWARM_MAX_ATTEMPTS=1), ops).run()
 
     assert res.outcome == "booked"
-    assert ops.logins == 2                       # the escalation fired...
-    assert ops.released == 0                     # ...without ever giving up the slot
+    assert ops.logins == 2                          # the escalation fired...
+    assert ops.release_reasons == ["form_stale"]    # ...and the slot went back unpenalised
+
+
+def test_no_slot_bounce_releases_with_the_penalised_reason():
+    """The other tier: a bounce back to the schedule form may mean the slot really is gone, so it
+    counts against the slot -- and is the only tier the Hub's false-slot revert may act on."""
+    ops = SimEngineOps(assignment={"date": "d1", "period": 3}, apply_outcome="no_slot",
+                       stop_after_polls=4)
+    PhaseMachine(_cfg(ROLE="apply"), ops).run()
+    assert ops.release_reasons and set(ops.release_reasons) == {"bounce"}
 
 
 def test_apply_parks_after_a_bounce_storm_instead_of_churning_the_pool():
@@ -279,32 +288,6 @@ def test_apply_bounce_releases_the_slot_so_the_worker_stays_assignable():
                        stop_after_polls=2)
     PhaseMachine(_cfg(ROLE="apply"), ops).run()
     assert ops.released >= 1
-
-
-# ── a slot that resists repeated rebuilt sessions is not "still real" (2026-08-14) ────────────
-def test_apply_abandons_a_slot_that_stays_form_stale_across_rebuilt_sessions():
-    """Confirmed live (e5dfc1b1): the same slot bounced form_stale 5x, each time from a session
-    warmed SEVEN SECONDS earlier -- which no lapsed-anchor story explains. Past
-    FORM_STALE_MAX_PER_SLOT the worker must hand the slot back, both so it stops burning ~5min
-    login+warmup cycles on it and so the Hub's false-slot counter can SEE the failure at all."""
-    ops = SimEngineOps(assignment={"date": "d1", "period": 3}, apply_outcome="form_stale",
-                       stop_after_polls=10)
-    res = PhaseMachine(_cfg(booking={"FORM_STALE_MAX_PER_SLOT": 2}, ROLE="apply",
-                            REWARM_MAX_ATTEMPTS=99), ops).run()
-
-    assert res.outcome == "stopped"          # still never terminates on its own
-    assert ops.released >= 1                 # the slot IS eventually handed back
-    assert ops.applied >= 2
-
-
-def test_apply_still_retries_the_same_slot_below_the_per_slot_cap():
-    """The storm-auto contract survives: a form_stale under the cap keeps the slot and retries."""
-    ops = SimEngineOps(assignment={"date": "d1", "period": 3},
-                       apply_outcome=["form_stale", "booked"], stop_after_polls=8)
-    res = PhaseMachine(_cfg(booking={"FORM_STALE_MAX_PER_SLOT": 3}, ROLE="apply",
-                            REWARM_MAX_ATTEMPTS=99), ops).run()
-    assert res.outcome == "booked"
-    assert ops.released == 0                 # never gave the real slot up
 
 
 # ── a scout whose session dies must rebuild it, not spin (2026-08-14) ─────────────────────────
