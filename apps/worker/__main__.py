@@ -35,6 +35,14 @@ def _build_ops(engine_kind: str, cfg: EngineConfig, payload: dict, bus: Bus, wor
         ops = LiveEngineOps(
             cfg,
             account=payload["account"],
+            # Confirmed live 2026-08-14: the Hub has always SENT `accounts` (the full ranked
+            # sub-account candidate list, _rank_live_sub_accounts) but this call never read it, so
+            # LiveEngineOps fell back to its single-candidate default and do_login()'s
+            # sticky-then-rotate loop could never rotate. A worker with 3 usable sub-accounts gave
+            # up after 3 sticky attempts on ONE of them (terminal failed/login) instead of 3x3=9.
+            # Both ends were unit-tested; the seam between them was not -- see
+            # tests/worker/test_main_engine_selection.py's payload-key coverage test.
+            accounts=payload.get("accounts"),
             posto_id=payload["posto_id"],
             nationality=payload["nationality"],
             residence=payload["residence"],

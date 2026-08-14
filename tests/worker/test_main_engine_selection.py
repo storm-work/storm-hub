@@ -51,6 +51,51 @@ def test_live_engine_constructed_from_launch_payload():
     assert ops.booking_id == "bk-1"
 
 
+def test_live_engine_receives_the_sub_account_rotation_candidates():
+    """Confirmed live 2026-08-14: the Hub sent `accounts` (the full ranked sub-account list) and
+    _build_ops silently dropped it, so LiveEngineOps fell back to its single-candidate default and
+    do_login()'s sticky-then-rotate loop could never rotate. A worker with 3 usable sub-accounts
+    terminated failed/login after 3 attempts on ONE account instead of 3x3=9."""
+    bus = _bus()
+    signals = BusSignals(bus, "w1", "c1")
+    accounts = [
+        {"username": "u1", "password": "p1", "sub_account_id": "sub-1"},
+        {"username": "u2", "password": "p2", "sub_account_id": "sub-2"},
+        {"username": "u3", "password": "p3", "sub_account_id": "sub-3"},
+    ]
+    payload = {
+        "account": accounts[0], "accounts": accounts,
+        "posto_id": "5084", "nationality": "CPV", "residence": "IRL",
+        "quest_steps": {"IRL": []},
+        "form_defaults": {"static": {}, "dynamic": {}, "from_account": {}, "from_nationality": {}},
+        "capsolver_keys": ["k1"], "warm_proxy": "http://p:1234",
+        "sub_account_id": "sub-1", "identity_id": "identity-1", "booking_id": "bk-1",
+    }
+    ops = _build_ops("live", _cfg(), payload, bus, "w1", signals)
+    assert [a["sub_account_id"] for a in ops.accounts] == ["sub-1", "sub-2", "sub-3"]
+
+
+def test_every_launch_payload_key_the_hub_sends_is_consumed_by_build_ops():
+    """The seam guard. Both ends of sub-account rotation were unit-tested -- the Hub's
+    _do_launch_worker built `accounts`, and LiveEngineOps._fresh_login rotated through it -- but
+    NOTHING tested that the value actually crossed the bus into the constructor, and it didn't.
+    Parses the Hub's launch_kwargs keys out of main.py and asserts _build_ops reads each one."""
+    import re
+    from pathlib import Path
+
+    main_src = Path("apps/hub/main.py").read_text()
+    block = re.search(r"launch_kwargs = dict\(\s*\n\s*_engine=\"live\",(.*?)\n\s*\)", main_src, re.S)
+    assert block, "could not find the live launch_kwargs block in apps/hub/main.py"
+    sent = set(re.findall(r"^\s*(\w+)=", block.group(1), re.M))
+
+    build_src = Path("apps/worker/__main__.py").read_text()
+    consumed = set(re.findall(r'payload(?:\.get)?[\[\(]"(\w+)"', build_src))
+
+    missing = sent - consumed
+    assert not missing, (
+        f"launch payload keys the Hub sends but apps/worker/__main__.py never reads: {missing}")
+
+
 def test_live_engine_log_wired_to_log_line_event():
     """Regression, confirmed live 2026-08-13: LiveEngineOps._log defaulted to a no-op and nothing
     in _build_ops ever overrode it, so every internal self._log(...) diagnostic (do_swap's own
