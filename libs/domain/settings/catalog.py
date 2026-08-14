@@ -256,6 +256,12 @@ _TEMPLATE = [
     _s("KEEPALIVE_OFF", L.TEMPLATE, bool, False, _WRK, "keepalive"),
     _s("KEEPALIVE_JITTER", L.TEMPLATE, float, 30.0, _WRK, "keepalive",
        note="anti-herd: randomize keepalive timing so many workers don't probe in the same instant"),
+    _s("CHECKPOINT_RESTORE_BUDGET", L.TEMPLATE, float, 90.0, _WRK, "keepalive",
+       note="wall-clock seconds the checkpoint restore chain (rebuild -> health probe -> re-warm) "
+            "may spend before abandoning and going straight to a full login. Every tier is a real "
+            "browser navigation, so with NAV_TIMEOUT_SCALE=4 a doomed restore burned up to 384s "
+            "before the worker even started logging in (confirmed live 2026-08-14). 0 disables the "
+            "budget and lets the chain run to completion."),
     _s("RESTORE_STAMPEDE_JITTER", L.TEMPLATE, float, 30.0, _WRK, "keepalive",
        note="anti-herd: stagger checkpoint-restore attempts after a mass relaunch"),
     _s("SESSION_REFRESH_STAGGER", L.TEMPLATE, float, 120.0, _WRK, "keepalive"),

@@ -851,3 +851,84 @@ def test_transient_budget_is_bounded(monkeypatch):
 
     assert ops._sticky_login_attempts(ops.cfg.login.sticky_retry_max) is False
     assert calls["n"] == 5      # 3 transient (uncharged) + 2 sticky, then give up
+
+
+# ── checkpoint restore: bounded, and self-cleaning (confirmed live 2026-08-14) ─
+def _ckpt_ops(monkeypatch, session, **cfg_kw):
+    import apps.worker.ops_live as ops_live_mod
+    monkeypatch.setattr(ops_live_mod, "get_session", lambda **kw: session)
+    monkeypatch.setattr(ops_live_mod.ckpt, "load_checkpoint",
+                        lambda identity_id: {"cookies": {}, "cookies_full": [], "sub_account_id": "s"})
+    cleared = []
+    monkeypatch.setattr(ops_live_mod.ckpt, "clear_checkpoint", lambda iid: cleared.append(iid))
+    ops = _make_ops(cfg=_cfg(RESTORE_STAMPEDE_JITTER=0, **cfg_kw), identity_id="id-1")
+    ops._log = lambda t: None
+    return ops, cleared
+
+
+def test_a_dead_checkpoint_is_discarded_so_the_next_respawn_does_not_retry_it(monkeypatch):
+    """The chain never deleted a checkpoint that had just proved itself dead, so every respawn
+    reloaded the same cookies and paid the same minutes again -- CARLOS burned three consecutive
+    restores, ERNESTO four, none producing a bookable session."""
+    ops, cleared = _ckpt_ops(monkeypatch, _FakeSession(alive=False))
+    ops._run_warmup_steps = lambda: False          # re-warm can't save it either
+
+    assert ops._try_restore_from_checkpoint() is False
+    assert cleared == ["id-1"]                     # cookies discarded
+    assert ops.session is None
+
+
+def test_a_rebuild_failure_keeps_the_checkpoint(monkeypatch):
+    """A browser/proxy that never came up says nothing about the stored cookies -- keep them."""
+    import apps.worker.ops_live as ops_live_mod
+
+    monkeypatch.setattr(ops_live_mod.ckpt, "load_checkpoint",
+                        lambda identity_id: {"cookies": {}, "cookies_full": []})
+    cleared = []
+    monkeypatch.setattr(ops_live_mod.ckpt, "clear_checkpoint", lambda iid: cleared.append(iid))
+    def _boom(**kw):
+        raise RuntimeError("Page.goto: net::ERR_CONNECTION_CLOSED")
+    monkeypatch.setattr(ops_live_mod, "get_session", _boom)
+    ops = _make_ops(cfg=_cfg(RESTORE_STAMPEDE_JITTER=0), identity_id="id-1")
+    ops._log = lambda t: None
+
+    assert ops._try_restore_from_checkpoint() is False
+    assert cleared == []                           # kept for the next attempt
+
+
+def test_restore_skips_the_rewarm_once_the_budget_is_spent(monkeypatch):
+    """Every tier is a real navigation; the re-warm must not start if the chain has already spent
+    its wall-clock budget -- that is what turned a doomed restore into 384 seconds."""
+    import apps.worker.ops_live as ops_live_mod
+
+    class _SlowProbe(_FakeSession):
+        def browser_nav(self, url, timeout=30):
+            ops_live_mod.time.sleep(0)             # patched clock does the work
+            return "https://x/Authentication.jsp"  # -> not alive
+
+    ops, cleared = _ckpt_ops(monkeypatch, _SlowProbe(alive=False), CHECKPOINT_RESTORE_BUDGET=5.0)
+    rewarmed = []
+    ops._run_warmup_steps = lambda: (rewarmed.append(1), True)[1]
+
+    t = {"now": 1000.0}
+    monkeypatch.setattr(ops_live_mod.time, "time", lambda: t["now"])
+    real_sleep = ops_live_mod.time.sleep
+    monkeypatch.setattr(ops_live_mod.time, "sleep", lambda s: None)
+    # the probe "takes" 20s of wall clock, blowing the 5s budget
+    orig_probe = ops._probe_alive
+    def _probe():
+        t["now"] += 20.0
+        return orig_probe()
+    ops._probe_alive = _probe
+
+    assert ops._try_restore_from_checkpoint() is False
+    assert rewarmed == []                          # re-warm never started
+    assert cleared == ["id-1"]
+
+
+def test_a_live_checkpoint_still_short_circuits_login(monkeypatch):
+    """The whole point of the chain: a good checkpoint must still skip login+warmup entirely."""
+    ops, cleared = _ckpt_ops(monkeypatch, _FakeSession(alive=True))
+    assert ops._try_restore_from_checkpoint() is True
+    assert ops._restore_stage == "alive"
+    assert cleared == []

@@ -232,10 +232,24 @@ class LiveEngineOps(EngineOps):
                 self._login_sem.release(self.identity_id)
 
     def _try_restore_from_checkpoint(self) -> bool:
-        """3-tier restore chain (Phase C3 design): restore -> health-check -> if unhealthy, re-warm
-        -> if re-warm fails, full re-login (returns False so do_login falls through to
-        _fresh_login()). Checkpoint restore is gated by the SAME login semaphore as fresh logins
-        (Phase F12) -- a mass relaunch must not fire N concurrent restores unbounded."""
+        """3-tier restore chain (Phase C3): restore -> health-check -> re-warm -> give up (return
+        False so do_login falls through to _fresh_login). Gated by the SAME login semaphore as fresh
+        logins (Phase F12) so a mass relaunch can't fire N concurrent restores.
+
+        BOUNDED, and self-cleaning. Confirmed live 2026-08-14: every tier is a real browser
+        navigation, and with NAV_TIMEOUT_SCALE=4 a doomed restore burned 92s, 118s, 180s -- one took
+        384s -- before the worker even STARTED its actual login. Worse, the chain never deleted a
+        checkpoint that had just proved itself dead, so each respawn faithfully reloaded the same
+        cookies and paid the same minutes again: CARLOS spent three consecutive restores, ERNESTO
+        four, none of which produced a bookable session.
+
+        Two guards:
+          * a wall-clock budget (CHECKPOINT_RESTORE_BUDGET) -- once spent, abandon the chain and go
+            log in, rather than starting another multi-minute tier;
+          * on a failure that is about the SESSION rather than the network (it rebuilt fine but
+            isn't bookable and won't re-warm), the checkpoint is deleted. A transient/proxy failure
+            leaves it alone -- that says nothing about whether the cookies are still good.
+        """
         data = ckpt.load_checkpoint(self.identity_id)
         if data is None:
             self._restore_stage = "none"
@@ -247,6 +261,10 @@ class LiveEngineOps(EngineOps):
         if jitter > 0:
             time.sleep(random.uniform(0, jitter))
 
+        budget = float(self.cfg.raw.get("CHECKPOINT_RESTORE_BUDGET", 90.0))
+        started = time.time()   # after the jitter: the anti-herd wait is not the chain's fault
+        spent = lambda: time.time() - started   # noqa: E731
+
         self._log(f"restoring checkpoint for identity {self.identity_id} (sub_account={data.get('sub_account_id')})")
         try:
             self.session = get_session(
@@ -257,26 +275,39 @@ class LiveEngineOps(EngineOps):
                 fp_seed=self.account.get("username"),
             )
         except Exception as e:
-            self._log(f"checkpoint restore: session rebuild failed ({e}) -- falling back to fresh login")
+            # The browser/proxy never came up -- this says nothing about the stored cookies, so the
+            # checkpoint is kept for the next attempt.
+            self._log(f"checkpoint restore: session rebuild failed after {spent():.0f}s ({e}) "
+                      f"-- keeping checkpoint, falling back to fresh login")
             self._restore_stage = "none"
             return False
 
-        alive = self._probe_alive()
-        if alive:
+        if self._probe_alive():
             self.posto_pdf = data.get("posto_pdf")
             self._restore_stage = "alive"
-            self._log("checkpoint restore: session alive, form-state bookable -- skipping login+warmup")
+            self._log(f"checkpoint restore: session alive and bookable after {spent():.0f}s "
+                      f"-- skipping login+warmup")
             return True
 
-        # Health-check failed -- try a re-warm on the restored (still-authenticated?) session before
-        # giving up and falling through to a full re-login.
-        self._log("checkpoint restore: not immediately bookable -- attempting re-warm")
-        if self._run_warmup_steps():
+        # Health-check failed. A re-warm is worth trying -- the session may still be authenticated
+        # and merely missing form state, and re-warming is far cheaper than burning the login wall
+        # and a CAPTCHA solve. But only if there is budget left for it.
+        if budget > 0 and spent() >= budget:
+            self._log(f"checkpoint restore: not bookable and {spent():.0f}s budget spent -- "
+                      f"skipping re-warm, going straight to login")
+        elif self._run_warmup_steps():
             self._restore_stage = "rewarmed"
-            self._log("checkpoint restore: re-warm succeeded")
+            self._log(f"checkpoint restore: re-warm succeeded after {spent():.0f}s")
             return True
 
-        self._log("checkpoint restore: re-warm failed -- falling back to full re-login")
+        # The session rebuilt but is not usable and would not re-warm: these cookies are spent.
+        # Delete them so the next respawn doesn't pay this again for the same dead state.
+        self._log(f"checkpoint restore: unusable after {spent():.0f}s -- discarding this checkpoint "
+                  f"and doing a full re-login")
+        try:
+            ckpt.clear_checkpoint(self.identity_id)
+        except Exception as e:      # best-effort; never let cleanup block the login
+            self._log(f"checkpoint restore: could not clear checkpoint ({e})")
         self._restore_stage = "none"
         try:
             self.session.close_browser()
