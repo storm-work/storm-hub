@@ -122,7 +122,10 @@ def test_live_engine_log_wired_to_log_line_event():
     ops._log("do_swap: new session failed health check -- reverting to phase-1 proxy")
 
     msgs = bus.read_events(last_id="0", block_ms=10, count=10)
-    log_lines = [m for m in msgs if m.type == "log_line"]
+    # _build_ops also emits its own "vendor env applied: {...}" line on a live build (see
+    # _export_vendor_env) -- match on the one under test rather than asserting a total count.
+    log_lines = [m for m in msgs if m.type == "log_line"
+                 and not m.payload["text"].startswith("vendor env applied:")]
     assert len(log_lines) == 1
     assert log_lines[0].payload["text"] == \
         "do_swap: new session failed health check -- reverting to phase-1 proxy"
@@ -134,3 +137,68 @@ def test_live_engine_missing_required_field_raises():
     signals = BusSignals(bus, "w1", "c1")
     with pytest.raises(KeyError):
         _build_ops("live", _cfg(), {"account": {}}, bus, "w1", signals)
+
+
+# ── vendor env knobs (confirmed live 2026-08-14) ──────────────────────────────
+def test_vendor_env_knobs_are_exported_from_frozen_settings():
+    """The whole vendor tuning surface (13 keys) is read from os.environ, never from EngineConfig,
+    while every key is ALSO a catalog setting the Hub freezes into effective_settings_json. The two
+    halves never met: workers ran with NAV_TIMEOUT_SCALE=1.0 while their frozen settings said 4.0,
+    and the entire anti-detect surface was off regardless of the template."""
+    import os
+
+    from apps.worker.__main__ import _export_vendor_env
+
+    cfg = EngineConfig.from_settings(resolve({L.TEMPLATE: {
+        "ROLE": "apply", "NAV_TIMEOUT_SCALE": 4.0, "LOGIN_FIELD_RETRIES": 4,
+        "STEALTH_HARDEN": True, "HUMAN_BEHAVIOR": False,
+    }}))
+    for k in ("NAV_TIMEOUT_SCALE", "LOGIN_FIELD_RETRIES", "STEALTH_HARDEN", "HUMAN_BEHAVIOR"):
+        os.environ.pop(k, None)
+
+    exported = _export_vendor_env(cfg)
+
+    assert exported["NAV_TIMEOUT_SCALE"] == "4"
+    assert exported["STEALTH_HARDEN"] == "1"      # vendor tests `== "1"`, not truthiness
+    assert exported["HUMAN_BEHAVIOR"] == "0"
+    # int() on the vendor side raises on "4.0" -- an integral float must serialise without the .0
+    assert exported["LOGIN_FIELD_RETRIES"] == "4"
+    assert int(os.environ["LOGIN_FIELD_RETRIES"]) == 4
+    assert float(os.environ["NAV_TIMEOUT_SCALE"]) == 4.0
+
+
+def test_every_vendor_env_knob_is_a_real_catalog_setting():
+    """Guard both directions: a knob the engine reads from the environment is only reachable by an
+    operator if it also exists in the settings catalog."""
+    import re
+    from pathlib import Path
+
+    from apps.worker.__main__ import _VENDOR_ENV_KNOBS
+
+    catalog = Path("libs/domain/settings/catalog.py").read_text()
+    missing = [k for k in _VENDOR_ENV_KNOBS if f'"{k}"' not in catalog]
+    assert not missing, f"vendor env knobs with no catalog setting (unreachable): {missing}"
+
+    vendor_src = "".join(
+        p.read_text() for p in Path("libs/engine/vendor").glob("*.py"))
+    read_from_env = set(re.findall(r'os\.environ\.get\("([A-Z_]+)"', vendor_src))
+    # every env knob the engine reads should be exported by the worker (minus infra-only ones)
+    unexported = read_from_env - set(_VENDOR_ENV_KNOBS) - {"REDIS_URL", "DATABASE_URL"}
+    assert not unexported, f"vendor reads these from env but the worker never exports them: {unexported}"
+
+
+def test_solver_race_defaults_match_the_proven_vendor_values():
+    """Regression guard for a near-miss (2026-08-14): these two were inert catalog numbers (4.0 /
+    120.0) for as long as nothing exported them. Wiring _export_vendor_env would have made them
+    real and CUT the solver's grace from the proven 25s to 4s. storm-auto ships no .env and runs on
+    the vendored solver's own 25/180, so those are ground truth -- if the vendor ever changes them,
+    this fails rather than letting the catalog drift into silently degrading CAPTCHA solving."""
+    import re
+    from pathlib import Path
+
+    src = Path("libs/engine/vendor/solver.py").read_text()
+    vendor = dict(re.findall(r'os\.environ\.get\("(SOLVER_RACE_\w+)",\s*"([\d.]+)"\)', src))
+    cfg = EngineConfig.from_settings(resolve({L.TEMPLATE: {"ROLE": "apply"}}))
+    for key, proven in vendor.items():
+        assert float(cfg.raw[key]) == float(proven), (
+            f"{key}: catalog default {cfg.raw[key]} != proven vendor default {proven}")

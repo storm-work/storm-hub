@@ -82,8 +82,17 @@ _GLOBAL = [
     _s("LOGIN_ANTICAPTCHA_ONLY", L.GLOBAL, bool, False, _TPL, "solver"),
     _s("RECAPTCHA_SOLVE_PROXY", L.GLOBAL, bool, False, _TPL, "solver"),
     _s("NATIVE_SOLVE", L.GLOBAL, bool, False, _TPL, "solver"),
-    _s("SOLVER_RACE_GRACE", L.GLOBAL, float, 4.0, _TPL, "solver"),
-    _s("SOLVER_RACE_HARD_TIMEOUT", L.GLOBAL, float, 120.0, _TPL, "solver"),
+    # Defaults corrected 2026-08-14 to match the PROVEN values. Both are read by the vendored solver
+    # from os.environ (libs/engine/vendor/solver.py), which until now nothing ever set -- so these
+    # catalog numbers were inert and the engine silently used its own 25/180. The moment the worker
+    # started actually exporting them (apps/worker/__main__.py's _export_vendor_env), the old 4.0/
+    # 120.0 would have taken effect and CUT the solver's grace period from 25s to 4s. storm-auto,
+    # which has booked successfully for months, ships no .env at all and therefore runs on exactly
+    # these 25/180 code defaults -- treat those as ground truth, not the reconstructed guesses.
+    _s("SOLVER_RACE_GRACE", L.GLOBAL, float, 25.0, _TPL, "solver",
+       note="seconds to keep racing for a better CAPTCHA score after the first acceptable solve"),
+    _s("SOLVER_RACE_HARD_TIMEOUT", L.GLOBAL, float, 180.0, _TPL, "solver",
+       note="absolute ceiling on one solve race"),
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────

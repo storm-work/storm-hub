@@ -26,10 +26,58 @@ from .ops_sim import SimEngineOps
 from .runtime import WorkerRuntime
 
 
+# The vendored engine (libs/engine/vendor/session.py + solver) reads ALL of its tuning knobs from
+# os.environ -- never from EngineConfig. Every one of them is ALSO a catalog setting that the Hub
+# faithfully resolves and freezes into effective_settings_json, so the two halves never met:
+# operators set them, the Hub stored them, and the engine read the environment and got its defaults.
+#
+# Confirmed live 2026-08-14 on booking "Test 0814": every worker's frozen settings said
+# NAV_TIMEOUT_SCALE=4.0 (from the seeded templates, see apps/hub/config_store.py) while the engine
+# ran at 1.0 -- i.e. quarter-length nav timeouts -- and the run failed with a pile of
+# "Page.goto: Timeout 30000ms/25000ms exceeded". The same logs showed
+# "ANTIDETECT flags: stealth_harden=0 det_fp=0 webrtc_block=0 human=0", i.e. the whole anti-detect
+# surface was off regardless of what the template asked for.
+#
+# ORDERING MATTERS: STEALTH_HARDEN / DETERMINISTIC_FP / HUMAN_BEHAVIOR / WEBRTC_BLOCK are read into
+# module-level constants at IMPORT time, so this must run before the vendor module is first
+# imported -- i.e. before `from .ops_live import LiveEngineOps` below, which is exactly why that
+# import is function-local rather than at the top of this file.
+_VENDOR_ENV_KNOBS = (
+    "NAV_TIMEOUT_SCALE", "LOGIN_FIELD_RETRIES", "STEALTH_HARDEN", "DETERMINISTIC_FP",
+    "HUMAN_BEHAVIOR", "WEBRTC_BLOCK", "HEADLESS_MODE", "DRIVER", "LOGIN_CAPSOLVER_ONLY",
+    "LOGIN_ANTICAPTCHA_ONLY", "RECAPTCHA_SOLVE_PROXY", "SOLVER_RACE_GRACE",
+    "SOLVER_RACE_HARD_TIMEOUT",
+)
+
+
+def _export_vendor_env(cfg: EngineConfig) -> dict[str, str]:
+    """Push the frozen settings the vendored engine expects into os.environ. Returns what was set,
+    for logging (this was invisible for the whole reconstruction -- worth saying out loud).
+
+    Encoding matters: the vendor tests booleans as `== "1"` and parses LOGIN_FIELD_RETRIES with
+    int(), which raises on "4.0" -- so an integral float must be written as "4", not "4.0"."""
+    exported: dict[str, str] = {}
+    for key in _VENDOR_ENV_KNOBS:
+        if key not in cfg.raw:
+            continue
+        value = cfg.raw[key]
+        if isinstance(value, bool):
+            text = "1" if value else "0"
+        elif isinstance(value, float) and value.is_integer():
+            text = str(int(value))
+        else:
+            text = str(value)
+        os.environ[key] = text
+        exported[key] = text
+    return exported
+
+
 def _build_ops(engine_kind: str, cfg: EngineConfig, payload: dict, bus: Bus, worker_id: str,
                signals: BusSignals):
     emit = lambda t, **p: bus.emit_event(worker_id, t, **p)  # noqa: E731
     if engine_kind == "live":
+        exported = _export_vendor_env(cfg)   # MUST precede the vendor import -- see above
+        emit("log_line", text=f"vendor env applied: {exported}")
         from .ops_live import LiveEngineOps
         redis_client = bus.r if hasattr(bus, "r") else None
         ops = LiveEngineOps(
