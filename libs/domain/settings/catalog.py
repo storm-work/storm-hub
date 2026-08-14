@@ -227,7 +227,17 @@ _TEMPLATE = [
     _s("NAV_TIMEOUT_SCALE", L.TEMPLATE, float, 1.0, _WRK, "login_resilience"),
     _s("LOGIN_FIELD_RETRIES", L.TEMPLATE, int, 3, _WRK, "login_resilience"),
     _s("LOGIN_STORM_RETRIES", L.TEMPLATE, int, 8, _WRK, "login_resilience"),
-    _s("STICKY_RETRY_MAX", L.TEMPLATE, int, 2, _WRK, "login_resilience"),
+    _s("STICKY_RETRY_MAX", L.TEMPLATE, int, 2, _WRK, "login_resilience",
+       note="login attempts spent on ONE sub-account before rotating to the next candidate. Only "
+            "charged for failures that are actually a verdict on the credentials -- see "
+            "LOGIN_TRANSIENT_RETRY_MAX"),
+    _s("LOGIN_TRANSIENT_RETRY_MAX", L.TEMPLATE, int, 6, _WRK, "login_resilience",
+       note="separate budget for INFRASTRUCTURE login failures (proxy connection errors, DataDome "
+            "challenges, timeouts, navigations that never landed). These say nothing about the "
+            "account, so charging them to STICKY_RETRY_MAX burns through every sub-account and "
+            "fails the worker over proxy weather -- confirmed live 2026-08-14, six workers "
+            "permanently FAILED that way. 0 makes every failure count against the sub-account, "
+            "i.e. the old (broken) behaviour."),
     _s("QUEST_STEP_RETRIES", L.TEMPLATE, int, 10, _WRK, "login_resilience"),
     _s("QUEST_STEP_GAP", L.TEMPLATE, float, 0.0, _WRK, "login_resilience"),
     _s("WARMUP_MAX_ATTEMPTS", L.TEMPLATE, int, 6, _WRK, "login_resilience"),

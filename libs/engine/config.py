@@ -19,6 +19,7 @@ class LoginConfig:
     field_retries: int = 3
     storm_retries: int = 8
     sticky_retry_max: int = 2
+    transient_retry_max: int = 6
     quest_step_retries: int = 10
     warmup_max_attempts: int = 6
     partial_render_retries: int = 3
@@ -118,6 +119,7 @@ class EngineConfig:
                 field_retries=int(g("LOGIN_FIELD_RETRIES", 3)),
                 storm_retries=int(g("LOGIN_STORM_RETRIES", 8)),
                 sticky_retry_max=int(g("STICKY_RETRY_MAX", 2)),
+                transient_retry_max=int(g("LOGIN_TRANSIENT_RETRY_MAX", 6)),
                 quest_step_retries=int(g("QUEST_STEP_RETRIES", 10)),
                 warmup_max_attempts=int(g("WARMUP_MAX_ATTEMPTS", 6)),
                 partial_render_retries=int(g("PARTIAL_RENDER_RETRIES", 3)),

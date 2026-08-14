@@ -326,8 +326,22 @@ class LiveEngineOps(EngineOps):
         return False
 
     def _sticky_login_attempts(self, sticky_max: int) -> bool:
-        for attempt in range(1, sticky_max + 1):
-            if attempt > 1:
+        """Spend up to `sticky_max` attempts ON THIS SUB-ACCOUNT, plus a separate, bounded budget for
+        transient infrastructure failures that say nothing about it.
+
+        Confirmed live 2026-08-14: this was a `for attempt in range(...)` loop in which BOTH the
+        transient and the hard-failure branches simply `continue`d -- so the loop variable advanced
+        either way and the transient classification had no effect whatsoever, despite logging
+        "sticky count not burned". Combined with connection errors not being classified as transient
+        at all, a run of bad proxies burned the whole sticky budget, rotated through every
+        sub-account, failed the worker, and consumed MAX_RESPAWN_ATTEMPTS."""
+        attempt = 0          # sticky attempts genuinely spent on this sub-account
+        transient = 0        # infrastructure retries, bounded but not charged to the account
+        max_transient = max(0, int(self.cfg.login.transient_retry_max))
+        rounds = 0
+        while attempt < sticky_max:
+            rounds += 1
+            if rounds > 1:
                 # Regression (L2/L3, closed by P3): a repeated login failure used to keep retrying
                 # on the SAME leased proxy forever -- if the proxy itself is the problem (burned IP,
                 # rate-limited), no number of retries recovers. Rotate before every retry past the
@@ -345,10 +359,13 @@ class LiveEngineOps(EngineOps):
                     min_score=50,
                 )
             except Exception as e:
-                if self._is_transient_login_failure(str(e)):
-                    self._log(f"login attempt {attempt}/{sticky_max}: transient ({e}) -- retrying, sticky count not burned")
-                    self._backoff(attempt)
-                    continue
+                if transient < max_transient and self._is_transient_login_failure(str(e)):
+                    transient += 1
+                    self._log(f"login: transient {transient}/{max_transient} ({e}) -- infrastructure, "
+                              f"not charged to sub-account (sticky still {attempt}/{sticky_max})")
+                    self._backoff(transient)
+                    continue          # deliberately does NOT advance `attempt`
+                attempt += 1
                 self._log(f"login attempt {attempt}/{sticky_max}: {e}")
                 self._backoff(attempt)
                 continue
@@ -364,7 +381,20 @@ class LiveEngineOps(EngineOps):
                 if self._breaker is not None:
                     self._breaker.record_success()
                 return True
-            self._log(f"login attempt {attempt}/{sticky_max}: rejected ({_login_reject_reason(result)})")
+            # A rejection can ALSO be infrastructure: the vendored login returns 200 with an error
+            # body for "datadome_challenge_on_post" (the exit IP is flagged) and for a navigation
+            # that never landed (chrome-error://chromewebdata). Neither is a verdict on the
+            # credentials, so neither may burn this sub-account's budget.
+            reason = _login_reject_reason(result)
+            if transient < max_transient and self._is_transient_login_failure(reason):
+                transient += 1
+                self._log(f"login: transient {transient}/{max_transient} rejected ({reason}) -- "
+                          f"infrastructure, not charged to sub-account "
+                          f"(sticky still {attempt}/{sticky_max})")
+                self._backoff(transient)
+                continue
+            attempt += 1
+            self._log(f"login attempt {attempt}/{sticky_max}: rejected ({reason})")
             self._backoff(attempt)
         return False
 
@@ -392,10 +422,30 @@ class LiveEngineOps(EngineOps):
 
     @staticmethod
     def _is_transient_login_failure(msg: str) -> bool:
-        """WAF/DataDome/waiting-room markers get their own backoff budget without burning the
-        sticky-retry counter (ported from the confirmed storm-auto failure-classification split)."""
-        low = msg.lower()
-        return any(m in low for m in ("datadome", "waf", "waiting room", "timed out", "timeout"))
+        """Is this failure about the INFRASTRUCTURE rather than the account?
+
+        A transient failure gets its own retry budget and must not burn the sticky counter, because
+        it carries no information about whether the credentials are good. Confirmed live 2026-08-14:
+        the connection-level markers below were NOT in this list, so a dead proxy burned the
+        account's sticky budget, exhausted its sub-account rotation, failed the worker, and
+        eventually tripped MAX_RESPAWN_ATTEMPTS -- six workers sat permanently FAILED because of
+        proxy weather. The portal never rejected them.
+
+        Deliberately NOT transient: `login_failed_auth_redirect` and a redirect back to /login --
+        those are the portal's verdict on the credentials, which is exactly what the sticky/rotate
+        budget exists to spend."""
+        low = (msg or "").lower()
+        return any(m in low for m in (
+            # WAF / bot-challenge -- a property of the exit IP, not the account
+            "datadome", "waf", "waiting room", "bot challenge",
+            # timeouts
+            "timed out", "timeout",
+            # connection/proxy level: the request never reached the portal at all
+            "err_connection", "err_tunnel", "err_proxy", "err_timed_out", "err_network",
+            "err_empty_response", "err_name_not_resolved", "err_socks", "err_address",
+            "chromewebdata",            # chrome-error://chromewebdata/ -- navigation never landed
+            "failed to fetch",
+        ))
 
     def _request_proxy_rotation(self, phase: str | None = None) -> str | None:
         """Ask the Hub for a fresh proxy from the pool matching `phase` ("warmup" or "hold") -- P3,

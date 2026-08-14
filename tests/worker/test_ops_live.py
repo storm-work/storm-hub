@@ -771,3 +771,83 @@ def test_login_reject_reason_survives_a_non_json_body():
     out = _login_reject_reason({"status": 503, "body": "<html>waiting room</html>"})
     assert "status=503" in out and "waiting room" in out
     assert _login_reject_reason(None) == "None"
+
+
+# ── transient vs sticky budget (confirmed live 2026-08-14) ────────────────────
+def test_connection_errors_are_transient_credential_rejections_are_not():
+    """A dead proxy says nothing about the account. These were NOT classified as transient, so
+    proxy weather burned the sticky budget, exhausted sub-account rotation, failed the worker and
+    consumed MAX_RESPAWN_ATTEMPTS -- six workers permanently FAILED without the portal ever
+    rejecting them."""
+    t = LiveEngineOps._is_transient_login_failure
+    for infra in ("Page.goto: net::ERR_CONNECTION_CLOSED", "net::ERR_TUNNEL_CONNECTION_FAILED",
+                  "status=200 datadome_challenge_on_post", "PlaywrightSession init timed out (>120s)",
+                  "unexpected_redirect_chrome-error://chromewebdata/", "TypeError: Failed to fetch"):
+        assert t(infra) is True, infra
+    for verdict in ("status=200 login_failed_auth_redirect",
+                    "unexpected_redirect_https://pedidodevistos.mne.gov.pt/VistosOnline/login"):
+        assert t(verdict) is False, verdict
+
+
+def test_transient_failures_do_not_burn_the_sticky_budget(monkeypatch):
+    """The old loop was `for attempt in range(...)` where BOTH branches continue'd, so the transient
+    classification advanced the counter identically and had no effect at all -- while logging
+    "sticky count not burned"."""
+    import apps.worker.ops_live as ops_live_mod
+
+    calls = {"n": 0}
+
+    class _FlakyThenGood(_FakeSession):
+        def browser_login(self, *a, **k):
+            calls["n"] += 1
+            if calls["n"] <= 4:      # four pure-infrastructure failures
+                raise RuntimeError("Page.goto: net::ERR_CONNECTION_CLOSED")
+            return {"status": 200, "body": '{"type":"success"}'}
+
+    monkeypatch.setattr(ops_live_mod, "get_session", lambda **kw: _FlakyThenGood())
+    ops = _make_ops(cfg=_cfg(STICKY_RETRY_MAX=2, LOGIN_TRANSIENT_RETRY_MAX=6))
+    ops._backoff = lambda n: None
+    ops._request_proxy_rotation = lambda phase=None: None
+
+    assert ops._sticky_login_attempts(ops.cfg.login.sticky_retry_max) is True
+    assert calls["n"] == 5      # would have given up after 2 with the old loop
+
+
+def test_credential_rejections_still_exhaust_the_sticky_budget(monkeypatch):
+    """The flip side: a real portal verdict MUST burn the budget, or rotation never happens."""
+    import apps.worker.ops_live as ops_live_mod
+
+    calls = {"n": 0}
+
+    class _AlwaysRejected(_FakeSession):
+        def browser_login(self, *a, **k):
+            calls["n"] += 1
+            return {"status": 200, "body": '{"type":"error","description":"login_failed_auth_redirect"}'}
+
+    monkeypatch.setattr(ops_live_mod, "get_session", lambda **kw: _AlwaysRejected())
+    ops = _make_ops(cfg=_cfg(STICKY_RETRY_MAX=2, LOGIN_TRANSIENT_RETRY_MAX=6))
+    ops._backoff = lambda n: None
+    ops._request_proxy_rotation = lambda phase=None: None
+
+    assert ops._sticky_login_attempts(ops.cfg.login.sticky_retry_max) is False
+    assert calls["n"] == 2      # exactly the sticky budget, no more
+
+
+def test_transient_budget_is_bounded(monkeypatch):
+    """Not-charging must not mean retrying forever on a permanently dead pool."""
+    import apps.worker.ops_live as ops_live_mod
+
+    calls = {"n": 0}
+
+    class _AlwaysDead(_FakeSession):
+        def browser_login(self, *a, **k):
+            calls["n"] += 1
+            raise RuntimeError("Page.goto: net::ERR_CONNECTION_CLOSED")
+
+    monkeypatch.setattr(ops_live_mod, "get_session", lambda **kw: _AlwaysDead())
+    ops = _make_ops(cfg=_cfg(STICKY_RETRY_MAX=2, LOGIN_TRANSIENT_RETRY_MAX=3))
+    ops._backoff = lambda n: None
+    ops._request_proxy_rotation = lambda phase=None: None
+
+    assert ops._sticky_login_attempts(ops.cfg.login.sticky_retry_max) is False
+    assert calls["n"] == 5      # 3 transient (uncharged) + 2 sticky, then give up
