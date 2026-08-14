@@ -53,6 +53,7 @@ from .auth import (
     verify_password,
 )
 from libs.bus import Bus, connect
+from libs.engine import vendor_env
 from libs.bus.names import EVENT_STREAM, notified_key, respawn_key
 from libs.domain.enums import WorkerStatus, WorkerSubstate
 from libs.domain.settings import resolve
@@ -212,8 +213,25 @@ def _launch_worker_fleet(worker_ids: list[str], *, jitter_secs: float = 0.0) -> 
             wid = futs[fut]
             try:
                 fut.result()
-            except Exception:
+            except Exception as e:
+                # Record WHY, don't just count it. Confirmed live 2026-08-14: two workers on a
+                # 7-worker booking sat at READY forever while the other five ran. Their launches had
+                # raised (proxy lease exhausting its health-probe budget, which raises BEFORE spawn
+                # and so correctly leaves the worker READY and relaunchable) -- but the exception
+                # was swallowed here and the `failed` list discarded by the caller, so there was no
+                # log line, no event, and no field on the row saying anything at all. The operator
+                # saw "ready" and had no way to learn more.
                 failed.append(wid)
+                reason = getattr(e, "detail", None) or f"{e.__class__.__name__}: {e}"
+                logger.warning("worker %s failed to launch: %s", wid, reason)
+                db = SessionLocal()
+                try:
+                    w = db.get(M.Worker, wid)
+                    if w is not None:
+                        w.substate_detail = f"launch failed: {str(reason)[:200]}"
+                        db.commit()
+                finally:
+                    db.close()
     return failed
 
 
@@ -350,6 +368,16 @@ async def lifespan(app: FastAPI):
         # here rather than in Supervisor's own constructor.
         running_ids = [w.id for w in db.scalars(
             select(M.Worker).where(M.Worker.status == WorkerStatus.RUNNING)).all()]
+        # The Hub runs the vendored browser too -- libs/proxies/health.py's check_proxy, called by
+        # lease_proxy on every live launch and by EventHub's proxy_request handler. It read the
+        # vendor's env defaults (NAV_TIMEOUT_SCALE=1.0, anti-detect entirely off) while the WORKERS
+        # that would use those very proxies ran at the operator's configured settings -- so the Hub
+        # screened with a harsher instrument than the one doing the real work, and every false
+        # negative set is_healthy=False, which _candidate_query filters on, permanently removing a
+        # good proxy from the pool. Applied from the GLOBAL layer: process-wide env can't be
+        # per-booking, and global is the layer that isn't a per-run choice.
+        exported = vendor_env.apply(get_global(db))
+        logger.info("vendor env applied for Hub-side proxy probes: %s", exported)
         db.close()
         supervisor.reconcile({wid: "apps.worker" for wid in running_ids})
     except Exception:

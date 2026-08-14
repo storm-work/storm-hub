@@ -419,3 +419,45 @@ def test_detaching_frees_the_identity_for_another_booking(client):
                        headers=h).json()["id"]
     assert client.post(f"/bookings/{bid2}/identities",
                        json={"identity_id": held}, headers=h).status_code == 201
+
+
+# ── launch failures must be recorded (confirmed live 2026-08-14) ──────────────
+def test_a_failed_launch_records_the_reason_on_the_worker(client, monkeypatch):
+    """Two workers on a 7-worker booking sat at READY forever while five ran. Their launches had
+    raised (proxy lease exhausting its health-probe budget -- which raises BEFORE spawn, correctly
+    leaving the worker READY and relaunchable) but the exception was swallowed and the `failed` list
+    discarded: no log, no event, no field on the row. The operator saw "ready" and nothing else."""
+    import apps.hub.main as hub_main
+
+    h = _operate_headers(client)
+    bid, wid = _bk_with_worker(client, h)
+
+    def _boom(db, w):
+        raise HTTPException(409, f"worker {w.id}: no free soax proxy available (pool exhausted)")
+
+    from fastapi import HTTPException
+    monkeypatch.setattr(hub_main, "_do_launch_worker", _boom)
+
+    failed = hub_main._launch_worker_fleet([wid])
+
+    assert failed == [wid]
+    row = _row(client, wid)
+    assert row["status"] == WorkerStatus.READY            # still relaunchable, as before
+    assert "launch failed" in row["detail"]
+    assert "pool exhausted" in row["detail"]              # and it says WHY
+
+
+def test_hub_applies_vendor_env_for_its_own_proxy_probes():
+    """check_proxy runs in the HUB, so the Hub must apply the same vendor settings as the workers.
+    It didn't: proxies were screened at NAV_TIMEOUT_SCALE=1.0 with anti-detect off, harsher than the
+    workers that would use them -- and each false negative set is_healthy=False, which
+    _candidate_query filters on, permanently dropping a good proxy from the pool."""
+    import os
+
+    from libs.engine import vendor_env
+
+    for k in ("NAV_TIMEOUT_SCALE", "STEALTH_HARDEN"):
+        os.environ.pop(k, None)
+    exported = vendor_env.apply({"NAV_TIMEOUT_SCALE": 4.0, "STEALTH_HARDEN": True, "IGNORED": "x"})
+    assert exported == {"NAV_TIMEOUT_SCALE": "4", "STEALTH_HARDEN": "1"}
+    assert os.environ["NAV_TIMEOUT_SCALE"] == "4"
