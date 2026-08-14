@@ -223,3 +223,56 @@ def test_scouts_invalid_defaults_false_when_absent():
     bus.send_command("w1", "assign", slot={"id": "s1"})
     sig.wait_assignment(timeout=2)
     assert sig.scouts_invalid() is False
+
+
+# ── a signal delivered outside its own wait must not be lost (2026-08-14) ─────
+def test_slot_open_delivered_during_warmup_is_not_lost():
+    """A signal is sent to each worker ONCE: the Hub marks it notified after a confirmed send and
+    _latch_signals skips it forever after. But _drain acks the whole batch regardless of which
+    wait_* is running, so a slot_open arriving while the worker was still logging in used to be
+    acked and dropped -- and the worker then waited in await_slot_open for a signal that had
+    already been delivered and would never be re-sent. Confirmed live: scouts stuck HOLDING while
+    the booking was already past slot-found."""
+    bus = _bus()
+    sig = BusSignals(bus, "w1", "c1")
+    bus.send_command("w1", "signal", name="slot_open")
+
+    sig.wait_launch(timeout=1)              # some OTHER wait consumes the batch first
+    assert sig.slot_open_seen is True
+
+    assert sig.wait_slot_open(timeout=1) == "slot_open"   # still honoured, no re-send needed
+
+
+def test_inactivate_clears_the_sticky_slot_open():
+    """The false-slot-open revert ends the window; a genuinely new one must be signalled again."""
+    bus = _bus()
+    sig = BusSignals(bus, "w1", "c1")
+    bus.send_command("w1", "signal", name="slot_open")
+    sig.wait_slot_open(timeout=1)
+    assert sig.slot_open_seen is True
+
+    bus.send_command("w1", "signal", name="inactivate")
+    sig.wait_discover_task(timeout=1)
+    assert sig.slot_open_seen is False
+    assert sig.wait_slot_open(timeout=1) == "timeout"     # waits for a real new window
+
+
+def test_every_signal_the_hub_sends_survives_arriving_out_of_band():
+    """Guard for the whole class. _drain acks everything it reads, so ANY command type the Hub
+    sends must either be recorded stickily or stashed -- otherwise it is silently destroyed when it
+    arrives while a different wait_* is running. Three separate live bugs came from this
+    (assign, slot_open, and the discover special_days payload)."""
+    for name, check in (("slot_open", lambda s: s.slot_open_seen),
+                        ("slot_found", lambda s: s.slot_found_seen),
+                        ("inactivate", lambda s: s.inactivated)):
+        bus = _bus()
+        sig = BusSignals(bus, "w1", "c1")
+        bus.send_command("w1", "signal", name=name)
+        sig.wait_launch(timeout=1)          # deliberately the WRONG wait for this signal
+        assert check(sig), f"{name} was destroyed by an unrelated wait_*"
+
+    bus = _bus()
+    sig = BusSignals(bus, "w1", "c1")
+    bus.send_command("w1", "assign", slot={"date": "2026-09-01", "period": 3})
+    sig.wait_launch(timeout=1)
+    assert sig.pending_assignment == {"date": "2026-09-01", "period": 3}

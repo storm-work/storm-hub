@@ -32,6 +32,8 @@ from libs.domain.enums import (
     IdentityStatus,
     SessionPurpose,
     SessionStatus,
+    SlotLeaseOutcome,
+    SlotStatus,
     UserRole,
 )
 from libs.domain.enums import SettingsLayer as L
@@ -1808,6 +1810,26 @@ def start_booking(booking_id: str, db: Session = Depends(get_db),
         bk.started_at = _now()
         bk.slot_open_fired_at = None
         bk.slot_found_fired_at = None
+        # Retire the previous run's discovered slots. They are per-run observations of a portal that
+        # has moved on, and leaving them AVAILABLE makes the scheduler fire slot_found on the very
+        # next tick -- confirmed live 2026-08-14: booking Test2 restarted at 08:44:22 and had
+        # slot_open AND slot_found stamped at 08:44:25, the same instant, purely because 24 slots
+        # from the prior run were still sitting in the table. The run skipped the entire slot-open
+        # discovery phase on stale data.
+        #
+        # CLOSED, not deleted: SlotStatus.CLOSED already means "no longer believed present" and
+        # reopens on rediscovery, so this keeps the history (and any BookedAppointment FK) intact
+        # while making the pool empty as far as _fire_slot_found_if_new and _assign_slots care.
+        # TAKEN is left alone -- that is a real booking, not an observation.
+        stale_slots = db.scalars(select(M.Slot).where(
+            M.Slot.booking_id == booking_id,
+            M.Slot.status.notin_([SlotStatus.TAKEN, SlotStatus.CLOSED]))).all()
+        for slot in stale_slots:
+            for lease in db.scalars(select(M.SlotLease).where(
+                    M.SlotLease.slot_id == slot.id, M.SlotLease.released_at.is_(None))).all():
+                lease.released_at = _now()
+                lease.outcome = SlotLeaseOutcome.EXPIRED
+            slot.status = SlotStatus.CLOSED
         for signal_name in ("slot_open", "slot_found"):
             try:
                 _bus.r.delete(notified_key(booking_id, signal_name))

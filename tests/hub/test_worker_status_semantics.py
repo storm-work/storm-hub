@@ -32,6 +32,7 @@ from apps.hub.db import get_db
 from apps.hub.main import app
 from libs.db import metadata
 from libs.db import models as M
+from libs.domain.enums import SlotStatus as M_SlotStatus
 from libs.domain.enums import WorkerStatus, WorkerSubstate
 from libs.domain.state_machines import can_worker_action
 
@@ -496,3 +497,54 @@ def test_put_settings_still_replaces_wholesale(client):
 
     got = client.get(f"/bookings/{bid}", headers=h).json()["settings_json"]
     assert got == {"PROXY_PROVIDER": "webshare"}     # CAL_START_DATE deliberately cleared
+
+
+# ── a fresh run must not inherit the previous run's slots ─────────────────────
+def test_start_closes_the_previous_runs_slots(client):
+    """Confirmed live 2026-08-14: booking Test2 restarted at 08:44:22 and had slot_open AND
+    slot_found stamped at 08:44:25 -- the same instant -- purely because 24 slots from the prior run
+    were still AVAILABLE, so _fire_slot_found_if_new fired on the next tick. The run skipped the
+    entire slot-open discovery phase on stale observations."""
+    h = _operate_headers(client)
+    bid, wid = _bk_with_worker(client, h)
+    db = client._Session()
+    try:
+        db.add(M.Slot(booking_id=bid, posto_id="5084", date="2026-09-01", period=1,
+                      status=M_SlotStatus.AVAILABLE))
+        db.add(M.Slot(booking_id=bid, posto_id="5084", date="2026-09-02", period=2,
+                      status=M_SlotStatus.TAKEN))       # a real booking -- must survive
+        db.commit()
+    finally:
+        db.close()
+
+    client.post(f"/bookings/{bid}/start", headers=h)
+
+    db = client._Session()
+    try:
+        statuses = sorted(str(s.status) for s in
+                          db.scalars(select(M.Slot).where(M.Slot.booking_id == bid)).all())
+    finally:
+        db.close()
+    assert statuses == ["closed", "taken"]     # observation retired, real booking untouched
+
+
+def test_start_releases_leases_on_the_slots_it_closes(client):
+    h = _operate_headers(client)
+    bid, wid = _bk_with_worker(client, h)
+    db = client._Session()
+    try:
+        slot = M.Slot(booking_id=bid, posto_id="5084", date="2026-09-01", period=1,
+                      status=M_SlotStatus.LEASED)
+        db.add(slot); db.commit()
+        db.add(M.SlotLease(slot_id=slot.id, worker_id=wid)); db.commit()
+    finally:
+        db.close()
+
+    client.post(f"/bookings/{bid}/start", headers=h)
+
+    db = client._Session()
+    try:
+        assert not db.scalars(select(M.SlotLease).where(
+            M.SlotLease.released_at.is_(None))).all()
+    finally:
+        db.close()

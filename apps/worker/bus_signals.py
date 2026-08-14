@@ -44,6 +44,7 @@ class BusSignals:
         # a session blip is worth burning a re-login over (storm-auto's LOOSE HOLD rule: before
         # slot_found there's nothing to book, so a proxy/conn flicker must never cost a re-login).
         self.slot_found_seen = False
+        self.slot_open_seen = False
         # Set by an `inactivate` signal (the Hub's false-slot-open revert). Passively observed in
         # _drain like slot_found_seen, so whichever wait_* call happens to see the batch records it.
         self.inactivated = False
@@ -70,6 +71,17 @@ class BusSignals:
         msgs = self.bus.read_commands(self.wid, self.consumer, block_ms=block_ms)
         for m in msgs:
             self.bus.ack_command(self.wid, m.id)
+            if m.type == "signal" and m.payload.get("name") == "slot_open":
+                # STICKY, like slot_found_seen. A signal is only ever sent once per worker: the Hub
+                # marks it notified after a confirmed send and _latch_signals then skips it forever.
+                # But _drain acks the WHOLE batch regardless of which wait_* is currently running,
+                # so a slot_open arriving while the worker was still logging in/warming up -- which
+                # is exactly what happens when slot_open_at is already in the past at launch -- was
+                # acked and dropped. The worker then reached await_slot_open() and waited forever
+                # for a signal that had already been delivered and would never be re-sent.
+                # Confirmed live 2026-08-14: scouts stuck in HOLDING while the booking was already
+                # past slot-found. Same class as the `assign` drop fixed earlier the same day.
+                self.slot_open_seen = True
             if m.type == "signal" and m.payload.get("name") == "slot_found":
                 self.slot_found_seen = True
             if m.type == "assign":
@@ -84,6 +96,7 @@ class BusSignals:
                 # scout that saw one in a PREVIOUS (now-inactivated) window doesn't skip loose-hold
                 # protection in the new one.
                 self.slot_found_seen = False
+                self.slot_open_seen = False   # the window is over; a new one must be signalled again
         return msgs
 
     def wait_launch(self, timeout: float = 3600) -> dict | None:
@@ -112,6 +125,9 @@ class BusSignals:
         heartbeat log line for sim), and must never let "timeout" escape to the phase machine, which
         doesn't handle it (that was the original bug: an unhandled "timeout" fell through as if
         slot_open had fired). Looping-until-stop lives one layer up now, wrapped around a real action."""
+        # Already delivered while some other wait_* was running -- see _drain.
+        if self.slot_open_seen:
+            return "slot_open"
         deadline = time.time() + timeout
         while time.time() < deadline and not self.stopped:
             for m in self._drain():
@@ -120,6 +136,8 @@ class BusSignals:
                 if m.type in ("stop", "shutdown"):
                     self.stopped = True
                     return "stop"
+            if self.slot_open_seen:
+                return "slot_open"
         return "timeout"
 
     def wait_assignment(self, timeout: float = 900):
