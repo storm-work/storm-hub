@@ -149,9 +149,14 @@ WORKER_SUBSTATE_TRANSITIONS = {
                                            WorkerSubstate.DISCOVERING, WorkerSubstate.FAILED}),
     WorkerSubstate.SWAPPED:     frozenset({WorkerSubstate.HOLDING, WorkerSubstate.DISCOVERING,
                                            WorkerSubstate.FAILED}),
+    # HOLDING -> LOGGING_IN added 2026-08-14: a held worker whose apply bounced to the questionnaire
+    # page has a lapsed server-side workflow anchor, and past REWARM_MAX_ATTEMPTS only a fresh login
+    # rebuilds it. That re-login happens IN-PROCESS on the same worker -- it is a first-class part of
+    # the hold loop, not a failure -- so it must not have to route through FAILED to be legal.
     WorkerSubstate.HOLDING:     frozenset({WorkerSubstate.HOLDING, WorkerSubstate.DISCOVERING,
                                            WorkerSubstate.POLLING, WorkerSubstate.APPLYING,
-                                           WorkerSubstate.WARMING_UP, WorkerSubstate.FAILED}),
+                                           WorkerSubstate.WARMING_UP, WorkerSubstate.LOGGING_IN,
+                                           WorkerSubstate.FAILED}),
     WorkerSubstate.DISCOVERING: frozenset({WorkerSubstate.POLLING, WorkerSubstate.APPLYING,
                                            WorkerSubstate.HOLDING, WorkerSubstate.DISCOVERING,
                                            WorkerSubstate.FAILED}),

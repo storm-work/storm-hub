@@ -1112,3 +1112,111 @@ def test_drive_scouts_does_not_retire_dates_before_slot_found(db):
     db.commit()
     sched._drive_scouts(db, bk, sample_dates=["d1", "d2", "d3"])
     assert sorted(sum(sched._scout_pools[bk.id].remaining_by_scout.values(), [])) == ["d1", "d2", "d3"]
+
+
+# ── false-slot-FOUND revert (operator spec 2026-08-14) ────────────────────────
+# "even when there are some slots found - but they may be false positive. so if applying keeps being
+# failed then regard the slots as false, and revert to hold phase. wipe out the slots and slot-found
+# signal state, then make scouts to be at slot-open phase."
+def _bounced_pool(db, bk, worker, *, n_bounces, since):
+    """A slot pool whose leases all came back BOUNCED after slot_found fired."""
+    from libs.domain.enums import SlotLeaseOutcome
+    slots = []
+    for i in range(max(1, n_bounces)):
+        # (date, period) must stay unique -- slots has a UNIQUE(booking_id, date, period)
+        s = M.Slot(booking_id=bk.id, posto_id="5084", date=f"2026-09-{i // 4 + 1:02d}",
+                   period=i % 4 + 1, status=SlotStatus.AVAILABLE)
+        db.add(s); slots.append(s)
+    db.commit()
+    for i in range(n_bounces):
+        db.add(M.SlotLease(slot_id=slots[i].id, worker_id=worker.id,
+                           leased_at=since, released_at=since + timedelta(seconds=10 + i),
+                           outcome=SlotLeaseOutcome.BOUNCED))
+    db.commit()
+    return slots
+
+
+def test_false_slot_found_wipes_the_pool_and_returns_scouts_to_the_slot_open_phase(db):
+    bus = _FakeBus()
+    redis = fakeredis.FakeStrictRedis(decode_responses=True)
+    sched = _scheduler(bus=bus, redis_client=redis)
+    found_at = NOW - timedelta(minutes=10)
+    bk = _make_booking(db, slot_open_fired_at=NOW - timedelta(minutes=30),
+                       slot_found_fired_at=found_at,
+                       settings_json={"FALSE_SLOT_BOUNCE_LIMIT": 5})
+    ident = _make_identity(db)
+    w = _make_worker(db, bk, ident, role=WorkerRole.SCOUT)
+    _bounced_pool(db, bk, w, n_bounces=5, since=found_at)
+    redis.sadd(notified_key(bk.id, "slot_open"), w.id)
+    redis.sadd(notified_key(bk.id, "slot_found"), w.id)
+    sched._scout_pools[bk.id] = orch.ScoutPoolState()
+
+    assert sched._maybe_revert_false_slot_found(db, bk, NOW) is True
+
+    # the pool is wiped...
+    assert {s.status for s in db.scalars(select(M.Slot)).all()} == {SlotStatus.CLOSED}
+    # ...the slot-found signal state is gone, Hub-side and worker-side...
+    assert bk.slot_found_fired_at is None
+    assert (w.id, "signal", {"name": "inactivate"}) in bus.sent
+    assert redis.smembers(notified_key(bk.id, "slot_found")) == set()
+    # ...and the scouts land back in the SLOT-OPEN phase, not in warming: slot_open stays fired and
+    # its notified-set is cleared so _latch_signals re-delivers it after `inactivate` cleared the
+    # worker-side latch.
+    assert bk.slot_open_fired_at is not None
+    assert bk.status == BookingStatus.RUNNING
+    assert redis.smembers(notified_key(bk.id, "slot_open")) == set()
+    assert bk.id not in sched._scout_pools          # back to cheap single-mode polling
+
+
+def test_false_slot_found_does_not_fire_below_the_bounce_limit(db):
+    sched = _scheduler(bus=_FakeBus())
+    found_at = NOW - timedelta(minutes=10)
+    bk = _make_booking(db, slot_found_fired_at=found_at,
+                       settings_json={"FALSE_SLOT_BOUNCE_LIMIT": 5})
+    w = _make_worker(db, bk, _make_identity(db))
+    _bounced_pool(db, bk, w, n_bounces=4, since=found_at)
+
+    assert sched._maybe_revert_false_slot_found(db, bk, NOW) is False
+    assert bk.slot_found_fired_at == found_at
+    assert {s.status for s in db.scalars(select(M.Slot)).all()} == {SlotStatus.AVAILABLE}
+
+
+def test_false_slot_found_never_fires_once_something_was_actually_booked(db):
+    """A real booking proves the pool was real, however many other periods bounced."""
+    sched = _scheduler(bus=_FakeBus())
+    found_at = NOW - timedelta(minutes=10)
+    bk = _make_booking(db, slot_found_fired_at=found_at,
+                       settings_json={"FALSE_SLOT_BOUNCE_LIMIT": 5})
+    ident = _make_identity(db)
+    w = _make_worker(db, bk, ident)
+    _bounced_pool(db, bk, w, n_bounces=20, since=found_at)
+    sub = M.SubAccount(identity_id=ident.id, username="u1", password="p1")
+    db.add(sub); db.commit()
+    db.add(M.BookedAppointment(booking_id=bk.id, identity_id=ident.id, sub_account_id=sub.id))
+    db.commit()
+
+    assert sched._maybe_revert_false_slot_found(db, bk, NOW) is False
+
+
+def test_false_slot_found_ignores_bounces_from_a_previous_found_window(db):
+    """The count window restarts at each slot_found -- stale bounces from an earlier, already-
+    reverted window must not instantly re-trip the revert on the next genuine find."""
+    sched = _scheduler(bus=_FakeBus())
+    old_window = NOW - timedelta(hours=3)
+    bk = _make_booking(db, slot_found_fired_at=NOW - timedelta(minutes=1),
+                       settings_json={"FALSE_SLOT_BOUNCE_LIMIT": 5})
+    w = _make_worker(db, bk, _make_identity(db))
+    _bounced_pool(db, bk, w, n_bounces=20, since=old_window)
+
+    assert sched._maybe_revert_false_slot_found(db, bk, NOW) is False
+
+
+def test_false_slot_found_disabled_by_zero_setting(db):
+    sched = _scheduler(bus=_FakeBus())
+    found_at = NOW - timedelta(minutes=10)
+    bk = _make_booking(db, slot_found_fired_at=found_at,
+                       settings_json={"FALSE_SLOT_BOUNCE_LIMIT": 0})
+    w = _make_worker(db, bk, _make_identity(db))
+    _bounced_pool(db, bk, w, n_bounces=50, since=found_at)
+
+    assert sched._maybe_revert_false_slot_found(db, bk, NOW) is False

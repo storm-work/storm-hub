@@ -207,6 +207,10 @@ _BOOKING = [
        note="consecutive portal-down signals before RedisBreaker trips"),
     _s("BREAKER_COOLDOWN", L.BOOKING, float, 120.0, group="guards", min_value=1.0),
     _s("APPLY_MAX_ATTEMPTS", L.BOOKING, int, 5, group="guards"),
+    # Consecutive apply bounces across the fleet after which the Hub stops believing its own slot
+    # pool. Operator's call 2026-08-14: "even when there are some slots found - they may be false
+    # positive. if applying keeps being failed then regard the slots as false, and revert to hold."
+    _s("FALSE_SLOT_BOUNCE_LIMIT", L.BOOKING, int, 12, group="guards"),
     _s("WORKER_STALL_TIMEOUT", L.BOOKING, float, 1500.0, group="guards", min_value=1.0,
        note="no events from a worker longer than this -> reaped as stalled"),
     _s("REDIS_STREAM_MAXLEN", L.BOOKING, int, 200, group="guards",
@@ -242,7 +246,14 @@ _TEMPLATE = [
     _s("QUEST_STEP_GAP", L.TEMPLATE, float, 0.0, _WRK, "login_resilience"),
     _s("WARMUP_MAX_ATTEMPTS", L.TEMPLATE, int, 6, _WRK, "login_resilience"),
     _s("PARTIAL_RENDER_RETRIES", L.TEMPLATE, int, 3, _WRK, "login_resilience"),
-    _s("REWARM_MAX_ATTEMPTS", L.TEMPLATE, int, 3, _WRK, "login_resilience"),
+    # Wired 2026-08-14 (was inert since it was written -- nothing read it). This is storm-auto's
+    # MAX_FORM_STALE_REWARMS: a bounce to the questionnaire/home page means the server-side workflow
+    # anchor lapsed, NOT that the slot is gone, so the fix is a re-warm rather than a re-POST.
+    # Default corrected 3 -> 1 to match the proven value: abc5 (storm-auto, 2026-07-23) showed
+    # re-warm is UNRELIABLE on a long-held session -- replaying steps 2-6 yields Formulario
+    # "Session lost" en masse (852x in one run) and only a FRESH LOGIN rebuilds the anchor. So the
+    # ladder is: re-warm once, then re-login IN-PROCESS. Neither step ever ends the process.
+    _s("REWARM_MAX_ATTEMPTS", L.TEMPLATE, int, 1, _WRK, "login_resilience"),
     _s("REWARM_EXPIRED_CAP", L.TEMPLATE, int, 0, _WRK, "login_resilience"),
     # Keepalive
     _s("KEEPALIVE_INTERVAL", L.TEMPLATE, float, 900.0, _WRK, "keepalive", min_value=1.0),

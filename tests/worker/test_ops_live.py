@@ -434,10 +434,27 @@ def test_classify_submit_response_comprovativo_without_bounce_is_booked():
     assert LiveEngineOps._classify_submit_response(html) == "booked"
 
 
-def test_classify_submit_response_bounced_to_questionario_is_not_booked():
-    # Even with "comprovativo" somewhere, a bounce-back marker means NOT confirmed.
+def test_classify_submit_response_bounced_to_questionario_is_form_stale_not_booked():
+    """Even with "comprovativo" somewhere, a bounce-back marker means NOT confirmed -- and WHICH
+    bounce it is decides the caller's next move. A questionnaire bounce is storm-auto's `form_stale`:
+    the server-side workflow anchor lapsed but THE SLOT IS STILL REAL, so the worker must re-warm and
+    retry the same slot rather than release it (which would poison the pool and wrongly feed the
+    Hub's false-slot counter). Confirmed live 2026-08-14 -- this is the single most common bounce."""
     html = "<html>questionario comprovativo</html>"
-    assert LiveEngineOps._classify_submit_response(html) == "bounced"
+    assert LiveEngineOps._classify_submit_response(html) == "form_stale"
+
+
+def test_classify_submit_response_bounced_to_slots_page_is_no_slot():
+    """The other bounce: back on the schedule/slots page means someone took it (or it was never
+    real). The session is fine -- hand the slot back and ask for another."""
+    assert LiveEngineOps._classify_submit_response("<html>getSlots</html>") == "no_slot"
+    assert LiveEngineOps._classify_submit_response("<html>captchaDiv</html>") == "no_slot"
+
+
+def test_classify_submit_response_unrecognised_bounce_stays_generic():
+    """An unclassified non-confirmation must not be silently promoted to form_stale -- that would
+    make the worker cling to a slot it has no evidence is real."""
+    assert LiveEngineOps._classify_submit_response("<html>something else</html>") == "bounced"
 
 
 def test_classify_submit_response_error_keyword_is_not_booked():

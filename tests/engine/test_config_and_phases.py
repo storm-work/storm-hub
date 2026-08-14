@@ -48,11 +48,15 @@ def test_apply_books_assigned_slot():
     assert WorkerSubstate.APPLYING in res.visited
 
 
-def test_apply_holds_when_no_assignment_and_scouts_valid():
-    ops = SimEngineOps(assignment=None, scouts_invalid=False)
+def test_apply_with_no_assignment_holds_indefinitely_instead_of_terminating():
+    """An empty assignment queue is what HOLDING is FOR -- it is not a failure and it is never a
+    reason to discard a warm authed session. The worker must sit in HOLDING and keep re-asking; the
+    only thing that ends the run is the operator stop the sim models via stop_after_polls."""
+    ops = SimEngineOps(assignment=None, scouts_invalid=False, stop_after_polls=4)
     res = PhaseMachine(_cfg(ROLE="apply"), ops).run()
-    assert res.outcome == "held"
-    assert "do_apply" not in dir(ops) or True   # never booked
+    assert res.outcome == "stopped"              # NOT "held" -- holding is not an ending
+    assert ops.applied == 0                      # never booked, never even tried
+    assert res.final_substate == WorkerSubstate.HOLDING
     assert WorkerSubstate.APPLYING not in res.visited
 
 
@@ -202,14 +206,61 @@ def test_apply_retries_on_the_same_warm_session_after_a_bounce():
     applied once, bounced back to `questionario` -- and the process EXITED, so hold-respawn paid the
     whole login+warmup again for the next single attempt. The login wall and the CAPTCHA solve are
     the scarce resources; portal traffic is not. A bounced worker still holds a valid warm session
-    and must go back for another assignment."""
-    ops = SimEngineOps(assignment={"date": "d1", "period": 3}, apply_outcome="bounced")
-    res = PhaseMachine(_cfg(booking={"APPLY_MAX_ATTEMPTS": 3}, ROLE="apply"), ops).run()
+    and must keep using it until the operator stops it."""
+    ops = SimEngineOps(assignment={"date": "d1", "period": 3}, apply_outcome="no_slot",
+                       stop_after_polls=6)
+    res = PhaseMachine(_cfg(ROLE="apply"), ops).run()
 
-    assert res.outcome == "held"
-    assert "3x" in res.detail                    # spent the whole budget...
-    assert ops.applied == 3                      # ...on three real attempts, one login
-    assert ops.released == 3                     # each bounce hands the slot back
+    assert res.outcome == "stopped"              # bouncing never ends the run by itself
+    assert ops.applied > 1                       # many attempts bought by ONE login
+    assert ops.released == ops.applied           # every bounce hands its slot back
+
+
+def test_apply_form_stale_rewarms_in_process_and_keeps_the_same_slot():
+    """storm-auto's confirmed contract: a bounce to the questionnaire/home page means the workflow
+    anchor lapsed, NOT that the slot is gone. Re-POSTing is futile -- re-warm and retry the SAME
+    slot. Critically the slot is NOT released: it is still real, so handing it back would poison
+    the pool and feed the Hub's false-slot counter with a session-level problem."""
+    ops = SimEngineOps(assignment={"date": "d1", "period": 3},
+                       apply_outcome=["form_stale", "booked"], stop_after_polls=6)
+    res = PhaseMachine(_cfg(ROLE="apply", REWARM_MAX_ATTEMPTS=2), ops).run()
+
+    assert res.outcome == "booked"
+    assert ops.applied == 2                      # bounced once, retried, booked on the retry
+    assert ops.released == 0                     # the real slot was never handed back
+    assert ops.logins == 1                       # and it cost NO new login
+    # No extra warm here on purpose: LiveEngineOps.do_apply re-warms at the top of every attempt, so
+    # the retry IS the re-warm. Warming again in the loop would replay steps 2-6 twice (abc5).
+    assert ops.warmups == 1
+
+
+def test_apply_form_stale_escalates_to_a_fresh_login_in_process():
+    """Past REWARM_MAX_ATTEMPTS a re-warm alone has stopped working and only a fresh login rebuilds
+    the server-side anchor (storm-auto abc5). That re-login happens IN-PROCESS -- same worker, same
+    proxy, same slot -- and is still not a process exit."""
+    ops = SimEngineOps(assignment={"date": "d1", "period": 3},
+                       apply_outcome=["form_stale", "booked"], stop_after_polls=6)
+    res = PhaseMachine(_cfg(ROLE="apply", REWARM_MAX_ATTEMPTS=1), ops).run()
+
+    assert res.outcome == "booked"
+    assert ops.logins == 2                       # the escalation fired...
+    assert ops.released == 0                     # ...without ever giving up the slot
+
+
+def test_apply_parks_after_a_bounce_storm_instead_of_churning_the_pool():
+    """storm-auto soak10: one degraded session bounced ~28 good slots off the shared pool. Past
+    APPLY_MAX_ATTEMPTS consecutive bounces the worker parks -- keeps its session, backs off -- so it
+    cannot manufacture the bounce volume that would convince the Hub its real slots are false."""
+    ops = SimEngineOps(assignment={"date": "d1", "period": 3}, apply_outcome="no_slot",
+                       stop_after_polls=12)
+    details: list[str] = []
+    res = PhaseMachine(_cfg(booking={"APPLY_MAX_ATTEMPTS": 2}, ROLE="apply"), ops,
+                       on_transition=lambda sub, detail: details.append(detail)).run()
+
+    assert res.outcome == "stopped"
+    assert [d for d in details if d.startswith("parked:")], f"never parked; details={details}"
+    # parking must cost poll gaps, not slots: far fewer bounces than an unparked run would produce
+    assert ops.released < 12
 
 
 def test_apply_stops_at_the_first_booking():
@@ -221,8 +272,10 @@ def test_apply_stops_at_the_first_booking():
 
 
 def test_apply_bounce_releases_the_slot_so_the_worker_stays_assignable():
-    """The lease must be handed back on each bounce -- otherwise _assign_slots' one-active-lease
-    rule leaves the worker warm and idle until SLOT_LEASE_TTL reclaims it minutes later."""
-    ops = SimEngineOps(assignment={"date": "d1", "period": 3}, apply_outcome="bounced")
-    PhaseMachine(_cfg(booking={"APPLY_MAX_ATTEMPTS": 1}, ROLE="apply"), ops).run()
-    assert ops.released == 1
+    """The lease must be handed back on each no_slot bounce -- otherwise _assign_slots'
+    one-active-lease rule leaves the worker warm and idle until SLOT_LEASE_TTL reclaims it minutes
+    later. (form_stale is the deliberate exception: that slot is still real, see above.)"""
+    ops = SimEngineOps(assignment={"date": "d1", "period": 3}, apply_outcome="no_slot",
+                       stop_after_polls=2)
+    PhaseMachine(_cfg(ROLE="apply"), ops).run()
+    assert ops.released >= 1

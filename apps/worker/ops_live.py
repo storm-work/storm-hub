@@ -75,6 +75,15 @@ _CSRF_RE_ALT = re.compile(
 # batch_apply.py apply_book) -- see do_apply()'s docstring for the full reasoning.
 _ERROR_KEYWORDS = ("indisponivel", "unavailable", "bd_problm")
 _BOUNCE_KEYWORDS = ("questionario", "getslots", "captchadiv", "authentication.jsp")
+# storm-auto's confirmed apply_book contract distinguishes two very different bounces, and treating
+# them alike is what made a bounce look terminal here:
+#   form_stale -- landed back on the questionnaire / home dashboard / auth page. The server-side
+#                 workflow anchor lapsed. THE SLOT IS STILL REAL. Re-POSTing is futile; the fix is a
+#                 RE-WARM (and, if that keeps failing, a fresh login) and then retry the SAME slot.
+#   no_slot    -- landed back on the schedule form / slots page. Somebody else took it, or every
+#                 period is leased. The session is fine; ask for a different slot.
+_FORM_STALE_MARKERS = ("questionario", "authentication.jsp")
+_NO_SLOT_MARKERS = ("getslots", "captchadiv")
 
 # storm-auto bounds its equivalent restore<->re-warm chain with MAX_WARMUP_RESTORES=3 ("a session
 # whose re-warm keeps bouncing to home can't churn fresh proxies forever"). Mirrored here as the
@@ -952,14 +961,15 @@ class LiveEngineOps(EngineOps):
 
             outcome = self._classify_submit_response(html)
             if outcome != "booked":
+                self._last_apply_outcome = outcome
                 # Confirmed live 2026-08-14: this returned silently. A holding applier went
                 # `-> applying` then `-> holding` 43s later with terminal "apply bounced" and NOT ONE
                 # log line in between, so there was no way to tell a rejected slot from a bounced
                 # session from a WAF page. The submit response is the single most important thing
                 # this worker does; its rejection must always say why.
-                self._log(f"do_apply: submit NOT confirmed -- {_submit_bounce_reason(html)} "
-                          f"| slot={slot} | final_url={_final_url}")
-                return "bounced"
+                self._log(f"do_apply: submit NOT confirmed [{outcome}] -- "
+                          f"{_submit_bounce_reason(html)} | slot={slot} | final_url={_final_url}")
+                return outcome
 
             try:
                 pdf = self.session.submit_form_binary(action_contains="MostrarPdf", timeout=45)
@@ -990,7 +1000,14 @@ class LiveEngineOps(EngineOps):
         has_error_kw = any(kw in low for kw in _ERROR_KEYWORDS)
         bounced_back = any(kw in low for kw in _BOUNCE_KEYWORDS)
         confirmed = has_pdf_form or (has_confirm and not bounced_back and not has_error_kw)
-        return "booked" if confirmed else "bounced"
+        if confirmed:
+            return "booked"
+        # Which KIND of bounce -- the caller's next move depends entirely on this.
+        if any(kw in low for kw in _FORM_STALE_MARKERS):
+            return "form_stale"
+        if any(kw in low for kw in _NO_SLOT_MARKERS):
+            return "no_slot"
+        return "bounced"      # unclassified: treated as no_slot by the caller, but logged as-is
 
     def _save_pdf(self, body: bytes) -> str:
         """Persist a confirmed booking's PDF to local disk (same var/ convention as checkpoints --

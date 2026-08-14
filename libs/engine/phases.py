@@ -35,6 +35,11 @@ from .config import EngineConfig
 # (the established direction) rather than libs reaching into apps.
 INACTIVATE = object()
 
+# How many poll gaps a worker sits out when it parks (see PhaseMachine._park). Deliberately a small
+# constant rather than a setting: it is a back-off shape, not an operator knob, and every unit of it
+# is a poll_gap() carrying the enforced minimum floor.
+_PARK_POLL_GAPS = 3
+
 
 def _flatten_found(results: list[dict]) -> list[dict]:
     """do_discover's per-date outcome list -> a flat list of {"date","period"} found slots
@@ -186,6 +191,16 @@ class PhaseMachine:
         return PhaseResult("discovered", self._sub, f"pushed {pushed_total}", self.visited)
 
     # ── apply: hold -> await assignment -> book; fallback self-scout ──────────
+    def _park(self, why: str) -> None:
+        """Session-preserving back-off. Keeps the authed session and the proxy; just stops this
+        worker consuming (and bouncing) pooled slots for a few poll gaps. Paced entirely by
+        poll_gap(), which carries the enforced minimum floor -- never a bare sleep."""
+        self._to(WorkerSubstate.HOLDING, detail=f"parked: {why}")
+        for _ in range(_PARK_POLL_GAPS):
+            if self.ops.is_stopped():
+                return
+            self.ops.poll_gap()
+
     def _run_apply(self) -> PhaseResult:
         # apply holds through slot-open, awaiting assignment. See _run_scout's comment above --
         # "stopped" (-> WorkerStatus.STOPPED) must never be reported as "held" (-> FAILED, which
@@ -202,17 +217,45 @@ class PhaseMachine:
         if not self.ops.slot_found_seen():
             if self.ops.await_slot_open() == "stop":
                 return PhaseResult("stopped", self._sub, "stopped before slot_open", self.visited)
-        # A bounce must NOT end the run. Confirmed live 2026-08-14 (DANYA ISABEL VIEIRA SILVA):
-        # 90s to log in, 59s to warm, held 4.5 minutes, applied once, bounced back to `questionario`
-        # -- and the process exited, so hold-respawn had to pay the whole login+warmup again for the
-        # next single attempt. A bounced worker still holds a valid warm session; the login wall and
-        # the CAPTCHA solve are the scarce resources, not portal traffic. Loop back to awaiting an
-        # assignment instead, bounded by APPLY_MAX_ATTEMPTS -- which has sat in the settings catalog
-        # since it was written, read by nothing, describing exactly this.
-        max_attempts = max(1, int(self.cfg.raw.get("APPLY_MAX_ATTEMPTS", 5)))
+        # A bounce must NEVER end the run, and must never cost the warm session. Operator, 2026-08-14:
+        # "each process should keep running just retying, rewarm - against the failures. logged in
+        # auth session is very precious - why close the process for a failure?"
+        #
+        # This is storm-auto's confirmed apply_book contract, which distinguishes two bounces that
+        # this file used to flatten into one terminal "held":
+        #   form_stale -- back on the questionnaire/home/auth page. The server-side workflow anchor
+        #                 lapsed; THE SLOT IS STILL REAL. Re-POSTing is futile -- RE-WARM (and, past
+        #                 REWARM_MAX_ATTEMPTS, re-login) IN-PROCESS, then retry the SAME slot.
+        #   no_slot    -- back on the schedule/slots page. Someone took it, or it was never real.
+        #                 The session is fine: hand the slot back and ask for another.
+        # Neither outcome ends the process. The login wall and the CAPTCHA solve are the scarce
+        # resources; portal traffic is not. The only terminal states here are booked, an operator
+        # stop, and a session that cannot be rebuilt even by a fresh login.
+        #
+        # PACING: every non-productive path through this loop MUST hit poll_gap(). An unthrottled
+        # retry loop is precisely the shape that produced the 66-minute/740k-row runaway that cost
+        # this project four days of work -- see the HOLD_POLL_GAP: 0.0 finding.
+        max_rewarms = max(1, int(self.cfg.raw.get("REWARM_MAX_ATTEMPTS", 1)))
+        # storm-auto's MAX_CONSECUTIVE_BOUNCES + SESSION_PRESERVING_FANOUT, and the reason
+        # APPLY_MAX_ATTEMPTS still earns its place now that it no longer bounds the process's life:
+        # many DISTINCT slots bouncing in a row means THIS session is degraded, not that the slots
+        # are taken. soak10 (storm-auto): one broken session bounced ~28 good slots off the shared
+        # pool. So past the limit the worker PARKS -- keeps its session, backs off, re-polls -- which
+        # is strictly gentler than a re-login and stops it churning the pool.
+        #
+        # This also protects the Hub's false-slot revert below from drawing the wrong conclusion: a
+        # single degraded session must not be able to manufacture the bounce volume that convinces
+        # the Hub its genuinely-real slots are false.
+        max_bounces = max(1, int(self.cfg.raw.get("APPLY_MAX_ATTEMPTS", 5)))
         attempts = 0
+        stale_streak = 0
+        bounce_streak = 0
+        slot = None                      # a form_stale retry KEEPS its slot across iterations
         while True:
-            slot = self.ops.await_assignment()
+            if self.ops.is_stopped():
+                return PhaseResult("stopped", self._sub, "stopped while holding", self.visited)
+            if slot is None:
+                slot = self.ops.await_assignment()
             if slot is None and self.ops.is_stopped():
                 return PhaseResult("stopped", self._sub, "stopped while awaiting assignment",
                                    self.visited)
@@ -227,9 +270,11 @@ class PhaseMachine:
                 found = _flatten_found(self.ops.do_discover(dates))
                 slot = found[0] if found else None
             if slot is None:
-                detail = (f"no slot assigned after {attempts} apply attempt(s)" if attempts
-                          else "no slot assigned")
-                return PhaseResult("held", self._sub, detail, self.visited)
+                # Nothing to apply right now. That is what HOLDING is for -- it is not a failure and
+                # it is emphatically not a reason to discard a warm authed session. Wait and re-ask.
+                self._to(WorkerSubstate.HOLDING)
+                self.ops.poll_gap()
+                continue
 
             self._to(WorkerSubstate.APPLYING)
             if self.cfg.no_book:
@@ -241,10 +286,49 @@ class PhaseMachine:
                 self._to(WorkerSubstate.BOOKED)
                 return PhaseResult("booked", self._sub, str(slot), self.visited)
 
-            # Hand the slot back so another worker can try it, and so the orchestrator will assign
-            # this one something new -- it still holds the lease until told otherwise.
+            if outcome == "form_stale":
+                # The slot is still real -- keep it and rebuild the session around it.
+                #
+                # Note what this branch does NOT do: it does not re-warm. do_apply already runs the
+                # questionnaire->Formulario->ScheduleController->Schedule.jsp chain at the top of
+                # every attempt, so simply retrying the same slot IS the re-warm -- one warm per
+                # attempt, exactly like storm-auto's outer loop + _ensure_form_state(). Adding an
+                # explicit warm here would replay steps 2-6 twice per retry, which is the very
+                # sequence abc5 showed yields Formulario "Session lost" en masse.
+                #
+                # What the loop CAN do that do_apply can't is escalate: past REWARM_MAX_ATTEMPTS a
+                # re-warm demonstrably isn't rebuilding the anchor and only a fresh login will.
+                bounce_streak = 0
+                stale_streak += 1
+                if stale_streak >= max_rewarms:
+                    stale_streak = 0
+                    self._to(WorkerSubstate.HOLDING,
+                             detail="form_stale: re-login in place (re-warm not rebuilding anchor)")
+                    self._to(WorkerSubstate.LOGGING_IN)
+                    if not self.ops.do_login():
+                        # Even here the slot is handed back rather than hoarded -- this session is
+                        # done, but the slot may still be good for somebody else.
+                        self.ops.release_slot(slot)
+                        return self._fail("form_stale re-login")
+                    self._to(WorkerSubstate.LOGGED_IN)
+                    self._to(WorkerSubstate.WARMING_UP)
+                    if not self.ops.do_warmup():
+                        self.ops.release_slot(slot)
+                        return self._fail("form_stale re-warm after re-login")
+                    self._to(WorkerSubstate.WARMED)
+                self._to(WorkerSubstate.HOLDING, detail=f"form_stale: retrying slot {slot}")
+                self.ops.poll_gap()
+                continue             # retry the SAME slot -- do_apply re-warms on the way in
+
+            # no_slot / bounced: hand the lease back so another worker can try it and so the
+            # orchestrator will assign this one something new. The Hub counts these releases -- past
+            # FALSE_SLOT_BOUNCE_LIMIT it stops believing the pool and reverts the whole booking.
             self.ops.release_slot(slot)
+            slot = None
+            stale_streak = 0
+            bounce_streak += 1
             self._to(WorkerSubstate.HOLDING)
-            if attempts >= max_attempts:
-                return PhaseResult("held", self._sub,
-                                   f"apply bounced {attempts}x (APPLY_MAX_ATTEMPTS)", self.visited)
+            if bounce_streak >= max_bounces:
+                bounce_streak = 0
+                self._park(f"{max_bounces} consecutive bounces")
+            self.ops.poll_gap()

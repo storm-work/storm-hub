@@ -20,7 +20,9 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import func, select
+import logging
+
+from sqlalchemy import func, select, update
 
 from libs.db import models as M
 from libs.bus.names import notified_key
@@ -28,6 +30,8 @@ from libs.domain.enums import (
     BookingStatus, SlotLeaseOutcome, SlotStatus, WorkerRole, WorkerStatus, WorkerSubstate,
 )
 from libs.engine import orchestration, pool_manager
+
+logger = logging.getLogger(__name__)
 
 
 def plan_booking_actions(status: str, warmup_start_at, slot_open_at, now: datetime) -> list[str]:
@@ -117,6 +121,8 @@ class Scheduler:
                     self._fire_slot_found_if_new(db, bk, now)
                     if self._maybe_inactivate_slot_open(db, bk, now):
                         continue   # reverted to WARMING -- no discovery/assignment work this tick
+                    if self._maybe_revert_false_slot_found(db, bk, now):
+                        continue   # pool declared false -- don't assign the slots we just wiped
                     self._assign_slots(db, bk)
                     self._drive_scouts(db, bk)
                     self._maybe_self_scout(db, bk, now)
@@ -365,6 +371,82 @@ class Scheduler:
         with no carried-over slices/strike-counts/awakened set. Called by the Hub's start_booking
         (every start is a fresh run) and internally by the false-slot-open revert."""
         self._scout_pools.pop(booking_id, None)
+
+    def _maybe_revert_false_slot_found(self, db, bk: M.Booking, now: datetime) -> bool:
+        """False-slot-FOUND revert (operator spec 2026-08-14). The mirror of
+        _maybe_inactivate_slot_open: that one handles "slot-open fired but nothing was ever found",
+        this one handles "slots WERE found, but every attempt to book them bounces".
+
+        The operator's reasoning, from the field: "even when there are some slots found - but they
+        may be false positive. so if applying keeps being failed then regard the slots as false, and
+        revert to hold phase. wipe out the slots and slot-found signal state, then make scouts to be
+        at slot-open phase." This matches what the portal actually does -- most postos permanently
+        advertise 3-4 phantom periods that cannot be booked by anyone.
+
+        Fires when, since slot_found_fired_at, the fleet has accumulated FALSE_SLOT_BOUNCE_LIMIT
+        bounced leases and booked NOTHING. Note what protects this from a false conclusion: a single
+        degraded session parks itself after APPLY_MAX_ATTEMPTS consecutive bounces (phases._park), so
+        the volume counted here has to come from the pool being bad rather than one bad worker.
+
+        Reverting keeps slot_open_fired_at set -- the scouts belong in the slot-open phase, cheaply
+        polling in single mode, not in the full-fan-out discovery that a slot-found implies. Returns
+        True if it reverted."""
+        if bk.slot_found_fired_at is None:
+            return False
+        limit = int(self._effective_booking_setting(db, bk, "FALSE_SLOT_BOUNCE_LIMIT", 12))
+        if limit <= 0:
+            return False
+        since = bk.slot_found_fired_at
+
+        # Anything actually booked in this window means the slots were real -- never revert.
+        booked = db.scalar(select(M.BookedAppointment.id)
+                           .where(M.BookedAppointment.booking_id == bk.id).limit(1))
+        if booked:
+            return False
+
+        bounces = db.scalar(
+            select(func.count(M.SlotLease.id))
+            .join(M.Slot, M.SlotLease.slot_id == M.Slot.id)
+            .where(M.Slot.booking_id == bk.id,
+                   M.SlotLease.outcome == SlotLeaseOutcome.BOUNCED,
+                   M.SlotLease.released_at.is_not(None),
+                   M.SlotLease.released_at >= since)) or 0
+        if bounces < limit:
+            return False
+
+        # 1. Wipe the pool. CLOSED rather than deleted so the history survives -- and so a genuine
+        #    rediscovery can still reopen it (_persist_slots does CLOSED -> AVAILABLE) if the portal
+        #    starts advertising something real.
+        db.execute(update(M.Slot)
+                   .where(M.Slot.booking_id == bk.id,
+                          M.Slot.status.in_([SlotStatus.AVAILABLE, SlotStatus.LEASED]))
+                   .values(status=SlotStatus.CLOSED))
+
+        # 2. Wipe the slot-found signal state, Hub-side and worker-side. `inactivate` is the proven
+        #    path for the worker half: it clears BOTH sticky latches, so no scout keeps behaving as
+        #    though the found-phase is still on.
+        bk.slot_found_fired_at = None
+        running = db.scalars(select(M.Worker).where(
+            M.Worker.booking_id == bk.id, M.Worker.status == WorkerStatus.RUNNING)).all()
+        if self._bus is not None:
+            for w in running:
+                try:
+                    self._bus.send_command(w.id, "signal", name="inactivate")
+                except Exception:
+                    pass
+        if self._redis is not None:
+            # Drop both notified-sets: slot_found so a genuinely new find re-reaches everyone, and
+            # slot_open so _latch_signals re-delivers the still-active open that `inactivate` just
+            # cleared worker-side -- which is what puts the scouts back in the slot-open phase.
+            for signal_name in ("slot_open", "slot_found"):
+                self._redis.delete(notified_key(bk.id, signal_name))
+
+        # 3. Scouts back to cheap single-mode polling. slot_open_fired_at stays set on purpose.
+        self.reset_scout_pool(bk.id)
+        logger.warning("booking %s: %d bounced leases and no booking since slot_found -- treating the "
+                    "slot pool as false positives; wiped %s slots, reverted to the slot-open phase",
+                    bk.id, bounces, "available/leased")
+        return True
 
     def _maybe_inactivate_slot_open(self, db, bk: M.Booking, now: datetime) -> bool:
         """False-slot-open guard (operator spec 2026-08-14): "if there are no slots during slot-open

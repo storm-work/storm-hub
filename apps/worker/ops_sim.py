@@ -25,7 +25,12 @@ class SimEngineOps(EngineOps):
         discover_outcomes: dict[str, dict] | None = None,
         assignment: dict | None = None,   # apply: slot handed by the orchestrator (None = none)
         scouts_invalid: bool = False,     # apply fallback trigger
-        apply_outcome: str = "booked",
+        apply_outcome: str | list[str] = "booked",   # str, or a scripted sequence (last repeats)
+        # The apply loop is deliberately NON-terminating now (a warm authed session is never thrown
+        # away over a bounce or an empty queue -- see phases._run_apply), so a sim run has to model
+        # the thing that actually ends it in production: an operator stop. Bounded generously enough
+        # that no legitimate scripted scenario trips it by accident.
+        stop_after_polls: int | None = 8,
         step_delay: float = 0.0,
         signals=None,                     # BusSignals: block on real slot-open/assign commands
         emit=None,                        # callable(type, **payload): emit an event (e.g. slots_found)
@@ -42,11 +47,19 @@ class SimEngineOps(EngineOps):
         self._task_idx = 0
         self._assignment = assignment
         self._scouts_invalid = scouts_invalid
-        self._apply_outcome = apply_outcome
+        self._apply_outcomes = ([apply_outcome] if isinstance(apply_outcome, str)
+                                else list(apply_outcome))
+        self._stop_after_polls = stop_after_polls
+        self._polls = 0
+        self._stopped = False
         # Counters for the apply-retry loop (phases.py): a bounced worker keeps its warm session
         # and comes back for another assignment, so 'how many attempts did one login buy' matters.
         self.applied = 0
         self.released = 0
+        # The re-warm ladder (form_stale -> re-warm -> re-login) must be observable: the whole point
+        # is that it costs warmups, not process restarts and not new logins.
+        self.logins = 0
+        self.warmups = 0
         self._delay = step_delay
         self._signals = signals
         self._emit = emit
@@ -59,10 +72,10 @@ class SimEngineOps(EngineOps):
 
     # shared
     def do_login(self) -> bool:
-        self._pause(); return self._login_ok
+        self._pause(); self.logins += 1; return self._login_ok
 
     def do_warmup(self) -> bool:
-        self._pause(); return self._warmup_ok
+        self._pause(); self.warmups += 1; return self._warmup_ok
 
     def do_swap(self) -> str | None:
         self._pause(); return self._swap_ip
@@ -111,6 +124,9 @@ class SimEngineOps(EngineOps):
 
     def poll_gap(self) -> None:
         self._pause()
+        self._polls += 1
+        if self._stop_after_polls is not None and self._polls >= self._stop_after_polls:
+            self._stopped = True
 
     # apply
     def await_assignment(self) -> dict | None:
@@ -139,9 +155,13 @@ class SimEngineOps(EngineOps):
         return self._scouts_invalid
 
     def is_stopped(self) -> bool:
+        if self._stopped:
+            return True
         return self._signals is not None and self._signals.stopped
 
     def do_apply(self, slot: dict) -> str:
         self._pause()
         self.applied += 1
-        return self._apply_outcome
+        # Scripted sequence: consume in order, then repeat the last entry forever.
+        i = min(self.applied - 1, len(self._apply_outcomes) - 1)
+        return self._apply_outcomes[i]
