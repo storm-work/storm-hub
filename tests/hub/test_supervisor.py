@@ -120,3 +120,26 @@ def test_reconcile_leaves_a_genuinely_dead_worker_untracked():
     sup.reconcile({"nonexistent-worker-id": "apps.worker"})
     assert sup.is_running("nonexistent-worker-id") is False
     assert "nonexistent-worker-id" not in sup._pids
+
+
+def test_worker_output_is_captured_to_a_log_file(tmp_path, monkeypatch):
+    """Worker stdout/stderr went to DEVNULL, discarding every diagnostic the VENDORED engine prints
+    -- and those are the only place some of the portal's own words appear. When browser_login
+    bounces, session.py prints `[session] auth-redirect error: <the portal's message>` plus the page
+    snippet; the worker's own log_line events never carry it, so "login_failed_auth_redirect" was as
+    much as anyone could learn about 160 failures in one day."""
+    import apps.hub.supervisor as sup_mod
+
+    monkeypatch.setattr(sup_mod, "_LOG_DIR", tmp_path)
+    s = sup_mod.Supervisor("redis://localhost:6379/0")
+    monkeypatch.setattr(sup_mod.sys, "executable", "/bin/echo")
+
+    pid = s._spawn_module("w-abc", "apps.worker")
+    assert pid > 0
+    for _ in range(50):
+        f = tmp_path / "worker-w-abc.log"
+        if f.exists() and f.stat().st_size:
+            break
+        time.sleep(0.05)
+    body = (tmp_path / "worker-w-abc.log").read_text()
+    assert "apps.worker" in body and "w-abc" in body   # echo wrote the argv we passed

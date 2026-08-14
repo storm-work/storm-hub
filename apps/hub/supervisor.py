@@ -21,6 +21,7 @@ import time
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parents[2]
+_LOG_DIR = _ROOT / "var" / "worker-logs"
 
 
 def _descendant_pids(pid: int) -> list[int]:
@@ -129,14 +130,29 @@ class Supervisor:
         if existing_pid is not None and _alive(existing_pid):
             return existing_pid
         env = {**os.environ, "REDIS_URL": self.redis_url}
+        # Worker stdout/stderr used to go to DEVNULL, which threw away every diagnostic the VENDORED
+        # engine prints -- and those are the only place some of the portal's own words appear. When
+        # browser_login bounces, session.py prints `[session] auth-redirect error: <the portal's own
+        # message>` and the surrounding page snippet; the worker's own log_line events never carry
+        # it, so "login_failed_auth_redirect" was as much as anyone could ever learn. Same for
+        # `[session] ANTIDETECT flags`, the browser-mode line, and the solver's per-provider trace.
+        # Kept per worker so a single run's file can be read straight through.
+        log_path = _LOG_DIR / f"{module.rsplit('.', 1)[-1]}-{key}.log"
+        try:
+            _LOG_DIR.mkdir(parents=True, exist_ok=True)
+            sink = open(log_path, "ab", buffering=0)
+        except OSError:
+            sink = subprocess.DEVNULL   # never let logging failure stop a launch
         proc = subprocess.Popen(
             [sys.executable, "-m", module, key],
             cwd=str(_ROOT),
             env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=sink,
+            stderr=subprocess.STDOUT,
             start_new_session=True,   # own process group so kill_tree is clean
         )
+        if sink is not subprocess.DEVNULL:
+            sink.close()   # the child holds its own dup; the parent must not keep this fd open
         self._procs[key] = proc
         self._pids[key] = proc.pid
         return proc.pid
