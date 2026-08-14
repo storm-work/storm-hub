@@ -633,13 +633,40 @@ function derivePoolOptions(proxyRows) {
 // immediately on change (no separate Save button), matching the "quick access, not a form" framing
 // of a shortcut. The full grouped-by-category editor (every booking-settable key) lives in the
 // Settings tab (BookingFullSettingsPanel) instead of duplicating a raw-JSON escape hatch here.
+// Keep a settings editor in sync with the server WITHOUT destroying unsaved edits.
+//
+// Both settings panels used `useEffect(..., [booking.id, booking.settings_json])` to re-seed local
+// state. `booking.settings_json` is a fresh object on every fetch, so the dep compares unequal by
+// reference even when the content is byte-identical -- which was harmless while /bookings only
+// refetched on an explicit action, and became destructive the moment it started polling every 5s
+// (2026-08-14). An operator typing a date had it wiped from under them within five seconds, so the
+// value was never in the form when they hit Save, and the setting "wouldn't stick".
+//
+// Rules: switching booking always re-seeds. Otherwise the server only re-seeds while the form is
+// CLEAN -- an in-progress edit outranks a background refresh, and `dirty` clears on save.
+function useServerSyncedSettings(booking) {
+  const [settings, setSettings] = useState(() => ({ ...(booking.settings_json || {}) }));
+  const [dirty, setDirty] = useState(false);
+  const serverJson = JSON.stringify(booking.settings_json || {});
+  const bookingId = booking.id;
+  useEffect(() => { setSettings({ ...(booking.settings_json || {}) }); setDirty(false); },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [bookingId]);
+  useEffect(() => {
+    if (dirty) return;                       // never clobber what the operator is typing
+    setSettings({ ...JSON.parse(serverJson) });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [serverJson]);
+  const edit = (updater) => { setDirty(true); setSettings(updater); };
+  return { settings, setSettings, edit, dirty, markClean: () => setDirty(false) };
+}
+
+
 function BookingShortcutSettings({ me, booking, onSaved }) {
   const proxies = useList("/proxies");
-  const [settings, setSettings] = useState({ ...(booking.settings_json || {}) });
+  const { settings, setSettings } = useServerSyncedSettings(booking);
   const [msg, setMsg] = useState("");
   const op = me.is_operating;
-
-  useEffect(() => { setSettings({ ...(booking.settings_json || {}) }); }, [booking.id, booking.settings_json]);
 
   const pools = derivePoolOptions(proxies.rows);
   const poolValue = (provider, kind) => `${provider}|${kind}`;
@@ -814,12 +841,11 @@ const _SETTING_GROUP_ORDER = {
 
 function BookingFullSettingsPanel({ me, booking, onSaved }) {
   const [catalog, setCatalog] = useState(null);
-  const [settings, setSettings] = useState({ ...(booking.settings_json || {}) });
+  const { settings, edit, dirty, markClean } = useServerSyncedSettings(booking);
   const [msg, setMsg] = useState("");
   const op = me.is_operating;
 
   useEffect(() => { api("/settings/catalog").then((c) => setCatalog(c.booking || [])).catch(() => setCatalog([])); }, []);
-  useEffect(() => { setSettings({ ...(booking.settings_json || {}) }); }, [booking.id, booking.settings_json]);
 
   if (catalog === null) return <div className="muted">Loading settings…</div>;
 
@@ -834,12 +860,16 @@ function BookingFullSettingsPanel({ me, booking, onSaved }) {
   // undefined (not null/""/0/false) means "no override, unset" -- JSON.stringify drops undefined
   // keys, so saving with a cleared field removes that override and falls back to the true default,
   // rather than persisting a copy of whatever the default happened to be when the tab was opened.
-  function setField(key, value) { setSettings((prev) => ({ ...prev, [key]: value })); }
+  function setField(key, value) { edit((prev) => ({ ...prev, [key]: value })); }
 
   async function save() {
     setMsg("");
-    try { await api(`/bookings/${booking.id}`, { method: "PUT", body: { settings } }); onSaved(); setMsg("saved"); }
-    catch (e) { setMsg(e.message); }
+    try {
+      await api(`/bookings/${booking.id}`, { method: "PUT", body: { settings } });
+      markClean();          // re-enable server sync now that our edits are persisted
+      onSaved();
+      setMsg("saved");
+    } catch (e) { setMsg(e.message); }
   }
 
   return (
@@ -889,7 +919,12 @@ function BookingFullSettingsPanel({ me, booking, onSaved }) {
           </div>
         </details>
       ))}
-      <button className="btn" disabled={!op} onClick={save} style={{ width: "100%", marginTop: 8 }}>Save settings</button>
+      <button className="btn" disabled={!op} onClick={save} style={{ width: "100%", marginTop: 8 }}>
+        {dirty ? "Save settings (unsaved changes)" : "Save settings"}
+      </button>
+      {dirty && <div className="muted" style={{ fontSize: 12, marginTop: 4 }}>
+        Unsaved edits — this form has stopped refreshing from the server until you save.
+      </div>}
     </>
   );
 }
