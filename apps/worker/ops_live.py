@@ -959,7 +959,7 @@ class LiveEngineOps(EngineOps):
                     self._breaker.record_portal_down()
                 return "bounced"
 
-            outcome = self._classify_submit_response(html)
+            outcome = self._classify_submit_response(html, _final_url)
             if outcome != "booked":
                 self._last_apply_outcome = outcome
                 # Confirmed live 2026-08-14: this returned silently. A holding applier went
@@ -971,15 +971,26 @@ class LiveEngineOps(EngineOps):
                           f"{_submit_bounce_reason(html)} | slot={slot} | final_url={_final_url}")
                 return outcome
 
+            self._log(f"do_apply: BOOKED slot={slot} | final_url={_final_url}")
             try:
-                pdf = self.session.submit_form_binary(action_contains="MostrarPdf", timeout=45)
-                self._log(f"MostrarPdf: status={pdf.get('status')} len={len(pdf.get('body', b''))}")
-                pdf_body = pdf.get("body") or b""
+                pdf_body = b""
+                if "mostrarpdf" in (_final_url or "").lower():
+                    # Already navigated through -- there is no auto-submit form left on the page, so
+                    # submit_form_binary has nothing to submit. Pull the bytes with an in-page fetch
+                    # instead (same credentialed-same-origin trick _run_warmup_steps uses; a raw
+                    # out-of-browser GET to MostrarPdf is DataDome-403'd).
+                    pdf_body = self._fetch_pdf_in_page(_final_url)
+                    self._log(f"MostrarPdf (already at PDF): len={len(pdf_body)}")
+                else:
+                    pdf = self.session.submit_form_binary(action_contains="MostrarPdf", timeout=45)
+                    self._log(f"MostrarPdf: status={pdf.get('status')} len={len(pdf.get('body', b''))}")
+                    pdf_body = pdf.get("body") or b""
                 if pdf_body and self._emit is not None:
                     pdf_path = self._save_pdf(pdf_body)
                     self._emit("booked_pdf", pdf_path=pdf_path, slot=slot)
             except Exception as e:
-                self._log(f"do_apply: PDF retrieval failed (booking likely still confirmed): {e}")
+                # NEVER let PDF retrieval downgrade the outcome -- the appointment is already made.
+                self._log(f"do_apply: PDF retrieval failed (booking IS confirmed, PDF missing): {e}")
             if self._breaker is not None:
                 self._breaker.record_success()
             return "booked"
@@ -987,19 +998,46 @@ class LiveEngineOps(EngineOps):
             if self._apply_sem is not None:
                 self._apply_sem.release(self.identity_id)
 
+    def _fetch_pdf_in_page(self, url: str) -> bytes:
+        """Read a PDF the browser is already displaying. page.content() only yields Chromium's
+        pdf-viewer shell, so go through a credentialed in-page fetch and base64 the bytes back."""
+        import base64
+        js = ("(async()=>{const r=await fetch(%r,{credentials:'include'});"
+              "if(!r.ok)return '';const b=new Uint8Array(await r.arrayBuffer());"
+              "let s='';const CH=8192;"
+              "for(let i=0;i<b.length;i+=CH){s+=String.fromCharCode.apply(null,b.subarray(i,i+CH));}"
+              "return btoa(s);})()" % url)
+        b64 = self.session.browser_eval(js, timeout=45) or ""
+        return base64.b64decode(b64) if b64 else b""
+
     @staticmethod
-    def _classify_submit_response(html: str) -> str:
+    def _classify_submit_response(html: str, final_url: str = "") -> str:
         """Ported verbatim (logic, not code) from storm-auto's confirmed apply_book classification.
         HTTP 200 is NOT sufficient -- a rejected booking (taken slot, or lapsed form-state) also
         returns 200, but bounces to the questionario/schedule page or the home dashboard instead of
         the confirmation page. The MostrarPdf auto-submit form is the deterministic success signal;
         'comprovativo' is only a secondary positive, gated by no bounce/error markers."""
         low = (html or "").lower()
+        url_low = (final_url or "").lower()
+        # CONFIRMED LIVE 2026-08-14, and it cost a real appointment. SubmeterVistoCriaPDF returns an
+        # HTML page whose <form action="MostrarPdf"> AUTO-SUBMITS via JS. storm-auto reads that
+        # intermediate page, so the "mostrarpdf" string is its success signal. Our browser_form_post
+        # waits for the navigation to SETTLE, so it overshoots: by the time we read outerHTML the
+        # form has already fired and Chrome is rendering the returned PDF, leaving a 174-byte
+        # pdf_embedder shell with no "mostrarpdf" anywhere in it. Worker e5dfc1b1 booked posto 3018
+        # / 2026-09-01 / period 4 at 13:04:02, was told it had bounced, and re-applied that same slot
+        # five more times.
+        #
+        # So landing ON MostrarPdf is success just as decisively as being handed the form that goes
+        # there -- arguably more so, since it means the auto-submit already succeeded.
+        at_pdf_url = "mostrarpdf" in url_low
+        is_pdf_render = "pdf_embedder" in low or low.strip().startswith("%pdf")
         has_pdf_form = "mostrarpdf" in low
         has_confirm = "comprovativo" in low
         has_error_kw = any(kw in low for kw in _ERROR_KEYWORDS)
         bounced_back = any(kw in low for kw in _BOUNCE_KEYWORDS)
-        confirmed = has_pdf_form or (has_confirm and not bounced_back and not has_error_kw)
+        confirmed = (has_pdf_form or at_pdf_url or is_pdf_render
+                     or (has_confirm and not bounced_back and not has_error_kw))
         if confirmed:
             return "booked"
         # Which KIND of bounce -- the caller's next move depends entirely on this.

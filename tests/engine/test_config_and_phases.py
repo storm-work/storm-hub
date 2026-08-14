@@ -279,3 +279,57 @@ def test_apply_bounce_releases_the_slot_so_the_worker_stays_assignable():
                        stop_after_polls=2)
     PhaseMachine(_cfg(ROLE="apply"), ops).run()
     assert ops.released >= 1
+
+
+# ── a slot that resists repeated rebuilt sessions is not "still real" (2026-08-14) ────────────
+def test_apply_abandons_a_slot_that_stays_form_stale_across_rebuilt_sessions():
+    """Confirmed live (e5dfc1b1): the same slot bounced form_stale 5x, each time from a session
+    warmed SEVEN SECONDS earlier -- which no lapsed-anchor story explains. Past
+    FORM_STALE_MAX_PER_SLOT the worker must hand the slot back, both so it stops burning ~5min
+    login+warmup cycles on it and so the Hub's false-slot counter can SEE the failure at all."""
+    ops = SimEngineOps(assignment={"date": "d1", "period": 3}, apply_outcome="form_stale",
+                       stop_after_polls=10)
+    res = PhaseMachine(_cfg(booking={"FORM_STALE_MAX_PER_SLOT": 2}, ROLE="apply",
+                            REWARM_MAX_ATTEMPTS=99), ops).run()
+
+    assert res.outcome == "stopped"          # still never terminates on its own
+    assert ops.released >= 1                 # the slot IS eventually handed back
+    assert ops.applied >= 2
+
+
+def test_apply_still_retries_the_same_slot_below_the_per_slot_cap():
+    """The storm-auto contract survives: a form_stale under the cap keeps the slot and retries."""
+    ops = SimEngineOps(assignment={"date": "d1", "period": 3},
+                       apply_outcome=["form_stale", "booked"], stop_after_polls=8)
+    res = PhaseMachine(_cfg(booking={"FORM_STALE_MAX_PER_SLOT": 3}, ROLE="apply",
+                            REWARM_MAX_ATTEMPTS=99), ops).run()
+    assert res.outcome == "booked"
+    assert ops.released == 0                 # never gave the real slot up
+
+
+# ── a scout whose session dies must rebuild it, not spin (2026-08-14) ─────────────────────────
+def test_scout_rebuilds_its_session_after_consecutive_all_failed_rounds():
+    """Confirmed live (062e6dd6): logged in fine, then every gettime died with "Execution context
+    was destroyed" -- 631 failures over 53 minutes at 0.6s a round -- while the dashboard showed a
+    healthy running/polling. All-failed rounds are a property of the session, not the calendar."""
+    ops = SimEngineOps(
+        discover_tasks=[["d1"], ["d2"], ["d3"], ["d4"]],
+        discover_outcomes={d: {"outcome": "failed"} for d in ("d1", "d2", "d3", "d4")},
+    )
+    res = PhaseMachine(_cfg(booking={"SCOUT_REBUILD_AFTER_FAILED_ROUNDS": 2}, ROLE="scout"), ops).run()
+
+    # 4 all-failed rounds at a cap of 2 = exactly 2 rebuilds, on top of the initial login.
+    assert ops.logins == 3
+    assert ops.warmups == 3
+    assert res.outcome in ("discovered", "stopped")   # never "failed": the rebuild worked
+
+
+def test_scout_does_not_rebuild_while_rounds_are_merely_empty():
+    """"empty" is a real answer about the calendar -- rebuilding on it would re-login endlessly
+    through every quiet period."""
+    ops = SimEngineOps(
+        discover_tasks=[["d1"], ["d2"], ["d3"], ["d4"]],
+        discover_outcomes={d: {"outcome": "empty"} for d in ("d1", "d2", "d3", "d4")},
+    )
+    PhaseMachine(_cfg(booking={"SCOUT_REBUILD_AFTER_FAILED_ROUNDS": 2}, ROLE="scout"), ops).run()
+    assert ops.logins == 1                   # no rebuild

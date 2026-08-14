@@ -159,6 +159,8 @@ class PhaseMachine:
         if self.ops.await_slot_open() == "stop":
             return PhaseResult("stopped", self._sub, "stopped before slot_open", self.visited)
         pushed_total = 0
+        failed_rounds = 0
+        rebuild_after = max(1, int(self.cfg.raw.get("SCOUT_REBUILD_AFTER_FAILED_ROUNDS", 3)))
         while True:
             dates = self.ops.await_discover_task()
             if dates is None:               # orchestrator says stop (booking done / applies closed)
@@ -180,6 +182,23 @@ class PhaseMachine:
                 self.ops.push_slots(found)     # orchestrator fires slot-found on the first push
                 pushed_total += len(found)
             self.ops.report_dates([{"date": r["date"], "outcome": r["outcome"]} for r in results])
+
+            # A round where EVERY date came back "failed" is a session-level problem, not news about
+            # the calendar. Confirmed live 2026-08-14: a scout whose browser page had died span this
+            # loop 631 times over 53 minutes at 0.6s a round (a real gettime takes ~15s), reporting
+            # failures nobody could act on, while the dashboard showed it healthily "polling". Same
+            # bug class as the apply path: a failure that should rebuild the session instead loops.
+            if results and all(r.get("outcome") == "failed" for r in results):
+                failed_rounds += 1
+                if failed_rounds >= rebuild_after:
+                    failed_rounds = 0
+                    self._to(WorkerSubstate.POLLING)
+                    if not self._rebuild_session("discovery failing every round"):
+                        return self._fail("scout session unrecoverable")
+                    continue
+            else:
+                failed_rounds = 0
+
             self._to(WorkerSubstate.POLLING)
             self.ops.poll_gap()
         # dates is None both on an explicit stop and (in unit-test/no-bus-wired mode) on genuinely
@@ -191,6 +210,29 @@ class PhaseMachine:
         return PhaseResult("discovered", self._sub, f"pushed {pushed_total}", self.visited)
 
     # ── apply: hold -> await assignment -> book; fallback self-scout ──────────
+    def _rebuild_session(self, why: str) -> bool:
+        """Rebuild the authed session IN PROCESS: re-login, then re-warm. Used wherever a failure is
+        a property of this session rather than of the portal -- never by exiting, because the login
+        and the CAPTCHA solve are what's actually scarce. Returns False only if even a fresh login
+        can't recover, which is the one genuinely terminal case."""
+        self._to(WorkerSubstate.HOLDING, detail=f"rebuilding session: {why}")
+        self._to(WorkerSubstate.LOGGING_IN)
+        if not self.ops.do_login():
+            return False
+        self._to(WorkerSubstate.LOGGED_IN)
+        self._to(WorkerSubstate.WARMING_UP)
+        if not self.ops.do_warmup():
+            return False
+        self._to(WorkerSubstate.WARMED)
+        self._to(WorkerSubstate.HOLDING)
+        self.ops.poll_gap()
+        return True
+
+    def _log_release(self, slot, why: str) -> None:
+        emit = getattr(self.ops, "_log", None)
+        if callable(emit):
+            emit(f"apply: releasing slot {slot} -- {why}")
+
     def _park(self, why: str) -> None:
         """Session-preserving back-off. Keeps the authed session and the proxy; just stops this
         worker consuming (and bouncing) pooled slots for a few poll gaps. Paced entirely by
@@ -247,15 +289,18 @@ class PhaseMachine:
         # single degraded session must not be able to manufacture the bounce volume that convinces
         # the Hub its genuinely-real slots are false.
         max_bounces = max(1, int(self.cfg.raw.get("APPLY_MAX_ATTEMPTS", 5)))
+        max_stale_per_slot = max(1, int(self.cfg.raw.get("FORM_STALE_MAX_PER_SLOT", 3)))
         attempts = 0
         stale_streak = 0
         bounce_streak = 0
+        slot_stale = 0                   # form_stale bounces against the CURRENT slot
         slot = None                      # a form_stale retry KEEPS its slot across iterations
         while True:
             if self.ops.is_stopped():
                 return PhaseResult("stopped", self._sub, "stopped while holding", self.visited)
             if slot is None:
                 slot = self.ops.await_assignment()
+                slot_stale = 0
             if slot is None and self.ops.is_stopped():
                 return PhaseResult("stopped", self._sub, "stopped while awaiting assignment",
                                    self.visited)
@@ -300,6 +345,25 @@ class PhaseMachine:
                 # re-warm demonstrably isn't rebuilding the anchor and only a fresh login will.
                 bounce_streak = 0
                 stale_streak += 1
+                slot_stale += 1
+                if slot_stale >= max_stale_per_slot:
+                    # This slot has now resisted `max_stale_per_slot` freshly-rebuilt sessions.
+                    # "The slot is still real" is no longer a defensible reading, so hand it back --
+                    # which also, crucially, is the only way the Hub's false-slot counter ever sees
+                    # a form_stale failure. Without this the revert can never fire on the exact
+                    # phantom-slot case it was built for.
+                    self._log_release(slot, f"{slot_stale} form_stale bounces despite re-login")
+                    self.ops.release_slot(slot)
+                    slot = None
+                    slot_stale = 0
+                    stale_streak = 0
+                    bounce_streak += 1
+                    self._to(WorkerSubstate.HOLDING, detail="slot abandoned: repeated form_stale")
+                    if bounce_streak >= max_bounces:
+                        bounce_streak = 0
+                        self._park(f"{max_bounces} consecutive bounces")
+                    self.ops.poll_gap()
+                    continue
                 if stale_streak >= max_rewarms:
                     stale_streak = 0
                     self._to(WorkerSubstate.HOLDING,

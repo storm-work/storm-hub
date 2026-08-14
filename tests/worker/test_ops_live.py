@@ -949,3 +949,43 @@ def test_a_live_checkpoint_still_short_circuits_login(monkeypatch):
     assert ops._try_restore_from_checkpoint() is True
     assert ops._restore_stage == "alive"
     assert cleared == []
+
+
+# ── the false-negative that cost a real appointment (confirmed live 2026-08-14) ───────────────
+_PDF_SHELL = ('<!DOCTYPE html><html><head>\n    <link rel="stylesheet" '
+              'href="chrome-extension://mhjfbmdgcfjbbpaeojofohoefgiehjai/pdf_embedder.css">\n'
+              '  </head>\n  <body>\n    \n  \n\n')
+
+
+def test_landing_on_mostrarpdf_is_booked_even_though_the_body_is_a_pdf_shell():
+    """THE regression. SubmeterVistoCriaPDF returns HTML whose <form action="MostrarPdf">
+    AUTO-SUBMITS via JS. storm-auto reads that intermediate page, so "mostrarpdf" in the body is its
+    success signal. Our browser_form_post waits for the navigation to SETTLE and overshoots it: the
+    form has already fired and Chrome is rendering the PDF, leaving a 174-byte pdf_embedder shell
+    with no "mostrarpdf" in it anywhere.
+
+    Worker e5dfc1b1 booked posto 3018 / 2026-09-01 / period 4 at 13:04:02, was told it had bounced,
+    and re-applied that same slot five more times. Landing ON MostrarPdf is success at least as
+    decisively as holding the form that goes there."""
+    url = "https://pedidodevistos.mne.gov.pt/VistosOnline/MostrarPdf?"
+    assert LiveEngineOps._classify_submit_response(_PDF_SHELL, url) == "booked"
+
+
+def test_a_rendered_pdf_is_booked_even_if_the_final_url_is_unavailable():
+    assert LiveEngineOps._classify_submit_response(_PDF_SHELL, "") == "booked"
+    assert LiveEngineOps._classify_submit_response("%PDF-1.4 ...", "") == "booked"
+
+
+def test_storm_autos_original_signal_still_wins():
+    """The intermediate auto-submit page must keep classifying as booked -- the new URL check is an
+    addition, not a replacement."""
+    assert LiveEngineOps._classify_submit_response(
+        '<form name="frm_1" action="MostrarPdf"></form>', "https://x/SubmeterVistoCriaPDF") == "booked"
+
+
+def test_a_bounce_is_still_a_bounce_when_the_url_is_not_the_pdf():
+    """The URL check must not turn genuine bounces into phantom bookings."""
+    home = "https://pedidodevistos.mne.gov.pt/VistosOnline/"
+    assert LiveEngineOps._classify_submit_response("<html>questionario</html>", home) == "form_stale"
+    assert LiveEngineOps._classify_submit_response("<html>getSlots</html>", home) == "no_slot"
+    assert LiveEngineOps._classify_submit_response("<html>servico indisponivel</html>", home) == "bounced"
