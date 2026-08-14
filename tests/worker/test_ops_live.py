@@ -957,28 +957,30 @@ _PDF_SHELL = ('<!DOCTYPE html><html><head>\n    <link rel="stylesheet" '
               '  </head>\n  <body>\n    \n  \n\n')
 
 
-def test_landing_on_mostrarpdf_is_booked_even_though_the_body_is_a_pdf_shell():
-    """THE regression. SubmeterVistoCriaPDF returns HTML whose <form action="MostrarPdf">
-    AUTO-SUBMITS via JS. storm-auto reads that intermediate page, so "mostrarpdf" in the body is its
-    success signal. Our browser_form_post waits for the navigation to SETTLE and overshoots it: the
-    form has already fired and Chrome is rendering the PDF, leaving a 174-byte pdf_embedder shell
-    with no "mostrarpdf" in it anywhere.
+def test_landing_on_mostrarpdf_is_unresolved_not_booked():
+    """CHECKED AGAINST THE PORTAL 2026-08-14: worker e5dfc1b1 ended at final_url=.../MostrarPdf?
+    with Chrome's pdf-viewer shell, and the account holds NO appointment. So reaching MostrarPdf is
+    NOT a success signal -- it only means browser_form_post overshot the intermediate auto-submit
+    page (it waits for navigation to settle; storm-auto reads that page before the JS fires), which
+    makes the response unclassifiable from the body alone.
 
-    Worker e5dfc1b1 booked posto 3018 / 2026-09-01 / period 4 at 13:04:02, was told it had bounced,
-    and re-applied that same slot five more times. Landing ON MostrarPdf is success at least as
-    decisively as holding the form that goes there."""
+    Guessing "booked" from a URL would invent appointments: workers marked COMPLETED and
+    BookedAppointment rows written for bookings that never happened. storm-auto carries the matching
+    scar from the other direction (a 58KB HTML page once saved as a PDF -- josand5837), and its rule
+    is strict: %PDF magic or nothing."""
     url = "https://pedidodevistos.mne.gov.pt/VistosOnline/MostrarPdf?"
-    assert LiveEngineOps._classify_submit_response(_PDF_SHELL, url) == "booked"
+    assert LiveEngineOps._classify_submit_response(_PDF_SHELL, url) == "verify_pdf"
+    assert LiveEngineOps._classify_submit_response(_PDF_SHELL, "") == "verify_pdf"
 
 
-def test_a_rendered_pdf_is_booked_even_if_the_final_url_is_unavailable():
-    assert LiveEngineOps._classify_submit_response(_PDF_SHELL, "") == "booked"
-    assert LiveEngineOps._classify_submit_response("%PDF-1.4 ...", "") == "booked"
+def test_verify_pdf_is_never_itself_a_booking():
+    """Drift guard: whatever else changes, `verify_pdf` must stay distinct from `booked` -- it means
+    "go prove it", and only real %PDF bytes may promote it."""
+    assert LiveEngineOps._classify_submit_response(_PDF_SHELL, "x/MostrarPdf") != "booked"
 
 
 def test_storm_autos_original_signal_still_wins():
-    """The intermediate auto-submit page must keep classifying as booked -- the new URL check is an
-    addition, not a replacement."""
+    """The intermediate auto-submit page is still the deterministic success signal."""
     assert LiveEngineOps._classify_submit_response(
         '<form name="frm_1" action="MostrarPdf"></form>', "https://x/SubmeterVistoCriaPDF") == "booked"
 
@@ -989,3 +991,52 @@ def test_a_bounce_is_still_a_bounce_when_the_url_is_not_the_pdf():
     assert LiveEngineOps._classify_submit_response("<html>questionario</html>", home) == "form_stale"
     assert LiveEngineOps._classify_submit_response("<html>getSlots</html>", home) == "no_slot"
     assert LiveEngineOps._classify_submit_response("<html>servico indisponivel</html>", home) == "bounced"
+
+
+# ── verify_pdf resolution: only real %PDF bytes may promote a bounce to a booking ─────────────
+class _SubmitSession(_FakeSession):
+    """Session whose SubmeterVistoCriaPDF POST lands on MostrarPdf showing the pdf-viewer shell --
+    the exact 2026-08-14 response -- and whose in-page PDF fetch returns `pdf_bytes`."""
+    def __init__(self, pdf_bytes: bytes):
+        super().__init__()
+        self._pdf = pdf_bytes
+
+    def browser_form_post(self, url, data, timeout=100):
+        return ("https://pedidodevistos.mne.gov.pt/VistosOnline/MostrarPdf?", _PDF_SHELL)
+
+    def browser_eval(self, js, timeout=30):
+        import base64
+        return base64.b64encode(self._pdf).decode()
+
+
+def _apply_ops(pdf_bytes: bytes, events: list):
+    ops = _make_ops(emit=lambda t, **p: events.append((t, p)))
+    ops.session = _SubmitSession(pdf_bytes)
+    ops._run_warmup_steps = lambda: True
+    ops._save_pdf = lambda b: "/tmp/x.pdf"
+    return ops
+
+
+def test_overshoot_promotes_to_booked_only_with_real_pdf_bytes():
+    events = []
+    ops = _apply_ops(b"%PDF-1.4\nreal confirmation document", events)
+    assert ops.do_apply({"date": "2026-09-01", "period": 4}) == "booked"
+    assert any(t == "booked_pdf" for t, _ in events)
+
+
+def test_overshoot_with_no_pdf_is_not_a_booking():
+    """The confirmed 2026-08-14 case: MostrarPdf reached, nothing rendered, no appointment. This
+    must NOT report booked -- inventing a booking is strictly worse than missing one, because the
+    worker completes, the run stops, and a BookedAppointment row is written for nothing."""
+    events = []
+    ops = _apply_ops(b"", events)
+    assert ops.do_apply({"date": "2026-09-01", "period": 4}) != "booked"
+    assert not any(t == "booked_pdf" for t, _ in events)
+
+
+def test_overshoot_with_an_html_page_instead_of_a_pdf_is_not_a_booking():
+    """storm-auto's josand5837 scar, in the new path: a large HTML page is not a PDF."""
+    events = []
+    ops = _apply_ops(b"<!DOCTYPE html><html>" + b"x" * 60000, events)
+    assert ops.do_apply({"date": "2026-09-01", "period": 4}) != "booked"
+    assert not any(t == "booked_pdf" for t, _ in events)
