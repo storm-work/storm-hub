@@ -53,6 +53,9 @@ def screen(targets: dict[str, str], *, check_fn=None, concurrency: int = 6,
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--provider", help="only check this provider (e.g. soax, webshare); default: all")
+    p.add_argument("--force", action="store_true",
+                   help="sweep even while workers are RUNNING (results will reflect contention, "
+                        "not proxy health -- see the refusal message)")
     p.add_argument("--concurrency", type=int, default=6, help="parallel browser probes (default 6)")
     p.add_argument("--timeout", type=float, default=25.0,
                    help="per-proxy nav timeout, seconds (default 25)")
@@ -62,6 +65,7 @@ def main() -> int:
 
     from apps.hub.db import SessionLocal
     from libs.db import models as M
+    from libs.domain import enums as E
     from libs.proxies.health import apply_result
     from libs.proxies.lease import conn_url as build_conn_url
 
@@ -74,6 +78,22 @@ def main() -> int:
         if not proxies:
             print("No active proxies match -- nothing to check.")
             return 0
+
+        # Refuse to sweep while a booking is live. Learned the hard way 2026-08-14: a sweep run
+        # alongside 6 working workers (each driving its own browser at the same portal, from the
+        # same box and often the same proxy subnets) measured soax at 5% healthy when an idle-box
+        # sample minutes earlier measured 67%. Those false negatives are not harmless -- apply_result
+        # writes is_healthy=False, and lease_proxy's _candidate_query filters on is_healthy, so a
+        # contended sweep silently REMOVES good proxies from the leasable pool. A health number is
+        # only meaningful when nothing else is competing for the same egress.
+        running = db.scalars(
+            select(M.Worker).where(M.Worker.status == E.WorkerStatus.RUNNING)).all()
+        if running and not args.force:
+            print(f"REFUSING: {len(running)} worker(s) are RUNNING. A sweep run against a live "
+                  f"booking measures contention, not proxy health, and writes the result back to "
+                  f"the pool.\nStop the booking first, or pass --force if you accept that.",
+                  file=sys.stderr)
+            return 2
 
         targets = {pr.id: build_conn_url(pr) for pr in proxies}
         print(f"Checking {len(targets)} active proxy(ies), concurrency={args.concurrency}, "
