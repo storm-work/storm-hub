@@ -1050,13 +1050,7 @@ function BookingWorkers({ me, booking, events, setRightPanel }) {
                 </td>
               </tr>
               {logsFor === w.id && (
-                <tr><td colSpan={6}>
-                  <div style={{ background: "var(--panel2)", border: "1px solid var(--border)", borderRadius: 8,
-                               padding: 8, maxHeight: 220, overflowY: "auto", fontFamily: "monospace", fontSize: 12 }}>
-                    {(live.logs && live.logs.length) ? live.logs.map((l, i) => <div key={i}>{l}</div>)
-                      : <span className="muted">no log lines received over the WS yet for this worker</span>}
-                  </div>
-                </td></tr>
+                <tr><td colSpan={6}><WorkerLog workerId={w.id} liveLogs={live.logs} /></td></tr>
               )}
             </React.Fragment>
           );
@@ -1066,6 +1060,44 @@ function BookingWorkers({ me, booking, events, setRightPanel }) {
     </>
   );
 }
+
+// Per-worker log: seeded from the Hub's replay of the shared event stream, then extended with
+// whatever arrives live over the WS. The view used to be WS-ONLY, so a worker that did its work
+// before the tab connected showed "no log lines received over the WS yet" while its whole history
+// sat in Redis -- i.e. the log was blank exactly when you needed it to explain something that had
+// already happened.
+function WorkerLog({ workerId, liveLogs }) {
+  const [history, setHistory] = useState(null);   // null = still loading
+  const [err, setErr] = useState("");
+  useEffect(() => {
+    let alive = true;
+    api(`/workers/${workerId}/logs`)
+      .then((r) => { if (alive) setHistory((r.lines || []).map((l) => l.text)); })
+      .catch((e) => { if (alive) { setHistory([]); setErr(e.message); } });
+    return () => { alive = false; };
+  }, [workerId]);
+
+  // The tail of `history` and the head of `liveLogs` overlap for a worker that was already emitting
+  // when the tab connected -- drop live lines already present at the end of history.
+  const hist = history || [];
+  const live = liveLogs || [];
+  let overlap = 0;
+  for (let n = Math.min(hist.length, live.length); n > 0; n--) {
+    if (hist.slice(-n).join("\u0000") === live.slice(0, n).join("\u0000")) { overlap = n; break; }
+  }
+  const lines = [...hist, ...live.slice(overlap)];
+
+  return (
+    <div style={{ background: "var(--panel2)", border: "1px solid var(--border)", borderRadius: 8,
+                  padding: 8, maxHeight: 220, overflowY: "auto", fontFamily: "monospace", fontSize: 12 }}>
+      {err && <div className="err">could not load history: {err}</div>}
+      {history === null ? <span className="muted">loading log…</span>
+        : lines.length ? lines.map((l, i) => <div key={i}>{l}</div>)
+        : <span className="muted">no log lines for this worker yet</span>}
+    </div>
+  );
+}
+
 
 function AttachPanel({ me, booking, identities, templates, attached, onAttached }) {
   const [q, setQ] = useState("");

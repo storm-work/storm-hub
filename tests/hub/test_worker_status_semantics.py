@@ -332,3 +332,29 @@ def test_start_clears_the_in_flight_flag_even_if_the_launch_raises(client, monke
             break
         time.sleep(0.05)
     assert bid not in hub_main._launching
+
+
+# ── worker log replay (confirmed live 2026-08-14) ─────────────────────────────
+def test_worker_logs_replays_history_from_the_event_stream(client):
+    """Worker logs were WS-only: a worker that did its work before the tab connected showed "no log
+    lines received over the WS yet" while its whole history sat in Redis. Oldest-first, and terminal
+    events are included so a failure reason is visible in the same view."""
+    import apps.hub.main as hub_main
+
+    h = _operate_headers(client)
+    bid, wid = _bk_with_worker(client, h)
+
+    hub_main._bus.emit_event(wid, "log_line", text="-> logging_in")
+    hub_main._bus.emit_event(wid, "log_line", text="-> warmed")
+    hub_main._bus.emit_event(wid, "terminal", outcome="held", detail="no slot assigned")
+    hub_main._bus.emit_event("someone-else", "log_line", text="not mine")
+
+    r = client.get(f"/workers/{wid}/logs", headers=h)
+    assert r.status_code == 200
+    texts = [l["text"] for l in r.json()["lines"]]
+    assert texts == ["-> logging_in", "-> warmed", "[terminal] held: no slot assigned"]
+
+
+def test_worker_logs_404s_for_an_unknown_worker(client):
+    h = _operate_headers(client)
+    assert client.get("/workers/nope/logs", headers=h).status_code == 404

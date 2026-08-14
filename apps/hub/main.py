@@ -6,6 +6,7 @@ exclusivity). Redis/worker-control and WS log streaming are added later in Phase
 """
 from __future__ import annotations
 
+import json
 import logging
 import random
 import re
@@ -52,7 +53,7 @@ from .auth import (
     verify_password,
 )
 from libs.bus import Bus, connect
-from libs.bus.names import notified_key, respawn_key
+from libs.bus.names import EVENT_STREAM, notified_key, respawn_key
 from libs.domain.enums import WorkerStatus, WorkerSubstate
 from libs.domain.settings import resolve
 
@@ -1822,6 +1823,43 @@ def booking_summary(booking_id: str, db: Session = Depends(get_db)) -> dict:
         "warmup_start_at": bk.warmup_start_at.isoformat() if bk.warmup_start_at else None,
         "slot_open_at": bk.slot_open_at.isoformat() if bk.slot_open_at else None,
     }
+
+
+@app.get("/workers/{worker_id}/logs")
+def worker_logs(worker_id: str, limit: int = 200, db: Session = Depends(get_db)) -> dict:
+    """A worker's recent log lines, replayed from the shared `evt` Redis stream.
+
+    Confirmed 2026-08-14: worker logs were WEBSOCKET-ONLY. The dashboard's per-worker log view
+    showed whatever `log_line` events had streamed in since the browser tab connected, and nothing
+    else -- so a worker that did its work before the page loaded (or before a refresh) showed "no
+    log lines received over the WS yet for this worker" while 31 of its lines, including its whole
+    successful login/warmup/swap/hold history, sat right here in Redis. Exactly when an operator
+    most wants the log -- explaining something that already happened -- was exactly when it was
+    unavailable.
+
+    Bounded by EVENT_STREAM_MAXLEN (the stream is capped, see libs/bus/bus.py), so this is
+    best-effort recent history, not an archive: a busy fleet ages older lines out. WorkerRun.log_path
+    exists in the schema for durable per-run logs but nothing writes it yet."""
+    if not db.get(M.Worker, worker_id):
+        raise HTTPException(404, "worker not found")
+    out: list[dict] = []
+    try:
+        for _eid, fields in _bus.r.xrevrange(EVENT_STREAM, count=5000):
+            payload = json.loads(fields.get("data", "{}") or "{}")
+            if payload.get("worker_id") != worker_id:
+                continue
+            etype = fields.get("type")
+            if etype == "log_line" and payload.get("text"):
+                out.append({"ts": float(fields.get("ts") or 0), "text": payload["text"]})
+            elif etype == "terminal":
+                out.append({"ts": float(fields.get("ts") or 0),
+                            "text": f"[terminal] {payload.get('outcome','')}: {payload.get('detail','')}"})
+            if len(out) >= limit:
+                break
+    except Exception as e:
+        raise HTTPException(503, f"could not read event stream: {e}")
+    out.reverse()   # xrevrange walks newest-first; the log view wants oldest-first
+    return {"worker_id": worker_id, "lines": out, "truncated": len(out) >= limit}
 
 
 @app.post("/workers/{worker_id}/stop", response_model=WorkerOut)
