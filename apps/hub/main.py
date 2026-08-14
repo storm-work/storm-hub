@@ -799,8 +799,38 @@ def create_identity(
 
 
 @app.get("/identities", response_model=list[IdentityOut])
-def list_identities(db: Session = Depends(get_db)) -> list[M.Identity]:
-    return list(db.scalars(select(M.Identity).order_by(M.Identity.created_at.desc())).all())
+def list_identities(db: Session = Depends(get_db)) -> list[IdentityOut]:
+    """Every identity, each annotated with the ACTIVE booking currently holding it (if any).
+
+    C2 exclusivity is enforced by attach_identity (409 "already allocated to another active
+    booking"), but nothing ever exposed the allocation, so the attach panel happily listed
+    identities that were guaranteed to fail -- the operator only found out by picking one. One
+    grouped query rather than per-identity lookups, so this stays a single round trip for the whole
+    list."""
+    identities = list(db.scalars(select(M.Identity).order_by(M.Identity.created_at.desc())).all())
+    # Keyed on an UNRELEASED allocation, deliberately NOT on BOOKING_ACTIVE_STATUSES: the partial
+    # unique index uq_identity_active_allocation is UNIQUE(identity_id) WHERE released_at IS NULL
+    # and does not look at booking status at all, so an unreleased row blocks re-attachment no
+    # matter what its booking is doing. attach_identity's own 409 check uses the narrower
+    # active-status rule, which means a DRAFT/COMPLETED/ABORTED booking's stale allocation passes
+    # that check and then hits the index instead -- see the KNOWN-GAP note on attach_identity.
+    # Reporting the narrower rule here would make this annotation lie in exactly that case.
+    held = {
+        identity_id: (booking_id, booking_name)
+        for identity_id, booking_id, booking_name in db.execute(
+            select(M.IdentityAllocation.identity_id, M.Booking.id, M.Booking.name)
+            .join(M.Booking, M.Booking.id == M.IdentityAllocation.booking_id)
+            .where(M.IdentityAllocation.released_at.is_(None))
+        ).all()
+    }
+    out: list[IdentityOut] = []
+    for ident in identities:
+        row = IdentityOut.model_validate(ident)
+        booking = held.get(ident.id)
+        if booking:
+            row.allocated_booking_id, row.allocated_booking_name = booking
+        out.append(row)
+    return out
 
 
 @app.patch("/identities/{identity_id}", response_model=IdentityOut)
@@ -1384,6 +1414,30 @@ def attach_identity(
     ).all()
     if any(st in BOOKING_ACTIVE_STATUSES for st in other_active):
         raise HTTPException(409, "identity already allocated to another active booking")
+
+    # KNOWN GAP (found 2026-08-14, not yet fixed): the check above uses BOOKING_ACTIVE_STATUSES,
+    # which excludes DRAFT/COMPLETED/ABORTED -- but the DB's uq_identity_active_allocation index is
+    # UNIQUE(identity_id) WHERE released_at IS NULL and ignores booking status entirely, and nothing
+    # releases an allocation when a booking merely becomes terminal (only detach_identity and
+    # booking delete do). So an identity left allocated to an aborted/completed/draft booking passes
+    # this check and then trips the index on flush. Caught here and reported honestly rather than
+    # surfacing as an opaque 500. The real fix is to release allocations when a booking reaches a
+    # terminal state; GET /identities already reports the DB's stricter reality so the attach panel
+    # doesn't offer these in the first place.
+    stale = db.scalar(
+        select(M.IdentityAllocation)
+        .where(M.IdentityAllocation.identity_id == ident.id,
+               M.IdentityAllocation.released_at.is_(None),
+               M.IdentityAllocation.booking_id != bk.id)
+    )
+    if stale is not None:
+        stale_bk = db.get(M.Booking, stale.booking_id)
+        raise HTTPException(
+            409,
+            f"identity still holds an unreleased allocation to booking "
+            f"'{stale_bk.name if stale_bk else stale.booking_id}' "
+            f"(status {stale_bk.status if stale_bk else '?'}) -- detach it there first",
+        )
 
     # Template: default to the first template matching the resolved role if none given.
     template_id = body.template_id

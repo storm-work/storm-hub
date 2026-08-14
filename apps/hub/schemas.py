@@ -84,6 +84,11 @@ class IdentityOut(BaseModel):
     comment: str | None = None
     target_posto: str | None = None
     created_at: datetime | None = None
+    # C2 exclusivity, surfaced so the UI can filter/explain instead of letting an operator pick an
+    # identity that attach_identity will 409. Set only when the identity currently holds an
+    # unreleased allocation to an ACTIVE booking; None means free to attach.
+    allocated_booking_id: str | None = None
+    allocated_booking_name: str | None = None
 
     model_config = {"from_attributes": True}
 

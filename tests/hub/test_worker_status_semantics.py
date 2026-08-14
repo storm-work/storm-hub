@@ -358,3 +358,64 @@ def test_worker_logs_replays_history_from_the_event_stream(client):
 def test_worker_logs_404s_for_an_unknown_worker(client):
     h = _operate_headers(client)
     assert client.get("/workers/nope/logs", headers=h).status_code == 404
+
+
+# ── identity allocation exposure (attach panel, 2026-08-14) ───────────────────
+def test_identities_expose_the_active_booking_holding_them(client):
+    """C2 exclusivity was enforced only at attach time (409), never exposed -- so the attach panel
+    listed identities that were guaranteed to fail and the operator found out by picking one."""
+    h = _operate_headers(client)
+    bid, wid = _bk_with_worker(client, h)          # attaches one identity to an active booking
+    held = client.get(f"/bookings/{bid}/workers", headers=h).json()[0]["identity_id"]
+    free = client.post("/identities", json={"full_name": "Free", "type": "real"},
+                       headers=h).json()["id"]
+
+    rows = {i["id"]: i for i in client.get("/identities", headers=h).json()}
+    assert rows[held]["allocated_booking_id"] == bid
+    assert rows[held]["allocated_booking_name"] == "b"
+    assert rows[free]["allocated_booking_id"] is None
+
+
+def test_an_unreleased_allocation_blocks_reattach_even_from_a_terminal_booking(client):
+    """The annotation must report what ACTUALLY blocks. attach_identity's own 409 uses
+    BOOKING_ACTIVE_STATUSES (which excludes DRAFT/COMPLETED/ABORTED), but the DB index is
+    UNIQUE(identity_id) WHERE released_at IS NULL and ignores booking status -- and nothing releases
+    an allocation when a booking merely goes terminal. Reporting the narrower rule would make the
+    attach panel offer identities that then fail."""
+    h = _operate_headers(client)
+    bid, wid = _bk_with_worker(client, h)
+    held = client.get(f"/bookings/{bid}/workers", headers=h).json()[0]["identity_id"]
+
+    db = client._Session()
+    try:
+        bk = db.get(M.Booking, bid)
+        bk.status = "aborted"          # terminal, but the allocation is still unreleased
+        db.commit()
+    finally:
+        db.close()
+
+    rows = {i["id"]: i for i in client.get("/identities", headers=h).json()}
+    assert rows[held]["allocated_booking_id"] == bid   # still reported as held -- correctly
+
+    bid2 = client.post("/bookings", json={"name": "b2", "type": "real", "posto_id": "5084"},
+                       headers=h).json()["id"]
+    r = client.post(f"/bookings/{bid2}/identities", json={"identity_id": held}, headers=h)
+    assert r.status_code == 409                        # and it genuinely does still block
+    assert "unreleased allocation" in r.json()["detail"]
+
+
+def test_detaching_frees_the_identity_for_another_booking(client):
+    """The escape hatch the 409 message points at must actually work."""
+    h = _operate_headers(client)
+    bid, wid = _bk_with_worker(client, h)
+    held = client.get(f"/bookings/{bid}/workers", headers=h).json()[0]["identity_id"]
+
+    assert client.delete(f"/bookings/{bid}/identities/{held}", headers=h).status_code == 200
+
+    rows = {i["id"]: i for i in client.get("/identities", headers=h).json()}
+    assert rows[held]["allocated_booking_id"] is None
+
+    bid2 = client.post("/bookings", json={"name": "b2", "type": "real", "posto_id": "5084"},
+                       headers=h).json()["id"]
+    assert client.post(f"/bookings/{bid2}/identities",
+                       json={"identity_id": held}, headers=h).status_code == 201

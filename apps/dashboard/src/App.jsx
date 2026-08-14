@@ -1107,15 +1107,24 @@ function AttachPanel({ me, booking, identities, templates, attached, onAttached 
   const [msg, setMsg] = useState("");
   const op = me.is_operating;
 
-  // Eligible = right type for this booking, not already attached, AND has a usable sub-account
-  // (status "active" means >=1 sub-account exists per IdentityStatus's own definition) --
-  // conversation_extract #269: not-ready identities (zero verified sub-accounts) were showing up
-  // here before; this is the fix.
-  const eligible = identities.filter((i) =>
-    (booking.type === "real" || i.type === "test") &&
-    !attached.has(i.id) &&
-    i.status === "active" &&
-    (!q || i.full_name.toLowerCase().includes(q.toLowerCase())));
+  // Eligible = right type for this booking, not already attached HERE, not allocated to another
+  // ACTIVE booking (C2 exclusivity -- attach_identity 409s on those, and listing them meant the
+  // operator only found out by picking one), AND has a usable sub-account (status "active" means
+  // >=1 sub-account exists per IdentityStatus's own definition) -- conversation_extract #269:
+  // not-ready identities (zero verified sub-accounts) were showing up here before.
+  const matchesSearch = (i) => !q || i.full_name.toLowerCase().includes(q.toLowerCase());
+  const forThisBooking = identities.filter(
+    (i) => (booking.type === "real" || i.type === "test") && matchesSearch(i));
+  const eligible = forThisBooking.filter(
+    (i) => !attached.has(i.id) && !i.allocated_booking_id && i.status === "active");
+
+  // Counted, not listed -- so "why isn't X here?" is answerable without hunting through the
+  // identities page. Silently hiding rows is what made the old panel confusing in both directions.
+  const hiddenAttached = forThisBooking.filter((i) => attached.has(i.id)).length;
+  const hiddenElsewhere = forThisBooking.filter(
+    (i) => !attached.has(i.id) && i.allocated_booking_id);
+  const hiddenNotReady = forThisBooking.filter(
+    (i) => !attached.has(i.id) && !i.allocated_booking_id && i.status !== "active").length;
 
   const selectedIds = Object.keys(sel).filter((k) => sel[k]);
 
@@ -1167,6 +1176,18 @@ function AttachPanel({ me, booking, identities, templates, attached, onAttached 
         ))}</tbody>
       </table>
       {eligible.length === 0 && <div className="muted" style={{ padding: 8 }}>No eligible not-yet-attached identities with a usable sub-account.</div>}
+      {(hiddenAttached || hiddenElsewhere.length || hiddenNotReady) > 0 && (
+        <div className="muted" style={{ fontSize: 12, padding: "8px 4px", borderTop: "1px solid var(--border)", marginTop: 8 }}>
+          <div style={{ marginBottom: 4 }}>Not shown:</div>
+          {hiddenAttached > 0 && <div>· {hiddenAttached} already attached to this booking</div>}
+          {hiddenNotReady > 0 && <div>· {hiddenNotReady} without a usable sub-account</div>}
+          {hiddenElsewhere.length > 0 && (
+            <div>· {hiddenElsewhere.length} held by another active booking
+              {" ("}{[...new Set(hiddenElsewhere.map((i) => i.allocated_booking_name).filter(Boolean))].join(", ")}{")"}
+            </div>
+          )}
+        </div>
+      )}
     </>
   );
 }
