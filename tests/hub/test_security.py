@@ -5,6 +5,7 @@ Redis-backed against the real Redis instance (same as the rest of the Hub's bus/
 keyed by client IP -- TestClient's fixed synthetic IP ("testclient") means the fail counter must be
 flushed before/after each test that touches it, or runs would bleed into each other.
 """
+from sqlalchemy import select
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
@@ -225,3 +226,70 @@ def test_dashboard_hides_exactly_the_pages_a_viewer_cannot_use(client):
     assert m, "HIDDEN_FOR_VIEWER not found in App.jsx -- renamed?"
     hidden = set(re.findall(r'"(\w+)"', m.group(1)))
     assert hidden == {"templates", "settings", "ops", "audit", "sessions"}
+
+
+# ── stale operate seat (confirmed live 2026-08-14) ────────────────────────────
+def test_a_quiet_operate_seat_is_released_and_a_waiting_login_takes_over(client):
+    """An operate seat is held by an ACTIVE session and only one may exist, but nothing ever expired
+    one -- so a browser tab closed hours earlier kept the lock and every later login sat PAUSED
+    behind it. Confirmed live: a session last seen at 03:36 still held the seat at 09:16, so the
+    operator's own 08:47 login was read-only. Every settings field and Save button silently
+    disabled, which reads as "saving is broken"."""
+    from datetime import timedelta
+
+    import apps.hub.main as hub_main
+    from libs.db import models as M
+    from libs.domain.enums import SessionPurpose, SessionStatus
+
+    c, TestSession = client
+    h = _admin(c)          # holds the seat, ACTIVE
+
+    db = TestSession()
+    try:
+        held = db.scalars(select(M.UserSession).where(
+            M.UserSession.purpose == SessionPurpose.OPERATE,
+            M.UserSession.status == SessionStatus.ACTIVE)).one()
+        held.last_seen = hub_main._now() - timedelta(seconds=hub_main.OPERATE_SEAT_STALE_AFTER + 60)
+        db.commit()
+        stale_id = held.id
+    finally:
+        db.close()
+
+    # a second operate login is paused behind the stale seat
+    r = c.post("/auth/login", json={"username": "admin", "password": "pw-admin", "purpose": "operate"})
+    assert r.status_code == 200
+    h2 = {"Authorization": f"Bearer {r.json()['token']}"}
+
+    who = c.get("/auth/whoami", headers=h2).json()      # polling whoami reclaims it
+    assert who["is_operating"] is True
+    assert who["session_status"] == "active"
+
+    db = TestSession()
+    try:
+        assert db.get(M.UserSession, stale_id).status == SessionStatus.ENDED
+    finally:
+        db.close()
+
+
+def test_a_live_operator_is_never_bumped(client):
+    """Only a seat that has gone quiet is reclaimable -- an operator actively polling keeps it."""
+    import apps.hub.main as hub_main
+    from libs.db import models as M
+    from libs.domain.enums import SessionPurpose, SessionStatus
+
+    c, TestSession = client
+    h = _admin(c)
+    assert c.get("/auth/whoami", headers=h).json()["is_operating"] is True
+
+    r = c.post("/auth/login", json={"username": "admin", "password": "pw-admin", "purpose": "operate"})
+    h2 = {"Authorization": f"Bearer {r.json()['token']}"}
+    assert c.get("/auth/whoami", headers=h2).json()["is_operating"] is False   # still paused
+
+    db = TestSession()
+    try:
+        actives = db.scalars(select(M.UserSession).where(
+            M.UserSession.purpose == SessionPurpose.OPERATE,
+            M.UserSession.status == SessionStatus.ACTIVE)).all()
+        assert len(actives) == 1      # the invariant holds
+    finally:
+        db.close()

@@ -15,7 +15,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -707,7 +707,14 @@ def logout(db: Session = Depends(get_db), me: Principal = Depends(current_princi
 
 
 @app.get("/auth/whoami", response_model=WhoAmI)
-def whoami(me: Principal = Depends(current_principal)) -> WhoAmI:
+def whoami(me: Principal = Depends(current_principal), db: Session = Depends(get_db)) -> WhoAmI:
+    # The dashboard polls whoami, so this is where a PAUSED seat naturally notices that the holder
+    # has gone quiet and takes over -- no manual admin force-release needed for the common case of
+    # a closed browser tab. See _expire_stale_operate_seats.
+    if me.session.purpose == SessionPurpose.OPERATE and me.session.status == SessionStatus.PAUSED:
+        if _expire_stale_operate_seats(db):
+            db.refresh(me.session)
+            me = Principal(user=me.user, session=me.session)
     return WhoAmI(
         username=me.user.username,
         role=me.user.role,
@@ -715,6 +722,43 @@ def whoami(me: Principal = Depends(current_principal)) -> WhoAmI:
         session_status=str(me.session.status),
         is_operating=me.is_operating,
     )
+
+
+# An operate seat is held by an ACTIVE session, and only one may exist at a time
+# (uq_single_active_operate). Nothing ever expired one, so a browser tab closed hours ago kept the
+# lock indefinitely and every later login was PAUSED behind it -- confirmed live 2026-08-14: a
+# session last seen at 03:36 was still holding the seat at 09:16, so the operator's own 08:47 login
+# was read-only. Every settings field and Save button silently disabled, which reads as "saving is
+# broken" rather than "you don't hold the seat".
+OPERATE_SEAT_STALE_AFTER = 1800.0   # seconds since last_seen
+
+
+def _expire_stale_operate_seats(db: Session) -> int:
+    """End ACTIVE operate sessions that have gone quiet, and promote the longest-waiting PAUSED one.
+
+    Deliberately conservative: only ACTIVE-and-silent seats are ended, and only when something is
+    actually waiting or asking. A live operator is never bumped -- whoami refreshes last_seen."""
+    now = _now()
+    cutoff = now - timedelta(seconds=OPERATE_SEAT_STALE_AFTER)
+    stale = db.scalars(select(M.UserSession).where(
+        M.UserSession.purpose == SessionPurpose.OPERATE,
+        M.UserSession.status == SessionStatus.ACTIVE,
+        M.UserSession.last_seen < cutoff,
+    )).all()
+    for s in stale:
+        s.status = SessionStatus.ENDED
+    if not stale:
+        return 0
+    db.flush()
+    # Promote the oldest waiting seat so the lock doesn't simply sit empty.
+    waiting = db.scalars(select(M.UserSession).where(
+        M.UserSession.purpose == SessionPurpose.OPERATE,
+        M.UserSession.status == SessionStatus.PAUSED,
+    ).order_by(M.UserSession.created_at.asc())).first()
+    if waiting is not None:
+        waiting.status = SessionStatus.ACTIVE
+    db.commit()
+    return len(stale)
 
 
 @app.get("/sessions")

@@ -930,6 +930,13 @@ function BookingFullSettingsPanel({ me, booking, onSaved }) {
           </div>
         </details>
       ))}
+      {!op && (
+        <div className="banner info" style={{ marginBottom: 10 }}>
+          Read-only — you don't hold the operator seat, so these fields and Save are disabled.
+          {" "}Take it from the <b>Sessions</b> tab (an idle seat is released automatically after 30
+          minutes). Nothing you type here can be saved until then.
+        </div>
+      )}
       <button className="btn" disabled={!op} onClick={save} style={{ width: "100%", marginTop: 8 }}>
         {dirty ? "Save settings (unsaved changes)" : "Save settings"}
       </button>
