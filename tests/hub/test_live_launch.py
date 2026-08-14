@@ -12,6 +12,21 @@ from libs.db import metadata
 
 
 @pytest.fixture()
+def db_session():
+    """A plain session for unit-testing _do_launch_worker directly (the `client` fixture below
+    builds a whole TestClient, which these launch-abort tests don't need)."""
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False},
+                           poolclass=StaticPool)
+    metadata.create_all(engine)
+    TestSession = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    db = TestSession()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+@pytest.fixture()
 def client(monkeypatch):
     engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     metadata.create_all(engine)
@@ -403,3 +418,50 @@ def test_launch_worker_fleet_zero_jitter_never_sleeps(monkeypatch):
     hub_main._launch_worker_fleet(["w1"], jitter_secs=0.0)
 
     assert sleeps == []
+
+
+# ── a launch decided before a stop must not spawn after it (confirmed live 2026-08-14) ───────
+def test_launch_aborts_when_the_booking_is_no_longer_active(db_session, monkeypatch):
+    """The operator stopped "Test 3018" at 15:01:24 and a scout process came up at 15:01:47 -- 23s
+    AFTER the stop. A launch decided beforehand (hold-respawn, or a fleet launch still inside its
+    WARMUP_START_JITTER sleep) spawns long after it, and a stop can only kill processes that already
+    exist when it runs. The decision must be re-validated at the moment of spawning."""
+    import apps.hub.main as main
+    from libs.db import models as M
+    from libs.domain.enums import BookingStatus, WorkerRole, WorkerStatus
+
+    spawned = []
+    monkeypatch.setattr(main.supervisor, "spawn", lambda *a, **k: spawned.append(a), raising=False)
+
+    db = db_session
+    bk = M.Booking(name="b", type="real", posto_id="3018", status=BookingStatus.STOPPED)
+    i = M.Identity(full_name="GILSON TAVARES", type="real")
+    db.add_all([bk, i]); db.commit()
+    w = M.Worker(booking_id=bk.id, identity_id=i.id, role=WorkerRole.SCOUT,
+                 status=WorkerStatus.READY)
+    db.add(w); db.commit()
+
+    main._do_launch_worker(db, w)
+
+    assert spawned == [], "spawned a worker for a stopped booking"
+    assert w.status != WorkerStatus.RUNNING
+
+
+def test_launch_aborts_when_the_worker_itself_was_stopped_mid_flight(db_session, monkeypatch):
+    import apps.hub.main as main
+    from libs.db import models as M
+    from libs.domain.enums import BookingStatus, WorkerRole, WorkerStatus
+
+    spawned = []
+    monkeypatch.setattr(main.supervisor, "spawn", lambda *a, **k: spawned.append(a), raising=False)
+
+    db = db_session
+    bk = M.Booking(name="b2", type="real", posto_id="3018", status=BookingStatus.RUNNING)
+    i = M.Identity(full_name="X Y", type="real")
+    db.add_all([bk, i]); db.commit()
+    w = M.Worker(booking_id=bk.id, identity_id=i.id, role=WorkerRole.SCOUT,
+                 status=WorkerStatus.STOPPED)
+    db.add(w); db.commit()
+
+    main._do_launch_worker(db, w)
+    assert spawned == []

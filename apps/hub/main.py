@@ -71,7 +71,7 @@ from .events import EventHub
 from .genaccounts import gen_fake_identities, gen_subaccounts
 from .importers import parse_identities, parse_proxies
 from .settings_store import get_global, set_layer
-from .scheduler import Scheduler
+from .scheduler import _LAUNCH_BLOCKED_BOOKING_STATUSES, Scheduler
 from .supervisor import Supervisor
 from .schemas import (
     ArtifactOut,
@@ -1671,6 +1671,21 @@ def _do_launch_worker(db: Session, w: M.Worker) -> None:
     same ordering principle as the signal-latch fix -- never record a state change the underlying
     action hasn't actually completed)."""
     bk = db.get(M.Booking, w.booking_id)
+    # CONFIRMED LIVE 2026-08-14: the operator stopped "Test 3018" at 15:01:24 and a scout process
+    # came up at 15:01:47 -- 23s AFTER the stop. A launch decided before the stop (hold-respawn, or
+    # a fleet launch still inside its WARMUP_START_JITTER sleep) spawns long after it, and the stop
+    # can only kill processes that already exist when it runs. So the decision to launch has to be
+    # re-validated at the moment of spawning, not just when it was made.
+    #
+    # This is the single choke point every launch path goes through -- fleet launch, relaunch,
+    # hold-respawn -- so the check belongs here rather than in each caller.
+    if bk is None or bk.status in _LAUNCH_BLOCKED_BOOKING_STATUSES:
+        logger.info("launch aborted for worker %s: booking is %s",
+                    w.id, bk.status if bk else "missing")
+        return
+    if w.status == WorkerStatus.STOPPED:
+        logger.info("launch aborted for worker %s: it was stopped while the launch was in flight", w.id)
+        return
     tpl = db.get(M.WorkerTemplate, w.template_id) if w.template_id else None
     layers = {L.GLOBAL: get_global(db), L.BOOKING: (bk.settings_json or {})}
     if tpl:

@@ -33,6 +33,22 @@ from libs.engine import orchestration, pool_manager
 
 logger = logging.getLogger(__name__)
 
+# The statuses in which a booking is actively driving workers. STOPPED is deliberately absent: it is
+# resumable (a restart moves it back to WARMING/RUNNING), but while it is stopped nothing may
+# relaunch, re-signal, or otherwise resurrect its workers.
+_ACTIVE_BOOKING_STATUSES = frozenset({
+    BookingStatus.WARMING, BookingStatus.ARMED, BookingStatus.RUNNING,
+})
+
+# Statuses in which NO worker may be spawned, however the launch was decided. Deliberately a
+# blocklist rather than reusing _ACTIVE_BOOKING_STATUSES: an operator legitimately launches workers
+# into a DRAFT or SCHEDULED booking (arm-with-template, manual worker restart), so an allowlist of
+# the actively-driving statuses would break those. What must never happen is a spawn landing in a
+# booking that has been stopped or has already ended.
+_LAUNCH_BLOCKED_BOOKING_STATUSES = frozenset({
+    BookingStatus.STOPPED, BookingStatus.COMPLETED, BookingStatus.ABORTED,
+})
+
 
 def plan_booking_actions(status: str, warmup_start_at, slot_open_at, now: datetime) -> list[str]:
     """Pure: which timed transitions are due for a booking. Returns subset of {'start','slot_open'}."""
@@ -116,6 +132,8 @@ class Scheduler:
                     self._stop_booking_core(db, bk, reason="timeout")
                     continue
 
+                if bk.status == BookingStatus.RUNNING and self._maybe_complete_booking(db, bk):
+                    continue   # target reached -- workers stopped, nothing further to drive
                 if bk.status == BookingStatus.RUNNING:
                     self._reclaim_stale_slot_leases(db, bk, now)
                     self._fire_slot_found_if_new(db, bk, now)
@@ -127,8 +145,16 @@ class Scheduler:
                     self._drive_scouts(db, bk)
                     self._maybe_self_scout(db, bk, now)
 
-                self._latch_signals(db, bk, now)
-                self._hold_respawn(db, bk, now)
+                # CONFIRMED LIVE 2026-08-14: these two ran for ANY non-terminal booking, including
+                # a STOPPED one -- so the operator stopped "Test 3018", every worker went STOPPED,
+                # and the next tick's _hold_respawn relaunched a scout anyway (GILSON TAVARES, a
+                # process younger than the stop itself). That is the "stop button doesn't work"
+                # class all over again, one layer up from the two earlier instances: stop must mean
+                # stop, and a booking that is not actively driving workers must not be re-signalled
+                # or re-populated behind the operator's back.
+                if bk.status in _ACTIVE_BOOKING_STATUSES:
+                    self._latch_signals(db, bk, now)
+                    self._hold_respawn(db, bk, now)
 
             self._reap_dead_workers(db, now)
             self._reap_stalled_workers(db, now)
@@ -145,10 +171,35 @@ class Scheduler:
         return float(self._effective_booking_setting(db, bk, "BOOKING_TIMEOUT_HOURS", 48.0))
 
     # ── D1: booking timeout ──────────────────────────────────────────────────
-    def _stop_booking_core(self, db, bk: M.Booking, *, reason: str) -> None:
-        """Shared stop path for both operator-initiated stop (apps/hub/main.py's /stop endpoint,
-        which duplicates the worker-stop half inline for now) and timeout. A timeout is a harder
-        give-up than a manual pause -- ABORTED, not the resumable STOPPED."""
+    def _maybe_complete_booking(self, db, bk: M.Booking) -> bool:
+        """Wire MAX_BOOKINGS -- until now NOTHING in the codebase ever set a booking COMPLETED. The
+        transition existed in the state machine (RUNNING -> COMPLETED) and no code performed it, so
+        a run that achieved everything it was asked to kept its scouts discovering and its appliers
+        logging in until the 48h timeout, burning proxies and CAPTCHA solves for nothing.
+
+        0 (the catalog default) means unlimited: no auto-complete, the operator stops it. Any
+        positive value is a target -- once that many appointments are actually recorded, the run has
+        done its job and stops cleanly as COMPLETED rather than ABORTED. Counting BookedAppointment
+        rows (not worker outcomes) deliberately: the row is only written once a booking is confirmed
+        AND persisted, so a run can never call itself complete on a booking the Hub failed to
+        record -- which is exactly what happened on 2026-08-14."""
+        target = int(self._effective_booking_setting(db, bk, "MAX_BOOKINGS", 0))
+        if target <= 0:
+            return False
+        made = db.scalar(select(func.count()).select_from(M.BookedAppointment)
+                         .where(M.BookedAppointment.booking_id == bk.id)) or 0
+        if made < target:
+            return False
+        logger.info("booking %s: %d/%d appointments booked -- completing the run", bk.id, made, target)
+        self._stop_booking_core(db, bk, reason="target reached", final=BookingStatus.COMPLETED)
+        return True
+
+    def _stop_booking_core(self, db, bk: M.Booking, *, reason: str,
+                           final: BookingStatus = BookingStatus.ABORTED) -> None:
+        """Shared stop path for operator-initiated stop (apps/hub/main.py's /stop endpoint, which
+        duplicates the worker-stop half inline for now), timeout, and target-reached completion.
+        A timeout is a harder give-up than a manual pause -- ABORTED, not the resumable STOPPED --
+        while a run that booked everything it was asked for ends COMPLETED."""
         from libs.domain.state_machines import IllegalTransition, booking_transition
         running = db.scalars(select(M.Worker).where(
             M.Worker.booking_id == bk.id, M.Worker.status == WorkerStatus.RUNNING)).all()
@@ -164,7 +215,7 @@ class Scheduler:
             self._release_worker_resources(db, w.id)
         if bk.status not in (BookingStatus.COMPLETED, BookingStatus.ABORTED):
             try:
-                bk.status = booking_transition(bk.status, BookingStatus.ABORTED)
+                bk.status = booking_transition(bk.status, final)
             except IllegalTransition:
                 pass
         db.commit()

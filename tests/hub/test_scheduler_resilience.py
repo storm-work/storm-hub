@@ -1243,3 +1243,93 @@ def test_false_slot_revert_ignores_form_stale_releases(db):
     db.commit()
 
     assert sched._maybe_revert_false_slot_found(db, bk, NOW) is False
+
+
+# ── MAX_BOOKINGS: nothing in the codebase ever completed a booking (2026-08-14) ───────────────
+def _appointment(db, bk, ident):
+    sub = M.SubAccount(identity_id=ident.id, username=f"u{ident.id[:4]}", password="p")
+    db.add(sub); db.commit()
+    db.add(M.BookedAppointment(booking_id=bk.id, identity_id=ident.id, sub_account_id=sub.id))
+    db.commit()
+
+
+def test_booking_completes_once_it_hits_its_booking_target(db):
+    """The RUNNING -> COMPLETED transition existed in the state machine and NO code ever performed
+    it, so a run that achieved everything asked of it kept its scouts discovering and its appliers
+    logging in until the 48h timeout -- burning proxies and CAPTCHA solves for nothing."""
+    bus = _FakeBus()
+    sched = _scheduler(bus=bus)
+    bk = _make_booking(db, settings_json={"MAX_BOOKINGS": 2})
+    ident = _make_identity(db)
+    w = _make_worker(db, bk, ident)
+    _appointment(db, bk, ident)
+    _appointment(db, bk, _make_identity(db))
+
+    assert sched._maybe_complete_booking(db, bk) is True
+    assert bk.status == BookingStatus.COMPLETED       # not ABORTED -- it succeeded
+    assert (w.id, "stop", {}) in bus.sent or any(c[1] == "stop" for c in bus.sent)
+    assert w.status == WorkerStatus.STOPPED
+
+
+def test_booking_does_not_complete_below_its_target(db):
+    sched = _scheduler(bus=_FakeBus())
+    bk = _make_booking(db, settings_json={"MAX_BOOKINGS": 3})
+    ident = _make_identity(db)
+    _make_worker(db, bk, ident)
+    _appointment(db, bk, ident)
+
+    assert sched._maybe_complete_booking(db, bk) is False
+    assert bk.status == BookingStatus.RUNNING
+
+
+def test_max_bookings_zero_means_unlimited(db):
+    """0 is the catalog default and must stay "no auto-complete" -- the operator ends the run."""
+    sched = _scheduler(bus=_FakeBus())
+    bk = _make_booking(db, settings_json={"MAX_BOOKINGS": 0})
+    ident = _make_identity(db)
+    _appointment(db, bk, ident)
+
+    assert sched._maybe_complete_booking(db, bk) is False
+    assert bk.status == BookingStatus.RUNNING
+
+
+# ── stop must mean stop (confirmed live 2026-08-14) ──────────────────────────────────────────
+def test_stopped_booking_is_never_re_signalled_or_respawned(db, monkeypatch):
+    """_latch_signals and _hold_respawn ran for ANY non-terminal booking, outside the RUNNING guard,
+    so a STOPPED booking kept being re-signalled every tick. (_hold_respawn had its own internal
+    STOPPED guard; _latch_signals had none.) Confirmed live: the operator stopped "Test 3018" and a
+    scout process came up 23 seconds later."""
+    called = []
+    sched = _scheduler(session_local=lambda: db, bus=_FakeBus())
+    monkeypatch.setattr(sched, "_latch_signals", lambda *a: called.append("latch"))
+    monkeypatch.setattr(sched, "_hold_respawn", lambda *a: called.append("respawn"))
+    monkeypatch.setattr(sched, "_reap_dead_workers", lambda *a: None)
+    monkeypatch.setattr(sched, "_reap_stalled_workers", lambda *a: None)
+    monkeypatch.setattr(sched, "_reap_runaway_workers", lambda *a: None)
+    bk = _make_booking(db)
+    bk.status = BookingStatus.STOPPED
+    db.commit()
+
+    sched._tick_once()
+
+    assert called == [], "a stopped booking was still being driven"
+
+
+def test_running_booking_is_still_signalled_and_respawned(db, monkeypatch):
+    """The guard must not break the feature it guards."""
+    called = []
+    sched = _scheduler(session_local=lambda: db, bus=_FakeBus())
+    monkeypatch.setattr(sched, "_latch_signals", lambda *a: called.append("latch"))
+    monkeypatch.setattr(sched, "_hold_respawn", lambda *a: called.append("respawn"))
+    for m in ("_reclaim_stale_slot_leases", "_fire_slot_found_if_new", "_assign_slots",
+              "_drive_scouts", "_maybe_self_scout", "_reap_dead_workers",
+              "_reap_stalled_workers", "_reap_runaway_workers"):
+        monkeypatch.setattr(sched, m, lambda *a, **k: None)
+    monkeypatch.setattr(sched, "_maybe_inactivate_slot_open", lambda *a: False)
+    monkeypatch.setattr(sched, "_maybe_revert_false_slot_found", lambda *a: False)
+    monkeypatch.setattr(sched, "_maybe_complete_booking", lambda *a: False)
+    _make_booking(db)          # the helper already creates it RUNNING
+
+    sched._tick_once()
+
+    assert set(called) == {"latch", "respawn"}

@@ -373,7 +373,7 @@ class EventHub:
 
         from sqlalchemy import select
 
-        from libs.domain.enums import SlotStatus
+        from libs.domain.enums import SlotLeaseOutcome, SlotStatus
 
         db = SessionLocal()
         try:
@@ -390,6 +390,17 @@ class EventHub:
                     M.Slot.period == int(slot["period"])))
                 if slot_row:
                     slot_id = slot_row.id
+                    # Close this worker's lease on the booked slot as BOOKED. SlotLeaseOutcome.BOOKED
+                    # existed in the enum from the start and was never once written: the terminal
+                    # path's release_worker_resources sets released_at but no outcome, so every real
+                    # booking left its lease reading `None` -- indistinguishable from an in-flight
+                    # one in any report or query.
+                    for le in db.scalars(select(M.SlotLease).where(
+                            M.SlotLease.slot_id == slot_row.id,
+                            M.SlotLease.worker_id == worker_id,
+                            M.SlotLease.released_at.is_(None))).all():
+                        le.released_at = datetime.now(timezone.utc)
+                        le.outcome = SlotLeaseOutcome.BOOKED
                     # SlotStatus has no BOOKED member -- TAKEN is the booked terminal state.
                     # Confirmed live 2026-08-14: this raised AttributeError inside the booked_pdf
                     # handler, so the whole transaction rolled back and a REAL booking (verified

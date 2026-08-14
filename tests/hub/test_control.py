@@ -284,6 +284,33 @@ def test_booked_pdf_writes_the_artifact_appointment_and_marks_the_slot_taken(slo
     db.close()
 
 
+def test_booked_pdf_closes_the_lease_as_booked(slots_db):
+    """SlotLeaseOutcome.BOOKED existed in the enum from day one and was never once written: the
+    terminal path sets released_at but no outcome, so every real booking left its lease reading
+    None -- indistinguishable from one still in flight."""
+    from sqlalchemy import select
+
+    import apps.hub.events as ev
+    from libs.db import models as M
+    from libs.domain.enums import SlotLeaseOutcome, SlotStatus
+
+    bid, wid = _seed_apply_worker(slots_db)
+    db = slots_db()
+    slot = M.Slot(booking_id=bid, posto_id="3018", date="2026-09-10", period=7,
+                  status=SlotStatus.LEASED)
+    db.add(slot); db.commit()
+    db.add(M.SlotLease(slot_id=slot.id, worker_id=wid)); db.commit()
+    db.close()
+
+    ev.EventHub.__new__(ev.EventHub)._persist_booked_pdf(
+        wid, "/var/artifacts/x.pdf", {"date": "2026-09-10", "period": 7})
+
+    db = slots_db()
+    lease = db.scalars(select(M.SlotLease)).one()
+    assert lease.outcome == SlotLeaseOutcome.BOOKED and lease.released_at is not None
+    db.close()
+
+
 def test_a_failing_side_effect_never_swallows_the_rest_of_the_event(monkeypatch, caplog):
     """The real cost of the crash above wasn't only the missing rows: it aborted the rest of that
     message's handling, so the `terminal` branch never ran and the worker still showed
