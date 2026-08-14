@@ -745,3 +745,29 @@ def test_do_discover_uses_cached_special_days_and_skips_gettime_fetch():
     assert outcomes["2026-08-15"] == "empty"
     assert outcomes["2026-08-16"] == "found"
     assert [t for t, _p in events if t == "gettime_result"] == []   # cache hit never re-reports
+
+
+# ── login-rejection log noise (confirmed live 2026-08-14) ─────────────────────
+def test_login_reject_reason_strips_the_captcha_token():
+    """browser_login returns the solver's captcha_token alongside the response, and the whole dict
+    used to be logged verbatim -- hundreds of base64 chars per attempt, once per retry, burying the
+    actual reason and aging real history out of the capped Redis event stream."""
+    from apps.worker.ops_live import _login_reject_reason
+
+    result = {
+        "status": 200,
+        "body": '{"type":"error","description":"datadome_challenge_on_post"}',
+        "captcha_token": "0cAFcWeA7vwgAPafAJ7GPimQvWGjJg-" + "x" * 900,
+    }
+    out = _login_reject_reason(result)
+    assert "datadome_challenge_on_post" in out
+    assert "status=200" in out
+    assert "0cAFcWeA" not in out and len(out) < 120
+
+
+def test_login_reject_reason_survives_a_non_json_body():
+    from apps.worker.ops_live import _login_reject_reason
+
+    out = _login_reject_reason({"status": 503, "body": "<html>waiting room</html>"})
+    assert "status=503" in out and "waiting room" in out
+    assert _login_reject_reason(None) == "None"

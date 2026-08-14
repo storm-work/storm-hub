@@ -27,6 +27,7 @@ robust.
 """
 from __future__ import annotations
 
+import json
 import random
 import re
 import time
@@ -79,6 +80,29 @@ _BOUNCE_KEYWORDS = ("questionario", "getslots", "captchadiv", "authentication.js
 # whose re-warm keeps bouncing to home can't churn fresh proxies forever"). Mirrored here as the
 # keepalive-restore retry budget once a worker enters the "session is dead" state.
 _MAX_KEEPALIVE_RESTORE_ATTEMPTS = 3
+
+
+def _login_reject_reason(result: object) -> str:
+    """The portal's rejection reason, WITHOUT the CAPTCHA token.
+
+    browser_login returns the solver's `captcha_token` alongside the response, and this used to be
+    logged by dumping the whole dict -- several hundred characters of base64 per attempt, repeated
+    once per retry. Confirmed 2026-08-14: the dashboard's log panel was unreadable, the actual
+    reason ("datadome_challenge_on_post") buried mid-blob, and every one of those lines also went
+    into the shared Redis event stream, aging real history out of the capped window that much
+    faster."""
+    if not isinstance(result, dict):
+        return str(result)[:120]
+    body = (result.get("body") or "").strip()
+    reason = body[:160]
+    try:
+        parsed = json.loads(body)
+    except (TypeError, ValueError):
+        pass
+    else:
+        if isinstance(parsed, dict):
+            reason = parsed.get("description") or parsed.get("type") or reason
+    return f"status={result.get('status')} {reason}"
 
 
 def _extract_csrf(html: str) -> str | None:
@@ -321,7 +345,7 @@ class LiveEngineOps(EngineOps):
                 if self._breaker is not None:
                     self._breaker.record_success()
                 return True
-            self._log(f"login attempt {attempt}/{sticky_max}: rejected ({result})")
+            self._log(f"login attempt {attempt}/{sticky_max}: rejected ({_login_reject_reason(result)})")
             self._backoff(attempt)
         return False
 
