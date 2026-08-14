@@ -82,6 +82,18 @@ _BOUNCE_KEYWORDS = ("questionario", "getslots", "captchadiv", "authentication.js
 _MAX_KEEPALIVE_RESTORE_ATTEMPTS = 3
 
 
+def _proxy_label(conn_url: str | None) -> str:
+    """host:port of a proxy, credentials stripped -- safe to log.
+
+    Every login attempt records which proxy it used. Without it a failure cannot be attributed to a
+    proxy vs an account vs the portal, which is exactly the ambiguity behind "why is one role's
+    login rate worse" -- the roles run identical code with identical accounts, so proxy draw is the
+    remaining variable and it was unobservable."""
+    if not conn_url:
+        return "proxy=none"
+    return "proxy=" + conn_url.rsplit("@", 1)[-1]
+
+
 def _submit_bounce_reason(html: str) -> str:
     """Why _classify_submit_response rejected a SubmeterVistoCriaPDF response.
 
@@ -392,12 +404,14 @@ class LiveEngineOps(EngineOps):
             except Exception as e:
                 if transient < max_transient and self._is_transient_login_failure(str(e)):
                     transient += 1
-                    self._log(f"login: transient {transient}/{max_transient} ({e}) -- infrastructure, "
-                              f"not charged to sub-account (sticky still {attempt}/{sticky_max})")
+                    self._log(f"login: transient {transient}/{max_transient} "
+                              f"[{_proxy_label(self.warm_proxy)}] ({e}) -- infrastructure, not "
+                              f"charged to sub-account (sticky still {attempt}/{sticky_max})")
                     self._backoff(transient)
                     continue          # deliberately does NOT advance `attempt`
                 attempt += 1
-                self._log(f"login attempt {attempt}/{sticky_max}: {e}")
+                self._log(f"login attempt {attempt}/{sticky_max} [{_proxy_label(self.warm_proxy)}"
+                          f" acct={self.sub_account_id[:8]}]: {e}")
                 self._backoff(attempt)
                 continue
             if self._is_login_success(result):
@@ -425,7 +439,8 @@ class LiveEngineOps(EngineOps):
                 self._backoff(transient)
                 continue
             attempt += 1
-            self._log(f"login attempt {attempt}/{sticky_max}: rejected ({reason})")
+            self._log(f"login attempt {attempt}/{sticky_max} [{_proxy_label(self.warm_proxy)}"
+                      f" acct={self.sub_account_id[:8]}]: rejected ({reason})")
             self._backoff(attempt)
         return False
 
