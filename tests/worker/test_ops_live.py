@@ -1136,3 +1136,70 @@ def test_bounce_reason_reports_both_halves_of_the_home_test():
     as home. Every bounce now spells out which markers were and weren't found."""
     r = _submit_bounce_reason("<html><title>Portal</title>questionario cmbPeriodo</html>")
     assert "home_markers=none" in r and "cmbperiodo" in r and "title=" in r
+
+
+# ── the warmup must PROVE it reached the scheduling page (root cause, 2026-08-14) ─────────────
+class _WarmupSession(_FakeSession):
+    """Runs the whole warmup chain successfully, and serves `sched_html` for Schedule.jsp."""
+    def __init__(self, sched_html):
+        super().__init__()
+        self._sched_html = sched_html
+        self.navs = []
+
+    def browser_eval(self, js, timeout=30):
+        if "outerHTML" in js:
+            return self._sched_html
+        # last quest step must yield fields, and the rest just need a 200
+        return {"status": 200, "fields": {"a": "1"}}
+
+    def browser_nav(self, url, timeout=30, **kw):
+        self.navs.append(url)
+        return url
+
+    def browser_form_post(self, url, data, timeout=100):
+        return (url, '<input name="__RequestVerificationToken" value="tok">')
+
+    def browser_fetch(self, *a, **k):
+        return {"status": 200}
+
+
+def _warmup_ops(sched_html):
+    ops = _make_ops()
+    ops.session = _WarmupSession(sched_html)
+    return ops
+
+
+_SCHED_OK = ('<html><title>Schedule</title><form action="SubmeterVistoCriaPDF?posto_id=3018">'
+             '<select id="cmbPeriodo"></select></form></html>')
+
+
+def test_warmup_fails_when_schedule_jsp_has_no_scheduling_markers():
+    """THE root cause of "applying doesn't work". storm-auto: "ScheduleController POST can return
+    200 yet the server silently fails to set up form state, causing Schedule.jsp to redirect to
+    authenticated_index ... must re-warm rather than returning a false 'warmed'."
+
+    We fired ScheduleController and navigated Schedule.jsp and DISCARDED BOTH RESULTS, then returned
+    True unconditionally -- so a rejected warmup reported success, do_apply POSTed with no
+    server-side anchor, and the portal answered with the questionnaire page. Live: every such bounce
+    carried title='questionnaire to apply for a visa' at 72113B."""
+    ops = _warmup_ops("<html><title>questionnaire to apply for a visa</title>no markers</html>")
+    assert ops._run_warmup_steps() is False
+
+
+def test_warmup_succeeds_when_the_scheduling_page_is_really_there():
+    ops = _warmup_ops(_SCHED_OK)
+    assert ops._run_warmup_steps() is True
+
+
+def test_warmup_reads_posto_pdf_from_the_schedule_page():
+    """posto_pdf can legitimately differ from posto_id, and the submit URL must use the one the
+    schedule page itself advertises -- this was hardcoded to posto_id and never read."""
+    ops = _warmup_ops(_SCHED_OK.replace("posto_id=3018", "posto_id=9999"))
+    assert ops._run_warmup_steps() is True
+    assert ops.posto_pdf == "9999"
+
+
+def test_warmup_falls_back_to_posto_id_when_the_page_advertises_none():
+    ops = _warmup_ops('<html><select id="cmbPeriodo"></select>getSlots</html>')
+    assert ops._run_warmup_steps() is True
+    assert ops.posto_pdf == "5084"      # _make_ops' posto_id

@@ -100,6 +100,10 @@ _BOUNCE_KEYWORDS = ("questionario", "getslots", "captchadiv", "authentication.js
 # IS the dashboard, whatever language it rendered in. The schedule-marker veto below stays absolute
 # in both cases -- a page carrying cmbPeriodo/getSlots is the schedule form, not the dashboard, and
 # must remain no_slot however it was reached.
+# The scheduling page's own markers, verbatim from storm-auto's _sched_markers. Their ABSENCE from
+# Schedule.jsp means ScheduleController was silently rejected and there is no form state to book
+# against -- see _run_warmup_steps.
+_SCHED_PAGE_MARKERS = ("getSlots", "captchaDiv", "SubmeterVistoCriaPDF", "f_date_c", "cmbPeriodo")
 _HOME_MARKERS = ("solicitar pedido de visto", "consultar pedidos")
 _SCHEDULE_MARKERS = ("getperiodosocupados", "cmbperiodo", "getslots")
 
@@ -630,8 +634,33 @@ class LiveEngineOps(EngineOps):
                 headers={"Referer": FORMULARIO}, encode="multipart",
                 file_fields=["foto", "file1", "file2", "file3", "file4"], timeout=45,
             )
+            # THE guard this file was missing, and the root cause of "applying doesn't work".
+            # storm-auto: "ScheduleController POST can return 200 yet the server silently fails to
+            # set up form state, causing Schedule.jsp to redirect to authenticated_index. Absence
+            # [of scheduling markers] means ScheduleController was rejected (bad CSRF or bad session
+            # state) -- must re-warm rather than returning a false 'warmed'."
+            #
+            # We fired ScheduleController and navigated Schedule.jsp and DISCARDED BOTH RESULTS,
+            # then returned True unconditionally. So a rejected warmup reported success, do_apply
+            # POSTed SubmeterVistoCriaPDF with no server-side anchor, and the portal answered with
+            # the questionnaire page. Confirmed live 2026-08-14: every such bounce carried
+            # title='questionnaire to apply for a visa' at 72113B -- the questionnaire, served back
+            # in response to a booking submit.
             self.session.browser_nav(SCHED_JSP + "?posto_id=" + self.posto_id, timeout=30)
-            self.posto_pdf = self.posto_id
+            sched_html = self.session.browser_eval("document.documentElement.outerHTML") or ""
+            if not any(m in sched_html for m in _SCHED_PAGE_MARKERS):
+                title = re.search(r"<title[^>]*>(.*?)</title>", sched_html, re.S | re.I)
+                self._log(f"do_warmup: Schedule.jsp has no scheduling markers "
+                          f"(len={len(sched_html)} title="
+                          f"{(title.group(1).strip()[:60] if title else '?')!r}) -- ScheduleController "
+                          f"was rejected; NOT warmed")
+                return False
+            # posto_pdf can legitimately differ from posto_id, and the submit URL must use the one
+            # the schedule page itself advertises -- we hardcoded posto_id and never read this.
+            m_pdf = re.search(r"SubmeterVistoCriaPDF\?posto_id=(\d+)", sched_html)
+            self.posto_pdf = m_pdf.group(1) if m_pdf else self.posto_id
+            if self.posto_pdf != self.posto_id:
+                self._log(f"do_warmup: posto_pdf={self.posto_pdf} differs from posto_id={self.posto_id}")
             return True
         except Exception as e:
             self._log(f"do_warmup failed: {e}")
