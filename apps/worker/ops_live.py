@@ -119,6 +119,11 @@ def _is_home_url(final_url: str) -> bool:
 # keepalive-restore retry budget once a worker enters the "session is dead" state.
 _MAX_KEEPALIVE_RESTORE_ATTEMPTS = 3
 
+# storm-auto's QUEST_STEP_RETRIES (default 3): re-attempt a questionnaire step that doesn't return
+# 200, "like a manual page refresh". Not a settings-catalog knob -- it is a retry shape, and the
+# proven value is the one that matters.
+_QUEST_STEP_RETRIES = 3
+
 
 def _proxy_label(conn_url: str | None) -> str:
     """host:port of a proxy, credentials stripped -- safe to log.
@@ -605,11 +610,22 @@ class LiveEngineOps(EngineOps):
                     )
                     + "})()"
                 ) % (url, QUEST_URL)
-                res = self.session.browser_eval(js)
-                if not isinstance(res, dict) or res.get("status") != 200:
-                    self._log(f"quest step {i+1}/{len(steps)} non-200: {res}")
+                # storm-auto retries a questionnaire step that doesn't come back 200 -- "like a
+                # manual page refresh" -- up to QUEST_STEP_RETRIES (default 3). We logged the
+                # non-200 and carried on regardless, so one flaky step silently poisoned the whole
+                # chain and surfaced later as the much vaguer quest_state_stale.
+                res = None
+                for attempt in range(1, _QUEST_STEP_RETRIES + 1):
+                    res = self.session.browser_eval(js)
+                    if isinstance(res, dict) and res.get("status") == 200:
+                        break
+                    self._log(f"quest step {i+1}/{len(steps)} attempt {attempt}/"
+                              f"{_QUEST_STEP_RETRIES} non-200: {res}")
                 if is_last and isinstance(res, dict):
                     last_fields = res.get("fields") or {}
+                    if not last_fields:
+                        self._log(f"quest step {i+1}/{len(steps)} (last) returned "
+                                  f"status={res.get('status')} but NO input fields")
 
             if not last_fields:
                 self._log("do_warmup: quest_state_stale (last step yielded no fields)")
@@ -629,11 +645,21 @@ class LiveEngineOps(EngineOps):
                 self.account, self.form_defaults, posto_id=self.posto_id, csrf=csrf,
                 nationality=self.nationality, residence=self.residence,
             )
-            self.session.browser_fetch(
+            # Log what ScheduleController actually said. This was fired and DISCARDED, which is
+            # why "Schedule.jsp redirected to E-VISA" (the guard below) could be observed without
+            # any way to see WHY the server rejected the form -- storm-auto logs both the key
+            # payload fields and the response, and that is the difference between a diagnosis and
+            # another guess.
+            self._log(f"ScheduleController: posto_id={self.posto_id} f0sf1={sc_payload.get('f0sf1')} "
+                      f"csrf_len={len(csrf)} fields={len(sc_payload)}")
+            sc = self.session.browser_fetch(
                 SCHED_CTRL, sc_payload, params={"posto_id": self.posto_id},
                 headers={"Referer": FORMULARIO}, encode="multipart",
                 file_fields=["foto", "file1", "file2", "file3", "file4"], timeout=45,
             )
+            if isinstance(sc, dict):
+                self._log(f"ScheduleController -> status={sc.get('status')} "
+                          f"url={str(sc.get('url'))[:90]} len={sc.get('len') or len(str(sc.get('body') or ''))}")
             # THE guard this file was missing, and the root cause of "applying doesn't work".
             # storm-auto: "ScheduleController POST can return 200 yet the server silently fails to
             # set up form state, causing Schedule.jsp to redirect to authenticated_index. Absence

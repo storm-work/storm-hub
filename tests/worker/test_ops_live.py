@@ -1203,3 +1203,37 @@ def test_warmup_falls_back_to_posto_id_when_the_page_advertises_none():
     ops = _warmup_ops('<html><select id="cmbPeriodo"></select>getSlots</html>')
     assert ops._run_warmup_steps() is True
     assert ops.posto_pdf == "5084"      # _make_ops' posto_id
+
+
+# ── questionnaire step retry, ported from storm-auto (2026-08-14) ─────────────────────────────
+class _FlakyQuestSession(_WarmupSession):
+    """First `fail_n` quest-step calls come back non-200, then they succeed."""
+    def __init__(self, sched_html, fail_n):
+        super().__init__(sched_html)
+        self.fail_n = fail_n
+        self.quest_calls = 0
+
+    def browser_eval(self, js, timeout=30):
+        if "outerHTML" in js:
+            return self._sched_html
+        self.quest_calls += 1
+        if self.quest_calls <= self.fail_n:
+            return {"status": 500}
+        return {"status": 200, "fields": {"a": "1"}}
+
+
+def test_a_flaky_questionnaire_step_is_retried_not_silently_carried_past():
+    """storm-auto retries a step that doesn't return 200 -- "like a manual page refresh" -- up to
+    QUEST_STEP_RETRIES. We logged the non-200 and carried on regardless, so one flaky step silently
+    poisoned the chain and surfaced later as the far vaguer quest_state_stale (6 of them in one live
+    run, with zero non-200s logged, because by then the evidence was gone)."""
+    ops = _make_ops()
+    ops.session = _FlakyQuestSession(_SCHED_OK, fail_n=2)
+    assert ops._run_warmup_steps() is True
+    assert ops.session.quest_calls > 2      # it retried rather than accepting the 500
+
+
+def test_quest_steps_give_up_after_the_retry_budget():
+    ops = _make_ops()
+    ops.session = _FlakyQuestSession(_SCHED_OK, fail_n=999)
+    assert ops._run_warmup_steps() is False   # never yields fields -> quest_state_stale
