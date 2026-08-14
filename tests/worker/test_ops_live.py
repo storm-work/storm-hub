@@ -1237,3 +1237,58 @@ def test_quest_steps_give_up_after_the_retry_budget():
     ops = _make_ops()
     ops.session = _FlakyQuestSession(_SCHED_OK, fail_n=999)
     assert ops._run_warmup_steps() is False   # never yields fields -> quest_state_stale
+
+
+class _RaisingQuestSession(_WarmupSession):
+    """Quest-step calls RAISE (a dead in-page fetch) `fail_n` times, then succeed."""
+    def __init__(self, sched_html, fail_n):
+        super().__init__(sched_html)
+        self.fail_n = fail_n
+        self.quest_calls = 0
+
+    def browser_eval(self, js, timeout=30):
+        if "outerHTML" in js:
+            return self._sched_html
+        if "lang=ENG&lang=PT" in js:
+            return 200                      # the home-lang POST succeeds
+        self.quest_calls += 1
+        if self.quest_calls <= self.fail_n:
+            raise RuntimeError("Page.evaluate: TypeError: Failed to fetch")
+        return {"status": 200, "fields": {"a": "1"}, "len": 10, "snippet": "x"}
+
+
+def test_a_transient_in_page_fetch_failure_is_retried_not_fatal(monkeypatch):
+    """storm-auto retries the EXCEPTION path of a quest step, not just a non-200 result. Ours only
+    retried the result, so a transient "TypeError: Failed to fetch" escaped to the outer handler and
+    killed the entire warmup on the first blip -- 306 aborted warmups in one live run."""
+    monkeypatch.setattr("apps.worker.ops_live.time.sleep", lambda s: None)
+    ops = _make_ops()
+    ops.session = _RaisingQuestSession(_SCHED_OK, fail_n=2)
+    assert ops._run_warmup_steps() is True
+    assert ops.session.quest_calls > 2
+
+
+def test_persistent_in_page_fetch_failure_still_fails_the_warmup(monkeypatch):
+    """The retry must not paper over a genuinely dead session."""
+    monkeypatch.setattr("apps.worker.ops_live.time.sleep", lambda s: None)
+    ops = _make_ops()
+    ops.session = _RaisingQuestSession(_SCHED_OK, fail_n=999)
+    assert ops._run_warmup_steps() is False
+
+
+class _DeadHomeSession(_WarmupSession):
+    def browser_eval(self, js, timeout=30):
+        if "lang=ENG&lang=PT" in js:
+            raise RuntimeError("Page.evaluate: TypeError: Failed to fetch")
+        return super().browser_eval(js, timeout)
+
+
+def test_the_home_lang_post_failure_names_itself(monkeypatch):
+    """"TypeError: Failed to fetch" names no step -- 306 of them in one run with no way to tell
+    which fetch died."""
+    logged = []
+    ops = _make_ops()
+    ops._log = logged.append          # _log defaults to a no-op; the worker wires it at launch
+    ops.session = _DeadHomeSession(_SCHED_OK)
+    assert ops._run_warmup_steps() is False
+    assert any("home-lang POST failed" in m for m in logged), logged

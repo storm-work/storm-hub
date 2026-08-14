@@ -583,11 +583,17 @@ class LiveEngineOps(EngineOps):
         """Questionnaire -> Formulario -> ScheduleController -> Schedule.jsp (confirmed URLs/flow,
         ported from storm-auto batch_apply._run_steps_2_to_6)."""
         try:
-            self.session.browser_eval(
-                "(async()=>{const r=await fetch('%s',{method:'POST',credentials:'include',"
-                "headers:{'Content-Type':'application/x-www-form-urlencoded'},"
-                "body:'lang=ENG&lang=PT'});return r.status;})()" % HOME_URL
-            )
+            try:
+                self.session.browser_eval(
+                    "(async()=>{const r=await fetch('%s',{method:'POST',credentials:'include',"
+                    "headers:{'Content-Type':'application/x-www-form-urlencoded'},"
+                    "body:'lang=ENG&lang=PT'});return r.status;})()" % HOME_URL
+                )
+            except Exception as e:
+                # "TypeError: Failed to fetch" is a NETWORK failure inside the page (dead proxy,
+                # dropped tunnel), and the bare message names no step -- 306 of them in one live run
+                # with no way to tell which fetch died. Say which.
+                raise RuntimeError(f"home-lang POST failed: {e}") from e
             self.session.browser_nav(QUEST_URL, timeout=35, skip_cookie_sync=True)
 
             quest_key = self.residence if self.residence != self.nationality else self.nationality
@@ -605,7 +611,8 @@ class LiveEngineOps(EngineOps):
                     + (
                         "const _t=document.createElement('div');_t.innerHTML=body;const f={};"
                         "_t.querySelectorAll('input').forEach(i=>{if(i.name)f[i.name]=i.value;});"
-                        "return {status:r.status,fields:f};"
+                        "return {status:r.status,fields:f,len:body.length,"
+                        "snippet:body.substring(0,300)};"
                         if is_last else "return {status:r.status};"
                     )
                     + "})()"
@@ -616,7 +623,19 @@ class LiveEngineOps(EngineOps):
                 # chain and surfaced later as the much vaguer quest_state_stale.
                 res = None
                 for attempt in range(1, _QUEST_STEP_RETRIES + 1):
-                    res = self.session.browser_eval(js)
+                    try:
+                        res = self.session.browser_eval(js)
+                    except Exception as e:
+                        # storm-auto retries the EXCEPTION path too. Ours only retried a non-200
+                        # RESULT, so a transient in-page fetch failure ("Failed to fetch") escaped
+                        # to the outer handler and killed the whole warmup on the first blip --
+                        # 306 aborted warmups in one live run.
+                        self._log(f"quest step {i+1}/{len(steps)} attempt {attempt}/"
+                                  f"{_QUEST_STEP_RETRIES} raised: {e}")
+                        if attempt == _QUEST_STEP_RETRIES:
+                            raise RuntimeError(f"quest step {i+1} failed: {e}") from e
+                        time.sleep(1.5)
+                        continue
                     if isinstance(res, dict) and res.get("status") == 200:
                         break
                     self._log(f"quest step {i+1}/{len(steps)} attempt {attempt}/"
@@ -624,8 +643,12 @@ class LiveEngineOps(EngineOps):
                 if is_last and isinstance(res, dict):
                     last_fields = res.get("fields") or {}
                     if not last_fields:
+                        # 196 of these in one live run with nothing to explain them. storm-auto logs
+                        # the body snippet for exactly this reason -- "no inputs" is a symptom, and
+                        # the page itself is the only thing that says which.
                         self._log(f"quest step {i+1}/{len(steps)} (last) returned "
-                                  f"status={res.get('status')} but NO input fields")
+                                  f"status={res.get('status')} but NO input fields "
+                                  f"| len={res.get('len')} snippet={str(res.get('snippet',''))[:200]!r}")
 
             if not last_fields:
                 self._log("do_warmup: quest_state_stale (last step yielded no fields)")
