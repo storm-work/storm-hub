@@ -468,10 +468,23 @@ class Scheduler:
         # 1. Wipe the pool. CLOSED rather than deleted so the history survives -- and so a genuine
         #    rediscovery can still reopen it (_persist_slots does CLOSED -> AVAILABLE) if the portal
         #    starts advertising something real.
-        db.execute(update(M.Slot)
-                   .where(M.Slot.booking_id == bk.id,
-                          M.Slot.status.in_([SlotStatus.AVAILABLE, SlotStatus.LEASED]))
-                   .values(status=SlotStatus.CLOSED))
+        closing = db.scalars(select(M.Slot).where(
+            M.Slot.booking_id == bk.id,
+            M.Slot.status.in_([SlotStatus.AVAILABLE, SlotStatus.LEASED]))).all()
+        for slot in closing:
+            # Release any lease still open on it. Closing a slot while leaving its lease open leaves
+            # a contradiction the next tick resolves the wrong way: _reclaim_stale_slot_leases
+            # reclaims the orphan and (before the guard above) reopened the very slot we just
+            # judged phantom.
+            for lease in db.scalars(select(M.SlotLease).where(
+                    M.SlotLease.slot_id == slot.id, M.SlotLease.released_at.is_(None))).all():
+                lease.released_at = now
+                lease.outcome = SlotLeaseOutcome.EXPIRED
+            slot.status = SlotStatus.CLOSED
+        # SessionLocal is autoflush=False, so the releases above stay ORM-level until flushed and
+        # any later query in this tick would still see them as open (the same trap called out in
+        # _reclaim_stale_slot_leases).
+        db.flush()
 
         # 2. Wipe the slot-found signal state, Hub-side and worker-side. `inactivate` is the proven
         #    path for the worker half: it clears BOTH sticky latches, so no scout keeps behaving as
@@ -742,6 +755,19 @@ class Scheduler:
         for slot in db.scalars(select(M.Slot).where(M.Slot.id.in_(reclaimed))).all():
             if slot.status == SlotStatus.TAKEN:
                 continue          # genuinely booked -- never reopen
+            if slot.status == SlotStatus.CLOSED:
+                # CLOSED means DELIBERATELY retired -- by /start's fresh-run retirement, by the
+                # false-slot revert, or by the operator's Clear. Only a genuine REDISCOVERY may
+                # reopen it (events.py's _persist_slots); reclaiming a stale lease must not.
+                #
+                # Confirmed live 2026-08-14: "Test 3018" restarted at 16:41:53 and had slot_open AND
+                # slot_found stamped at 16:41:58.432469 -- the identical microsecond, i.e. one tick,
+                # 4.5 minutes before any scout pushed anything. Leases left open on slots the
+                # false-slot revert had CLOSED were reclaimed here, this reopened them, and
+                # _fire_slot_found_if_new saw an AVAILABLE slot in the same tick. The run skipped
+                # its entire slot-open discovery phase on resurrected slots it had already judged
+                # phantom.
+                continue
             active = db.scalar(select(func.count()).select_from(M.SlotLease).where(
                 M.SlotLease.slot_id == slot.id, M.SlotLease.released_at.is_(None))) or 0
             cap = pool_manager.resolve_slot_capacity(

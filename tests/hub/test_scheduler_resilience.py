@@ -1333,3 +1333,73 @@ def test_running_booking_is_still_signalled_and_respawned(db, monkeypatch):
     sched._tick_once()
 
     assert set(called) == {"latch", "respawn"}
+
+
+# ── a retired slot must never be resurrected by lease bookkeeping (confirmed live 2026-08-14) ────
+def test_reclaiming_a_stale_lease_never_reopens_a_closed_slot(db):
+    """CLOSED means DELIBERATELY retired -- by /start's fresh-run retirement, the false-slot revert,
+    or the operator's Clear. Only a genuine rediscovery may reopen it.
+
+    Live: "Test 3018" restarted at 16:41:53 and had slot_open AND slot_found stamped at
+    16:41:58.432469 -- the identical microsecond, one tick, and 4.5 MINUTES before any scout pushed
+    anything. Leases left open on slots the false-slot revert had CLOSED got reclaimed here, that
+    reopened them, and _fire_slot_found_if_new saw an AVAILABLE slot in the same tick. The run
+    skipped its whole slot-open discovery phase on slots it had already judged phantom."""
+    from libs.domain.enums import SlotLeaseOutcome
+
+    sched = _scheduler(bus=_FakeBus())
+    bk = _make_booking(db, settings_json={"SLOT_LEASE_TTL": 1})
+    w = _make_worker(db, bk, _make_identity(db))
+    closed = M.Slot(booking_id=bk.id, posto_id="5084", date="2026-09-01", period=1,
+                    status=SlotStatus.CLOSED)
+    db.add(closed); db.commit()
+    db.add(M.SlotLease(slot_id=closed.id, worker_id=w.id,
+                       leased_at=NOW - timedelta(hours=1)))       # long stale
+    db.commit()
+
+    sched._reclaim_stale_slot_leases(db, bk, NOW)
+
+    assert db.get(M.Slot, closed.id).status == SlotStatus.CLOSED, "a retired slot was resurrected"
+    lease = db.scalars(select(M.SlotLease)).one()
+    assert lease.released_at is not None and lease.outcome == SlotLeaseOutcome.EXPIRED
+
+
+def test_reclaiming_a_stale_lease_still_reopens_a_live_leased_slot(db):
+    """The guard must not break the reclaim it guards: a LEASED slot whose holder went silent is
+    exactly what this path exists to free."""
+    sched = _scheduler(bus=_FakeBus())
+    bk = _make_booking(db, settings_json={"SLOT_LEASE_TTL": 1})
+    w = _make_worker(db, bk, _make_identity(db))
+    leased = M.Slot(booking_id=bk.id, posto_id="5084", date="2026-09-02", period=2,
+                    status=SlotStatus.LEASED)
+    db.add(leased); db.commit()
+    db.add(M.SlotLease(slot_id=leased.id, worker_id=w.id, leased_at=NOW - timedelta(hours=1)))
+    db.commit()
+
+    sched._reclaim_stale_slot_leases(db, bk, NOW)
+
+    assert db.get(M.Slot, leased.id).status == SlotStatus.AVAILABLE
+
+
+def test_false_slot_revert_releases_the_leases_of_the_slots_it_closes(db):
+    """Closing a slot while leaving its lease open leaves a contradiction the next tick resolves the
+    wrong way -- an orphan lease on a retired slot."""
+    from libs.domain.enums import SlotLeaseOutcome
+
+    sched = _scheduler(bus=_FakeBus(), redis_client=fakeredis.FakeStrictRedis(decode_responses=True))
+    found_at = NOW - timedelta(minutes=10)
+    bk = _make_booking(db, slot_found_fired_at=found_at,
+                       settings_json={"FALSE_SLOT_BOUNCE_LIMIT": 5})
+    w = _make_worker(db, bk, _make_identity(db))
+    slots = _bounced_pool(db, bk, w, n_bounces=5, since=found_at)
+    # an extra slot still actively leased when the verdict lands
+    db.add(M.SlotLease(slot_id=slots[0].id, worker_id=w.id, leased_at=NOW))
+    slots[0].status = SlotStatus.LEASED
+    db.commit()
+
+    assert sched._maybe_revert_false_slot_found(db, bk, NOW) is True
+
+    assert db.get(M.Slot, slots[0].id).status == SlotStatus.CLOSED
+    open_leases = db.scalars(select(M.SlotLease).where(
+        M.SlotLease.released_at.is_(None))).all()
+    assert open_leases == [], "left an orphan lease on a slot it retired"

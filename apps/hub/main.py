@@ -1920,6 +1920,14 @@ def start_booking(booking_id: str, db: Session = Depends(get_db),
     # reopens on rediscovery, so this keeps the history (and any BookedAppointment FK) intact
     # while making the pool empty as far as _fire_slot_found_if_new and _assign_slots care.
     # TAKEN is left alone -- that is a real booking, not an observation.
+    # Note the CLOSED slots are included here, unlike the status filter below: a slot can be CLOSED
+    # and STILL hold an open lease (the false-slot revert closed slots without releasing them), and
+    # an orphan lease on a retired slot is exactly what _reclaim_stale_slot_leases later trips over.
+    for lease in db.scalars(select(M.SlotLease).join(M.Slot, M.SlotLease.slot_id == M.Slot.id).where(
+            M.Slot.booking_id == booking_id, M.Slot.status != SlotStatus.TAKEN,
+            M.SlotLease.released_at.is_(None))).all():
+        lease.released_at = _now()
+        lease.outcome = SlotLeaseOutcome.EXPIRED
     stale_slots = db.scalars(select(M.Slot).where(
         M.Slot.booking_id == booking_id,
         M.Slot.status.notin_([SlotStatus.TAKEN, SlotStatus.CLOSED]))).all()
