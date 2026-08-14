@@ -231,3 +231,94 @@ def test_form_stale_release_is_recorded_distinctly_from_a_bounce(slots_db):
     assert db.scalars(select(M.SlotLease)).one().outcome == SlotLeaseOutcome.FORM_STALE
     assert db.scalars(select(M.Slot)).one().status == SlotStatus.AVAILABLE   # still freed
     db.close()
+
+
+# ── the success path had never once run end to end (confirmed live 2026-08-14) ────────────────
+def _seed_apply_worker(S, sub_account=True):
+    from libs.db import models as M
+    from libs.domain.enums import BookingStatus, WorkerRole, WorkerStatus
+
+    db = S()
+    bk = M.Booking(name="b", type="real", posto_id="3018", status=BookingStatus.RUNNING)
+    i = M.Identity(full_name="CLAUDIA BORGES", type="real")
+    db.add_all([bk, i]); db.commit()
+    sa = M.SubAccount(identity_id=i.id, username="clabor4612", password="p")
+    db.add(sa); db.commit()
+    w = M.Worker(booking_id=bk.id, identity_id=i.id, role=WorkerRole.APPLY,
+                 status=WorkerStatus.RUNNING,
+                 effective_settings_json={"_sub_account_id": sa.id} if sub_account else {})
+    db.add(w); db.commit()
+    ids = (bk.id, w.id)
+    db.close()
+    return ids
+
+
+def test_booked_pdf_writes_the_artifact_appointment_and_marks_the_slot_taken(slots_db):
+    """This whole handler had never executed successfully -- it referenced SlotStatus.BOOKED, which
+    is not a member of SlotStatus (TAKEN is the booked state). A bug reachable ONLY on the success
+    path survives every failing run: it first fired on 2026-08-14 when a worker booked posto 3018 /
+    2026-09-10 / period 7 with a verified 250KB PDF, and the AttributeError rolled the transaction
+    back -- no Artifact, no BookedAppointment, slot never marked."""
+    from sqlalchemy import select
+
+    import apps.hub.events as ev
+    from libs.db import models as M
+    from libs.domain.enums import SlotStatus
+
+    bid, wid = _seed_apply_worker(slots_db)
+    db = slots_db()
+    db.add(M.Slot(booking_id=bid, posto_id="3018", date="2026-09-10", period=7,
+                  status=SlotStatus.LEASED))
+    db.commit(); db.close()
+
+    ev.EventHub.__new__(ev.EventHub)._persist_booked_pdf(
+        wid, "/var/artifacts/x.pdf", {"date": "2026-09-10", "period": 7})
+
+    db = slots_db()
+    art = db.scalars(select(M.Artifact)).one()
+    appt = db.scalars(select(M.BookedAppointment)).one()
+    assert art.kind == "pdf" and art.path == "/var/artifacts/x.pdf"
+    assert appt.pdf_artifact_id == art.id and appt.booking_id == bid
+    assert appt.booked_at is not None
+    assert db.scalars(select(M.Slot)).one().status == SlotStatus.TAKEN
+    db.close()
+
+
+def test_a_failing_side_effect_never_swallows_the_rest_of_the_event(monkeypatch, caplog):
+    """The real cost of the crash above wasn't only the missing rows: it aborted the rest of that
+    message's handling, so the `terminal` branch never ran and the worker still showed
+    running/applying after it had booked and exited. Handlers must be isolated and loud."""
+    import logging
+
+    import apps.hub.events as ev
+
+    hub = ev.EventHub.__new__(ev.EventHub)
+    hub.last_seen, hub._event_times, hub.dates_reported = {}, {}, {}
+    hub._stop = __import__("threading").Event()
+    hub._loop = None
+    hub._redis_url = "redis://unused"
+    calls = []
+
+    def _boom(*a, **k):
+        raise AttributeError("BOOKED")
+
+    monkeypatch.setattr(hub, "_apply_db", _boom, raising=False)
+    monkeypatch.setattr(hub, "_release_on_terminal", lambda *a: calls.append("terminal"),
+                        raising=False)
+
+    class _M:
+        id, type, ts = "1-0", "terminal", 0.0
+        payload = {"worker_id": "w1", "outcome": "booked"}
+
+    class _Bus:
+        def read_events(self, **kw):
+            hub._stop.set()
+            return [_M()]
+
+    monkeypatch.setattr(ev, "Bus", lambda *a, **k: _Bus())
+    monkeypatch.setattr(ev, "connect", lambda *a, **k: None)
+    with caplog.at_level(logging.ERROR):
+        hub._consume()
+
+    assert calls == ["terminal"], "a failing handler swallowed the terminal status update"
+    assert any("apply_db" in r.message for r in caplog.records), "the failure was not logged"

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import logging
 import time
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
@@ -18,6 +19,8 @@ from libs.domain.enums import WorkerStatus, WorkerSubstate
 from .config import settings
 from .db import SessionLocal
 from libs.db import models as M
+
+logger = logging.getLogger(__name__)
 
 # PhaseResult.outcome -> terminal worker status. MUST cover every outcome libs/engine/phases.py can
 # emit: an unmapped one silently becomes FAILED via the .get() default below, which is exactly how
@@ -387,7 +390,12 @@ class EventHub:
                     M.Slot.period == int(slot["period"])))
                 if slot_row:
                     slot_id = slot_row.id
-                    slot_row.status = SlotStatus.BOOKED
+                    # SlotStatus has no BOOKED member -- TAKEN is the booked terminal state.
+                    # Confirmed live 2026-08-14: this raised AttributeError inside the booked_pdf
+                    # handler, so the whole transaction rolled back and a REAL booking (verified
+                    # 250KB PDF on disk) produced no Artifact and no BookedAppointment row. A bug
+                    # that can only fire on the success path survives every failing run.
+                    slot_row.status = SlotStatus.TAKEN
             sub_account_id = (w.effective_settings_json or {}).get("_sub_account_id")
             if not sub_account_id:
                 return  # sim-engine or pre-upgrade worker with no recorded sub-account; nothing to link
@@ -469,26 +477,42 @@ class EventHub:
                     now = time.time()
                     self.last_seen[wid] = now
                     self._event_times.setdefault(wid, []).append(now)
-                    self._apply_db(wid, map_event_to_update(m.type, m.payload))
+                    # Each side-effect is isolated. Confirmed live 2026-08-14: _persist_booked_pdf
+                    # raised AttributeError on SlotStatus.BOOKED (no such member), which aborted the
+                    # rest of THIS message's handling -- so a real, PDF-verified booking produced no
+                    # Artifact, no BookedAppointment, and, because the `terminal` branch below never
+                    # ran, left the worker showing running/applying after it had already exited.
+                    # A failure in one persistence path must never silently swallow another; log it
+                    # loudly and keep going, so a status update is never lost to an unrelated bug.
+                    def _step(name, fn, *a):
+                        try:
+                            fn(*a)
+                        except Exception:
+                            logger.exception("event handler %s failed for worker %s (event=%s)",
+                                             name, wid, m.type)
+
+                    _step("apply_db", self._apply_db, wid, map_event_to_update(m.type, m.payload))
                     if m.type == "slots_found":
-                        self._persist_slots(wid, m.payload.get("slots", []))
+                        _step("persist_slots", self._persist_slots, wid, m.payload.get("slots", []))
                     if m.type == "booked_pdf" and m.payload.get("pdf_path"):
-                        self._persist_booked_pdf(wid, m.payload["pdf_path"], m.payload.get("slot"))
+                        _step("persist_booked_pdf", self._persist_booked_pdf,
+                              wid, m.payload["pdf_path"], m.payload.get("slot"))
                     if m.type == "reg_result" and m.payload.get("sub_account_id"):
-                        self._persist_registration_result(
-                            m.payload["sub_account_id"], m.payload.get("outcome", ""), m.payload)
+                        _step("persist_registration_result", self._persist_registration_result,
+                              m.payload["sub_account_id"], m.payload.get("outcome", ""), m.payload)
                     if m.type == "terminal":
-                        self._release_on_terminal(wid, bus)
+                        _step("release_on_terminal", self._release_on_terminal, wid, bus)
                     if m.type == "proxy_request":
                         self._proxy_executor.submit(
                             self._handle_proxy_request, wid, m.payload.get("phase", "warmup"), bus)
                     if m.type == "dates_reported":
                         self.dates_reported.setdefault(wid, []).append(m.payload.get("outcomes", []))
                     if m.type == "slot_released":
-                        self._release_slot_lease(wid, m.payload.get("slot") or {},
-                                                 m.payload.get("reason", "bounce"))
+                        _step("release_slot_lease", self._release_slot_lease,
+                              wid, m.payload.get("slot") or {}, m.payload.get("reason", "bounce"))
                     if m.type == "gettime_result":
-                        self._cache_gettime(wid, m.payload.get("special_days", {}))
+                        _step("cache_gettime", self._cache_gettime, wid,
+                              m.payload.get("special_days", {}))
                 item = {"id": m.id, "type": m.type, "ts": m.ts, **m.payload}
                 if self._loop is not None:
                     self._loop.call_soon_threadsafe(self._broadcast, item)
