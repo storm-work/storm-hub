@@ -240,16 +240,27 @@ function Login({ onLogin }) {
   );
 }
 
-function useList(path) {
+function useList(path, { pollMs = 0 } = {}) {
   const [rows, setRows] = useState([]);
   const [err, setErr] = useState("");
   const reload = () => api(path).then(setRows).catch((e) => setErr(e.message));
-  useEffect(() => { reload(); }, [path]);
+  // `pollMs`: re-fetch on a timer. Worker/booking STATUS comes from REST -- only the live substate
+  // arrives over the WS -- so without this the page froze on whatever it loaded with. Confirmed
+  // 2026-08-14: after clicking Start, the fleet launch correctly ran in the background for several
+  // minutes while the table kept showing the pre-launch snapshot ("0 of 6 workers running,
+  // failed: 5"), so a launch that was working looked like a launch that did nothing.
+  useEffect(() => {
+    reload();
+    if (!pollMs) return undefined;
+    const t = setInterval(reload, pollMs);
+    return () => clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [path, pollMs]);
   return { rows, err, reload };
 }
 
 function Bookings({ me, events, setLeftPanel, setRightPanel }) {
-  const { rows, err, reload } = useList("/bookings");
+  const { rows, err, reload } = useList("/bookings", { pollMs: 5000 });
   const [selectedId, setSelectedId] = useState(null);
   const [showCreate, setShowCreate] = useState(false);
   const booking = rows.find((b) => b.id === selectedId) || null;
@@ -439,7 +450,7 @@ const RUN_SUMMARY_SUBSTATES = [
 ];
 
 function BookingRunSummary({ booking, events }) {
-  const { rows } = useList(`/bookings/${booking.id}/workers`);
+  const { rows } = useList(`/bookings/${booking.id}/workers`, { pollMs: 5000 });
   // Only RUNNING workers have a substate (workerView), so this can no longer report "holding: 12"
   // for a fleet that is entirely stopped -- which is exactly what it did when first added.
   const counts = rows.reduce((a, w) => {
@@ -688,7 +699,7 @@ function BookingOpsTabs({ me, booking, events, setRightPanel, onBookingChanged }
 }
 
 function BookingSlots({ booking }) {
-  const { rows, err } = useList(`/bookings/${booking.id}/slots`);
+  const { rows, err } = useList(`/bookings/${booking.id}/slots`, { pollMs: 5000 });
   const [statusFilter, setStatusFilter] = useState("all");
   const filtered = rows.filter((s) => statusFilter === "all" || s.status === statusFilter);
   const { q, setQ, sort, setSort, rows: shown } = useSortSearch(filtered, { key: "date", dir: "asc" });
@@ -873,7 +884,7 @@ function BookingFullSettingsPanel({ me, booking, onSaved }) {
 }
 
 function BookingWorkers({ me, booking, events, setRightPanel }) {
-  const workers = useList(`/bookings/${booking.id}/workers`);
+  const workers = useList(`/bookings/${booking.id}/workers`, { pollMs: 5000 });
   const identities = useList("/identities");
   const templates = useList("/templates");
   const appointments = useList(`/bookings/${booking.id}/appointments`);

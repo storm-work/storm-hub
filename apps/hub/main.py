@@ -311,8 +311,11 @@ def _set_worker_status(w: M.Worker, status: WorkerStatus, *, detail: str | None 
     of a previous incarnation."""
     w.status = status
     w.substate = None
-    if detail is not None:
-        w.substate_detail = detail
+    # Clear the detail too unless a NEW one is supplied. It describes why the worker reached its
+    # LAST state; carrying it forward means a relaunched worker still reads "no live process
+    # (dead-worker reap)" while it is demonstrably alive and running -- observed 2026-08-14, and
+    # doubly misleading now that the dashboard surfaces this as the status tooltip.
+    w.substate_detail = detail
 
 
 def _sched_on_relaunch(db: Session, worker: M.Worker) -> None:
