@@ -36,7 +36,7 @@ def test_apply_worker_emits_started_status_and_booked(bus):
 
 
 def test_scout_worker_pushes_and_terminal_discovered(bus):
-    ops = SimEngineOps(scout_rounds=1)
+    ops = SimEngineOps()   # defaults: single task ["2026-08-18"] -> found period 4, then stops
     res = WorkerRuntime(bus, "s1").run(_cfg(template={"ROLE": "scout"}), ops)
     assert res.outcome == "discovered"
     assert ops.pushed == [{"date": "2026-08-18", "period": 4}]
@@ -57,3 +57,38 @@ def test_login_failure_terminal_failed(bus):
     assert res.outcome == "failed"
     term = _events(bus)[-1]
     assert term.type == "terminal" and term.payload["outcome"] == "failed"
+
+
+class _CheckpointingOps(SimEngineOps):
+    """SimEngineOps + a save_checkpoint_now spy -- mirrors LiveEngineOps having that method while
+    SimEngineOps (used above) deliberately doesn't, so those tests double as proof the hook is a
+    no-op for ops that don't support checkpointing."""
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.checkpoint_calls = 0
+
+    def save_checkpoint_now(self):
+        self.checkpoint_calls += 1
+
+
+def test_checkpoint_saved_on_reaching_holding(bus):
+    """Regression (C1): save_checkpoint_now() previously had zero callers anywhere -- the entire
+    restore chain was dead code. It must fire at least once when a worker first reaches a healthy
+    holding state, so a later respawn can restore instead of paying a full fresh login."""
+    ops = _CheckpointingOps(assignment={"date": "d", "period": 1})
+    WorkerRuntime(bus, "w4").run(_cfg(template={"ROLE": "apply"}), ops)
+    assert ops.checkpoint_calls >= 1
+
+
+def test_checkpoint_not_saved_for_ops_without_support(bus):
+    ops = SimEngineOps(assignment={"date": "d", "period": 1})
+    # must not raise even though SimEngineOps has no save_checkpoint_now
+    res = WorkerRuntime(bus, "w5").run(_cfg(template={"ROLE": "apply"}), ops)
+    assert res.outcome == "booked"
+
+
+def test_checkpoint_saved_repeatedly_during_scout_polling(bus):
+    ops = _CheckpointingOps()   # default scout plan: one discover round then stop
+    WorkerRuntime(bus, "s2").run(_cfg(template={"ROLE": "scout"}), ops)
+    # HOLDING (pre-discover) + POLLING (post-discover) -> at least 2 saves for one round
+    assert ops.checkpoint_calls >= 2

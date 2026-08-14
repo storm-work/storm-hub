@@ -76,6 +76,8 @@ class Identity(Base, PKMixin, TimestampMixin):
         _enum(E.IdentityStatus), nullable=False, default=E.IdentityStatus.EMPTY
     )
     archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    comment: Mapped[str | None] = mapped_column(String(512))
+    target_posto: Mapped[str | None] = mapped_column(String(16))  # real identities only (app-enforced)
     __table_args__ = (Index("ix_identities_type_status", "type", "status"),)
 
 
@@ -154,6 +156,9 @@ class Booking(Base, PKMixin, TimestampMixin):
     warmup_start_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     slot_open_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     settings_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    slot_open_fired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    slot_found_fired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class BookingIdentity(Base, PKMixin):
@@ -198,6 +203,10 @@ class Worker(Base, PKMixin, TimestampMixin):
     substate: Mapped[E.WorkerSubstate | None] = mapped_column(_enum(E.WorkerSubstate))
     substate_detail: Mapped[str | None] = mapped_column(String(255))
     effective_settings_json: Mapped[dict] = mapped_column(JSON, default=dict)  # frozen at launch
+    # Which sub-account this worker is actually logged in with right now -- set at launch, then kept
+    # in sync by do_login()'s sticky-then-rotate loop (ops_live.py) via the "account_rotated" event,
+    # since a worker can rotate off its launch-time pick after repeated login failures.
+    sub_account_id: Mapped[str | None] = mapped_column(ForeignKey("sub_accounts.id"))
 
 
 class WorkerRun(Base, PKMixin, TimestampMixin):

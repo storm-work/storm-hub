@@ -63,6 +63,13 @@ class IdentityCreate(BaseModel):
     passport_no: str | None = None
     gender: str | None = None
     nationality: str | None = None
+    comment: str | None = None
+    target_posto: str | None = None
+
+
+class IdentityUpdate(BaseModel):
+    comment: str | None = None
+    target_posto: str | None = None
 
 
 class IdentityOut(BaseModel):
@@ -70,8 +77,12 @@ class IdentityOut(BaseModel):
     full_name: str
     type: IdentityType
     status: str
+    birthdate: str | None = None
+    gender: str | None = None
     passport_no: str | None = None
     nationality: str | None = None
+    comment: str | None = None
+    target_posto: str | None = None
     created_at: datetime | None = None
 
     model_config = {"from_attributes": True}
@@ -110,6 +121,13 @@ class BookingOut(BaseModel):
     slot_open_at: datetime | None = None
     settings_json: dict = Field(default_factory=dict)
     created_at: datetime | None = None
+    # Regression: these three DB columns existed and were written correctly, but were never
+    # returned here -- the dashboard's Booking Overview panel read booking.slot_open_fired_at/
+    # slot_found_fired_at expecting a real signal-fire display and silently got `undefined` every
+    # time, since the API response never carried them.
+    started_at: datetime | None = None
+    slot_open_fired_at: datetime | None = None
+    slot_found_fired_at: datetime | None = None
 
     model_config = {"from_attributes": True}
 
@@ -128,6 +146,7 @@ class WorkerOut(BaseModel):
     role: WorkerRole
     status: str
     substate: str | None = None
+    sub_account_id: str | None = None
 
     model_config = {"from_attributes": True}
 
@@ -145,16 +164,16 @@ class ProxyOut(BaseModel):
 
 
 class ProxyCreate(BaseModel):
-    provider: str = "isp"
-    kind: str = "static_res"
+    provider: str = "soax"
+    kind: str = "static"
     endpoint: str
     credentials_ref: str | None = None
     max_sessions: int = 2
 
 
 class ProxyImport(BaseModel):
-    provider: str = "isp"
-    kind: str = "static_res"
+    provider: str = "soax"
+    kind: str = "static"
     max_sessions: int = 2
     text: str                    # newline-separated proxy lines
 
@@ -169,6 +188,11 @@ class ImportResult(BaseModel):
     sub_accounts: int = 0
     skipped: int = 0
     errors: list[str] = Field(default_factory=list)
+    # Populated by identity-related imports/generators (empty/unused for proxy imports) so the
+    # dashboard can chain follow-up actions (gen-subaccounts, then registration/run) onto exactly
+    # the rows this call just created, without a second lookup.
+    identity_ids: list[str] = Field(default_factory=list)
+    sub_account_ids: list[str] = Field(default_factory=list)
 
 
 class GlobalSettingsPut(BaseModel):
@@ -178,6 +202,46 @@ class GlobalSettingsPut(BaseModel):
 class GenSubAccounts(BaseModel):
     identity_ids: list[str]
     count: int = 3                # sub-accounts per identity
+
+
+# ── Registration subsystem ─────────────────────────────────────────────────────
+class SubAccountOut(BaseModel):
+    id: str
+    identity_id: str
+    identity_name: str
+    identity_type: str
+    username: str
+    status: str
+    email: str | None = None
+    registration_status: str | None = None  # latest registration_jobs.status for this account, if any
+    attempts: int = 0
+    created_at: datetime | None = None
+
+
+class SubAccountResetRequest(BaseModel):
+    sub_account_ids: list[str]
+
+
+class RegistrationRunRequest(BaseModel):
+    sub_account_ids: list[str]
+    concurrency: int = 10
+    browser_concurrency: int | None = None   # defaults to concurrency
+    provider: str = "soax"                   # proxy provider for registration (soax confirmed
+                                              # preferred; see conversation_extract)
+    kind: str | None = None
+    mode: str = "parallel"                   # RegistrationMode value
+
+
+class RegistrationJobOut(BaseModel):
+    id: str
+    sub_account_id: str
+    mode: str
+    status: str
+    attempts: int
+    proxy_id: str | None = None
+    solver_used: str | None = None
+    created_at: datetime | None = None
+    model_config = {"from_attributes": True}
 
 
 class GenTestIdentities(BaseModel):
@@ -199,4 +263,51 @@ class TemplateOut(BaseModel):
     role: WorkerRole
     settings_json: dict = Field(default_factory=dict)
     logic_snapshot: str = "latest"
+    model_config = {"from_attributes": True}
+
+
+# ── Booked appointments / artifacts / audit (read-only viewers) ───────────────
+class ArtifactOut(BaseModel):
+    id: str
+    worker_id: str | None = None
+    kind: str
+    path: str
+    created_at: datetime | None = None
+    model_config = {"from_attributes": True}
+
+
+class BookedAppointmentOut(BaseModel):
+    id: str
+    booking_id: str
+    identity_id: str
+    sub_account_id: str
+    appointment_ref: str | None = None
+    pdf_artifact_id: str | None = None
+    booked_at: datetime | None = None
+    model_config = {"from_attributes": True}
+
+
+class SlotOut(BaseModel):
+    id: str
+    booking_id: str
+    posto_id: str
+    date: str
+    period: int
+    status: str
+    capacity_estimate: int | None = None
+    miss_count: int = 0
+    discovered_by: str | None = None
+    first_seen: datetime | None = None
+    last_seen: datetime | None = None
+    created_at: datetime | None = None
+    model_config = {"from_attributes": True}
+
+
+class AuditRowOut(BaseModel):
+    id: str
+    actor: str | None = None
+    action: str
+    target: str | None = None
+    payload: dict = Field(default_factory=dict)
+    ts: datetime
     model_config = {"from_attributes": True}

@@ -1,0 +1,122 @@
+"""Supervisor -- process tracking must survive a Hub restart (confirmed bug, 2026-08-13): the old
+Popen-only tracking meant a fresh Supervisor() instance had no record of processes a PREVIOUS Hub
+instance spawned, so stop() silently no-oped for them and running_ids()/is_running() reported them
+as dead even though they were perfectly healthy. Uses a real subprocess whose argv matches the
+`python -m <module> <key>` shape Supervisor._spawn_module uses (stand-in module: the stdlib's own
+http.server, so this needs no apps.worker/Redis machinery) to exercise the actual /proc-scan fallback
+against a real, "foreign" (not-spawned-by-this-instance) process.
+"""
+import subprocess
+import sys
+import time
+
+from apps.hub.supervisor import Supervisor, _find_pid_by_cmdline
+
+
+def _spawn_foreign(key: str) -> subprocess.Popen:
+    """A real process with the exact argv shape Supervisor looks for, started OUTSIDE any
+    Supervisor instance -- standing in for "a process a previous Hub instance spawned"."""
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "http.server", key],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+    )
+    time.sleep(0.3)   # let it actually start and register its cmdline
+    return proc
+
+
+def test_find_pid_by_cmdline_locates_a_real_foreign_process():
+    key = "18231"   # a port number doubling as this test's unique "key"
+    proc = _spawn_foreign(key)
+    try:
+        found = _find_pid_by_cmdline("http.server", key)
+        assert found == proc.pid
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
+def test_find_pid_by_cmdline_returns_none_for_unknown_key():
+    assert _find_pid_by_cmdline("http.server", "no-such-key-ever-18232") is None
+
+
+def test_stop_kills_a_reconciled_pid_it_never_spawned_itself():
+    """The core regression: Supervisor.stop() must kill a process it never spawned itself (e.g.
+    spawned by a previous Hub instance before a restart, now known only via reconcile()'s pid
+    registry), not silently return False."""
+    key = "18233"
+    proc = _spawn_foreign(key)
+    sup = Supervisor("redis://localhost:6379/0")   # fresh instance -- never spawned this pid
+    sup.reconcile({key: "http.server"})
+    assert sup._pids[key] == proc.pid
+
+    try:
+        ok = sup.stop(key)
+        assert ok is True
+        # proc is a real child of THIS test process (unlike in production, where Supervisor's
+        # process is the real parent) -- os.kill(pid, 0) reports a killed-but-unreaped child as
+        # still "alive" (zombie) until something wait()s on it, so reap it here rather than relying
+        # on _alive() to observe the kill.
+        assert proc.wait(timeout=5) is not None
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+
+
+def test_stop_falls_back_to_direct_proc_scan_for_worker_module():
+    """Even with NO reconcile() call at all, stop() itself does a last-resort /proc scan for the
+    two real module names it spawns (apps.worker / apps.registrar) -- covers a worker whose row
+    predates this Hub instance in some edge case reconcile() didn't get to."""
+    key = "18235"
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "apps.worker", key],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+    )
+    time.sleep(0.3)
+    sup = Supervisor("redis://localhost:6379/0")
+    assert sup._pids == {}
+    try:
+        ok = sup.stop(key)
+        assert ok is True
+        assert proc.wait(timeout=5) is not None   # reaped -- see the sibling test's note on zombies
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+
+
+def test_stop_returns_false_when_nothing_matches():
+    sup = Supervisor("redis://localhost:6379/0")
+    assert sup.stop("no-such-worker-id-at-all") is False
+
+
+def test_reconcile_picks_up_a_preexisting_process_and_is_running_reports_it():
+    """reconcile() is what Hub startup calls with the DB's list of RUNNING workers -- after it,
+    running_ids()/is_running() must correctly see a process this instance never spawned."""
+    key = "18234"
+    proc = _spawn_foreign(key)
+    sup = Supervisor("redis://localhost:6379/0")
+    try:
+        assert sup.is_running(key) is False   # not yet reconciled
+
+        sup.reconcile({key: "http.server"})
+
+        assert sup.is_running(key) is True
+        assert key in sup.running_ids()
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
+def test_reconcile_does_not_overwrite_an_already_tracked_pid():
+    sup = Supervisor("redis://localhost:6379/0")
+    sup._pids["w1"] = 999999   # pretend already tracked (e.g. spawned by this instance)
+    sup.reconcile({"w1": "apps.worker"})
+    assert sup._pids["w1"] == 999999   # untouched -- reconcile only fills in gaps
+
+
+def test_reconcile_leaves_a_genuinely_dead_worker_untracked():
+    sup = Supervisor("redis://localhost:6379/0")
+    sup.reconcile({"nonexistent-worker-id": "apps.worker"})
+    assert sup.is_running("nonexistent-worker-id") is False
+    assert "nonexistent-worker-id" not in sup._pids

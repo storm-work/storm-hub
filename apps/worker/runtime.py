@@ -8,8 +8,15 @@ turns these events into DB status updates + dashboard WS pushes.
 from __future__ import annotations
 
 from libs.bus import Bus
+from libs.domain.enums import WorkerSubstate
 from libs.engine.config import EngineConfig
 from libs.engine.phases import EngineOps, PhaseMachine, PhaseResult
+
+# Substates at which a checkpoint is worth taking: first entering a healthy holding state (unblocks
+# the restore chain for any later respawn -- previously save_checkpoint_now() had zero callers
+# anywhere, so checkpoint restore was fully dead code despite being built and tested), and every
+# scout POLLING lap (already-recurring, so a free periodic refresh).
+_CHECKPOINT_SUBSTATES = {WorkerSubstate.HOLDING, WorkerSubstate.POLLING}
 
 
 class WorkerRuntime:
@@ -26,6 +33,11 @@ class WorkerRuntime:
         def on_transition(substate, detail):
             self._emit("status_change", substate=str(substate), detail=detail)
             self._emit("log_line", text=f"-> {substate}" + (f" ({detail})" if detail else ""))
+            if substate in _CHECKPOINT_SUBSTATES and hasattr(ops, "save_checkpoint_now"):
+                try:
+                    ops.save_checkpoint_now()
+                except Exception as e:  # best-effort -- never let a checkpoint save kill the worker
+                    self._emit("log_line", text=f"checkpoint save failed (non-fatal): {e}")
 
         pm = PhaseMachine(cfg, ops, on_transition=on_transition)
         try:

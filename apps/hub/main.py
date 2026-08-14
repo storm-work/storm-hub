@@ -6,14 +6,19 @@ exclusivity). Redis/worker-control and WS log streaming are added later in Phase
 """
 from __future__ import annotations
 
+import random
+import re
+import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import func, select, text
+from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -21,6 +26,7 @@ from libs.db import models as M
 from libs.domain.enums import (
     BOOKING_ACTIVE_STATUSES,
     BookingStatus,
+    IdentityStatus,
     SessionPurpose,
     SessionStatus,
     UserRole,
@@ -28,6 +34,7 @@ from libs.domain.enums import (
 from libs.domain.enums import SettingsLayer as L
 from libs.domain.rules import RuleViolation, resolve_worker_role
 from libs.domain.settings import CATALOG, settings_for_layer, validate_layer
+from libs.domain.state_machines import IllegalTransition, booking_transition
 
 from libs.domain.enums import HandoverStatus
 
@@ -39,11 +46,17 @@ from .auth import (
     make_token,
     open_session,
     require_operator,
+    try_decode,
     verify_password,
 )
 from libs.bus import Bus, connect
+from libs.bus.names import notified_key, respawn_key
 from libs.domain.enums import WorkerStatus, WorkerSubstate
 from libs.domain.settings import resolve
+
+from libs.domain.enums import RegistrationMode, RegistrationStatus, SubAccountStatus
+from libs.proxies.health import check_proxy
+from libs.proxies.lease import ProxyLeaseError, lease_proxy, release_proxy, conn_url
 
 from .config import settings
 from .config_store import get_config, seed_defaults, seed_templates, set_config
@@ -55,7 +68,10 @@ from .settings_store import get_global, set_layer
 from .scheduler import Scheduler
 from .supervisor import Supervisor
 from .schemas import (
+    ArtifactOut,
     AttachIdentity,
+    AuditRowOut,
+    BookedAppointmentOut,
     BookingCreate,
     BookingOut,
     BookingUpdate,
@@ -66,12 +82,18 @@ from .schemas import (
     IdentityCreate,
     IdentityImport,
     IdentityOut,
+    IdentityUpdate,
     ImportResult,
     LoginRequest,
     LoginResponse,
     ProxyCreate,
     ProxyImport,
     ProxyOut,
+    RegistrationJobOut,
+    RegistrationRunRequest,
+    SlotOut,
+    SubAccountOut,
+    SubAccountResetRequest,
     TemplateCreate,
     TemplateOut,
     UserCreate,
@@ -84,22 +106,92 @@ supervisor = Supervisor(settings.redis_url)
 event_hub = EventHub(settings.redis_url)
 _bus = Bus(connect(settings.redis_url))
 
+# A live-mode launch now runs a real-portal health probe before leasing a proxy (see
+# _do_launch_worker's lease_proxy(..., health_check=check_proxy) calls) -- launching a whole fleet
+# serially through that would take minutes for a large booking and, worse, stall whichever thread
+# runs the loop for its entire duration. Bounded concurrency here keeps a fleet launch's wall-clock
+# time close to fleet_size/_LAUNCH_FLEET_CONCURRENCY instead of fleet_size, and keeps the DB
+# connection pool (pool_size=10, max_overflow=20, see db.py) comfortably headroomed against the
+# Hub's other concurrent DB users (request handlers, the scheduler tick, the event consumer).
+_LAUNCH_FLEET_CONCURRENCY = 8
+
+
+def _resolve_booking_setting(db: Session, bk: M.Booking, key: str, default):
+    """One-off booking-level setting lookup (global<booking, no template layer) for call sites that
+    aren't inside the Scheduler class (which has its own _effective_booking_setting for the same
+    global<booking<template resolution, but needs a template per-worker -- this is booking-only)."""
+    eff = resolve({L.GLOBAL: get_global(db), L.BOOKING: (bk.settings_json or {})})
+    return eff.get(key, default)
+
+
+def _launch_worker_fleet(worker_ids: list[str], *, jitter_secs: float = 0.0) -> list[str]:
+    """Launch many workers concurrently, each on its OWN DB session (SQLAlchemy Sessions aren't
+    thread-safe to share) -- needed now that a live-mode launch's proxy lease can involve a live
+    network probe per candidate (libs/proxies/health.py's check_proxy), which is too slow to run
+    fleet_size times in a serial loop. Each worker is launched independently: one worker's failure
+    (e.g. its proxy pool momentarily exhausted) does NOT prevent the others from being attempted,
+    unlike the old serial `for w in workers: _do_launch_worker(db, w)` loop, where an exception
+    raised mid-loop (_do_launch_worker re-raises after marking the worker FAILED) aborted every
+    worker after it in iteration order. Returns the ids of workers whose launch raised, for the
+    caller to log -- a failed worker's own row is already left in a terminal FAILED state by
+    _do_launch_worker itself, so callers don't need to do anything else with this list.
+
+    `jitter_secs` (WARMUP_START_JITTER, operator spec 2026-08-14: "hub spawns worker processors
+    (concurrency window + jitter do matter)") staggers each worker's actual spawn moment by a random
+    delay in [0, jitter_secs) BEFORE it does anything (including its proxy-lease health probe) --
+    anti-herd, same principle as RESTORE_STAMPEDE_JITTER, so a fleet's warmup doesn't all hit the
+    portal/proxy pool in the same instant. The concurrency window (_LAUNCH_FLEET_CONCURRENCY) still
+    bounds how many run at once; jitter only spreads out WHEN each one starts within that window."""
+    failed: list[str] = []
+
+    def _one(worker_id: str) -> None:
+        if jitter_secs > 0:
+            time.sleep(random.uniform(0, jitter_secs))
+        db = SessionLocal()
+        try:
+            w = db.get(M.Worker, worker_id)
+            if w is not None:
+                _do_launch_worker(db, w)
+        finally:
+            db.close()
+
+    if not worker_ids:
+        return failed
+    with ThreadPoolExecutor(max_workers=_LAUNCH_FLEET_CONCURRENCY) as ex:
+        futs = {ex.submit(_one, wid): wid for wid in worker_ids}
+        for fut in as_completed(futs):
+            wid = futs[fut]
+            try:
+                fut.result()
+            except Exception:
+                failed.append(wid)
+    return failed
+
 
 # ── auto-ops scheduler callbacks ──────────────────────────────────────────────
 def _sched_on_start(db: Session, bk: M.Booking) -> None:
-    for w in db.scalars(select(M.Worker).where(
-            M.Worker.booking_id == bk.id, M.Worker.status == WorkerStatus.READY)).all():
-        _do_launch_worker(db, w)
-    bk.status = BookingStatus.WARMING
+    from libs.domain.state_machines import IllegalTransition, booking_transition
+    worker_ids = [w.id for w in db.scalars(select(M.Worker).where(
+        M.Worker.booking_id == bk.id, M.Worker.status == WorkerStatus.READY)).all()]
+    jitter = float(_resolve_booking_setting(db, bk, "WARMUP_START_JITTER", 0.0) or 0.0)
+    _launch_worker_fleet(worker_ids, jitter_secs=jitter)
+    try:
+        bk.status = booking_transition(bk.status, BookingStatus.WARMING)
+    except IllegalTransition:
+        pass
     db.commit()
 
 
 def _sched_on_slot_open(db: Session, bk: M.Booking) -> None:
+    """Publishes the broadcast + flips booking status. Per-worker command delivery is the
+    scheduler's own _latch_signals' job (D5) -- called every tick, confirm-before-mark, so a worker
+    that starts/respawns after this fires still gets notified (the confirmed 2026-08-07 bug's fix)."""
+    from libs.domain.state_machines import IllegalTransition, booking_transition
     _bus.publish_signal(bk.id, "slot_open")
-    for w in db.scalars(select(M.Worker).where(
-            M.Worker.booking_id == bk.id, M.Worker.status == WorkerStatus.RUNNING)).all():
-        _bus.send_command(w.id, "signal", name="slot_open")
-    bk.status = BookingStatus.RUNNING
+    try:
+        bk.status = booking_transition(bk.status, BookingStatus.RUNNING)
+    except IllegalTransition:
+        pass
     db.commit()
 
 
@@ -108,8 +200,85 @@ def _sched_on_assign(db: Session, worker: M.Worker, slot: M.Slot) -> None:
                       slot={"id": slot.id, "date": slot.date, "period": slot.period})
 
 
-scheduler = Scheduler(SessionLocal, on_start=_sched_on_start, on_slot_open=_sched_on_slot_open,
-                      on_assign=_sched_on_assign)
+def _reset_worker_bus_state(booking_id: str, worker_id: str) -> None:
+    """A worker about to get a fresh process incarnation (relaunch/requeue) must start with a clean
+    slate on the bus:
+      - its command stream -- a stale unconsumed command (most commonly an earlier "stop") would
+        otherwise poison the very next "launch": BusSignals.wait_launch() drains its whole batch and
+        returns on the FIRST match in stream order, so a stale stop ahead of the fresh launch makes
+        the new process exit immediately without ever reaching its own launch payload (confirmed
+        bug, 2026-08-13: "I click start, no workers start").
+      - its hold-respawn backoff counter (`respawn:<id>`) -- an operator-initiated fresh start
+        should reset an exhausted MAX_RESPAWN_ATTEMPTS count, not leave it permanently given up on.
+      - its membership in the slot_open/slot_found "already notified" sets
+        (libs.bus.names.notified_key). That set is keyed by the STABLE worker_id and is meant to
+        survive a HUB restart (the Hub shouldn't forget who it already told) but must NOT survive
+        the WORKER's own restart: a freshly-spawned process has an empty command stream and has
+        never actually received the signal in ITS OWN lifetime. Confirmed bug (2026-08-13): a
+        booking whose signals fired hours earlier, restarted after several workers died/were
+        stopped, had no way to get slot_open/slot_found to the new processes -- apps/hub/
+        scheduler.py's _latch_signals thought it had nothing left to do, and the manual
+        fire-slot-open/fire-slot-found endpoints are correctly idempotent no-ops once the BOOKING
+        itself has fired (that's the right, durable half) -- so "I can't fire any signal after
+        restart" was actually "the relaunched worker was silently never told, and the booking
+        correctly refused to re-fire something that already happened."
+    """
+    _bus.delete_worker_stream(worker_id)
+    _bus.r.delete(respawn_key(worker_id))
+    _bus.r.srem(notified_key(booking_id, "slot_open"), worker_id)
+    _bus.r.srem(notified_key(booking_id, "slot_found"), worker_id)
+
+
+def _require_worker_action(w: M.Worker, action: str) -> None:
+    """409 unless `action` is legal from this worker's current status (libs.domain.state_machines'
+    WORKER_ACTION_STATUSES -- the same table the dashboard mirrors for button enablement).
+
+    Confirmed bug (2026-08-14): launch/restart had NO status guard at all. Launching an already
+    RUNNING worker was a no-op at the process level (Supervisor.spawn is idempotent) but still ran
+    _do_launch_worker's unconditional lease_proxy, and lease_proxy has no per-worker dedupe -- so
+    every extra click added a permanently unreleased ProxyLease row (two, with swap on) and
+    overwrote the frozen effective_settings_json. Worse, both actions were live on COMPLETED
+    workers, i.e. ones that had already booked a real appointment."""
+    from libs.domain.state_machines import can_worker_action
+    if not can_worker_action(action, w.status):
+        raise HTTPException(409, f"cannot {action} worker {w.id}: status is {w.status}")
+
+
+def _set_worker_status(w: M.Worker, status: WorkerStatus, *, detail: str | None = None) -> None:
+    """The ONLY sanctioned way to write Worker.status outside the event consumer, because it also
+    clears `substate`.
+
+    Confirmed bug (2026-08-14): apps/hub/events.py's map_event_to_update was the only writer of
+    `substate` anywhere, so every endpoint/reaper that moved a worker out of RUNNING left the
+    in-flight substate behind -- stop/restart/requeue produced rows reading `status=ready,
+    substate=holding`, and the dashboard faithfully rendered a worker as "holding" when it wasn't
+    running at all. `substate` describes what a RUNNING worker is doing right now; for any other
+    status it must be NULL, and the last-known context lives in `substate_detail` + the logs.
+
+    The worker's own `started`/`status_change` events re-populate it the moment a new process is
+    actually alive, so clearing here never loses live information -- it only drops the stale corpse
+    of a previous incarnation."""
+    w.status = status
+    w.substate = None
+    if detail is not None:
+        w.substate_detail = detail
+
+
+def _sched_on_relaunch(db: Session, worker: M.Worker) -> None:
+    """Hold-phase respawn (D2) — relaunch a single FAILED worker via the same launch path a fresh
+    start uses. The scheduler's _hold_respawn already stopped the old process first (F15) and gates
+    this call with per-worker backoff + a hard attempt cap (F6) before ever calling it."""
+    _reset_worker_bus_state(worker.booking_id, worker.id)
+    _set_worker_status(worker, WorkerStatus.READY)
+    db.commit()
+    _do_launch_worker(db, worker)
+
+
+scheduler = Scheduler(
+    SessionLocal, on_start=_sched_on_start, on_slot_open=_sched_on_slot_open,
+    on_assign=_sched_on_assign, on_relaunch=_sched_on_relaunch,
+    supervisor=supervisor, event_hub=event_hub, redis_client=_bus.r, bus=_bus,
+)
 
 
 @asynccontextmanager
@@ -118,7 +287,16 @@ async def lifespan(app: FastAPI):
         db = SessionLocal()
         seed_defaults(db)      # form_defaults / quest_steps into the DB if absent
         seed_templates(db)     # default scout + apply worker templates
+        # Re-discover worker processes a PREVIOUS Hub instance spawned (confirmed bug: without
+        # this, a restarted Hub could neither stop nor correctly detect-as-alive any worker that
+        # predated it -- the booking Stop button silently no-oped for them, and the dead-worker
+        # reaper would eventually mark them FAILED despite being perfectly healthy). Needs DB
+        # access for the "which workers does the DB say are RUNNING" list, which is why this lives
+        # here rather than in Supervisor's own constructor.
+        running_ids = [w.id for w in db.scalars(
+            select(M.Worker).where(M.Worker.status == WorkerStatus.RUNNING)).all()]
         db.close()
+        supervisor.reconcile({wid: "apps.worker" for wid in running_ids})
     except Exception:
         pass                   # DB may be down at boot; endpoints still report degraded
     event_hub.start()          # background thread tailing the evt stream -> DB + WS
@@ -129,11 +307,97 @@ async def lifespan(app: FastAPI):
     supervisor.shutdown_all()
 
 
-app = FastAPI(title="storm-hub", version="0.1.0", lifespan=lifespan)
+app = FastAPI(
+    title="storm-hub",
+    version="0.1.0",
+    lifespan=lifespan,
+    # /docs, /redoc, /openapi.json disclose the full endpoint/schema surface unauthenticated --
+    # closed by default now the Hub is reachable over the public internet (ENABLE_API_DOCS=1 to
+    # open them back up for local dev).
+    docs_url="/docs" if settings.enable_api_docs else None,
+    redoc_url="/redoc" if settings.enable_api_docs else None,
+    openapi_url="/openapi.json" if settings.enable_api_docs else None,
+)
 
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _bday_for_register(raw: str | None) -> str:
+    """Identity.birthdate is stored ISO (YYYY-MM-DD) -- the importer normalizes to this on purpose
+    (apps/hub/importers.py's _normalize_dob), and libs/domain generators match it. The portal's
+    /register endpoint's `bday` field expects YYYY/MM/DD (confirmed against storm-auto's proven
+    batch_register.py -- gen_fake_accounts.py's _random_birthdate() emits slash-format directly and
+    it's passed straight through, unconverted, into the payload there). Sending ISO dashes through
+    unconverted is a real bug: found by comparing this implementation against storm-auto's after a
+    live run failed 10/10 registrations. Converts here, at the single point of use, rather than
+    changing the stored format (which importers.py and genaccounts.py both already agree on)."""
+    if not raw:
+        return "1985/01/01"
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", raw.strip())
+    if m:
+        y, mo, d = m.groups()
+        return f"{y}/{mo}/{d}"
+    return raw  # already slash-formatted (or unrecognized) -- pass through as-is
+
+
+def _client_ip(request: Request) -> str:
+    """Real client IP. Correct ONLY because storm-hub.service runs uvicorn with --proxy-headers
+    --forwarded-allow-ips=127.0.0.1 -- uvicorn's ProxyHeadersMiddleware then trusts Caddy's
+    X-Forwarded-For (which Caddy's reverse_proxy sets automatically) and rewrites request.client
+    accordingly. Without that flag this always reads 127.0.0.1 (Caddy's own address), which would
+    silently collapse rate limiting and audit-log IPs for every real visitor into one bucket."""
+    return request.client.host if request.client else "unknown"
+
+
+# ── Audit logging (Phase: production hardening) ───────────────────────────────
+# A generic middleware, not per-endpoint calls: catches every mutating (state-changing) request —
+# including any added later — without having to remember to thread an _audit() call through each
+# new endpoint. Never logs request/response bodies (they can carry passwords/tokens); only
+# method+path+status+actor+ip. /auth/login is excluded here and audited explicitly below instead,
+# since only that endpoint knows the attempted username *before* the password is checked.
+_AUDIT_SKIP_PATHS = {"/auth/login"}
+_AUDIT_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+
+
+@app.middleware("http")
+async def _audit_middleware(request: Request, call_next):
+    response = await call_next(request)
+    if request.method in _AUDIT_METHODS and request.url.path not in _AUDIT_SKIP_PATHS:
+        try:
+            # Resolve the session the same way FastAPI's Depends(get_db) would -- respecting
+            # app.dependency_overrides -- so tests (which override get_db onto an isolated
+            # in-memory SQLite session) don't leak audit rows into the real production DB.
+            db_factory = app.dependency_overrides.get(get_db, get_db)
+            gen = db_factory()
+            db = next(gen)
+            try:
+                actor = None
+                auth_header = request.headers.get("authorization", "")
+                if auth_header.lower().startswith("bearer "):
+                    data = try_decode(auth_header[7:])
+                    if data:
+                        u = db.get(M.User, data.get("sub"))
+                        actor = u.username if u else data.get("sub")
+                # action stays just the HTTP method (AuditRow.action is VARCHAR(64)); several
+                # routes' resolved paths (e.g. /bookings/{36-char-uuid}/fire-slot-open) exceed 64
+                # chars once a real id is substituted in, which would silently fail to audit those
+                # calls if the method were prefixed onto the path here. Full path -> target
+                # (VARCHAR(128), comfortably fits every route in this app).
+                db.add(M.AuditRow(
+                    actor=actor,
+                    action=request.method,
+                    target=request.url.path,
+                    ts=_now(),
+                    payload={"status": response.status_code, "ip": _client_ip(request)},
+                ))
+                db.commit()
+            finally:
+                gen.close()
+        except Exception:
+            pass  # audit logging must never break the actual request
+    return response
 
 
 # ── Health & meta ─────────────────────────────────────────────────────────────
@@ -148,21 +412,129 @@ def health(db: Session = Depends(get_db)) -> dict:
         return {"status": "degraded", "db": f"error: {e.__class__.__name__}"}
 
 
+@app.get("/ops/status")
+def ops_status(db: Session = Depends(get_db)) -> dict:
+    """Minimum-viable operational observability (Phase F3) -- exists specifically because of the
+    confirmed incident's root cause: a runaway hold loop drove Redis writes into the hundreds/sec
+    for over an hour with nothing surfacing it until the operator noticed live, by hand. This
+    endpoint is the cheap, always-on alternative: Redis memory + the hot streams' lengths (should
+    stay bounded by Phase F1's maxlen caps), disk headroom, and live worker counts, polled by
+    whoever/whatever is watching this deployment."""
+    import shutil
+
+    out: dict = {}
+
+    try:
+        info = _bus.r.info("memory")
+        out["redis"] = {
+            "used_memory_human": info.get("used_memory_human"),
+            "used_memory_bytes": info.get("used_memory"),
+            "maxmemory_bytes": info.get("maxmemory"),
+            "evicted_keys": info.get("evicted_keys", 0),
+        }
+        out["evt_stream_len"] = _bus.r.xlen("evt")
+    except Exception as e:
+        out["redis"] = {"error": f"{e.__class__.__name__}: {e}"}
+
+    try:
+        disk = shutil.disk_usage("/")
+        out["disk"] = {"free_bytes": disk.free, "total_bytes": disk.total,
+                       "free_pct": round(100 * disk.free / disk.total, 1)}
+    except Exception as e:
+        out["disk"] = {"error": f"{e.__class__.__name__}: {e}"}
+
+    try:
+        running = db.scalars(select(func.count()).select_from(M.Worker)
+                             .where(M.Worker.status == WorkerStatus.RUNNING)).one()
+        by_role = dict(db.execute(
+            select(M.Worker.role, func.count()).where(M.Worker.status == WorkerStatus.RUNNING)
+            .group_by(M.Worker.role)
+        ).all())
+        out["workers"] = {"running": running, "by_role": {str(k): v for k, v in by_role.items()},
+                          "supervisor_processes": len(supervisor.running_ids())}
+    except Exception as e:
+        out["workers"] = {"error": f"{e.__class__.__name__}: {e}"}
+
+    return out
+
+
+@app.get("/audit", response_model=list[AuditRowOut])
+def list_audit(limit: int = 200, db: Session = Depends(get_db),
+               me: Principal = Depends(current_principal)) -> list[M.AuditRow]:
+    limit = max(1, min(limit, 1000))
+    return list(db.scalars(select(M.AuditRow).order_by(M.AuditRow.ts.desc()).limit(limit)).all())
+
+
+@app.get("/bookings/{booking_id}/appointments", response_model=list[BookedAppointmentOut])
+def list_appointments(booking_id: str, db: Session = Depends(get_db),
+                      me: Principal = Depends(current_principal)) -> list[M.BookedAppointment]:
+    return list(db.scalars(
+        select(M.BookedAppointment).where(M.BookedAppointment.booking_id == booking_id)
+        .order_by(M.BookedAppointment.booked_at.desc())
+    ).all())
+
+
+@app.get("/bookings/{booking_id}/slots", response_model=list[SlotOut])
+def list_slots(booking_id: str, db: Session = Depends(get_db),
+               me: Principal = Depends(current_principal)) -> list[M.Slot]:
+    """Slots a scout has found for this booking (libs.db.models.Slot, written by
+    events.py's _persist_slots on every slots_found event) -- no read endpoint existed for these
+    before; the dashboard's Slots tab is the first consumer."""
+    return list(db.scalars(
+        select(M.Slot).where(M.Slot.booking_id == booking_id)
+        .order_by(M.Slot.date.asc(), M.Slot.period.asc())
+    ).all())
+
+
+@app.get("/artifacts/{artifact_id}")
+def get_artifact_meta(artifact_id: str, db: Session = Depends(get_db),
+                      me: Principal = Depends(current_principal)) -> ArtifactOut:
+    a = db.get(M.Artifact, artifact_id)
+    if not a:
+        raise HTTPException(404, "artifact not found")
+    return a
+
+
+@app.get("/artifacts/{artifact_id}/file")
+def get_artifact_file(artifact_id: str, db: Session = Depends(get_db),
+                      me: Principal = Depends(current_principal)) -> FileResponse:
+    # PDFs contain passport/PII -- gated behind auth even though several other list endpoints in
+    # this app are open-read, because this is a document download, not a status table.
+    a = db.get(M.Artifact, artifact_id)
+    if not a:
+        raise HTTPException(404, "artifact not found")
+    p = Path(a.path)
+    if not p.is_file():
+        raise HTTPException(404, "artifact file missing on disk")
+    media = "application/pdf" if a.kind == "pdf" else "application/octet-stream"
+    return FileResponse(p, media_type=media, filename=p.name)
+
+
 @app.get("/settings/catalog")
 def settings_catalog() -> dict:
-    """The settings taxonomy (§6), grouped by home layer — powers the dashboard settings editors."""
+    """The settings taxonomy (§6), grouped by home layer — powers the dashboard settings editors.
+
+    The "booking" list is the one exception to "home layer only": it also includes settings whose
+    home is elsewhere but that declare BOOKING as an override layer (currently just
+    HOLD_SWAP_AFTER_FOUND, home=TEMPLATE) -- the Booking Settings tab needs the full set of what's
+    actually legal to set at BOOKING, not just what's homed there."""
     out: dict[str, list[dict]] = {}
     for layer in (L.GLOBAL, L.BOOKING, L.TEMPLATE):
+        settings = (
+            sorted((s for s in CATALOG.values() if layer in s.settable_layers()), key=lambda s: (s.group, s.key))
+            if layer == L.BOOKING else settings_for_layer(layer)
+        )
         out[str(layer)] = [
             {
                 "key": s.key,
                 "type": s.type.__name__,
                 "default": s.default,
                 "group": s.group,
+                "home": str(s.home),
                 "override_layers": sorted(str(x) for x in s.override_layers),
                 "note": s.note,
             }
-            for s in settings_for_layer(layer)
+            for s in settings
         ]
     out["_meta"] = {"total": len(CATALOG), "precedence": "worker > template > booking > global"}
     return out
@@ -196,13 +568,41 @@ def create_user(
     return user
 
 
+_LOGIN_MAX_ATTEMPTS = 5
+_LOGIN_LOCKOUT_SECONDS = 900  # 15 min
+
+
 @app.post("/auth/login", response_model=LoginResponse)
-def login(body: LoginRequest, db: Session = Depends(get_db)) -> LoginResponse:
+def login(body: LoginRequest, request: Request, db: Session = Depends(get_db)) -> LoginResponse:
+    """Brute-force protection: a Redis-backed per-IP fail counter (defense in depth alongside the
+    fail2ban jail watching Caddy's access log at infra/Caddyfile — that one bans at the firewall
+    level; this one blocks at the app level even if fail2ban is down/misconfigured). Counter is
+    per-IP, not per-username, so a single attacker can't spread guesses across many usernames to
+    dodge it. Relies on _client_ip resolving the real visitor IP, not Caddy's own address."""
+    ip = _client_ip(request)
+    fail_key = f"loginfail:{ip}"
+    r = _bus.r
+    fails = int(r.get(fail_key) or 0)
+    if fails >= _LOGIN_MAX_ATTEMPTS:
+        ttl = r.ttl(fail_key)
+        raise HTTPException(429, f"too many failed login attempts; try again in {max(int(ttl), 1)}s")
+
     user = db.scalar(select(M.User).where(M.User.username == body.username))
     if not user or not verify_password(body.password, user.password_hash):
+        pipe = r.pipeline()
+        pipe.incr(fail_key)
+        pipe.expire(fail_key, _LOGIN_LOCKOUT_SECONDS)
+        pipe.execute()
+        db.add(M.AuditRow(actor=body.username, action="login_failed", target=ip, ts=_now(),
+                          payload={"ip": ip}))
+        db.commit()
         raise HTTPException(401, "bad credentials")
+
+    r.delete(fail_key)
     sess, notice = open_session(db, user, body.purpose)
     user.last_login = _now()
+    db.add(M.AuditRow(actor=user.username, action="login_ok", target=ip, ts=_now(),
+                      payload={"ip": ip, "purpose": str(body.purpose)}))
     db.commit()
     db.refresh(sess)
     return LoginResponse(
@@ -334,6 +734,8 @@ def create_identity(
         passport_no=body.passport_no,
         gender=body.gender,
         nationality=body.nationality,
+        comment=body.comment,
+        target_posto=body.target_posto if body.type == "real" else None,
     )
     db.add(ident)
     db.commit()
@@ -346,11 +748,67 @@ def list_identities(db: Session = Depends(get_db)) -> list[M.Identity]:
     return list(db.scalars(select(M.Identity).order_by(M.Identity.created_at.desc())).all())
 
 
+@app.patch("/identities/{identity_id}", response_model=IdentityOut)
+def update_identity(identity_id: str, body: IdentityUpdate, db: Session = Depends(get_db),
+                    _op: Principal = Depends(require_operator)) -> M.Identity:
+    ident = db.get(M.Identity, identity_id)
+    if not ident:
+        raise HTTPException(404, "identity not found")
+    if body.comment is not None:
+        ident.comment = body.comment
+    if body.target_posto is not None:
+        if ident.type != "real":
+            raise HTTPException(400, "target_posto only applies to real identities")
+        ident.target_posto = body.target_posto
+    db.commit()
+    db.refresh(ident)
+    return ident
+
+
+@app.post("/identities/{identity_id}/archive", response_model=IdentityOut)
+def archive_identity(identity_id: str, db: Session = Depends(get_db),
+                     _op: Principal = Depends(require_operator)) -> M.Identity:
+    ident = db.get(M.Identity, identity_id)
+    if not ident:
+        raise HTTPException(404, "identity not found")
+    ident.status = IdentityStatus.ARCHIVED
+    ident.archived_at = _now()
+    db.commit()
+    db.refresh(ident)
+    return ident
+
+
+@app.delete("/identities/{identity_id}", status_code=204)
+def delete_identity(identity_id: str, db: Session = Depends(get_db),
+                    _op: Principal = Depends(require_operator)) -> None:
+    ident = db.get(M.Identity, identity_id)
+    if not ident:
+        return
+    # Blocks on ANY existing worker/booking-identity link, not just an active-status booking --
+    # simpler and correct regardless of DB backend (SQLite in tests doesn't enforce FK constraints
+    # by default the way Postgres does, so this can't rely on IntegrityError alone as the guard).
+    # /bookings/{id}/identities/{id} DELETE (detach) removes these rows first, so a detached
+    # identity is always deletable afterward.
+    still_attached = db.scalar(select(func.count()).select_from(M.Worker)
+                               .where(M.Worker.identity_id == identity_id))
+    if still_attached:
+        raise HTTPException(409, "identity is attached to a booking -- detach it first")
+    try:
+        db.delete(ident)
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "identity has related records (sub-accounts, bookings, appointments) "
+                                 "-- archive it instead of deleting")
+
+
 @app.post("/identities/import", response_model=ImportResult)
 def import_identities(body: IdentityImport, db: Session = Depends(get_db),
                       _op: Principal = Depends(require_operator)) -> ImportResult:
     parsed, errors = parse_identities(body.csv, default_type=str(body.default_type))
     created = subs = 0
+    identity_ids: list[str] = []
+    sub_account_ids: list[str] = []
     existing = {u for (u,) in db.execute(select(M.SubAccount.username)).all()}
     known_passports = {p for (p,) in db.execute(
         select(M.Identity.passport_no).where(M.Identity.passport_no.isnot(None))).all()}
@@ -366,16 +824,21 @@ def import_identities(body: IdentityImport, db: Session = Depends(get_db),
         db.add(ident)
         db.flush()
         created += 1
+        identity_ids.append(ident.id)
         for sa in pi.sub_accounts:
             if sa.username in existing:
                 errors.append(f"skip duplicate username {sa.username}")
                 continue
-            db.add(M.SubAccount(identity_id=ident.id, username=sa.username, password=sa.password,
-                                email=sa.email, email_pass=sa.email_pass, status=sa.status))
+            new_sa = M.SubAccount(identity_id=ident.id, username=sa.username, password=sa.password,
+                                  email=sa.email, email_pass=sa.email_pass, status=sa.status)
+            db.add(new_sa)
+            db.flush()
             existing.add(sa.username)
             subs += 1
+            sub_account_ids.append(new_sa.id)
     db.commit()
-    return ImportResult(created=created, sub_accounts=subs, errors=errors)
+    return ImportResult(created=created, sub_accounts=subs, errors=errors,
+                        identity_ids=identity_ids, sub_account_ids=sub_account_ids)
 
 
 # ── Sub-account generation ────────────────────────────────────────────────────
@@ -386,6 +849,7 @@ def gen_subaccounts_bulk(body: GenSubAccounts, db: Session = Depends(get_db),
     existing = {u for (u,) in db.execute(select(M.SubAccount.username)).all()}
     subs = 0
     errors: list[str] = []
+    sub_account_ids: list[str] = []
     for iid in body.identity_ids:
         ident = db.get(M.Identity, iid)
         if not ident:
@@ -393,13 +857,17 @@ def gen_subaccounts_bulk(body: GenSubAccounts, db: Session = Depends(get_db),
             continue
         first, _, last = (ident.full_name or "x x").partition(" ")
         for sa in gen_subaccounts(first, last or "x", body.count, existing):
-            db.add(M.SubAccount(identity_id=ident.id, username=sa.username, password=sa.password,
-                                status="new"))
+            new_sa = M.SubAccount(identity_id=ident.id, username=sa.username, password=sa.password,
+                                  status="new")
+            db.add(new_sa)
+            db.flush()
             subs += 1
+            sub_account_ids.append(new_sa.id)
         if ident.status == "empty":
             ident.status = "active"
     db.commit()
-    return ImportResult(created=len(body.identity_ids), sub_accounts=subs, errors=errors)
+    return ImportResult(created=len(body.identity_ids), sub_accounts=subs, errors=errors,
+                        identity_ids=list(body.identity_ids), sub_account_ids=sub_account_ids)
 
 
 @app.post("/identities/gen-test", response_model=ImportResult)
@@ -464,6 +932,172 @@ def import_proxies(body: ProxyImport, db: Session = Depends(get_db),
         created += 1
     db.commit()
     return ImportResult(created=created, errors=errors)
+
+
+@app.post("/proxies/{proxy_id}/toggle-active", response_model=ProxyOut)
+def toggle_proxy_active(proxy_id: str, db: Session = Depends(get_db),
+                        _op: Principal = Depends(require_operator)) -> M.Proxy:
+    p = db.get(M.Proxy, proxy_id)
+    if not p:
+        raise HTTPException(404, "proxy not found")
+    p.active = not p.active
+    db.commit()
+    db.refresh(p)
+    return p
+
+
+# ── Registration subsystem (apps/registrar) ────────────────────────────────────
+@app.get("/sub-accounts", response_model=list[SubAccountOut])
+def list_sub_accounts(db: Session = Depends(get_db),
+                      me: Principal = Depends(current_principal)) -> list[SubAccountOut]:
+    """Flattened for the dashboard's Registration page: identity name/type + this sub-account's
+    latest registration_jobs row (status/attempts), so the table doesn't need a client-side join."""
+    subs = list(db.scalars(select(M.SubAccount).order_by(M.SubAccount.created_at.desc())).all())
+    if not subs:
+        return []
+    ident_ids = {s.identity_id for s in subs}
+    idents = {i.id: i for i in db.scalars(select(M.Identity).where(M.Identity.id.in_(ident_ids))).all()}
+    sub_ids = [s.id for s in subs]
+    jobs = db.scalars(
+        select(M.RegistrationJob).where(M.RegistrationJob.sub_account_id.in_(sub_ids))
+        .order_by(M.RegistrationJob.created_at.desc())
+    ).all()
+    latest_job: dict[str, M.RegistrationJob] = {}
+    for j in jobs:
+        latest_job.setdefault(j.sub_account_id, j)  # first seen per id = most recent (query is DESC)
+
+    out = []
+    for s in subs:
+        ident = idents.get(s.identity_id)
+        job = latest_job.get(s.id)
+        out.append(SubAccountOut(
+            id=s.id, identity_id=s.identity_id,
+            identity_name=ident.full_name if ident else "?",
+            identity_type=str(ident.type) if ident else "?",
+            username=s.username, status=str(s.status), email=s.email,
+            registration_status=str(job.status) if job else None,
+            attempts=job.attempts if job else 0,
+            created_at=s.created_at,
+        ))
+    return out
+
+
+@app.post("/sub-accounts/reset", response_model=ImportResult)
+def reset_sub_accounts(body: SubAccountResetRequest, db: Session = Depends(get_db),
+                       _op: Principal = Depends(require_operator)) -> ImportResult:
+    """Regenerate username+password for selected sub-accounts and clear prior registration state --
+    the dashboard's "Reset" button (requested in the recovered conversation history: regen
+    credentials for selected accounts, which naturally requeues them -- status back to NEW -- for
+    another registration run). Status is set directly, not via subaccount_transition(): this is a
+    deliberate operator override, not a normal forward progression (mirrors force_release's same
+    direct-assignment treatment of an admin override)."""
+    from .genaccounts import make_password, make_username
+    existing = {u for (u,) in db.execute(select(M.SubAccount.username)).all()}
+    updated = 0
+    errors: list[str] = []
+    for sid in body.sub_account_ids:
+        sa = db.get(M.SubAccount, sid)
+        if not sa:
+            errors.append(f"{sid}: not found")
+            continue
+        ident = db.get(M.Identity, sa.identity_id)
+        first, _, last = (ident.full_name if ident else "x x").partition(" ")
+        sa.username = make_username(first or "x", last or "x", existing)
+        sa.password = make_password()
+        sa.email = None
+        sa.email_pass = None
+        sa.notes = "reset"
+        sa.status = SubAccountStatus.NEW
+        updated += 1
+    db.commit()
+    return ImportResult(created=updated, errors=errors)
+
+
+@app.post("/registration/run")
+def run_registration(body: RegistrationRunRequest, db: Session = Depends(get_db),
+                     _op: Principal = Depends(require_operator)) -> dict:
+    subs = [db.get(M.SubAccount, sid) for sid in body.sub_account_ids]
+    subs = [s for s in subs if s is not None]
+    if not subs:
+        raise HTTPException(400, "no valid sub_account_ids")
+
+    # get-or-create + bump the RegistrationJob row for each selected sub-account (one row per
+    # sub-account, mutated in place across retries -- the pre-existing schema's own design, see
+    # RegistrationJob's attempts counter).
+    for sa in subs:
+        job = db.scalar(select(M.RegistrationJob).where(M.RegistrationJob.sub_account_id == sa.id)
+                        .order_by(M.RegistrationJob.created_at.desc()))
+        if job is None:
+            job = M.RegistrationJob(sub_account_id=sa.id)
+            db.add(job)
+        job.mode = body.mode
+        job.status = RegistrationStatus.QUEUED
+        job.attempts = (job.attempts or 0) + 1
+    db.commit()
+
+    # Proxies: a read-only selection, not a per-account DB lease -- ProxyLease.worker_id is a real
+    # FK to workers.id, which a registration run has none of, and registration cycles through many
+    # proxies briefly rather than holding one for a long booking-style hold phase, so the capacity
+    # bookkeeping ProxyLease exists for doesn't fit here. apps/registrar round-robins this list.
+    q = select(M.Proxy).where(M.Proxy.provider == body.provider, M.Proxy.active.is_(True),
+                              M.Proxy.is_healthy.is_(True))
+    if body.kind:
+        q = q.where(M.Proxy.kind == body.kind)
+    proxy_rows = list(db.scalars(q).all())
+    if not proxy_rows:
+        raise HTTPException(409, f"no active healthy {body.provider} proxies available")
+    proxies = [{"id": p.id, "url": conn_url(p)} for p in proxy_rows]
+
+    g = get_global(db)
+    capsolver_keys = [k.strip() for k in str(g.get("CAPSOLVER_KEYS", "")).split(",") if k.strip()]
+    if not capsolver_keys:
+        raise HTTPException(409, "CAPSOLVER_KEYS not set in global settings")
+    email_provider = str(g.get("EMAIL_PROVIDER", "") or "mailtm")
+    email_cfg = {
+        "cf_mail_domain": g.get("CF_MAIL_DOMAIN"),
+        "cf_worker_url": g.get("CF_WORKER_URL"),
+        "cf_worker_secret": g.get("CF_WORKER_SECRET"),
+    }
+
+    accounts = []
+    for sa in subs:
+        ident = db.get(M.Identity, sa.identity_id)
+        first, _, last = (ident.full_name if ident else "x x").partition(" ")
+        accounts.append({
+            "sub_account_id": sa.id, "username": sa.username, "password": sa.password,
+            "first_name": first, "last_name": last or first,
+            "birthdate": _bday_for_register(ident.birthdate if ident else None),
+            "gender": (ident.gender if ident else None) or "M",
+            "nationality": (ident.nationality if ident else None) or "PRT",
+            "traveldoc": (ident.passport_no if ident else None) or "",
+        })
+
+    run_id = f"reg-{uuid.uuid4().hex[:12]}"
+    supervisor.spawn_registrar(run_id)
+    _bus.ensure_command_group(run_id)
+    _bus.send_command(
+        run_id, "launch", cfg={}, accounts=accounts, proxies=proxies,
+        capsolver_keys=capsolver_keys, lang="PT", email_provider=email_provider,
+        email_cfg=email_cfg, concurrency=body.concurrency,
+        browser_concurrency=body.browser_concurrency or body.concurrency,
+    )
+    return {"run_id": run_id, "queued": len(accounts)}
+
+
+@app.get("/registration/jobs", response_model=list[RegistrationJobOut])
+def list_registration_jobs(limit: int = 100, db: Session = Depends(get_db),
+                           me: Principal = Depends(current_principal)) -> list[M.RegistrationJob]:
+    limit = max(1, min(limit, 500))
+    return list(db.scalars(
+        select(M.RegistrationJob).order_by(M.RegistrationJob.created_at.desc()).limit(limit)
+    ).all())
+
+
+@app.post("/registration/runs/{run_id}/stop")
+def stop_registration_run(run_id: str, _op: Principal = Depends(require_operator)) -> dict:
+    _bus.send_command(run_id, "stop")
+    supervisor.stop(run_id)
+    return {"stopped": True}
 
 
 # ── Global settings (capsolver keys, browser/solver defaults) ─────────────────
@@ -623,6 +1257,47 @@ def get_booking(booking_id: str, db: Session = Depends(get_db)) -> M.Booking:
     return bk
 
 
+@app.delete("/bookings/{booking_id}", status_code=204)
+def delete_booking(booking_id: str, db: Session = Depends(get_db),
+                   _op: Principal = Depends(require_operator)) -> None:
+    """Permanently remove a booking and everything scoped to it -- there was previously no way to
+    delete a booking at all (only nested resources: identities-within-a-booking, templates). Refuses
+    to touch a booking that ever actually booked something (a real BookedAppointment row) -- that's
+    exactly the data this whole system exists to produce, never something to let a cleanup click
+    wipe by accident. Everything else scoped to the booking (workers, their proxy/slot leases and
+    artifacts, slots, the identity attachments/allocations) is deleted; each RUNNING worker is
+    stopped first (bus stop + supervisor kill + the same bus-state reset stop_worker uses) so no
+    orphaned process keeps running against rows that no longer exist. An identity's own
+    identity_events history is preserved (booking_id nulled out, not deleted) -- that's the
+    identity's audit trail, not the booking's."""
+    bk = db.get(M.Booking, booking_id)
+    if not bk:
+        raise HTTPException(404, "booking not found")
+    if db.scalar(select(M.BookedAppointment.id).where(
+            M.BookedAppointment.booking_id == booking_id).limit(1)):
+        raise HTTPException(409, "cannot delete a booking with a real booked appointment on it")
+
+    workers = list(db.scalars(select(M.Worker).where(M.Worker.booking_id == booking_id)).all())
+    for w in workers:
+        if w.status == WorkerStatus.RUNNING:
+            _bus.send_command(w.id, "stop")
+            supervisor.stop(w.id)
+        _reset_worker_bus_state(booking_id, w.id)
+        db.execute(delete(M.ProxyLease).where(M.ProxyLease.worker_id == w.id))
+        db.execute(delete(M.SlotLease).where(M.SlotLease.worker_id == w.id))
+        db.execute(delete(M.Artifact).where(M.Artifact.worker_id == w.id))
+        db.execute(delete(M.WorkerRun).where(M.WorkerRun.worker_id == w.id))
+    db.execute(delete(M.Worker).where(M.Worker.booking_id == booking_id))
+    db.execute(delete(M.Slot).where(M.Slot.booking_id == booking_id))
+    db.execute(delete(M.BookingIdentity).where(M.BookingIdentity.booking_id == booking_id))
+    db.execute(delete(M.IdentityAllocation).where(M.IdentityAllocation.booking_id == booking_id))
+    db.execute(update(M.IdentityEvent).where(M.IdentityEvent.booking_id == booking_id)
+              .values(booking_id=None))
+    db.delete(bk)
+    db.commit()
+    scheduler._scout_pools.pop(booking_id, None)
+
+
 # ── Attach identity → materialize worker (rules + C2 exclusivity) ─────────────
 @app.post("/bookings/{booking_id}/identities", response_model=WorkerOut, status_code=201)
 def attach_identity(
@@ -687,9 +1362,104 @@ def list_workers(booking_id: str, db: Session = Depends(get_db)) -> list[M.Worke
     return list(db.scalars(select(M.Worker).where(M.Worker.booking_id == booking_id)).all())
 
 
+@app.delete("/bookings/{booking_id}/identities/{identity_id}")
+def detach_identity(booking_id: str, identity_id: str, db: Session = Depends(get_db),
+                    _op: Principal = Depends(require_operator)) -> dict:
+    """Reverse of attach: stop+remove the worker, release its proxy/slot leases, release the C2
+    allocation. Requested repeatedly in the recovered conversation history (a "remove identities"
+    control was part of the original booking-page spec) but never had a UI or endpoint before.
+
+    Confirmed bug (2026-08-14): `release_proxy` only sets `released_at` -- it does NOT delete the
+    ProxyLease row -- so the row still held a live FK to `worker.id`, and the very next line
+    (`db.delete(worker)`) always failed with a ForeignKeyViolation for any worker that had ever
+    actually leased a proxy (i.e. any live-mode worker that got past launch). That 500 came back as
+    Starlette's default PLAIN-TEXT "Internal Server Error" body (no JSON, since nothing here ever
+    caught it), which is why the dashboard showed a raw JSON-parse error instead of a real message.
+    Fixed by actually deleting the ProxyLease rows (matching how SlotLease rows are already
+    correctly deleted just below) and WorkerRun rows (currently always empty in this codebase --
+    nothing writes WorkerRun yet -- but defensive all the same). Artifact.worker_id is nulled, not
+    deleted: an Artifact can be a booked PDF's record, worth keeping even once the worker row that
+    produced it is gone."""
+    worker = db.scalar(select(M.Worker).where(
+        M.Worker.booking_id == booking_id, M.Worker.identity_id == identity_id))
+    if worker:
+        if worker.status == WorkerStatus.RUNNING:
+            _bus.send_command(worker.id, "stop")
+            supervisor.stop(worker.id)
+        db.execute(delete(M.ProxyLease).where(M.ProxyLease.worker_id == worker.id))
+        for lease in db.scalars(select(M.SlotLease).where(M.SlotLease.worker_id == worker.id)).all():
+            db.delete(lease)
+        db.execute(delete(M.WorkerRun).where(M.WorkerRun.worker_id == worker.id))
+        db.execute(update(M.Artifact).where(M.Artifact.worker_id == worker.id).values(worker_id=None))
+        _reset_worker_bus_state(booking_id, worker.id)
+        db.delete(worker)
+    alloc = db.scalar(select(M.IdentityAllocation).where(
+        M.IdentityAllocation.booking_id == booking_id, M.IdentityAllocation.identity_id == identity_id,
+        M.IdentityAllocation.released_at.is_(None)))
+    if alloc:
+        alloc.released_at = _now()
+    bi = db.scalar(select(M.BookingIdentity).where(
+        M.BookingIdentity.booking_id == booking_id, M.BookingIdentity.identity_id == identity_id))
+    if bi:
+        db.delete(bi)
+    db.commit()
+    return {"detached": True}
+
+
 # ── Worker control (supervisor + bus) ─────────────────────────────────────────
+def _live_account(identity: M.Identity, sub_account: M.SubAccount) -> dict:
+    """Build the account dict LiveEngineOps/booking_payload's from_account merge expects. Field
+    names/derivation (gender expansion, first/last split) match storm-auto's confirmed
+    _build_schedule_payload account_map exactly. passport_issued/passport_expiry are intentionally
+    absent -- libs.db.models.Identity doesn't track them yet, so booking_payload's merge falls
+    through to the `dynamic` today±yr defaults for those two fields, which is the documented,
+    intended fallback behavior, not a bug."""
+    first, _, last = (identity.full_name or "").partition(" ")
+    gender_raw = (identity.gender or "M").upper()
+    return {
+        "username": sub_account.username,
+        "password": sub_account.password,
+        "email": sub_account.email or "",
+        "first_name": first,
+        "last_name": last or first,
+        "birthdate": identity.birthdate or "",
+        "gender_expanded": "MALE" if gender_raw in ("M", "MALE") else "FEMALE",
+        "traveldoc": identity.passport_no or "",
+    }
+
+
+def _rank_live_sub_accounts(db: Session, identity_id: str) -> list[M.SubAccount]:
+    """ALL usable (non-BURNED) sub-accounts for an identity, ranked best-first (LOGIN_OK > HELD >
+    VERIFIED > REGISTERED > NEW). The full ranked list -- not just the top pick -- is what
+    LiveEngineOps.do_login() rotates through once its sticky-retry budget on the current sub-account
+    is exhausted (operator spec: sticky=2, rotating=number of subaccounts, e.g. a 3-subaccount
+    identity gets up to 2x3=6 login attempts total, ported from storm-auto's confirmed
+    app/worker.py:323-326 sticky-then-rotate pattern)."""
+    rank = {SubAccountStatus.LOGIN_OK: 0, SubAccountStatus.HELD: 1, SubAccountStatus.VERIFIED: 2,
+            SubAccountStatus.REGISTERED: 3, SubAccountStatus.NEW: 4}
+    candidates = list(db.scalars(
+        select(M.SubAccount).where(M.SubAccount.identity_id == identity_id,
+                                   M.SubAccount.status != SubAccountStatus.BURNED)
+    ).all())
+    candidates.sort(key=lambda s: rank.get(s.status, 99))
+    return candidates
+
+
+def _pick_live_sub_account(db: Session, identity_id: str) -> M.SubAccount | None:
+    candidates = _rank_live_sub_accounts(db, identity_id)
+    return candidates[0] if candidates else None
+
+
 def _do_launch_worker(db: Session, w: M.Worker) -> None:
-    """Resolve + FREEZE effective settings (global<booking<template), spawn, send launch command."""
+    """Resolve + FREEZE effective settings (global<booking<template), spawn, send launch command.
+
+    For a live-engine booking (ENGINE_MODE=live), extends the launch payload with everything
+    LiveEngineOps needs (account, proxy, quest_steps, form_defaults, capsolver keys) -- the worker
+    process touches only the bus, never the DB, so all of this must travel through the command
+    payload (Phase C6). Only marks the worker RUNNING after BOTH the process spawn and the
+    command-group creation are confirmed to have succeeded (Phase F5: confirm-before-commit, the
+    same ordering principle as the signal-latch fix -- never record a state change the underlying
+    action hasn't actually completed)."""
     bk = db.get(M.Booking, w.booking_id)
     tpl = db.get(M.WorkerTemplate, w.template_id) if w.template_id else None
     layers = {L.GLOBAL: get_global(db), L.BOOKING: (bk.settings_json or {})}
@@ -697,12 +1467,111 @@ def _do_launch_worker(db: Session, w: M.Worker) -> None:
         layers[L.TEMPLATE] = (tpl.settings_json or {})
     eff = resolve(layers)
     eff["ROLE"] = str(w.role)                     # role comes from the worker row, not settings
+
+    launch_kwargs: dict = {}
+    engine_mode = str(eff.get("ENGINE_MODE", "sim"))
+    if engine_mode == "live":
+        identity = db.get(M.Identity, w.identity_id)
+        ranked_subs = _rank_live_sub_accounts(db, w.identity_id) if identity else []
+        sub_account = ranked_subs[0] if ranked_subs else None
+        if identity is None or sub_account is None:
+            raise HTTPException(409, f"worker {w.id}: no usable sub-account for identity "
+                                     f"{w.identity_id} -- cannot launch in live mode")
+        # Stashed on the frozen settings blob (no dedicated column) so the Hub has a durable record
+        # of which sub-account this worker used -- needed by the booked-PDF event handler
+        # (events.py's _persist_booked_pdf) to fill BookedAppointment.sub_account_id.
+        eff["_sub_account_id"] = sub_account.id
+        w.sub_account_id = sub_account.id
+        try:
+            proxy, warm_proxy = lease_proxy(
+                db, w.id, provider=str(eff.get("PROXY_PROVIDER", "soax")),
+                kind=eff.get("PROXY_KIND") or None, health_check=check_proxy,
+            )
+        except ProxyLeaseError as e:
+            raise HTTPException(409, f"worker {w.id}: {e}")
+
+        # Phase-2 (hold/apply/discovery) proxy, only leased when the swap is actually switched on
+        # (HOLD_SWAP_AFTER_FOUND) -- a worker with swap off keeps its phase-1 proxy for the whole
+        # run, matching do_swap()'s off-by-default behavior in ops_live.py.
+        hold_proxy = None
+        if bool(eff.get("HOLD_SWAP_AFTER_FOUND", False)):
+            try:
+                _hold_proxy_row, hold_proxy = lease_proxy(
+                    db, w.id, provider=str(eff.get("HOLD_PROXY_PROVIDER", "soax")),
+                    kind=eff.get("HOLD_PROXY_KIND") or None, health_check=check_proxy,
+                )
+            except ProxyLeaseError as e:
+                # The phase-1 lease already succeeded -- release it, otherwise it's stranded (this
+                # worker never reaches RUNNING, so D3's dead-worker reap -- which only scans RUNNING
+                # workers -- would never release it either).
+                release_proxy(db, w.id)
+                raise HTTPException(
+                    409, f"worker {w.id}: HOLD_SWAP_AFTER_FOUND is on but no hold proxy available: {e}"
+                )
+
+        quest_steps = get_config(db, "quest_steps", {}) or {}
+        form_defaults = get_config(db, "form_defaults", {}) or {}
+        g = get_global(db)
+        capsolver_keys = [k.strip() for k in str(g.get("CAPSOLVER_KEYS", "")).split(",") if k.strip()]
+        # Sub-account rotation candidates (do_login()'s rotate-after-sticky-exhausted loop): the FULL
+        # ranked list, each already carrying its own sub_account_id, so the worker (deliberately
+        # DB-less) can rotate entirely locally without a Hub round-trip per attempt.
+        accounts = [dict(_live_account(identity, sa), sub_account_id=sa.id) for sa in ranked_subs]
+        launch_kwargs = dict(
+            _engine="live",
+            account=_live_account(identity, sub_account),
+            accounts=accounts,
+            posto_id=bk.posto_id,
+            nationality=bk.nationality,
+            residence=bk.residence,
+            quest_steps=quest_steps,
+            form_defaults=form_defaults,
+            capsolver_keys=capsolver_keys,
+            warm_proxy=warm_proxy,
+            hold_proxy=hold_proxy,
+            sub_account_id=sub_account.id,
+            identity_id=identity.id,
+            booking_id=bk.id,
+        )
+    else:
+        launch_kwargs = dict(_engine="sim")
+
     w.effective_settings_json = eff
+    db.commit()   # freeze settings before spawn; status flips only after spawn+group are confirmed
+
+    spawned = False
+    try:
+        supervisor.spawn(w.id)
+        spawned = True
+        _bus.ensure_command_group(w.id)
+        _bus.send_command(w.id, "launch", cfg=eff, **launch_kwargs)
+    except Exception:
+        if spawned:
+            supervisor.stop(w.id)
+        _set_worker_status(w, WorkerStatus.FAILED, detail="launch failed")
+        db.commit()
+        raise
+
+    # Regression (confirmed live, 2026-08-13): setting substate=IDLE here used to race the freshly
+    # spawned worker process's OWN "started" event (which ALSO sets substate=IDLE, then immediately
+    # LOGGING_IN/... as the phase machine advances) -- under a fast serial launch this write almost
+    # always won the race and landed first, so the clobber was never observed. Once launches started
+    # running concurrently on background threads (P4, _launch_worker_fleet, needed for the
+    # live-proxy-lease health probe), the ordering inverted often enough to be common: the worker
+    # process would race ahead, get several real status_change events applied by EventHub (up to and
+    # including HOLDING), and then THIS write would land late and stomp substate back to IDLE --
+    # permanently, if the worker had nothing further to report (already holding, no more events
+    # coming). That worker then became invisible to the scheduler's HOLDING-only assignment query
+    # despite genuinely holding, and the dashboard showed a stale substate that never matched reality
+    # again. Fix: never write `substate` here at all -- the worker's own "started" event (handled by
+    # EventHub, same as every subsequent transition) is the ONLY source of truth for substate, so
+    # there's nothing left to race.
+    # Deliberately a BARE status write, not _set_worker_status: that helper clears `substate`, which
+    # is precisely the write this block's comment above forbids here. By now the worker may already
+    # have emitted several real status_change events, and clearing substate would resurrect the
+    # 2026-08-13 race. The requeue-to-READY that preceded this launch already cleared the stale one.
     w.status = WorkerStatus.RUNNING
-    w.substate = WorkerSubstate.IDLE
     db.commit()
-    supervisor.spawn(w.id)
-    _bus.send_command(w.id, "launch", cfg=eff)
 
 
 @app.post("/workers/{worker_id}/launch", response_model=WorkerOut)
@@ -711,6 +1580,7 @@ def launch_worker(worker_id: str, db: Session = Depends(get_db),
     w = db.get(M.Worker, worker_id)
     if not w:
         raise HTTPException(404, "worker not found")
+    _require_worker_action(w, "launch")
     _do_launch_worker(db, w)
     db.refresh(w)
     return w
@@ -719,19 +1589,110 @@ def launch_worker(worker_id: str, db: Session = Depends(get_db),
 @app.post("/bookings/{booking_id}/start")
 def start_booking(booking_id: str, db: Session = Depends(get_db),
                   _op: Principal = Depends(require_operator)) -> dict:
-    """Start Instantly — launch every READY worker in the booking (the run begins)."""
+    """Start Instantly — launch every READY worker now (warmup begins immediately). Does **not**
+    fire slot-open: that's a separate decision, made later either by the timed auto-schedule
+    (/schedule + slot_open_at) or manually (POST .../fire-slot-open). Also the resume path for a
+    STOPPED booking.
+
+    EVERY start is a FRESH RUN (operator decision 2026-08-14). `started_at` is re-stamped and the
+    signal latch (slot_open_fired_at/slot_found_fired_at) is CLEARED, so the booking always enters
+    WARMING with both fire-slot-open and fire-slot-found available again.
+
+    Confirmed bug this fixes: those two timestamps persisted across a stop/start cycle, so a booking
+    restarted after its signals had fired went straight back to RUNNING with both fire buttons
+    permanently disabled (the endpoints correctly reported `already_fired`) -- the operator had no
+    way to re-fire a signal on what was, from their point of view, a brand-new run. The old
+    resume-into-RUNNING shortcut is deliberately gone: after a restart, slot-open is re-fired
+    explicitly, either manually or by the timed auto-schedule.
+
+    A booking already at WARMING/ARMED/RUNNING is left alone (this isn't a restart -- it just
+    launches any still-READY worker, PLUS any STOPPED/FAILED worker requeued to READY here first,
+    see below). A worker that already reached COMPLETED (booked, or a finished dry-run/discovery) is
+    never touched -- it's done, not stale.
+
+    Confirmed bug (2026-08-13): "Start Instantly" clicked on a booking that had been running for a
+    while did nothing, because every worker had drifted to STOPPED/FAILED and this endpoint only
+    ever looked at READY ones. Fixed by requeuing STOPPED/FAILED workers to READY first, resetting
+    each one's bus state via _reset_worker_bus_state (command stream, respawn backoff, and signal
+    latch membership -- see its docstring; the last of these is what closes the follow-up "I can't
+    fire any signal after restart" bug, since a relaunched worker otherwise never gets slot_open/
+    slot_found re-sent despite genuinely never having received them in its new process)."""
+    from libs.domain.state_machines import IllegalTransition, booking_transition
     bk = db.get(M.Booking, booking_id)
     if not bk:
         raise HTTPException(404, "booking not found")
+    stale = list(db.scalars(select(M.Worker).where(
+        M.Worker.booking_id == booking_id,
+        M.Worker.status.in_([WorkerStatus.STOPPED, WorkerStatus.HELD, WorkerStatus.FAILED]))).all())
+    for w in stale:
+        _reset_worker_bus_state(booking_id, w.id)
+        _set_worker_status(w, WorkerStatus.READY)
+    if stale:
+        db.commit()
+
     workers = list(db.scalars(select(M.Worker).where(
         M.Worker.booking_id == booking_id, M.Worker.status == WorkerStatus.READY)).all())
-    for w in workers:
-        _do_launch_worker(db, w)
-    if bk.status in (BookingStatus.DRAFT, BookingStatus.SCHEDULED, BookingStatus.WARMING,
-                     BookingStatus.ARMED):
-        bk.status = BookingStatus.RUNNING
-        db.commit()
+    jitter = float(_resolve_booking_setting(db, bk, "WARMUP_START_JITTER", 0.0) or 0.0)
+    _launch_worker_fleet([w.id for w in workers], jitter_secs=jitter)
+    if bk.status in (BookingStatus.DRAFT, BookingStatus.SCHEDULED, BookingStatus.STOPPED):
+        # Fresh run: re-anchor the booking timeout and clear the signal latch (both timestamps AND
+        # the per-worker "already notified" sets, which are keyed by booking+signal in Redis) so
+        # slot-open/slot-found can genuinely be fired again on this run.
+        bk.started_at = _now()
+        bk.slot_open_fired_at = None
+        bk.slot_found_fired_at = None
+        for signal_name in ("slot_open", "slot_found"):
+            try:
+                _bus.r.delete(notified_key(booking_id, signal_name))
+            except Exception:
+                pass
+        scheduler.reset_scout_pool(booking_id)
+        try:
+            bk.status = booking_transition(bk.status, BookingStatus.WARMING)
+        except IllegalTransition as e:
+            raise HTTPException(409, str(e))
+    db.commit()
     return {"started": len(workers), "booking_status": str(bk.status)}
+
+
+@app.post("/bookings/{booking_id}/fire-slot-open")
+def fire_slot_open(booking_id: str, db: Session = Depends(get_db),
+                   _op: Principal = Depends(require_operator)) -> dict:
+    """Manually fire slot-open now — the operator-triggered alternative to /schedule's timed
+    auto-fire (which needs slot_open_at + WARMING/ARMED status). Idempotent: already-fired is a
+    no-op. Per-worker delivery (including to any worker that joins/respawns afterward) is the
+    scheduler's _latch_signals job on its next tick, not this endpoint's — this only records the
+    decision and publishes the broadcast once."""
+    bk = db.get(M.Booking, booking_id)
+    if not bk:
+        raise HTTPException(404, "booking not found")
+    if bk.slot_open_fired_at is not None:
+        return {"already_fired": True, "booking_status": str(bk.status)}
+    if bk.status not in (BookingStatus.WARMING, BookingStatus.ARMED):
+        raise HTTPException(409, f"cannot fire slot-open from status {bk.status}")
+    bk.slot_open_fired_at = _now()
+    db.commit()
+    _sched_on_slot_open(db, bk)
+    return {"fired": True, "booking_status": str(bk.status)}
+
+
+@app.post("/bookings/{booking_id}/fire-slot-found")
+def fire_slot_found(booking_id: str, db: Session = Depends(get_db),
+                    _op: Principal = Depends(require_operator)) -> dict:
+    """Manually fire slot-found now — the operator-triggered alternative to the scheduler's own
+    automatic _fire_slot_found_if_new (which only fires once a real AVAILABLE Slot row exists in
+    the DB; there was previously no way to force it, unlike slot-open which has always had this
+    manual override). Idempotent: already-fired is a no-op. Requires slot-open to have already
+    fired -- slot-found is semantically downstream of it (RUNNING status, scouts split-polling)."""
+    bk = db.get(M.Booking, booking_id)
+    if not bk:
+        raise HTTPException(404, "booking not found")
+    if bk.slot_found_fired_at is not None:
+        return {"already_fired": True, "booking_status": str(bk.status)}
+    if bk.slot_open_fired_at is None:
+        raise HTTPException(409, "cannot fire slot-found before slot-open")
+    scheduler.fire_slot_found_manual(db, bk)
+    return {"fired": True, "booking_status": str(bk.status)}
 
 
 @app.post("/bookings/{booking_id}/schedule", response_model=BookingOut)
@@ -755,7 +1716,9 @@ def schedule_booking(booking_id: str, db: Session = Depends(get_db),
 @app.post("/bookings/{booking_id}/stop")
 def stop_booking(booking_id: str, db: Session = Depends(get_db),
                  _op: Principal = Depends(require_operator)) -> dict:
-    """Stop every running worker in the booking and mark it completed."""
+    """Stop every running worker in the booking. Marks the booking STOPPED (resumable via /start),
+    NOT COMPLETED -- confirmed bug fix: a manual stop was previously indistinguishable from a
+    successfully-finished booking, and restarting afterward silently no-opped."""
     bk = db.get(M.Booking, booking_id)
     if not bk:
         raise HTTPException(404, "booking not found")
@@ -764,9 +1727,15 @@ def stop_booking(booking_id: str, db: Session = Depends(get_db),
     for w in running:
         _bus.send_command(w.id, "stop")
         supervisor.stop(w.id)
-        w.status = WorkerStatus.STOPPED
-    if bk.status == BookingStatus.RUNNING:
-        bk.status = BookingStatus.COMPLETED
+        _set_worker_status(w, WorkerStatus.STOPPED)
+        # Reset now, not just at requeue time (start_booking) -- see _reset_worker_bus_state's
+        # docstring -- so a single-worker restart right after this stop is safe too.
+        _reset_worker_bus_state(booking_id, w.id)
+    if bk.status not in (BookingStatus.COMPLETED, BookingStatus.ABORTED, BookingStatus.STOPPED):
+        try:
+            bk.status = booking_transition(bk.status, BookingStatus.STOPPED)
+        except IllegalTransition as e:
+            raise HTTPException(409, str(e))
     db.commit()
     return {"stopped": len(running), "booking_status": str(bk.status)}
 
@@ -800,10 +1769,32 @@ def stop_worker(worker_id: str, db: Session = Depends(get_db),
     w = db.get(M.Worker, worker_id)
     if not w:
         raise HTTPException(404, "worker not found")
+    _require_worker_action(w, "stop")
     _bus.send_command(worker_id, "stop")
     supervisor.stop(worker_id)
-    w.status = WorkerStatus.STOPPED
+    _set_worker_status(w, WorkerStatus.STOPPED)
+    _reset_worker_bus_state(w.booking_id, worker_id)   # see its docstring -- never leave a stale
+    db.commit()                                        # command/signal-latch state behind
+    db.refresh(w)
+    return w
+
+
+@app.post("/workers/{worker_id}/restart", response_model=WorkerOut)
+def restart_worker(worker_id: str, db: Session = Depends(get_db),
+                   _op: Principal = Depends(require_operator)) -> M.Worker:
+    """Stop (verified-kill via supervisor.stop, F15) then relaunch through the normal launch path --
+    the dashboard-visible version of what _sched_on_relaunch already does for hold-phase auto-respawn."""
+    w = db.get(M.Worker, worker_id)
+    if not w:
+        raise HTTPException(404, "worker not found")
+    _require_worker_action(w, "restart")
+    if w.status == WorkerStatus.RUNNING:
+        _bus.send_command(worker_id, "stop")
+        supervisor.stop(worker_id)
+    _reset_worker_bus_state(w.booking_id, worker_id)   # see its docstring
+    _set_worker_status(w, WorkerStatus.READY)
     db.commit()
+    _do_launch_worker(db, w)
     db.refresh(w)
     return w
 
@@ -836,7 +1827,12 @@ if _DIST.is_dir():
 
     @app.get("/{full_path:path}", include_in_schema=False)
     def _spa_fallback(full_path: str) -> FileResponse:
-        # unknown non-API GET path -> let the SPA router handle it
+        # unknown non-API GET path -> let the SPA router handle it. EXCEPT the reserved docs paths
+        # -- when ENABLE_API_DOCS is off, FastAPI simply never registers those routes, so without
+        # this guard this catch-all would silently swallow /docs, /redoc, /openapi.json and serve
+        # index.html (200) instead of a 404, defeating the point of disabling them.
+        if full_path in ("docs", "redoc", "openapi.json"):
+            raise HTTPException(404, "not found")
         candidate = _DIST / full_path
         if candidate.is_file():
             return FileResponse(candidate)

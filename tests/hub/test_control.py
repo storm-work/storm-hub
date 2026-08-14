@@ -2,7 +2,7 @@
 import subprocess
 import time
 
-from apps.hub.events import map_event_to_update
+from apps.hub.events import EventHub, map_event_to_update
 from apps.hub.supervisor import _alive, kill_tree
 from libs.domain.enums import WorkerStatus, WorkerSubstate
 
@@ -31,8 +31,48 @@ def test_terminal_stopped():
     assert map_event_to_update("terminal", {"outcome": "stopped"})["status"] == WorkerStatus.STOPPED
 
 
+def test_terminal_held_is_its_own_status_not_a_failure():
+    """Confirmed bug 2026-08-14: `held` (emitted by _run_apply for "no slot assigned" and "apply
+    bounced") had no entry in _TERMINAL_STATUS, so it hit the FAILED default -- a worker that did
+    nothing wrong was shown red, counted as failed, and burned MAX_RESPAWN_ATTEMPTS."""
+    assert map_event_to_update("terminal", {"outcome": "held"})["status"] == WorkerStatus.HELD
+
+
+def test_every_phase_outcome_has_an_explicit_terminal_status():
+    """Drift guard -- this is the test that would have caught the `held` bug. Any outcome
+    libs/engine/phases.py can emit MUST be an explicit key in _TERMINAL_STATUS; falling through to
+    the FAILED default silently mislabels a worker."""
+    import re
+    from pathlib import Path
+
+    from apps.hub.events import _TERMINAL_STATUS
+
+    src = Path("libs/engine/phases.py").read_text()
+    emitted = set(re.findall(r'PhaseResult\(\s*"(\w+)"', src))
+    assert emitted, "failed to parse any PhaseResult outcomes -- fix this test's regex"
+    missing = emitted - set(_TERMINAL_STATUS)
+    assert not missing, f"outcomes with no explicit terminal status (would silently become FAILED): {missing}"
+
+
 def test_log_line_no_db_change():
     assert map_event_to_update("log_line", {"text": "hi"}) == {}
+
+
+# ── EventHub.dates_reported buffer (D6) ────────────────────────────────────────
+def test_pop_dates_reported_returns_and_clears_buffered_reports():
+    hub = EventHub.__new__(EventHub)   # bypass __init__ -- no Redis needed for this
+    hub.dates_reported = {}
+
+    assert hub.pop_dates_reported("s1") == []   # nothing buffered yet
+
+    hub.dates_reported.setdefault("s1", []).append([{"date": "d1", "outcome": "empty"}])
+    hub.dates_reported.setdefault("s1", []).append([{"date": "d2", "outcome": "found"}])
+    hub.dates_reported.setdefault("s2", []).append([{"date": "d3", "outcome": "failed"}])
+
+    popped = hub.pop_dates_reported("s1")
+    assert popped == [[{"date": "d1", "outcome": "empty"}], [{"date": "d2", "outcome": "found"}]]
+    assert hub.pop_dates_reported("s1") == []          # drained
+    assert hub.pop_dates_reported("s2") == [[{"date": "d3", "outcome": "failed"}]]   # untouched by s1's pop
 
 
 # ── supervisor kill_tree ──────────────────────────────────────────────────────

@@ -43,6 +43,22 @@ class WrongLayer(SettingsError):
         self.key, self.layer, self.allowed = key, layer, allowed
 
 
+class BelowMinimum(SettingsError):
+    """Raised when a resolved loop-cadence/throttle setting is below its declared floor.
+
+    Exists specifically because of a confirmed incident: a worker's frozen effective_settings_json
+    resolved HOLD_POLL_GAP to 0.0, and the hold loop spun unthrottled (~150-280 writes/sec) for 66
+    minutes. Never silently clamp-and-continue here — a throttle resolving to ~0 is exactly the
+    failure mode this guards against, so it must be loud, not quietly "fixed."
+    """
+    def __init__(self, key: str, value: float, min_value: float):
+        super().__init__(
+            f"setting {key!r} resolved to {value!r}, below its declared minimum {min_value!r} — "
+            "refusing to produce a config that would let a loop spin unthrottled"
+        )
+        self.key, self.value, self.min_value = key, value, min_value
+
+
 def _coerce(setting: Setting, value: Any) -> Any:
     """Coerce a raw value (possibly a string from a form/env) to the setting's declared type."""
     if value is None:
@@ -83,7 +99,10 @@ def validate_layer(layer: L, values: Mapping[str, Any]) -> dict[str, Any]:
             raise UnknownSetting(key, layer)
         if layer not in setting.settable_layers():
             raise WrongLayer(key, layer, setting.settable_layers())
-        out[key] = _coerce(setting, raw)
+        coerced = _coerce(setting, raw)
+        if setting.min_value is not None and coerced is not None and coerced < setting.min_value:
+            raise BelowMinimum(key, coerced, setting.min_value)
+        out[key] = coerced
     return out
 
 
@@ -108,6 +127,16 @@ def resolve(layers: LayerValues, *, include_defaults: bool = True) -> dict[str, 
     for layer in sorted(validated, key=lambda l: _RANK[l]):
         for key, value in validated[layer].items():
             effective[key] = value
+
+    # Hard floor on loop-cadence/throttle settings (see BelowMinimum) — checked on the FINAL resolved
+    # value regardless of which layer supplied it, so no override path can silently reintroduce the
+    # confirmed HOLD_POLL_GAP=0.0 incident.
+    for key, value in effective.items():
+        setting = CATALOG.get(key)
+        if setting is None or setting.min_value is None or value is None:
+            continue
+        if value < setting.min_value:
+            raise BelowMinimum(key, value, setting.min_value)
 
     return effective
 

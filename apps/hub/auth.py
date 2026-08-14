@@ -64,6 +64,15 @@ def _decode(token: str) -> dict:
         raise HTTPException(401, "invalid or expired token")
 
 
+def try_decode(token: str) -> dict | None:
+    """Best-effort decode for non-request-blocking callers (e.g. audit logging middleware) —
+    never raises, returns None on any invalid/expired/missing token."""
+    try:
+        return jwt.decode(token, settings.jwt_secret, algorithms=["HS256"])
+    except jwt.PyJWTError:
+        return None
+
+
 # ── Current-principal dependencies ────────────────────────────────────────────
 class Principal:
     def __init__(self, user: M.User, session: M.UserSession):

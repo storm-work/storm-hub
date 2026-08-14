@@ -14,10 +14,16 @@ dependencies = [
     "playwright==1.61.0",   # pinned to the shared chromium build 1228 (matches storm-auto)
     "primp",                # TLS-fingerprint HTTP client (login/discovery)
     "requests",              # vendored solver HTTP client
+    "pyjwt",                # apps.hub.auth session tokens
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "httpx"]
+dev = [
+    "pytest>=8.0",
+    "httpx",
+    "fakeredis",
+    "lupa>=2.8",
+]
 
 # The domain layer (Phase 1) is pure-stdlib and importable as top-level packages.
 [tool.setuptools]

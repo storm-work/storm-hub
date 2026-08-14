@@ -61,6 +61,21 @@ def test_booking_lifecycle():
     assert booking_transition(BookingStatus.SCHEDULED, BookingStatus.RUNNING)
 
 
+def test_booking_stop_is_resumable_and_distinct_from_completed():
+    # Confirmed bug fix (F13): stopping a booking was previously conflated with COMPLETED, and
+    # restarting a stopped booking silently no-opped. STOPPED must be reachable from the active
+    # states and must be resumable back to RUNNING/WARMING, unlike the terminal COMPLETED/ABORTED.
+    assert booking_transition(BookingStatus.RUNNING, BookingStatus.STOPPED)
+    assert booking_transition(BookingStatus.WARMING, BookingStatus.STOPPED)
+    assert booking_transition(BookingStatus.STOPPED, BookingStatus.RUNNING)
+    assert booking_transition(BookingStatus.STOPPED, BookingStatus.ABORTED)
+    with pytest.raises(IllegalTransition):
+        booking_transition(BookingStatus.COMPLETED, BookingStatus.STOPPED)
+    with pytest.raises(IllegalTransition):
+        # a genuinely terminal give-up still can't be resumed, unlike STOPPED
+        booking_transition(BookingStatus.ABORTED, BookingStatus.RUNNING)
+
+
 def test_worker_status_and_resume():
     assert worker_transition(WorkerStatus.READY, WorkerStatus.RUNNING)
     assert worker_transition(WorkerStatus.RUNNING, WorkerStatus.STOPPED)

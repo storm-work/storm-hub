@@ -30,3 +30,16 @@ export async function api(path, { method = "GET", body } = {}) {
   }
   return data;
 }
+
+// Downloads (e.g. a booked PDF) need the bearer token too, so a plain <a href> won't work --
+// fetch as a blob and open it in a new tab.
+export async function openFile(path) {
+  const headers = {};
+  if (auth.token) headers.Authorization = `Bearer ${auth.token}`;
+  const res = await fetch(path, { headers });
+  if (!res.ok) throw new Error(`${res.status}: could not fetch file`);
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  window.open(url, "_blank");
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
+}

@@ -4,6 +4,8 @@ from .gettime import (
     candidate_dates,
     classify_gettime_body,
     parse_special_days,
+    special_days_from_json,
+    special_days_to_json,
 )
 
 __all__ = [
@@ -13,4 +15,6 @@ __all__ = [
     "candidate_dates",
     "classify_gettime_body",
     "parse_special_days",
+    "special_days_to_json",
+    "special_days_from_json",
 ]

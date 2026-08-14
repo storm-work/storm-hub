@@ -33,12 +33,20 @@ class KeepaliveConfig:
     browser_confirm: bool = True
     browser_from: str = ""
     off: bool = False
+    # dead_trip/probe/jitter exist in the settings catalog (group "keepalive") but were missing from
+    # this bridge -- added when the hold loop's keepalive was actually wired up (it was previously
+    # parsed nowhere: a "holding" worker sat with zero portal traffic for up to 900s per wait, and
+    # the server-side session/form-state can lapse in that gap).
+    dead_trip: int = 3
+    probe: str = "home"
+    jitter: float = 30.0
 
 
 @dataclass(frozen=True)
 class HoldSwapConfig:
     swap_after_found: bool = False
     swap_retries: int = 3
+    retry_hold_secs: float = 600.0
     verify: bool = True
     poll_gap: float = 0.0
     direct_bootstrap: bool = False
@@ -122,10 +130,14 @@ class EngineConfig:
                 browser_confirm=bool(g("KEEPALIVE_BROWSER_CONFIRM", True)),
                 browser_from=str(g("KEEPALIVE_BROWSER_FROM", "") or ""),
                 off=bool(g("KEEPALIVE_OFF", False)),
+                dead_trip=int(g("KEEPALIVE_DEAD_TRIP", 3)),
+                probe=str(g("KEEPALIVE_PROBE", "home") or "home"),
+                jitter=float(g("KEEPALIVE_JITTER", 30.0)),
             ),
             hold_swap=HoldSwapConfig(
                 swap_after_found=bool(g("HOLD_SWAP_AFTER_FOUND", False)),
                 swap_retries=int(g("HOLD_SWAP_RETRIES", 3)),
+                retry_hold_secs=float(g("HOLD_SWAP_RETRY_HOLD_SECS", 600.0)),
                 verify=bool(g("HOLD_VERIFY", True)),
                 poll_gap=float(g("HOLD_POLL_GAP", 0.0)),
                 direct_bootstrap=bool(g("SWAP_DIRECT_BOOTSTRAP", False)),

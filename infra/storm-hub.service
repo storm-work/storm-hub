@@ -1,0 +1,18 @@
+[Unit]
+Description=storm-hub Manager Hub (FastAPI API + scheduler + event consumer)
+After=network.target postgresql.service redis-server.service
+Wants=postgresql.service redis-server.service
+
+[Service]
+Type=simple
+User=storm
+WorkingDirectory=/srv/projects/storm-hub
+ExecStart=/srv/projects/storm-hub/.venv/bin/python -m uvicorn apps.hub.main:app --host 127.0.0.1 --port 8123 --proxy-headers --forwarded-allow-ips=127.0.0.1
+Restart=no
+
+# Deliberately no [Install] section and Restart=no, matching storm-auto's own storm-worker.service/
+# storm-scout.service convention (see /etc/systemd/system/storm-worker.service's comment for the full
+# reasoning): the Hub's scheduler resumes driving any booking that was already RUNNING when it
+# restarts -- including hold-respawning live workers -- so an auto-restart or auto-boot-start would
+# resume live-money automation with no human decision in the loop. Always start this explicitly:
+# `sudo systemctl start storm-hub`.

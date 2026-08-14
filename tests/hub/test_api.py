@@ -16,7 +16,7 @@ from libs.db import metadata
 
 
 @pytest.fixture()
-def client():
+def client(monkeypatch):
     engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     metadata.create_all(engine)
     with engine.begin() as c:
@@ -34,6 +34,11 @@ def client():
             db.close()
 
     app.dependency_overrides[get_db] = _override
+    # _launch_worker_fleet (POST /bookings/{id}/start) opens its own SessionLocal() per background
+    # thread instead of using Depends(get_db) -- point it at this test's isolated engine too, or a
+    # fleet launch silently no-ops against the real dev DB instead of this StaticPool one.
+    import apps.hub.main as hub_main
+    monkeypatch.setattr(hub_main, "SessionLocal", TestSession)
     yield TestClient(app)
     app.dependency_overrides.clear()
 
@@ -49,6 +54,15 @@ def _operate_headers(client, username="admin", password="pw"):
 # ── open endpoints ────────────────────────────────────────────────────────────
 def test_health_and_catalog(client):
     assert client.get("/health").json()["status"] == "ok"
+
+
+def test_ops_status_reports_redis_disk_and_workers(client):
+    r = client.get("/ops/status")
+    assert r.status_code == 200
+    body = r.json()
+    assert "redis" in body and "disk" in body and "workers" in body
+    assert "free_pct" in body["disk"]
+    assert "running" in body["workers"]
     cat = client.get("/settings/catalog").json()
     assert cat["_meta"]["total"] > 90
     assert {"global", "booking", "template"} <= set(cat)
@@ -167,6 +181,14 @@ def test_import_identities_and_proxies(client):
     r = client.post("/identities/import", json={"csv": csv}, headers=h).json()
     assert r["created"] == 1 and r["sub_accounts"] == 2
     assert len(client.get("/identities", headers=h).json()) == 1
+    # Regression: identity_ids/sub_account_ids let the dashboard chain gen-subaccounts + a
+    # registration run onto exactly the rows this import just created, without a second lookup.
+    assert len(r["identity_ids"]) == 1
+    assert len(r["sub_account_ids"]) == 2
+    all_ids = {i["id"] for i in client.get("/identities", headers=h).json()}
+    assert set(r["identity_ids"]) <= all_ids
+    all_sub_ids = {s["id"] for s in client.get("/sub-accounts", headers=h).json()}
+    assert set(r["sub_account_ids"]) <= all_sub_ids
 
     # SOAX-style: same endpoint, DIFFERENT session strings -> distinct proxies; exact dup -> skipped
     r = client.post("/proxies/import", json={"provider": "soax", "kind": "datacenter",
@@ -206,6 +228,109 @@ def test_arm_with_template_and_start_booking(client):
     # start booking launches ready workers (supervisor.spawn will try a subprocess; tolerate)
     r = client.post(f"/bookings/{bid}/start", headers=h)
     assert r.status_code == 200 and r.json()["started"] >= 1
+
+    # Regression guard: _launch_worker_fleet launches each worker on its own background-thread DB
+    # session (P4, needed once a live-mode lease can do a real network probe) -- confirm the worker
+    # actually reaches RUNNING, not just that /start counted it as "started".
+    workers = client.get(f"/bookings/{bid}/workers", headers=h).json()
+    assert any(w["status"] == "running" for w in workers)
+
+
+def test_start_does_not_fire_slot_open(client):
+    # /start launches workers and begins warmup; it must NOT decide slot-open on its own -- that's
+    # a separate decision (timed /schedule, or manual /fire-slot-open). Corrected after an initial
+    # version auto-fired slot-open on every start, which isn't what "Start Instantly" means.
+    h = _operate_headers(client)
+    bid = client.post("/bookings", json={"name": "b-warm", "type": "real", "posto_id": "5084"}, headers=h).json()["id"]
+    r = client.post(f"/bookings/{bid}/start", headers=h)
+    assert r.status_code == 200 and r.json()["booking_status"] == "warming"
+    got = client.get(f"/bookings/{bid}", headers=h)
+    assert got.json()["status"] == "warming"
+
+
+def test_fire_slot_open_manually(client):
+    h = _operate_headers(client)
+    bid = client.post("/bookings", json={"name": "b-fso", "type": "real", "posto_id": "5084"}, headers=h).json()["id"]
+    # too early: not warming/armed yet
+    r = client.post(f"/bookings/{bid}/fire-slot-open", headers=h)
+    assert r.status_code == 409
+
+    client.post(f"/bookings/{bid}/start", headers=h)
+    r = client.post(f"/bookings/{bid}/fire-slot-open", headers=h)
+    assert r.status_code == 200 and r.json()["fired"] is True and r.json()["booking_status"] == "running"
+
+    # idempotent
+    r2 = client.post(f"/bookings/{bid}/fire-slot-open", headers=h)
+    assert r2.status_code == 200 and r2.json()["already_fired"] is True
+
+
+def test_fire_slot_found_manually(client):
+    """Regression: unlike fire-slot-open, slot-found previously had NO manual override at all --
+    it only ever fired automatically once a real AVAILABLE Slot row existed, so an operator testing
+    the apply-worker path had no way to force it."""
+    h = _operate_headers(client)
+    bid = client.post("/bookings", json={"name": "b-fsf", "type": "real", "posto_id": "5084"}, headers=h).json()["id"]
+
+    # too early: slot-open hasn't fired yet
+    r = client.post(f"/bookings/{bid}/fire-slot-found", headers=h)
+    assert r.status_code == 409
+
+    client.post(f"/bookings/{bid}/start", headers=h)
+    client.post(f"/bookings/{bid}/fire-slot-open", headers=h)
+
+    r = client.post(f"/bookings/{bid}/fire-slot-found", headers=h)
+    assert r.status_code == 200 and r.json()["fired"] is True
+
+    got = client.get(f"/bookings/{bid}", headers=h)
+    assert got.json()["slot_open_fired_at"] is not None
+    assert got.json()["slot_found_fired_at"] is not None
+    r2 = client.post(f"/bookings/{bid}/fire-slot-found", headers=h)
+    assert r2.status_code == 200 and r2.json()["already_fired"] is True
+
+
+def test_stop_then_restart_booking_status_not_conflated(client):
+    # Confirmed bug fix (F13): stop must not report the booking as "completed", and restart must
+    # actually move the status forward again, not leave it stuck.
+    h = _operate_headers(client)
+    bid = client.post("/bookings", json={"name": "b2", "type": "real", "posto_id": "5084"}, headers=h).json()["id"]
+    r = client.post(f"/bookings/{bid}/start", headers=h)
+    assert r.status_code == 200 and r.json()["booking_status"] == "warming"
+
+    r = client.post(f"/bookings/{bid}/stop", headers=h)
+    assert r.status_code == 200
+    assert r.json()["booking_status"] == "stopped"   # NOT "completed"
+
+    got = client.get(f"/bookings/{bid}", headers=h)
+    assert got.json()["status"] == "stopped"
+
+    r = client.post(f"/bookings/{bid}/start", headers=h)
+    assert r.status_code == 200
+    assert r.json()["booking_status"] == "warming"   # actually resumed, not stuck -- and slot-open
+                                                      # never fired before, so it's a fresh warmup
+
+
+def test_restart_after_slot_open_is_a_fresh_run_and_re_enables_the_signals(client):
+    """Operator decision 2026-08-14 (replaces the old resume-into-RUNNING shortcut): every /start is
+    a FRESH RUN. Confirmed bug it fixes -- slot_open_fired_at/slot_found_fired_at persisted across a
+    stop/start cycle, so a restarted booking came back at RUNNING with both fire buttons
+    permanently disabled and no way to re-fire a signal on what was, to the operator, a new run."""
+    h = _operate_headers(client)
+    bid = client.post("/bookings", json={"name": "b3", "type": "real", "posto_id": "5084"}, headers=h).json()["id"]
+    client.post(f"/bookings/{bid}/start", headers=h)
+    assert client.post(f"/bookings/{bid}/fire-slot-open", headers=h).json()["fired"] is True
+    assert client.post(f"/bookings/{bid}/fire-slot-found", headers=h).json()["fired"] is True
+
+    r = client.post(f"/bookings/{bid}/stop", headers=h)
+    assert r.json()["booking_status"] == "stopped"
+
+    r = client.post(f"/bookings/{bid}/start", headers=h)
+    assert r.status_code == 200 and r.json()["booking_status"] == "warming"
+
+    bk = client.get(f"/bookings/{bid}", headers=h).json()
+    assert bk["slot_open_fired_at"] is None
+    assert bk["slot_found_fired_at"] is None
+    # and they're genuinely re-firable, not just blank in the response
+    assert client.post(f"/bookings/{bid}/fire-slot-open", headers=h).json()["fired"] is True
 
 
 def test_configs_seed_and_edit(client):

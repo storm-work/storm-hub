@@ -27,6 +27,9 @@ class Settings:
         # dev fallback secret keeps tests running without a .env; prod supplies JWT_SECRET.
         self.jwt_secret = os.environ.get("JWT_SECRET", "dev-insecure-secret-change-me")
         self.jwt_ttl_hours = int(os.environ.get("JWT_TTL_HOURS", "12"))
+        # /docs, /redoc, /openapi.json disclose the full API schema unauthenticated -- closed by
+        # default now that the Hub is reachable over the public internet; opt in for local dev.
+        self.enable_api_docs = os.environ.get("ENABLE_API_DOCS", "0") == "1"
 
 
 settings = Settings()

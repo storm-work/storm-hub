@@ -53,13 +53,19 @@ class BookingStatus(StrEnum):
     WARMING = "warming"      # auto at warmup_start_at
     ARMED = "armed"          # all workers warmed + holding
     RUNNING = "running"      # slot_open fired
+    STOPPED = "stopped"      # operator/timeout stop; resumable (mirrors WorkerStatus.STOPPED) --
+                              # NOT the same as COMPLETED (confirmed bug: stop was previously
+                              # conflated with completed, and restart from it silently no-opped)
     COMPLETED = "completed"
     ABORTED = "aborted"
 
 
-# Booking statuses during which an identity is exclusively allocated (C2).
+# Booking statuses during which an identity is exclusively allocated (C2). STOPPED stays "active"
+# here (same reasoning as WorkerStatus.STOPPED) -- a paused-but-resumable booking still owns its
+# identities; only COMPLETED/ABORTED/DRAFT release them.
 BOOKING_ACTIVE_STATUSES = frozenset(
-    {BookingStatus.SCHEDULED, BookingStatus.WARMING, BookingStatus.ARMED, BookingStatus.RUNNING}
+    {BookingStatus.SCHEDULED, BookingStatus.WARMING, BookingStatus.ARMED, BookingStatus.RUNNING,
+     BookingStatus.STOPPED}
 )
 
 
@@ -72,7 +78,14 @@ class WorkerRole(StrEnum):
 class WorkerStatus(StrEnum):
     READY = "ready"
     RUNNING = "running"
-    STOPPED = "stopped"
+    STOPPED = "stopped"      # operator/timeout stop -- somebody decided to end this run
+    # The phase machine ran to a clean end WITHOUT booking: an apply worker never got a slot
+    # assigned, or its apply bounced (libs/engine/phases.py's two PhaseResult("held", ...) exits).
+    # Confirmed bug 2026-08-14: `held` had no entry in events.py's _TERMINAL_STATUS, so it hit the
+    # FAILED default -- a worker that did nothing wrong was shown red, counted as failed, and burned
+    # MAX_RESPAWN_ATTEMPTS. Distinct from FAILED (something broke) and from STOPPED (somebody
+    # decided); like both, it's relaunchable, and hold-respawn DOES retry it.
+    HELD = "held"
     COMPLETED = "completed"
     FAILED = "failed"
 

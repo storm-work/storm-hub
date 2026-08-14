@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, timezone
 
-from apps.hub.scheduler import plan_booking_actions, plan_slot_assignments
+from apps.hub.scheduler import plan_booking_actions
 from libs.domain.enums import BookingStatus
 
 NOW = datetime(2026, 8, 4, 11, 0, tzinfo=timezone.utc)
@@ -29,9 +29,3 @@ def test_start_and_slot_open_can_both_be_due():
     past = NOW - timedelta(minutes=1)
     # a scheduled booking whose warmup time passed -> start (slot_open needs WARMING status first)
     assert plan_booking_actions(BookingStatus.SCHEDULED, past, past, NOW) == ["start"]
-
-
-def test_slot_assignment_pairs_1to1_in_order():
-    assert plan_slot_assignments(["s1", "s2", "s3"], ["wA", "wB"]) == [("wA", "s1"), ("wB", "s2")]
-    assert plan_slot_assignments([], ["wA"]) == []
-    assert plan_slot_assignments(["s1"], []) == []

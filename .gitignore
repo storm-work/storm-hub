@@ -29,6 +29,20 @@ data/
 logs/
 *.pdf
 
+# Worker checkpoints (session cookies) -- never commit; see libs/engine/checkpoint.py
+var/
+
+# Post-accident recovery material: a 142MB Postgres dump carrying CAPSOLVER_KEYS, 162 sub-account
+# passwords and 1238 proxy credentials, plus the full prompt-history extract. Reference material for
+# the reconstruction, never repo content.
+_recovery/
+
+# Runtime evidence screenshots (libs/engine/vendor/screenshots) -- worker output, not source.
+libs/engine/vendor/screenshots/
+
+__pycache__/
+*.pyc
+
 # OS
 .DS_Store
 

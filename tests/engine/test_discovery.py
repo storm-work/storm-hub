@@ -8,12 +8,16 @@ from datetime import date
 
 import pytest
 
+import json
+
 from libs.engine.discovery import (
     GettimeStatus,
     candidate_dates,
     classify_gettime_body,
     parse_periodos_ocupados,
     parse_special_days,
+    special_days_from_json,
+    special_days_to_json,
 )
 
 # (input, (free, occupied-active)) — captured from storm-auto's parser.
@@ -58,6 +62,25 @@ def test_parse_special_days():
     sd = parse_special_days(body)
     assert sd[2026][8] == {1, 15, 25}
     assert sd[2026][9] == {3}
+
+
+def test_special_days_json_round_trip_through_a_real_bus_payload():
+    """special_days_to_json/from_json must survive an actual json.dumps/loads round trip (the bus's
+    real transport, libs/bus/bus.py's _encode/_decode) -- sets aren't JSON-native, so this is the
+    thing that would silently break if the encoding were wrong."""
+    sd = parse_special_days(
+        "SPECIAL_DAYS[2026]=new Array(); "
+        "SPECIAL_DAYS[2026][8] = new Array('1','15','25');"
+        "SPECIAL_DAYS[2026][9] = new Array(3);"
+    )
+    wire = json.loads(json.dumps(special_days_to_json(sd)))
+    restored = special_days_from_json(wire)
+    assert restored == sd
+
+
+def test_special_days_from_json_empty_or_none():
+    assert special_days_from_json({}) == {}
+    assert special_days_from_json(None) == {}
 
 
 # ── candidate-date window ─────────────────────────────────────────────────────

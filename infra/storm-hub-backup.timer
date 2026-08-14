@@ -1,0 +1,10 @@
+[Unit]
+Description=Run storm-hub-backup.service nightly at 23:15 UTC
+
+[Timer]
+OnCalendar=*-*-* 23:15:00
+RandomizedDelaySec=300
+Persistent=true
+
+[Install]
+WantedBy=timers.target

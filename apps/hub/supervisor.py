@@ -3,7 +3,13 @@
 One worker = one OS process (`python -m apps.worker <id>`). On stop we terminate the whole process
 tree and force-kill on timeout — a leaked Chromium (once live ops land) can't run away and exhaust
 inotify/FDs the way it did in storm-auto. Tracks pids in-memory; the durable source of truth is the
-DB + the bus events, so a Hub restart re-attaches without killing live workers.
+DB + the bus events. A Hub restart does NOT kill already-running workers (they're spawned with their
+own session via start_new_session=True) -- but a fresh Supervisor() instance has no memory of them
+either, which is exactly why `reconcile()` exists (called once at Hub startup, apps/hub/main.py's
+lifespan): without it, a restarted Hub can neither stop nor correctly detect-as-alive any worker a
+PREVIOUS instance spawned, which was a confirmed bug (the booking Stop button silently did nothing
+for pre-restart workers, and the dead-worker reaper would eventually mark them FAILED despite being
+perfectly healthy).
 """
 from __future__ import annotations
 
@@ -57,48 +63,130 @@ def _alive(pid: int) -> bool:
         return False
 
 
+def _find_pid_by_cmdline(module: str, key: str) -> int | None:
+    """Fallback for Supervisor.stop() when `key` isn't in this instance's own self._procs -- e.g.
+    spawned by a PREVIOUS Hub process, before the current one restarted. self._procs is in-memory
+    only and a fresh Supervisor() starts with it empty (confirmed bug: the module docstring claims
+    "a Hub restart re-attaches without killing live workers", but no re-attachment logic actually
+    existed anywhere -- every worker/registrar process spawned before the most recent Hub restart
+    was silently unstoppable via the API from then on, since Supervisor.stop() just returned False
+    for a `key` it had no record of and never even tried to find the real OS process). Scans /proc
+    for a process whose cmdline matches the exact `python -m <module> <key>` invocation
+    Supervisor._spawn_module uses, since that's a stable, predictable signature."""
+    try:
+        pids = os.listdir("/proc")
+    except FileNotFoundError:
+        return None
+    for entry in pids:
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        try:
+            raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
+            continue
+        parts = [p for p in raw.split(b"\x00") if p]
+        if len(parts) < 3:
+            continue
+        tail = [p.decode(errors="replace") for p in parts[-3:]]
+        if tail == ["-m", module, key]:
+            return pid
+    return None
+
+
 class Supervisor:
+    """Authoritative process tracking is by PID (`self._pids`), not by `subprocess.Popen` object --
+    `Popen` can only ever represent a process THIS Python process actually started, which breaks the
+    moment the Hub itself restarts: a fresh Supervisor() has no Popen handle for any worker/registrar
+    a PREVIOUS Hub instance spawned, even though those processes (own session, own process group)
+    are still very much alive. Confirmed bug (2026-08-13): the old `self._procs: dict[str, Popen]`
+    design meant `stop()` silently no-oped for anything not spawned by the CURRENT instance -- the
+    booking "Stop" button did nothing for any worker that predated the last Hub restart -- and
+    `running_ids()`/`is_running()` (which `_reap_dead_workers` trusts) reported EVERY such worker as
+    not-running, so the very next scheduler tick past the dead-grace window would mark genuinely
+    healthy, holding workers FAILED and release their leases. `self._procs` is kept only for
+    processes spawned by THIS instance, purely so `stop()` can `Popen.wait()` and reap its own
+    child's zombie; `self._pids` is the real source of truth for is_running/running_ids/stop,
+    checked via a plain `os.kill(pid, 0)` liveness probe that works for any PID regardless of
+    parentage."""
+
     def __init__(self, redis_url: str):
         self.redis_url = redis_url
         self._procs: dict[str, subprocess.Popen] = {}
+        self._pids: dict[str, int] = {}
 
     def spawn(self, worker_id: str) -> int:
         """Start the worker subprocess (idempotent — a live one is left running)."""
-        existing = self._procs.get(worker_id)
-        if existing and existing.poll() is None:
-            return existing.pid
+        return self._spawn_module(worker_id, "apps.worker")
+
+    def spawn_registrar(self, run_id: str) -> int:
+        """Start a registration-run subprocess (apps/registrar) -- same idempotent/process-tree-owned
+        treatment as a booking worker, just a different entrypoint module."""
+        return self._spawn_module(run_id, "apps.registrar")
+
+    def _spawn_module(self, key: str, module: str) -> int:
+        existing_pid = self._pids.get(key)
+        if existing_pid is not None and _alive(existing_pid):
+            return existing_pid
         env = {**os.environ, "REDIS_URL": self.redis_url}
         proc = subprocess.Popen(
-            [sys.executable, "-m", "apps.worker", worker_id],
+            [sys.executable, "-m", module, key],
             cwd=str(_ROOT),
             env=env,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,   # own process group so kill_tree is clean
         )
-        self._procs[worker_id] = proc
+        self._procs[key] = proc
+        self._pids[key] = proc.pid
         return proc.pid
 
+    def reconcile(self, keys_by_module: dict[str, str]) -> None:
+        """Re-discover processes a PREVIOUS Hub instance spawned, so a restart doesn't strand them
+        as untrackable (unstoppable via stop(), invisible/false-dead to running_ids()/is_running()).
+        `keys_by_module`: {worker_or_run_id: "apps.worker" | "apps.registrar"}, normally every
+        DB-RUNNING Worker's id at Hub startup (apps/hub/main.py's lifespan, which has DB access this
+        module deliberately doesn't). Safe to call repeatedly; a key already tracked is left alone,
+        and a key whose process is genuinely gone (crashed while the Hub was down) is simply not
+        added -- the existing dead/stall reap paths already handle a DB-RUNNING row with no live
+        process behind it, once running_ids() can actually see the truth."""
+        for key, module in keys_by_module.items():
+            if key in self._pids:
+                continue
+            pid = _find_pid_by_cmdline(module, key)
+            if pid is not None:
+                self._pids[key] = pid
+
     def stop(self, worker_id: str) -> bool:
-        proc = self._procs.get(worker_id)
-        if not proc:
+        pid = self._pids.get(worker_id)
+        if pid is None:
+            # Not reconciled/tracked yet -- last-resort direct lookup (covers a key that arrived
+            # after the one-time startup reconcile(), e.g. a worker whose row predates this Hub
+            # instance in some edge case reconcile() didn't cover).
+            for module in ("apps.worker", "apps.registrar"):
+                pid = _find_pid_by_cmdline(module, worker_id)
+                if pid is not None:
+                    break
+        if pid is None:
             return False
-        if proc.poll() is None:
-            kill_tree(proc.pid)
-        try:
-            proc.wait(timeout=5)   # reap so it doesn't linger as a zombie
-        except subprocess.TimeoutExpired:
-            pass
-        self._procs.pop(worker_id, None)
+        if _alive(pid):
+            kill_tree(pid)
+        proc = self._procs.pop(worker_id, None)
+        if proc is not None:
+            try:
+                proc.wait(timeout=5)   # reap so it doesn't linger as a zombie (only valid for OUR
+            except subprocess.TimeoutExpired:  # own child -- a foreign/reconciled pid isn't ours to
+                pass                            # wait() on; its real parent or init(1) reaps it)
+        self._pids.pop(worker_id, None)
         return True
 
     def is_running(self, worker_id: str) -> bool:
-        proc = self._procs.get(worker_id)
-        return bool(proc and proc.poll() is None)
+        pid = self._pids.get(worker_id)
+        return pid is not None and _alive(pid)
 
     def running_ids(self) -> list[str]:
-        return [wid for wid, p in self._procs.items() if p.poll() is None]
+        return [wid for wid, pid in self._pids.items() if _alive(pid)]
 
     def shutdown_all(self) -> None:
-        for wid in list(self._procs):
+        for wid in list(self._pids):
             self.stop(wid)

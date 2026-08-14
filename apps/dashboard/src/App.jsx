@@ -1,9 +1,13 @@
 import React, { useEffect, useRef, useState } from "react";
-import { api, auth } from "./api.js";
+import { api, auth, openFile } from "./api.js";
 
-// Live worker status/logs over the Hub WebSocket. Returns a map worker_id -> {substate, logs[]}.
+// Live status over the single shared Hub WebSocket. Returns { byWorker, bySubAccount } --
+// byWorker: worker_id -> {substate, logs[]} (booking workers); bySubAccount: sub_account_id ->
+// {phase, outcome} (apps/registrar's reg_progress/reg_result events, keyed differently since a
+// registration run has no Worker row -- see apps/hub/main.py's run_registration).
 function useEvents(enabled) {
-  const [live, setLive] = useState({});
+  const [byWorker, setByWorker] = useState({});
+  const [bySubAccount, setBySubAccount] = useState({});
   const ref = useRef(null);
   useEffect(() => {
     if (!enabled) return;
@@ -12,25 +16,115 @@ function useEvents(enabled) {
     ref.current = ws;
     ws.onmessage = (ev) => {
       const m = JSON.parse(ev.data);
+      if (m.sub_account_id && (m.type === "reg_progress" || m.type === "reg_result")) {
+        setBySubAccount((prev) => {
+          const cur = prev[m.sub_account_id] || {};
+          const next = { ...cur };
+          if (m.type === "reg_progress") next.phase = m.detail;
+          if (m.type === "reg_result") { next.outcome = m.outcome; next.phase = m.outcome; }
+          return { ...prev, [m.sub_account_id]: next };
+        });
+        return;
+      }
       if (!m.worker_id) return;
-      setLive((prev) => {
+      setByWorker((prev) => {
         const cur = prev[m.worker_id] || { substate: null, logs: [] };
         const next = { ...cur };
         if (m.type === "status_change" && m.substate) next.substate = m.substate;
         if (m.type === "terminal") { next.substate = m.substate || next.substate; next.outcome = m.outcome; }
-        if (m.type === "log_line" && m.text) next.logs = [...cur.logs.slice(-40), m.text];
+        if (m.type === "log_line" && m.text) next.logs = [...cur.logs.slice(-100), m.text];
         return { ...prev, [m.worker_id]: next };
       });
     };
     return () => ws.close();
   }, [enabled]);
-  return live;
+  return { byWorker, bySubAccount };
+}
+
+// Generic client-side search + click-to-sort for any row array. Small and reused across every
+// table page instead of a bespoke filter per page (conversation_extract #224: "sort/filter/search
+// by table or by column features for all tables").
+function useSortSearch(rows, initialSort) {
+  const [q, setQ] = useState("");
+  const [sort, setSort] = useState(initialSort || null); // {key, dir}
+  const filtered = q
+    ? rows.filter((r) => JSON.stringify(r).toLowerCase().includes(q.toLowerCase()))
+    : rows;
+  const sorted = sort
+    ? [...filtered].sort((a, b) => {
+        const av = a[sort.key], bv = b[sort.key];
+        if (av == null && bv == null) return 0;
+        if (av == null) return 1;
+        if (bv == null) return -1;
+        const cmp = av > bv ? 1 : av < bv ? -1 : 0;
+        return sort.dir === "desc" ? -cmp : cmp;
+      })
+    : filtered;
+  return { q, setQ, sort, setSort, rows: sorted };
+}
+
+function SearchBox({ q, setQ, placeholder = "search…" }) {
+  return <input value={q} onChange={(e) => setQ(e.target.value)} placeholder={placeholder}
+    style={{ width: 200 }} />;
+}
+
+function Sortable({ label, k, sort, setSort, w }) {
+  const active = sort && sort.key === k;
+  const next = () => setSort(active && sort.dir === "asc" ? { key: k, dir: "desc" } : { key: k, dir: "asc" });
+  return (
+    <th style={{ cursor: "pointer", userSelect: "none", width: w }} onClick={next} title="click to sort">
+      {label}{active ? (sort.dir === "asc" ? " ▲" : " ▼") : ""}
+    </th>
+  );
+}
+
+// The general page-structure pattern for fold-out side panels, from now on: a page never renders
+// its own <SidePanel> -- App owns that (mounted in .app-body, outside .container, so it's a real
+// full-height docked sidebar flush to the viewport edge, not a floating card next to the table). A
+// page calls the setLeftPanel/setRightPanel callbacks App passes it: setLeftPanel({title, content})
+// to open, setLeftPanel(null) to close. See Identities() for the reference usage.
+function SidePanel({ side, title, onClose, children }) {
+  // onClose omitted (e.g. Proxies' pool tree, which is permanent page navigation, not an on-demand
+  // action panel like Identities'/Bookings' fold-outs) -> no × button, nothing to dismiss it with.
+  // The fold/unfold toggle is independent of onClose -- available on every SidePanel (permanent nav
+  // panels included), since collapsing to a thin rail is a viewing preference, not a dismissal.
+  const [collapsed, setCollapsed] = useState(false);
+  const foldGlyph = side === "left" ? (collapsed ? "»" : "«") : (collapsed ? "«" : "»");
+  return (
+    <div className={`side-panel ${side}${collapsed ? " collapsed" : ""}`}>
+      <div className="side-panel-header">
+        {!collapsed && <h3>{title}</h3>}
+        <button className="panel-fold" onClick={() => setCollapsed(!collapsed)}
+          title={collapsed ? "expand" : "collapse"}>{foldGlyph}</button>
+        {!collapsed && onClose && <button className="panel-close" onClick={onClose} title="close">×</button>}
+      </div>
+      {!collapsed && children}
+    </div>
+  );
+}
+
+// Reusable transient dialog (as opposed to SidePanel's persistent docked panel) -- "dedicated
+// actions" for something clicked, then gone. Closes on backdrop click or the × button.
+function Modal({ title, onClose, children }) {
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="modal-box" onClick={(e) => e.stopPropagation()}>
+        <div className="side-panel-header">
+          <h3>{title}</h3>
+          <button className="panel-close" onClick={onClose} title="close">×</button>
+        </div>
+        {children}
+      </div>
+    </div>
+  );
 }
 
 export default function App() {
   const [me, setMe] = useState(null);
   const [ready, setReady] = useState(false);
   const [page, setPage] = useState("bookings");
+  const [leftPanel, setLeftPanel] = useState(null);   // {title, content} | null
+  const [rightPanel, setRightPanel] = useState(null); // {title, content} | null
   const events = useEvents(!!me);
 
   async function refreshMe() {
@@ -41,15 +135,25 @@ export default function App() {
   }
   useEffect(() => { refreshMe(); }, []);
 
+  function goPage(p) {
+    setPage(p);
+    setLeftPanel(null);
+    setRightPanel(null);
+  }
+
   if (!ready) return <div className="container muted">Loading…</div>;
   if (!me) return <Login onLogin={refreshMe} />;
 
+  const panelProps = { setLeftPanel, setRightPanel };
   const pages = {
-    bookings: <Bookings me={me} events={events} />,
-    identities: <Identities me={me} />,
-    proxies: <Proxies me={me} />,
+    bookings: <Bookings me={me} events={events} {...panelProps} />,
+    identities: <Identities me={me} {...panelProps} />,
+    registration: <Registration me={me} events={events} />,
+    proxies: <Proxies me={me} {...panelProps} />,
     templates: <Templates me={me} />,
     settings: <Settings me={me} />,
+    ops: <Ops />,
+    audit: <Audit />,
     sessions: <Sessions me={me} onChange={refreshMe} />,
   };
 
@@ -58,8 +162,8 @@ export default function App() {
       <div className="topbar">
         <span className="brand">⛈ storm-hub</span>
         <nav className="nav">
-          {["bookings", "identities", "proxies", "templates", "settings", "sessions"].map((p) => (
-            <button key={p} className={page === p ? "active" : ""} onClick={() => setPage(p)}>
+          {["bookings", "identities", "registration", "proxies", "templates", "settings", "ops", "audit", "sessions"].map((p) => (
+            <button key={p} className={page === p ? "active" : ""} onClick={() => goPage(p)}>
               {p[0].toUpperCase() + p.slice(1)}
             </button>
           ))}
@@ -73,13 +177,18 @@ export default function App() {
           Logout
         </button>
       </div>
-      <div className="container">
-        {!me.is_operating && (
-          <div className="banner info">
-            You're in <b>{me.purpose}</b> mode{me.session_status === "paused" ? " (seat held by another operator — request handover in Sessions)" : ""}. Viewing is read-only.
-          </div>
-        )}
-        {pages[page]}
+      <div className="app-body">
+        {leftPanel && <SidePanel side="left" title={leftPanel.title}
+          onClose={leftPanel.closable === false ? undefined : () => setLeftPanel(null)}>{leftPanel.content}</SidePanel>}
+        <div className="container">
+          {!me.is_operating && (
+            <div className="banner info">
+              You're in <b>{me.purpose}</b> mode{me.session_status === "paused" ? " (seat held by another operator — request handover in Sessions)" : ""}. Viewing is read-only.
+            </div>
+          )}
+          {pages[page]}
+        </div>
+        {rightPanel && <SidePanel side="right" title={rightPanel.title} onClose={() => setRightPanel(null)}>{rightPanel.content}</SidePanel>}
       </div>
     </>
   );
@@ -123,7 +232,8 @@ function Login({ onLogin }) {
           <button className="btn" disabled={busy}>{busy ? "…" : "Sign in"}</button>
         </form>
         <p className="muted" style={{ marginTop: 12, fontSize: 13 }}>
-          First run? Bootstrap an admin via <code>POST /auth/bootstrap</code> in <a href="/docs">/docs</a>.
+          First run? Bootstrap an admin from the server shell:
+          <br /><code>{"curl -X POST http://127.0.0.1:8123/auth/bootstrap -H 'Content-Type: application/json' -d '{\"username\":\"...\",\"password\":\"...\"}'"}</code>
         </p>
       </div>
     </div>
@@ -138,235 +248,1443 @@ function useList(path) {
   return { rows, err, reload };
 }
 
-function Bookings({ me, events }) {
+function Bookings({ me, events, setLeftPanel, setRightPanel }) {
   const { rows, err, reload } = useList("/bookings");
+  const [selectedId, setSelectedId] = useState(null);
+  const [showCreate, setShowCreate] = useState(false);
+  const booking = rows.find((b) => b.id === selectedId) || null;
+
+  // The booking list is permanent page navigation (like Proxies' pool tree), not an on-demand
+  // action panel -- foldable via SidePanel's collapse toggle, but never auto-dismissed.
+  useEffect(() => {
+    setLeftPanel({
+      title: "Bookings",
+      closable: false,
+      content: <BookingListPanel me={me} bookings={rows} selectedId={selectedId}
+        onSelect={setSelectedId} onNew={() => setShowCreate(true)} />,
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rows, selectedId]);
+  useEffect(() => () => setLeftPanel(null), []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  return (
+    <>
+      {err && <div className="banner err">{err}</div>}
+      {showCreate && (
+        <Modal title="New booking" onClose={() => setShowCreate(false)}>
+          <BookingCreateForm me={me} onCreated={(id) => { setShowCreate(false); reload(); setSelectedId(id); }} />
+        </Modal>
+      )}
+      {booking ? (
+        <>
+          <BookingOverview me={me} booking={booking} events={events} onBookingChanged={reload}
+            onDeleted={() => { setSelectedId(null); reload(); }} />
+          <BookingOpsTabs me={me} booking={booking} events={events}
+            setRightPanel={setRightPanel} onBookingChanged={reload} />
+        </>
+      ) : (
+        <div className="card muted">
+          {rows.length === 0 ? "No bookings yet — create one from the sidebar." : "Select a booking from the sidebar."}
+        </div>
+      )}
+    </>
+  );
+}
+
+function BookingListPanel({ me, bookings, selectedId, onSelect, onNew }) {
+  const [filter, setFilter] = useState("all"); // all | test | real
+  const enriched = bookings.map((b) => ({ ...b, _date: b.warmup_start_at || b.created_at || "" }));
+  const filtered = enriched.filter((b) => filter === "all" || b.type === filter);
+  const { q, setQ, sort, setSort, rows: shown } = useSortSearch(filtered, { key: "_date", dir: "desc" });
+
+  return (
+    <>
+      <button className="btn ghost" disabled={!me.is_operating} onClick={onNew} style={{ width: "100%", marginBottom: 10 }}>
+        + New booking
+      </button>
+      <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="search…"
+        style={{ width: "100%", marginBottom: 8 }} />
+      <div className="field" style={{ marginBottom: 10 }}>
+        <select value={filter} onChange={(e) => setFilter(e.target.value)} style={{ width: "100%" }}>
+          <option value="all">all types</option><option value="test">test</option><option value="real">real</option>
+        </select>
+      </div>
+      <table className="table-compact">
+        <thead><tr>
+          <Sortable label="Name" k="name" sort={sort} setSort={setSort} w="46%" />
+          <Sortable label="Date" k="_date" sort={sort} setSort={setSort} w="28%" />
+          <Sortable label="Status" k="status" sort={sort} setSort={setSort} w="26%" />
+        </tr></thead>
+        <tbody>{shown.map((b) => (
+          <tr key={b.id} className={`row-clickable${b.id === selectedId ? " row-selected" : ""}`} onClick={() => onSelect(b.id)}>
+            <td>{b.name}</td>
+            <td className="muted">{b._date ? b._date.slice(0, 10) : "—"}</td>
+            <td className="muted">{b.status}</td>
+          </tr>
+        ))}</tbody>
+      </table>
+      {shown.length === 0 && <div className="muted" style={{ marginTop: 10, fontSize: 13 }}>No bookings match.</div>}
+    </>
+  );
+}
+
+function BookingCreateForm({ me, onCreated }) {
   const [f, setF] = useState({ name: "", type: "test", posto_id: "2032", nationality: "CPV", residence: "CPV",
                                warmup_start_at: "", slot_open_at: "" });
   const [msg, setMsg] = useState("");
-  const [sel, setSel] = useState(null);
   const canOperate = me.is_operating;
 
   async function create() {
     setMsg("");
     const body = { ...f };
-    // empty datetime-local -> omit (send null)
     body.warmup_start_at = f.warmup_start_at ? new Date(f.warmup_start_at).toISOString() : null;
     body.slot_open_at = f.slot_open_at ? new Date(f.slot_open_at).toISOString() : null;
-    try { await api("/bookings", { method: "POST", body }); reload(); }
+    try { const r = await api("/bookings", { method: "POST", body }); onCreated(r.id); }
     catch (e) { setMsg(e.message); }
   }
+
   return (
     <>
-      <div className="card">
-        <h2>New booking</h2>
-        {msg && <div className="banner err">{msg}</div>}
-        <div className="row" style={{ flexWrap: "wrap" }}>
-          <div className="field"><label>Name</label><input value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} /></div>
-          <div className="field"><label>Type</label>
-            <select value={f.type} onChange={(e) => setF({ ...f, type: e.target.value })}>
-              <option value="test">test</option><option value="real">real</option>
-            </select></div>
-          <div className="field"><label>Posto</label><input value={f.posto_id} onChange={(e) => setF({ ...f, posto_id: e.target.value })} style={{ width: 90 }} /></div>
-          <div className="field"><label>Nat.</label><input value={f.nationality} onChange={(e) => setF({ ...f, nationality: e.target.value })} style={{ width: 70 }} /></div>
-          <div className="field"><label>Res.</label><input value={f.residence} onChange={(e) => setF({ ...f, residence: e.target.value })} style={{ width: 70 }} /></div>
-          <div className="field"><label>Warmup start</label><input type="datetime-local" value={f.warmup_start_at} onChange={(e) => setF({ ...f, warmup_start_at: e.target.value })} /></div>
-          <div className="field"><label>Slot-open</label><input type="datetime-local" value={f.slot_open_at} onChange={(e) => setF({ ...f, slot_open_at: e.target.value })} /></div>
-          <div className="field" style={{ alignSelf: "end" }}><button className="btn" disabled={!canOperate} onClick={create}>Create</button></div>
-        </div>
-        {!canOperate && <div className="muted">Operate seat required to create. Leave times blank for manual/instant start.</div>}
-      </div>
-      <div className="card">
-        <h2>Bookings ({rows.length})</h2>
-        {err && <div className="banner err">{err}</div>}
-        <table><thead><tr><th>Name</th><th>Type</th><th>Posto</th><th>Status</th><th></th></tr></thead>
-          <tbody>{rows.map((b) => (
-            <tr key={b.id}><td>{b.name}</td><td><span className="pill">{b.type}</span></td><td>{b.posto_id}</td>
-              <td>{b.status}</td>
-              <td><button className="btn ghost" onClick={() => setSel(sel === b.id ? null : b.id)}>{sel === b.id ? "Hide" : "Workers"}</button></td></tr>
-          ))}</tbody></table>
-      </div>
-      {sel && <BookingWorkers me={me} booking={rows.find((b) => b.id === sel)} events={events} />}
+      {msg && <div className="banner err">{msg}</div>}
+      <div className="field"><label>Name</label>
+        <input value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} style={{ width: "100%" }} /></div>
+      <div className="field"><label>Type</label>
+        <select value={f.type} onChange={(e) => setF({ ...f, type: e.target.value })} style={{ width: "100%" }}>
+          <option value="test">test</option><option value="real">real</option>
+        </select></div>
+      <div className="field"><label>Posto</label>
+        <input value={f.posto_id} onChange={(e) => setF({ ...f, posto_id: e.target.value })} style={{ width: "100%" }} /></div>
+      <div className="field"><label>Nationality</label>
+        <input value={f.nationality} onChange={(e) => setF({ ...f, nationality: e.target.value })} style={{ width: "100%" }} /></div>
+      <div className="field"><label>Residence</label>
+        <input value={f.residence} onChange={(e) => setF({ ...f, residence: e.target.value })} style={{ width: "100%" }} /></div>
+      <div className="field"><label>Warmup start</label>
+        <input type="datetime-local" value={f.warmup_start_at} onChange={(e) => setF({ ...f, warmup_start_at: e.target.value })} style={{ width: "100%" }} /></div>
+      <div className="field"><label>Slot-open</label>
+        <input type="datetime-local" value={f.slot_open_at} onChange={(e) => setF({ ...f, slot_open_at: e.target.value })} style={{ width: "100%" }} /></div>
+      {!canOperate && <div className="muted" style={{ marginBottom: 8, fontSize: 12 }}>Operate seat required. Leave times blank for manual/instant start.</div>}
+      <button className="btn" disabled={!canOperate || !f.name} onClick={create} style={{ width: "100%" }}>Create</button>
     </>
   );
 }
 
-function BookingWorkers({ me, booking, events }) {
+function isoToDatetimeLocal(iso) {
+  return iso ? iso.slice(0, 16) : "";
+}
+
+// THE single place the dashboard decides what a worker is doing. Everything else (workers table,
+// counts row, run summary, action buttons) reads this -- previously each computed its own blend of
+// DB row + WS cache and they disagreed constantly.
+//
+// Two rules, both learned from confirmed bugs:
+//  1. `events.byWorker` accumulates for the whole page session and is NEVER cleared, so it is only
+//     trustworthy while the worker is CURRENTLY running. A worker that failed, was restarted, and
+//     is now healthily holding otherwise renders forever as "holding (failed)" -- the substate half
+//     of this was fixed 2026-08-13, the `outcome` half was still leaking through until 2026-08-14.
+//  2. `substate` describes what a RUNNING worker is doing. For any other status it is meaningless,
+//     and the backend now actively NULLs it on stop/restart/requeue/reap (apps/hub/main.py's
+//     _set_worker_status). Old rows written before that fix can still carry a stale value, so this
+//     drops it for non-running workers rather than trusting the column.
+//
+// Result: a non-running worker reports substate/outcome as null and renders "—". Its last-known
+// context lives in `substate_detail`, which is shown as the row's tooltip.
+function workerView(w, events) {
+  const running = w.status === "running";
+  const live = running ? (events.byWorker[w.id] || {}) : {};
+  return {
+    running,
+    status: w.status,
+    substate: running ? (live.substate || w.substate || null) : null,
+    outcome: running ? (live.outcome || null) : null,
+    detail: w.substate_detail || null,
+  };
+}
+
+// Mirrors libs/domain/state_machines.py's WORKER_ACTION_STATUSES exactly -- keep the two in sync.
+// The Hub enforces these (via _require_worker_action, 409 otherwise); this table exists so a
+// disabled button always means "not applicable to this worker", never "will fail if you click it".
+//
+// Before this, each action invented its own rule and they contradicted each other: row Launch was
+// `!running` (so it was live on COMPLETED workers that had already booked a real appointment, and
+// launching one leaked a proxy lease), row Restart was unguarded entirely, bulk Launch/Detach both
+// used a set called `selectedStopped` that actually meant "not running" (i.e. including READY and
+// COMPLETED, despite Detach's tooltip claiming "stopped workers only"), and bulk Restart used every
+// selected row. One table, used by both levels, is the fix.
+const WORKER_ACTIONS = {
+  launch:  ["ready", "stopped", "held", "failed"],
+  stop:    ["running"],
+  restart: ["ready", "running", "stopped", "held", "failed"],
+  detach:  ["ready", "stopped", "held", "failed", "completed"],
+};
+const canWorkerAction = (action, status) => (WORKER_ACTIONS[action] || []).includes(status);
+
+// Why a given action is unavailable, for the button tooltip -- "disabled and unexplained" was a
+// large part of what made these controls feel arbitrary.
+function actionTitle(action, status) {
+  if (canWorkerAction(action, status)) return `${action} this worker`;
+  if (status === "completed") return `worker already completed — cannot ${action}`;
+  if (action === "stop") return "worker is not running";
+  if (action === "detach") return "stop the worker first";
+  return `cannot ${action} from status "${status}"`;
+}
+
+// The operator's requested run-summary layout: 8 named substates in a fixed 2-column grid, always
+// shown (including zeros) so the panel's shape stays stable at a glance rather than reflowing as
+// workers move between phases.
+const RUN_SUMMARY_SUBSTATES = [
+  ["idle", "discovering"],
+  ["logging_in", "polling"],
+  ["warmed", "applying"],
+  ["holding", "failed"],
+];
+
+function BookingRunSummary({ booking, events }) {
+  const { rows } = useList(`/bookings/${booking.id}/workers`);
+  // Only RUNNING workers have a substate (workerView), so this can no longer report "holding: 12"
+  // for a fleet that is entirely stopped -- which is exactly what it did when first added.
+  const counts = rows.reduce((a, w) => {
+    const s = workerView(w, events).substate;
+    if (s) a[s] = (a[s] || 0) + 1;
+    return a;
+  }, {});
+  const active = rows.filter((w) => w.status === "running").length;
+  return (
+    <div style={{ marginBottom: 12 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(150px, 220px))",
+                    gap: "2px 24px", fontSize: 13 }}>
+        {RUN_SUMMARY_SUBSTATES.flat().map((s) => (
+          <div key={s} className="row" style={{ gap: 6, justifyContent: "space-between" }}>
+            <span className="muted">{s}:</span>
+            <b style={{ opacity: counts[s] ? 1 : 0.35 }}>{counts[s] || 0}</b>
+          </div>
+        ))}
+      </div>
+      {/* Substates only exist for running workers, so an all-zero grid is ambiguous between "idle
+          fleet" and "nothing running" -- say which. */}
+      <div className="muted" style={{ fontSize: 12, marginTop: 4 }}>
+        {active} of {rows.length} worker{rows.length === 1 ? "" : "s"} running
+      </div>
+    </div>
+  );
+}
+
+function BookingOverview({ me, booking, events, onBookingChanged, onDeleted }) {
+  const op = me.is_operating;
+  const [msg, setMsg] = useState("");
+  const [editing, setEditing] = useState(false);
+  const [edit, setEdit] = useState(() => ({
+    name: booking.name, nationality: booking.nationality || "", residence: booking.residence || "",
+    warmup_start_at: isoToDatetimeLocal(booking.warmup_start_at), slot_open_at: isoToDatetimeLocal(booking.slot_open_at),
+  }));
+
+  useEffect(() => {
+    setEditing(false);
+    setEdit({
+      name: booking.name, nationality: booking.nationality || "", residence: booking.residence || "",
+      warmup_start_at: isoToDatetimeLocal(booking.warmup_start_at), slot_open_at: isoToDatetimeLocal(booking.slot_open_at),
+    });
+  }, [booking.id]);
+
+  async function act(fn) { setMsg(""); try { await fn(); onBookingChanged(); } catch (e) { setMsg(e.message); } }
+  const startAll = () => act(() => api(`/bookings/${booking.id}/start`, { method: "POST" }));
+  const stopAll = () => act(() => api(`/bookings/${booking.id}/stop`, { method: "POST" }));
+  const schedule = () => act(() => api(`/bookings/${booking.id}/schedule`, { method: "POST" }));
+  const fireSlotOpen = () => act(() => api(`/bookings/${booking.id}/fire-slot-open`, { method: "POST" }));
+  const fireSlotFound = () => act(() => api(`/bookings/${booking.id}/fire-slot-found`, { method: "POST" }));
+  async function deleteBooking() {
+    if (!window.confirm(
+      `Delete "${booking.name}" permanently? This stops and removes every worker, slot, and ` +
+      `identity attachment on it. Cannot be undone. (A booking with a real booked appointment ` +
+      `can't be deleted.)`
+    )) return;
+    setMsg("");
+    try { await api(`/bookings/${booking.id}`, { method: "DELETE" }); onDeleted(); }
+    catch (e) { setMsg(e.message); }
+  }
+  const saveEdit = () => act(async () => {
+    await api(`/bookings/${booking.id}`, {
+      method: "PUT",
+      body: {
+        name: edit.name, nationality: edit.nationality, residence: edit.residence,
+        warmup_start_at: edit.warmup_start_at ? new Date(edit.warmup_start_at).toISOString() : null,
+        slot_open_at: edit.slot_open_at ? new Date(edit.slot_open_at).toISOString() : null,
+      },
+    });
+    setEditing(false);
+  });
+
+  // Scheduling/firing are only legal from specific booking statuses (the backend 409s otherwise --
+  // these mirror those checks so a disabled button always means "not applicable right now", not a
+  // guaranteed-to-fail click).
+  const canFireSlotOpen = !booking.slot_open_fired_at && ["warming", "armed"].includes(booking.status);
+  const canFireSlotFound = !!booking.slot_open_fired_at && !booking.slot_found_fired_at;
+  const canStart = !["completed", "aborted"].includes(booking.status);
+  const canStop = !["draft", "stopped", "completed", "aborted"].includes(booking.status);
+  const canSchedule = !!booking.warmup_start_at && ["draft", "scheduled"].includes(booking.status);
+
+  return (
+    <div className="card">
+      <div className="row" style={{ marginBottom: 8, flexWrap: "wrap", gap: 10 }}>
+        {editing ? (
+          <div className="row" style={{ flexWrap: "wrap", gap: 8, alignItems: "flex-end" }}>
+            <div className="field" style={{ margin: 0 }}><label>Name</label>
+              <input value={edit.name} onChange={(e) => setEdit({ ...edit, name: e.target.value })} /></div>
+            <div className="field" style={{ margin: 0 }}><label>Nationality</label>
+              <input value={edit.nationality} onChange={(e) => setEdit({ ...edit, nationality: e.target.value })} style={{ width: 90 }} /></div>
+            <div className="field" style={{ margin: 0 }}><label>Residence</label>
+              <input value={edit.residence} onChange={(e) => setEdit({ ...edit, residence: e.target.value })} style={{ width: 90 }} /></div>
+            <div className="field" style={{ margin: 0 }}><label>Warmup start</label>
+              <input type="datetime-local" value={edit.warmup_start_at} onChange={(e) => setEdit({ ...edit, warmup_start_at: e.target.value })} /></div>
+            <div className="field" style={{ margin: 0 }}><label>Slot-open</label>
+              <input type="datetime-local" value={edit.slot_open_at} onChange={(e) => setEdit({ ...edit, slot_open_at: e.target.value })} /></div>
+            <button className="btn" disabled={!op || !edit.name} onClick={saveEdit}>Save</button>
+            <button className="btn ghost" onClick={() => setEditing(false)}>Cancel</button>
+          </div>
+        ) : (
+          <h2 style={{ margin: 0 }}>
+            {booking.name} <span className="muted">({booking.type} · posto {booking.posto_id}
+            {booking.nationality ? ` · ${booking.nationality}` : ""}{booking.residence ? `→${booking.residence}` : ""})</span>
+            {op && <button className="btn ghost btn-sm" onClick={() => setEditing(true)} style={{ marginLeft: 8 }} title="edit name/nationality/residence/scheduling">✎ Edit</button>}
+          </h2>
+        )}
+        <span className="grow" />
+        <button className="btn" disabled={!op || !canStart} onClick={startAll} title={!canStart ? `booking is ${booking.status}` : "launch ready workers now"}>▶ Start now</button>
+        <button className="btn ghost" disabled={!op || !canSchedule} onClick={schedule}
+          title={!booking.warmup_start_at ? "set a warmup start time first" : "auto-start at warmup time"}>⏱ Scheduled</button>
+        <button className="btn ghost" disabled={!op || !canFireSlotOpen} onClick={fireSlotOpen}
+          title={booking.slot_open_fired_at ? "already fired" : "manually fire slot-open now"}>⚡ Fire slot-open</button>
+        <button className="btn ghost" disabled={!op || !canFireSlotFound} onClick={fireSlotFound}
+          title={booking.slot_found_fired_at ? "already fired" : !booking.slot_open_fired_at ? "fire slot-open first" : "manually fire slot-found now"}>🔔 Fire slot-found</button>
+        <button className="btn ghost" disabled={!op || !canStop} onClick={stopAll} title={!canStop ? `booking is ${booking.status}` : "stop all running workers"}>■ Stop</button>
+        <button className="btn ghost" disabled={!op} onClick={deleteBooking} title="permanently delete this booking and everything on it">🗑 Delete</button>
+      </div>
+      <div className="row muted" style={{ fontSize: 13, marginBottom: 6, gap: 14, flexWrap: "wrap" }}>
+        <span>status: <b>{booking.status}</b></span>
+        {booking.warmup_start_at && <span>warmup (scheduled)@{(booking.warmup_start_at || "").slice(0, 16).replace("T", " ")}Z</span>}
+        {booking.slot_open_at && <span>slot-open (scheduled)@{(booking.slot_open_at || "").slice(0, 16).replace("T", " ")}Z</span>}
+      </div>
+      <div className="row" style={{ fontSize: 13, marginBottom: 12, gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+        <span className="muted">signal:</span>
+        {!booking.slot_open_fired_at && !booking.slot_found_fired_at && <span className="pill">no-signal</span>}
+        {booking.slot_open_fired_at && (
+          <span className="pill ok">slot-open fired @{booking.slot_open_fired_at.slice(0, 16).replace("T", " ")}Z</span>
+        )}
+        {booking.slot_found_fired_at && (
+          <span className="pill ok">slot-found fired @{booking.slot_found_fired_at.slice(0, 16).replace("T", " ")}Z</span>
+        )}
+      </div>
+      <BookingRunSummary booking={booking} events={events} />
+      {msg && <div className="banner err">{msg}</div>}
+      <BookingShortcutSettings me={me} booking={booking} onSaved={onBookingChanged} />
+    </div>
+  );
+}
+
+// {provider, kind: ""} means "any kind of that provider" (PROXY_KIND/HOLD_PROXY_KIND blank = no
+// filter, see apps/hub/main.py's `eff.get("...KIND") or None`). Falls back to the two known
+// providers (soax/webshare) when no proxies are loaded yet, so the dropdown is never empty.
+function derivePoolOptions(proxyRows) {
+  const providers = [...new Set(proxyRows.map((p) => p.provider))].sort();
+  if (providers.length === 0) return [{ provider: "soax", kind: "", label: "soax (any kind)" },
+                                       { provider: "webshare", kind: "", label: "webshare (any kind)" }];
+  const out = [];
+  for (const provider of providers) {
+    out.push({ provider, kind: "", label: `${provider} (any kind)` });
+    const kinds = [...new Set(proxyRows.filter((p) => p.provider === provider).map((p) => p.kind))].sort();
+    for (const kind of kinds) out.push({ provider, kind, label: `${provider} / ${kind}` });
+  }
+  return out;
+}
+
+// The overview's compact shortcut controls -- warmup/post-hold proxy pool + swap toggle. Saves
+// immediately on change (no separate Save button), matching the "quick access, not a form" framing
+// of a shortcut. The full grouped-by-category editor (every booking-settable key) lives in the
+// Settings tab (BookingFullSettingsPanel) instead of duplicating a raw-JSON escape hatch here.
+function BookingShortcutSettings({ me, booking, onSaved }) {
+  const proxies = useList("/proxies");
+  const [settings, setSettings] = useState({ ...(booking.settings_json || {}) });
+  const [msg, setMsg] = useState("");
+  const op = me.is_operating;
+
+  useEffect(() => { setSettings({ ...(booking.settings_json || {}) }); }, [booking.id, booking.settings_json]);
+
+  const pools = derivePoolOptions(proxies.rows);
+  const poolValue = (provider, kind) => `${provider}|${kind}`;
+  const warmupValue = poolValue(settings.PROXY_PROVIDER ?? "soax", settings.PROXY_KIND ?? "");
+  const holdValue = poolValue(settings.HOLD_PROXY_PROVIDER ?? "soax", settings.HOLD_PROXY_KIND ?? "");
+  const swapOn = !!settings.HOLD_SWAP_AFTER_FOUND;
+
+  async function saveFields(patch) {
+    setMsg("");
+    const next = { ...settings, ...patch };
+    setSettings(next);
+    try { await api(`/bookings/${booking.id}`, { method: "PUT", body: { settings: next } }); onSaved(); }
+    catch (e) { setMsg(e.message); }
+  }
+  function onPoolChange(providerKey, kindKey, value) {
+    const [provider, kind] = value.split("|");
+    saveFields({ [providerKey]: provider, [kindKey]: kind });
+  }
+
+  return (
+    <div className="row" style={{ flexWrap: "wrap", gap: 16, alignItems: "flex-end", borderTop: "1px solid var(--border)", paddingTop: 12 }}>
+      {msg && <div className="banner err" style={{ width: "100%" }}>{msg}</div>}
+      <div className="field" style={{ margin: 0, minWidth: 220 }}>
+        <label>Warmup phase proxy pool</label>
+        <select value={warmupValue} disabled={!op} style={{ width: "100%" }}
+          onChange={(e) => onPoolChange("PROXY_PROVIDER", "PROXY_KIND", e.target.value)}>
+          {pools.map((p) => <option key={`w-${p.provider}-${p.kind}`} value={poolValue(p.provider, p.kind)}>{p.label}</option>)}
+        </select>
+      </div>
+      <div className="field" style={{ margin: 0, display: "flex", alignItems: "center", gap: 8 }}>
+        <input type="checkbox" id="hold-swap-toggle" checked={swapOn} disabled={!op}
+          onChange={(e) => saveFields({ HOLD_SWAP_AFTER_FOUND: e.target.checked })} />
+        <label htmlFor="hold-swap-toggle" style={{ margin: 0 }}>Swap after slot found</label>
+      </div>
+      <div className="field" style={{ margin: 0, minWidth: 220 }}>
+        <label>Post-hold phase proxy pool{!swapOn ? " (enabled when swap is on)" : ""}</label>
+        <select value={holdValue} disabled={!op || !swapOn} style={{ width: "100%" }}
+          onChange={(e) => onPoolChange("HOLD_PROXY_PROVIDER", "HOLD_PROXY_KIND", e.target.value)}>
+          {pools.map((p) => <option key={`h-${p.provider}-${p.kind}`} value={poolValue(p.provider, p.kind)}>{p.label}</option>)}
+        </select>
+      </div>
+    </div>
+  );
+}
+
+function BookingOpsTabs({ me, booking, events, setRightPanel, onBookingChanged }) {
+  const [tab, setTab] = useState("workers");
+  return (
+    <div className="card">
+      <div className="tabs">
+        <button className={tab === "workers" ? "active" : ""} onClick={() => setTab("workers")}>Workers</button>
+        <button className={tab === "slots" ? "active" : ""} onClick={() => setTab("slots")}>Slots</button>
+        <button className={tab === "appointments" ? "active" : ""} onClick={() => setTab("appointments")}>Appointments</button>
+        <button className={tab === "settings" ? "active" : ""} onClick={() => setTab("settings")}>Settings</button>
+      </div>
+      {tab === "workers" && <BookingWorkers me={me} booking={booking} events={events} setRightPanel={setRightPanel} />}
+      {tab === "slots" && <BookingSlots booking={booking} />}
+      {tab === "appointments" && <BookingAppointments booking={booking} />}
+      {tab === "settings" && <BookingFullSettingsPanel me={me} booking={booking} onSaved={onBookingChanged} />}
+    </div>
+  );
+}
+
+function BookingSlots({ booking }) {
+  const { rows, err } = useList(`/bookings/${booking.id}/slots`);
+  const [statusFilter, setStatusFilter] = useState("all");
+  const filtered = rows.filter((s) => statusFilter === "all" || s.status === statusFilter);
+  const { q, setQ, sort, setSort, rows: shown } = useSortSearch(filtered, { key: "date", dir: "asc" });
+  const statuses = [...new Set(rows.map((s) => s.status))].sort();
+
+  return (
+    <>
+      <div className="row" style={{ marginBottom: 10, flexWrap: "wrap", gap: 10 }}>
+        <h3 style={{ margin: 0 }}>Slots found ({shown.length}/{rows.length})</h3>
+        <span className="grow" />
+        <SearchBox q={q} setQ={setQ} placeholder="search slots…" />
+        <div className="field" style={{ margin: 0 }}><label>Status</label>
+          <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
+            <option value="all">all</option>
+            {statuses.map((s) => <option key={s} value={s}>{s}</option>)}
+          </select></div>
+      </div>
+      {err && <div className="banner err">{err}</div>}
+      <table className="table-compact"><thead><tr>
+        <Sortable label="Date" k="date" sort={sort} setSort={setSort} w="20%" />
+        <Sortable label="Period" k="period" sort={sort} setSort={setSort} w="12%" />
+        <Sortable label="Status" k="status" sort={sort} setSort={setSort} w="16%" />
+        <Sortable label="Capacity" k="capacity_estimate" sort={sort} setSort={setSort} w="14%" />
+        <Sortable label="Misses" k="miss_count" sort={sort} setSort={setSort} w="12%" />
+        <Sortable label="Last seen" k="last_seen" sort={sort} setSort={setSort} w="26%" />
+      </tr></thead>
+        <tbody>{shown.map((s) => (
+          <tr key={s.id}>
+            <td>{s.date}</td><td>{s.period}</td>
+            <td><span className={`pill ${s.status === "available" ? "ok" : s.status === "taken" ? "err" : ""}`}>{s.status}</span></td>
+            <td className="muted">{s.capacity_estimate ?? "—"}</td>
+            <td className="muted">{s.miss_count}</td>
+            <td className="muted">{s.last_seen ? s.last_seen.slice(0, 19).replace("T", " ") : "—"}</td>
+          </tr>
+        ))}</tbody></table>
+      {rows.length === 0 && <div className="muted">No slots found yet.</div>}
+    </>
+  );
+}
+
+function BookingAppointments({ booking }) {
+  const { rows, err } = useList(`/bookings/${booking.id}/appointments`);
+  const identities = useList("/identities");
+  const identityById = Object.fromEntries(identities.rows.map((i) => [i.id, i]));
+  const enriched = rows.map((a) => ({ ...a, identity_name: identityById[a.identity_id]?.full_name || a.identity_id.slice(0, 8) }));
+  const { q, setQ, sort, setSort, rows: shown } = useSortSearch(enriched, { key: "booked_at", dir: "desc" });
+
+  return (
+    <>
+      <div className="row" style={{ marginBottom: 10, flexWrap: "wrap", gap: 10 }}>
+        <h3 style={{ margin: 0 }}>Appointments booked ({shown.length})</h3>
+        <span className="grow" />
+        <SearchBox q={q} setQ={setQ} placeholder="search appointments…" />
+      </div>
+      {err && <div className="banner err">{err}</div>}
+      <table className="table-compact"><thead><tr>
+        <Sortable label="Identity" k="identity_name" sort={sort} setSort={setSort} w="26%" />
+        <Sortable label="Reference" k="appointment_ref" sort={sort} setSort={setSort} w="20%" />
+        <Sortable label="Booked at" k="booked_at" sort={sort} setSort={setSort} w="26%" />
+        <th style={{ width: "28%" }}>PDF</th>
+      </tr></thead>
+        <tbody>{shown.map((a) => (
+          <tr key={a.id}>
+            <td>{a.identity_name}</td>
+            <td className="muted">{a.appointment_ref || "—"}</td>
+            <td className="muted">{a.booked_at ? a.booked_at.slice(0, 19).replace("T", " ") : "—"}</td>
+            <td>{a.pdf_artifact_id
+              ? <button className="btn-sm btn ghost" onClick={() => openFile(`/artifacts/${a.pdf_artifact_id}/file`)}>📄 Open PDF</button>
+              : <span className="muted">—</span>}</td>
+          </tr>
+        ))}</tbody></table>
+      {rows.length === 0 && <div className="muted">No appointments booked yet.</div>}
+    </>
+  );
+}
+
+// Settings whose valid values are a small, CONFIRMED fixed set (traced to actual code that
+// branches on them, or the catalog's own note -- not guessed) get a dropdown instead of free text.
+// "" is a legitimate value for the two *_KIND keys (blank = no kind filter, see
+// apps/hub/main.py's `eff.get("...KIND") or None`), not a placeholder/unset marker.
+const _SETTING_SELECT_OPTIONS = {
+  ENGINE_MODE: ["sim", "live"],
+  PROXY_PROVIDER: ["soax", "webshare"],
+  HOLD_PROXY_PROVIDER: ["soax", "webshare"],
+  PROXY_KIND: ["", "rotating", "static"],
+  HOLD_PROXY_KIND: ["", "rotating", "static"],
+};
+// Confirmed plain ISO dates (libs/engine/pool_manager.py's date.fromisoformat(CAL_START_DATE/...)).
+const _SETTING_DATE_KEYS = new Set(["CAL_START_DATE", "CAL_END_DATE"]);
+// Unconfirmed exact format (no current consumer) but named like every other _at timestamp in this
+// app (warmup_start_at/slot_open_at), which all store a bare datetime-local string -- no ISO/UTC
+// conversion here since that contract isn't established anywhere for these two.
+const _SETTING_DATETIME_KEYS = new Set(["SIM_SLOTS_OPEN_AT", "SIMULATE_RELEASE_AT"]);
+// settings_for_layer() (libs/domain/settings/catalog.py) sorts a group's fields alphabetically by
+// key, which puts CAL_END_DATE before CAL_START_DATE ("E" < "S") -- confusing reading order for a
+// date range. Explicit per-group order override for the handful of groups where alphabetical isn't
+// the right reading order; every other group keeps the API's alphabetical order untouched.
+const _SETTING_GROUP_ORDER = {
+  date_window: { CAL_START_DATE: 0, CAL_END_DATE: 1, CAL_NUM_DAYS: 2 },
+};
+
+function BookingFullSettingsPanel({ me, booking, onSaved }) {
+  const [catalog, setCatalog] = useState(null);
+  const [settings, setSettings] = useState({ ...(booking.settings_json || {}) });
+  const [msg, setMsg] = useState("");
+  const op = me.is_operating;
+
+  useEffect(() => { api("/settings/catalog").then((c) => setCatalog(c.booking || [])).catch(() => setCatalog([])); }, []);
+  useEffect(() => { setSettings({ ...(booking.settings_json || {}) }); }, [booking.id, booking.settings_json]);
+
+  if (catalog === null) return <div className="muted">Loading settings…</div>;
+
+  const groups = {};
+  for (const s of catalog) (groups[s.group || "other"] = groups[s.group || "other"] || []).push(s);
+  for (const [group, list] of Object.entries(groups)) {
+    const order = _SETTING_GROUP_ORDER[group];
+    if (order) list.sort((a, b) => (order[a.key] ?? 99) - (order[b.key] ?? 99));
+  }
+  const groupNames = Object.keys(groups).sort();
+
+  // undefined (not null/""/0/false) means "no override, unset" -- JSON.stringify drops undefined
+  // keys, so saving with a cleared field removes that override and falls back to the true default,
+  // rather than persisting a copy of whatever the default happened to be when the tab was opened.
+  function setField(key, value) { setSettings((prev) => ({ ...prev, [key]: value })); }
+
+  async function save() {
+    setMsg("");
+    try { await api(`/bookings/${booking.id}`, { method: "PUT", body: { settings } }); onSaved(); setMsg("saved"); }
+    catch (e) { setMsg(e.message); }
+  }
+
+  return (
+    <>
+      <div className="muted" style={{ fontSize: 12, marginBottom: 10 }}>
+        Overrides GLOBAL for this booking only. {catalog.length} settings across {groupNames.length} groups.
+        Empty fields show their default as a placeholder and use it until you set an explicit override.
+      </div>
+      {msg && <div className={`banner ${msg === "saved" ? "info" : "err"}`}>{msg}</div>}
+      {groupNames.map((group) => (
+        <details key={group} open style={{ marginBottom: 10, border: "1px solid var(--border)", borderRadius: 8, padding: "10px 14px" }}>
+          <summary style={{ cursor: "pointer", fontWeight: 600, fontSize: 13, textTransform: "uppercase", letterSpacing: "0.4px", color: "var(--muted)" }}>
+            {group.replace(/_/g, " ")} <span className="muted" style={{ textTransform: "none", fontWeight: 400 }}>({groups[group].length})</span>
+          </summary>
+          <div className="row" style={{ flexWrap: "wrap", gap: 12, marginTop: 10 }}>
+            {groups[group].map((s) => {
+              const value = settings[s.key];
+              const selectOptions = _SETTING_SELECT_OPTIONS[s.key];
+              const placeholder = s.default != null ? String(s.default) : "";
+              return (
+                <div className="field" key={s.key} style={{ margin: 0, minWidth: 200 }} title={s.note}>
+                  <label>{s.key}{s.home !== "booking" ? ` (${s.home} override)` : ""}</label>
+                  {s.type === "bool" ? (
+                    <input type="checkbox" checked={!!(value ?? s.default)} disabled={!op}
+                      onChange={(e) => setField(s.key, e.target.checked)} />
+                  ) : selectOptions ? (
+                    <select value={value ?? s.default ?? ""} disabled={!op}
+                      onChange={(e) => setField(s.key, e.target.value)} style={{ width: "100%" }}>
+                      {selectOptions.map((opt) => <option key={opt} value={opt}>{opt || "(none / no filter)"}</option>)}
+                    </select>
+                  ) : _SETTING_DATE_KEYS.has(s.key) ? (
+                    <input type="date" value={value ?? ""} disabled={!op}
+                      onChange={(e) => setField(s.key, e.target.value || undefined)} style={{ width: "100%" }} />
+                  ) : _SETTING_DATETIME_KEYS.has(s.key) ? (
+                    <input type="datetime-local" value={value ?? ""} disabled={!op}
+                      onChange={(e) => setField(s.key, e.target.value || undefined)} style={{ width: "100%" }} />
+                  ) : s.type === "int" || s.type === "float" ? (
+                    <input type="number" step={s.type === "float" ? "any" : "1"} value={value ?? ""} placeholder={placeholder} disabled={!op}
+                      onChange={(e) => setField(s.key, e.target.value === "" ? undefined : Number(e.target.value))} style={{ width: "100%" }} />
+                  ) : (
+                    <input type="text" value={value ?? ""} placeholder={placeholder} disabled={!op}
+                      onChange={(e) => setField(s.key, e.target.value === "" ? undefined : e.target.value)} style={{ width: "100%" }} />
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </details>
+      ))}
+      <button className="btn" disabled={!op} onClick={save} style={{ width: "100%", marginTop: 8 }}>Save settings</button>
+    </>
+  );
+}
+
+function BookingWorkers({ me, booking, events, setRightPanel }) {
   const workers = useList(`/bookings/${booking.id}/workers`);
   const identities = useList("/identities");
   const templates = useList("/templates");
-  const [attachId, setAttachId] = useState("");
+  const appointments = useList(`/bookings/${booking.id}/appointments`);
+  const [msg, setMsg] = useState("");
+  const [logsFor, setLogsFor] = useState(null);
+  const [sel, setSel] = useState({});
+  const [roleFilter, setRoleFilter] = useState("all");
+  const [statusFilter, setStatusFilter] = useState("all");
+  const op = me.is_operating;
+
+  async function run(fn) { setMsg(""); try { await fn(); workers.reload(); } catch (e) { setMsg(e.message); } }
+
+  const identityById = Object.fromEntries(identities.rows.map((i) => [i.id, i]));
+  const pdfByIdentity = Object.fromEntries(appointments.rows.map((a) => [a.identity_id, a.pdf_artifact_id]));
+
+  // A pure STATUS histogram -- one axis, nothing else spliced in. It used to read
+  // `live.outcome === "booked" ? "booked" : w.status`, which mixed an *outcome* into a *status*
+  // count (ungated on running, so it never expired either): the same booked worker was
+  // simultaneously status=completed, substate=booked, and displayed here as "booked" -- three names
+  // for one worker. Booked workers now show up as `completed`, and the Appointments tab is the
+  // place that actually lists bookings.
+  const counts = workers.rows.reduce((a, w) => {
+    a[w.status] = (a[w.status] || 0) + 1; return a;
+  }, {});
+
+  // Flatten identity name + live substate/outcome onto each row so search/sort/filter work on
+  // plain fields (matching the pattern used on Identities/Proxies), not a lookup done at render time.
+  const enriched = workers.rows.map((w) => {
+    const view = workerView(w, events);
+    const ident = identityById[w.identity_id];
+    return {
+      ...w,
+      identity_name: ident ? ident.full_name : w.identity_id.slice(0, 8),
+      live_substate: view.substate || "—",
+      live_outcome: view.outcome || "",
+      substate_detail: view.detail || "",
+      artifact_id: pdfByIdentity[w.identity_id] || null,
+    };
+  });
+  const filtered = enriched.filter((w) =>
+    (roleFilter === "all" || w.role === roleFilter) &&
+    (statusFilter === "all" || w.status === statusFilter));
+  const { q, setQ, sort, setSort, rows: shown } = useSortSearch(filtered, { key: "identity_name", dir: "asc" });
+
+  const selectedIds = Object.keys(sel).filter((k) => sel[k]);
+  // Bulk actions apply to exactly the selected rows the action is LEGAL for, using the same table
+  // the row buttons and the Hub use. Selecting a mixed bag no longer silently 409s on some rows:
+  // the button's own label says how many of the selection it will actually act on.
+  const selectedFor = (action) =>
+    shown.filter((w) => sel[w.id] && canWorkerAction(action, w.status)).map((w) => w.id);
+
+  async function bulk(ids, fn) {
+    setMsg("");
+    try { await Promise.all(ids.map(fn)); workers.reload(); setSel({}); }
+    catch (e) { setMsg(e.message); }
+  }
+  const bulkLaunch = () => bulk(selectedFor("launch"), (id) => api(`/workers/${id}/launch`, { method: "POST" }));
+  const bulkStop = () => bulk(selectedFor("stop"), (id) => api(`/workers/${id}/stop`, { method: "POST" }));
+  const bulkRestart = () => bulk(selectedFor("restart"), (id) => api(`/workers/${id}/restart`, { method: "POST" }));
+  const bulkDetach = () => bulk(
+    selectedFor("detach"),
+    (id) => api(`/bookings/${booking.id}/identities/${shown.find((w) => w.id === id).identity_id}`, { method: "DELETE" })
+  );
+
+  function openAttachPanel() {
+    setRightPanel({
+      title: "Attach identities",
+      content: <AttachPanel me={me} booking={booking} identities={identities.rows} templates={templates.rows}
+        attached={new Set(workers.rows.map((w) => w.identity_id))}
+        onAttached={() => { workers.reload(); }} />,
+    });
+  }
+
+  const roles = [...new Set(workers.rows.map((w) => w.role))].sort();
+  const statuses = [...new Set(workers.rows.map((w) => w.status))].sort();
+
+  return (
+    <>
+      <div className="row muted" style={{ fontSize: 13, marginBottom: 8, gap: 14 }}>
+        {Object.entries(counts).map(([k, v]) => <span key={k}>{k}: {v}</span>)}
+      </div>
+      {msg && <div className="banner err">{msg}</div>}
+      <div className="row" style={{ marginBottom: 10, flexWrap: "wrap", gap: 10 }}>
+        <button className="btn ghost" disabled={!op} onClick={openAttachPanel}>+ Attach identities</button>
+        <span className="grow" />
+        <SearchBox q={q} setQ={setQ} placeholder="search workers…" />
+        <div className="field" style={{ margin: 0 }}><label>Role</label>
+          <select value={roleFilter} onChange={(e) => setRoleFilter(e.target.value)}>
+            <option value="all">all</option>
+            {roles.map((r) => <option key={r} value={r}>{r}</option>)}
+          </select></div>
+        <div className="field" style={{ margin: 0 }}><label>Status</label>
+          <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
+            <option value="all">all</option>
+            {statuses.map((s) => <option key={s} value={s}>{s}</option>)}
+          </select></div>
+      </div>
+      {selectedIds.length > 0 && (
+        <div className="banner info row" style={{ flexWrap: "wrap", gap: 8 }}>
+          <span>{selectedIds.length} selected</span>
+          <span className="grow" />
+          {[["launch", bulkLaunch, "btn"], ["stop", bulkStop, "btn ghost"],
+            ["restart", bulkRestart, "btn ghost"], ["detach", bulkDetach, "btn ghost"]].map(
+            ([action, fn, cls]) => {
+              const n = selectedFor(action).length;
+              return (
+                <button key={action} className={`btn-sm ${cls}`} disabled={!op || !n} onClick={fn}
+                  title={n ? `${action} ${n} of ${selectedIds.length} selected`
+                           : `none of the selected workers can be ${action}ed`}>
+                  {action[0].toUpperCase() + action.slice(1)}{n ? ` (${n})` : ""}
+                </button>
+              );
+            })}
+        </div>
+      )}
+      <table className="table-compact">
+        <thead><tr>
+          <th style={{ width: 28 }}><input type="checkbox" checked={shown.length > 0 && shown.every((w) => sel[w.id])}
+            onChange={(e) => { const s = {}; if (e.target.checked) shown.forEach((w) => (s[w.id] = true)); setSel(s); }} /></th>
+          <Sortable label="Identity" k="identity_name" sort={sort} setSort={setSort} w="20%" />
+          <Sortable label="Role" k="role" sort={sort} setSort={setSort} w="8%" />
+          <Sortable label="Status" k="status" sort={sort} setSort={setSort} w="9%" />
+          <Sortable label="Live substate" k="live_substate" sort={sort} setSort={setSort} w="16%" />
+          <th style={{ width: "39%" }}>Actions</th>
+        </tr></thead>
+        <tbody>{shown.map((w) => {
+          const live = events.byWorker[w.id] || {};   // log lines only -- status/substate come from workerView
+          return (
+            <React.Fragment key={w.id}>
+              <tr>
+                <td onClick={(e) => e.stopPropagation()}>
+                  <input type="checkbox" checked={!!sel[w.id]} onChange={(e) => setSel({ ...sel, [w.id]: e.target.checked })} />
+                </td>
+                <td>{w.identity_name}</td>
+                <td><span className="pill">{w.role}</span></td>
+                <td className={w.status === "completed" ? "ok" : w.status === "failed" ? "err" : ""}
+                    title={w.substate_detail || ""}>{w.status}</td>
+                <td className={w.live_outcome === "booked" ? "ok" : w.live_outcome === "failed" ? "err" : ""}
+                    title={w.substate_detail || ""}>
+                  {w.live_substate}{w.live_outcome ? ` (${w.live_outcome})` : ""}
+                </td>
+                <td className="row" style={{ flexWrap: "nowrap", gap: 4, overflowX: "auto" }}>
+                  <button className="btn-sm btn" disabled={!op || !canWorkerAction("launch", w.status)}
+                    title={actionTitle("launch", w.status)}
+                    onClick={() => run(() => api(`/workers/${w.id}/launch`, { method: "POST" }))}>Launch</button>
+                  <button className="btn-sm btn ghost" disabled={!op || !canWorkerAction("stop", w.status)}
+                    title={actionTitle("stop", w.status)}
+                    onClick={() => run(() => api(`/workers/${w.id}/stop`, { method: "POST" }))}>Stop</button>
+                  <button className="btn-sm btn ghost" disabled={!op || !canWorkerAction("restart", w.status)}
+                    title={actionTitle("restart", w.status)}
+                    onClick={() => run(() => api(`/workers/${w.id}/restart`, { method: "POST" }))}>Restart</button>
+                  <button className="btn-sm btn ghost" onClick={() => setLogsFor(logsFor === w.id ? null : w.id)}>
+                    {logsFor === w.id ? "Hide log" : "Show log"}
+                  </button>
+                  {w.artifact_id && (
+                    <button className="btn-sm btn ghost" onClick={() => openFile(`/artifacts/${w.artifact_id}/file`)}>📄 PDF</button>
+                  )}
+                  <button className="btn-sm btn ghost" disabled={!op || !canWorkerAction("detach", w.status)}
+                    onClick={() => run(() => api(`/bookings/${booking.id}/identities/${w.identity_id}`, { method: "DELETE" }))}
+                    title={actionTitle("detach", w.status)}>
+                    Detach
+                  </button>
+                </td>
+              </tr>
+              {logsFor === w.id && (
+                <tr><td colSpan={6}>
+                  <div style={{ background: "var(--panel2)", border: "1px solid var(--border)", borderRadius: 8,
+                               padding: 8, maxHeight: 220, overflowY: "auto", fontFamily: "monospace", fontSize: 12 }}>
+                    {(live.logs && live.logs.length) ? live.logs.map((l, i) => <div key={i}>{l}</div>)
+                      : <span className="muted">no log lines received over the WS yet for this worker</span>}
+                  </div>
+                </td></tr>
+              )}
+            </React.Fragment>
+          );
+        })}</tbody></table>
+      {workers.rows.length === 0 && <div className="muted">No workers yet — attach identities above.</div>}
+      {workers.rows.length > 0 && shown.length === 0 && <div className="muted">No workers match the current filter/search.</div>}
+    </>
+  );
+}
+
+function AttachPanel({ me, booking, identities, templates, attached, onAttached }) {
+  const [q, setQ] = useState("");
+  const [sel, setSel] = useState({});
   const [role, setRole] = useState("scout");
   const [tplId, setTplId] = useState("");
   const [msg, setMsg] = useState("");
   const op = me.is_operating;
 
-  async function run(fn) { setMsg(""); try { await fn(); workers.reload(); } catch (e) { setMsg(e.message); } }
-  const attach = () => run(() => api(`/bookings/${booking.id}/identities`,
-    { method: "POST", body: { identity_id: attachId,
-      assigned_role: booking.type === "test" ? role : undefined,
-      template_id: tplId || undefined } }));
-  const startAll = () => run(() => api(`/bookings/${booking.id}/start`, { method: "POST" }));
-  const stopAll = () => run(() => api(`/bookings/${booking.id}/stop`, { method: "POST" }));
-  const schedule = () => run(() => api(`/bookings/${booking.id}/schedule`, { method: "POST" }));
+  // Eligible = right type for this booking, not already attached, AND has a usable sub-account
+  // (status "active" means >=1 sub-account exists per IdentityStatus's own definition) --
+  // conversation_extract #269: not-ready identities (zero verified sub-accounts) were showing up
+  // here before; this is the fix.
+  const eligible = identities.filter((i) =>
+    (booking.type === "real" || i.type === "test") &&
+    !attached.has(i.id) &&
+    i.status === "active" &&
+    (!q || i.full_name.toLowerCase().includes(q.toLowerCase())));
 
-  // live counts from the workers table merged with the WS substate
-  const counts = workers.rows.reduce((a, w) => {
-    const live = (events[w.id] || {});
-    const st = live.outcome === "booked" ? "booked" : w.status;
-    a[st] = (a[st] || 0) + 1; return a;
-  }, {});
-
-  return (
-    <div className="card">
-      <div className="row" style={{ marginBottom: 8 }}>
-        <h2 style={{ margin: 0 }}>Workers — {booking.name} <span className="muted">({booking.type} · posto {booking.posto_id})</span></h2>
-        <span className="grow" />
-        <button className="btn" disabled={!op || workers.rows.length === 0} onClick={startAll}>▶ Start now</button>
-        <button className="btn ghost" disabled={!op || !booking.warmup_start_at} onClick={schedule} title="auto-start at warmup time">⏱ Scheduled</button>
-        <button className="btn ghost" disabled={!op || workers.rows.length === 0} onClick={stopAll}>■ Stop</button>
-      </div>
-      <div className="row muted" style={{ fontSize: 13, marginBottom: 8, gap: 14 }}>
-        <span>status: <b>{booking.status}</b></span>
-        {Object.entries(counts).map(([k, v]) => <span key={k}>{k}: {v}</span>)}
-        {booking.warmup_start_at && <span>warmup@{(booking.warmup_start_at || "").slice(11, 16)}Z</span>}
-        {booking.slot_open_at && <span>slot-open@{(booking.slot_open_at || "").slice(11, 16)}Z</span>}
-      </div>
-      {msg && <div className="banner err">{msg}</div>}
-      <div className="row" style={{ flexWrap: "wrap", marginBottom: 12 }}>
-        <div className="field"><label>Attach identity</label>
-          <select value={attachId} onChange={(e) => setAttachId(e.target.value)}>
-            <option value="">— pick —</option>
-            {identities.rows.filter((i) => booking.type === "real" || i.type === "test").map((i) => (
-              <option key={i.id} value={i.id}>{i.full_name} ({i.type})</option>
-            ))}
-          </select></div>
-        {booking.type === "test" && (
-          <div className="field"><label>Role</label>
-            <select value={role} onChange={(e) => setRole(e.target.value)}>
-              <option value="scout">scout</option><option value="apply">apply</option>
-            </select></div>
-        )}
-        <div className="field"><label>Template</label>
-          <select value={tplId} onChange={(e) => setTplId(e.target.value)}>
-            <option value="">auto (by role)</option>
-            {templates.rows.map((t) => (<option key={t.id} value={t.id}>{t.name} ({t.role})</option>))}
-          </select></div>
-        <div className="field" style={{ alignSelf: "end" }}>
-          <button className="btn" disabled={!op || !attachId} onClick={attach}>Attach → worker</button></div>
-      </div>
-      <table><thead><tr><th>Role</th><th>Status</th><th>Live substate</th><th>Actions</th></tr></thead>
-        <tbody>{workers.rows.map((w) => {
-          const live = events[w.id] || {};
-          const substate = live.substate || w.substate || "—";
-          return (
-            <tr key={w.id}>
-              <td><span className="pill">{w.role}</span></td>
-              <td>{w.status}</td>
-              <td className={live.outcome === "booked" ? "ok" : live.outcome === "failed" ? "err" : ""}>
-                {substate}{live.outcome ? ` (${live.outcome})` : ""}
-              </td>
-              <td className="row">
-                <button className="btn" disabled={!op} onClick={() => run(() => api(`/workers/${w.id}/launch`, { method: "POST" }))}>Launch</button>
-                <button className="btn ghost" disabled={!op} onClick={() => run(() => api(`/workers/${w.id}/stop`, { method: "POST" }))}>Stop</button>
-              </td>
-            </tr>
-          );
-        })}</tbody></table>
-      {workers.rows.length === 0 && <div className="muted">No workers yet — attach an identity above.</div>}
-    </div>
-  );
-}
-
-function Identities({ me }) {
-  const { rows, err, reload } = useList("/identities");
-  const [f, setF] = useState({ full_name: "", type: "test", passport_no: "", nationality: "CPV" });
-  const [msg, setMsg] = useState("");
-  const [sel, setSel] = useState({});           // id -> bool
-  const [filter, setFilter] = useState("all");  // all | test | real | new
-  const [subCount, setSubCount] = useState(3);
-  const [gt, setGt] = useState({ count: 10, accounts_per_identity: 3, nationality: "CPV" });
-  const op = me.is_operating;
-
-  async function create() {
-    setMsg("");
-    try { await api("/identities", { method: "POST", body: f }); reload(); }
-    catch (e) { setMsg(e.message); }
-  }
-  const shown = rows.filter((i) =>
-    filter === "all" ? true : filter === "new" ? i.status === "empty" : i.type === filter);
   const selectedIds = Object.keys(sel).filter((k) => sel[k]);
-  async function act(fn) { setMsg(""); try { await fn(); setSel({}); reload(); } catch (e) { setMsg(e.message); } }
-  const genSubs = () => act(() => api("/identities/gen-subaccounts",
-    { method: "POST", body: { identity_ids: selectedIds, count: Number(subCount) } }));
-  const genTest = () => act(() => api("/identities/gen-test", { method: "POST", body: gt }));
+
+  async function attachSelected() {
+    setMsg("");
+    try {
+      for (const identity_id of selectedIds) {
+        await api(`/bookings/${booking.id}/identities`, {
+          method: "POST",
+          body: { identity_id, assigned_role: booking.type === "test" ? role : undefined,
+                  template_id: tplId || undefined },
+        });
+      }
+      setSel({});
+      onAttached();
+    } catch (e) { setMsg(e.message); }
+  }
 
   return (
     <>
-      <div className="card">
-        <h2>Generate test identities</h2>
-        <div className="row" style={{ flexWrap: "wrap" }}>
-          <div className="field"><label>Count</label><input type="number" value={gt.count} onChange={(e) => setGt({ ...gt, count: +e.target.value })} style={{ width: 80 }} /></div>
-          <div className="field"><label>Sub-accounts / id</label><input type="number" value={gt.accounts_per_identity} onChange={(e) => setGt({ ...gt, accounts_per_identity: +e.target.value })} style={{ width: 80 }} /></div>
-          <div className="field"><label>Nationality</label><input value={gt.nationality} onChange={(e) => setGt({ ...gt, nationality: e.target.value })} style={{ width: 80 }} /></div>
-          <div className="field" style={{ alignSelf: "end" }}><button className="btn" disabled={!op} onClick={genTest}>Generate</button></div>
-        </div>
-      </div>
-      <div className="card">
-        <h2>New identity</h2>
-        {msg && <div className="banner err">{msg}</div>}
-        <div className="row" style={{ flexWrap: "wrap" }}>
-          <div className="field"><label>Full name</label><input value={f.full_name} onChange={(e) => setF({ ...f, full_name: e.target.value })} /></div>
-          <div className="field"><label>Type</label>
-            <select value={f.type} onChange={(e) => setF({ ...f, type: e.target.value })}>
-              <option value="test">test</option><option value="real">real</option>
-            </select></div>
-          <div className="field"><label>Passport</label><input value={f.passport_no} onChange={(e) => setF({ ...f, passport_no: e.target.value })} /></div>
-          <div className="field"><label>Nat.</label><input value={f.nationality} onChange={(e) => setF({ ...f, nationality: e.target.value })} style={{ width: 70 }} /></div>
-          <div className="field" style={{ alignSelf: "end" }}><button className="btn" disabled={!me.is_operating} onClick={create}>Create</button></div>
-        </div>
-      </div>
-      <ImportCsv me={me} path="/identities/import" label="Import identities CSV"
-        hint="Columns: identity_id, first_name, last_name, traveldoc/passport_no, nationality, account_type/type, username, password, email, email_pass"
-        makeBody={(csv) => ({ csv })} onDone={reload} />
-      <div className="card">
-        <div className="row" style={{ marginBottom: 10 }}>
-          <h2 style={{ margin: 0 }}>Identities ({shown.length}/{rows.length})</h2>
-          <span className="grow" />
-          <div className="field" style={{ margin: 0 }}><label>Filter</label>
-            <select value={filter} onChange={(e) => setFilter(e.target.value)}>
-              <option value="all">all</option><option value="test">test</option>
-              <option value="real">real</option><option value="new">new (no sub-accts)</option>
-            </select></div>
-        </div>
-        {msg && <div className="banner err">{msg}</div>}
-        {err && <div className="banner err">{err}</div>}
-        {selectedIds.length > 0 && (
-          <div className="banner info row">
-            <span>{selectedIds.length} selected</span>
-            <span className="grow" />
-            <label style={{ margin: 0 }}>Sub-accounts/id</label>
-            <input type="number" value={subCount} onChange={(e) => setSubCount(e.target.value)} style={{ width: 60 }} />
-            <button className="btn" disabled={!op} onClick={genSubs}>Gen sub-accounts</button>
-          </div>
-        )}
-        <table>
-          <thead><tr>
-            <th><input type="checkbox" checked={shown.length > 0 && shown.every((i) => sel[i.id])}
-              onChange={(e) => { const s = {}; if (e.target.checked) shown.forEach((i) => (s[i.id] = true)); setSel(s); }} /></th>
-            <th>Name</th><th>Type</th><th>Status</th><th>Passport</th><th>Nat.</th>
-          </tr></thead>
-          <tbody>{shown.map((i) => (
-            <tr key={i.id}>
-              <td><input type="checkbox" checked={!!sel[i.id]} onChange={(e) => setSel({ ...sel, [i.id]: e.target.checked })} /></td>
-              <td>{i.full_name}</td><td><span className="pill">{i.type}</span></td><td>{i.status}</td>
-              <td className="muted">{i.passport_no || "—"}</td><td>{i.nationality || "—"}</td></tr>
-          ))}</tbody></table>
-      </div>
+      <div className="field"><SearchBox q={q} setQ={setQ} placeholder="filter identities by name…" /></div>
+      {booking.type === "test" && (
+        <div className="field"><label>Role</label>
+          <select value={role} onChange={(e) => setRole(e.target.value)} style={{ width: "100%" }}>
+            <option value="scout">scout</option><option value="apply">apply</option>
+          </select></div>
+      )}
+      <div className="field"><label>Template</label>
+        <select value={tplId} onChange={(e) => setTplId(e.target.value)} style={{ width: "100%" }}>
+          <option value="">auto (by role)</option>
+          {templates.map((t) => (<option key={t.id} value={t.id}>{t.name} ({t.role})</option>))}
+        </select></div>
+      <div className="muted" style={{ fontSize: 12, marginBottom: 8 }}>{selectedIds.length} selected · {eligible.length} eligible</div>
+      <button className="btn" disabled={!op || selectedIds.length === 0} onClick={attachSelected} style={{ width: "100%", marginBottom: 12 }}>
+        Attach {selectedIds.length > 0 ? `(${selectedIds.length})` : ""}
+      </button>
+      {msg && <div className="banner err">{msg}</div>}
+      <table>
+        <thead><tr>
+          <th style={{ width: 28 }}><input type="checkbox" checked={eligible.length > 0 && eligible.every((i) => sel[i.id])}
+            onChange={(e) => { const s = {}; if (e.target.checked) eligible.forEach((i) => (s[i.id] = true)); setSel(s); }} /></th>
+          <th>Name</th><th style={{ width: "22%" }}>Type</th>
+        </tr></thead>
+        <tbody>{eligible.map((i) => (
+          <tr key={i.id}>
+            <td><input type="checkbox" checked={!!sel[i.id]} onChange={(e) => setSel({ ...sel, [i.id]: e.target.checked })} /></td>
+            <td>{i.full_name}</td><td><span className="pill">{i.type}</span></td>
+          </tr>
+        ))}</tbody>
+      </table>
+      {eligible.length === 0 && <div className="muted" style={{ padding: 8 }}>No eligible not-yet-attached identities with a usable sub-account.</div>}
     </>
   );
 }
 
-function ImportCsv({ me, path, label, hint, makeBody, onDone }) {
+// Compact "3 new + 2 verified" style summary instead of the coarse Identity.status alone -- built
+// client-side from /sub-accounts (already fetched for the Registration page; no backend change
+// needed) rather than a new aggregate endpoint.
+function summarizeSubAccounts(subs) {
+  if (!subs || subs.length === 0) return "no accounts";
+  const counts = {};
+  for (const s of subs) counts[s.status] = (counts[s.status] || 0) + 1;
+  return Object.entries(counts).map(([status, n]) => `${n} ${status}`).join(" + ");
+}
+
+function Identities({ me, setLeftPanel, setRightPanel }) {
+  const { rows, err, reload } = useList("/identities");
+  const { rows: subRows, reload: reloadSubs } = useList("/sub-accounts");
+  const [selectedId, setSelectedId] = useState(null);  // visual highlight only; panel content lives in App
+  const [sel, setSel] = useState({});           // id -> bool (bulk multi-select, unrelated to selectedId)
+  const [filter, setFilter] = useState("all");  // all | test | real
+  const [dateFrom, setDateFrom] = useState("");
+  const [dateTo, setDateTo] = useState("");
+  const [subCount, setSubCount] = useState(3);
+  const [msg, setMsg] = useState("");
+  const op = me.is_operating;
+
+  const typeAndStatus = rows.filter((i) => filter === "all" ? true : i.type === filter);
+  const dateFiltered = typeAndStatus.filter((i) => {
+    if (!i.created_at) return true;
+    const d = i.created_at.slice(0, 10);
+    if (dateFrom && d < dateFrom) return false;
+    if (dateTo && d > dateTo) return false;
+    return true;
+  });
+  const { q, setQ, sort, setSort, rows: shown } = useSortSearch(dateFiltered, { key: "created_at", dir: "desc" });
+
+  const subsByIdentity = {};
+  for (const s of subRows) (subsByIdentity[s.identity_id] = subsByIdentity[s.identity_id] || []).push(s);
+
+  const selectedIds = Object.keys(sel).filter((k) => sel[k]);
+  async function act(fn) { setMsg(""); try { await fn(); setSel({}); reload(); reloadSubs(); } catch (e) { setMsg(e.message); } }
+  const genSubs = () => act(() => api("/identities/gen-subaccounts",
+    { method: "POST", body: { identity_ids: selectedIds, count: Number(subCount) } }));
+
+  function openCreatePanel() {
+    // reload() alone left the Sub-accounts column stale after Generate/Import (which create
+    // sub-accounts server-side) until a manual page refresh -- looked like 0 sub-accounts were
+    // created when they actually were.
+    setLeftPanel({
+      title: "Add / import",
+      content: <IdentityCreatePanel me={me} onDone={() => { reload(); reloadSubs(); }} />,
+    });
+  }
+  function openDetailPanel(i) {
+    setSelectedId(i.id);
+    setRightPanel({
+      title: i.full_name,
+      content: <IdentityDetailPanel i={i} op={op} subs={subsByIdentity[i.id] || []}
+        onChanged={() => { reload(); reloadSubs(); }} onClose={() => { setRightPanel(null); setSelectedId(null); }} />,
+    });
+  }
+
+  return (
+    <div className="card">
+      <div className="row" style={{ marginBottom: 10, flexWrap: "wrap", gap: 10 }}>
+        <h2 style={{ margin: 0 }}>Identities ({shown.length}/{rows.length})</h2>
+        <span className="grow" />
+        <button className="btn ghost" onClick={openCreatePanel}>+ Add / import</button>
+        <SearchBox q={q} setQ={setQ} placeholder="search identities…" />
+        <div className="field" style={{ margin: 0 }}><label>Filter</label>
+          <select value={filter} onChange={(e) => setFilter(e.target.value)}>
+            <option value="all">all</option><option value="test">test</option>
+            <option value="real">real</option>
+          </select></div>
+        <div className="field" style={{ margin: 0 }}><label>Created from</label>
+          <input type="date" value={dateFrom} onChange={(e) => setDateFrom(e.target.value)} /></div>
+        <div className="field" style={{ margin: 0 }}><label>to</label>
+          <input type="date" value={dateTo} onChange={(e) => setDateTo(e.target.value)} /></div>
+      </div>
+      {msg && <div className="banner err">{msg}</div>}
+      {err && <div className="banner err">{err}</div>}
+      {selectedIds.length > 0 && (
+        <div className="banner info row">
+          <span>{selectedIds.length} selected</span>
+          <span className="grow" />
+          <label style={{ margin: 0 }}>Sub-accounts/id</label>
+          <input type="number" value={subCount} onChange={(e) => setSubCount(e.target.value)} style={{ width: 60 }} />
+          <button className="btn" disabled={!op} onClick={genSubs}>Gen sub-accounts</button>
+        </div>
+      )}
+      <table>
+        <thead><tr>
+          <th style={{ width: 36 }}><input type="checkbox" checked={shown.length > 0 && shown.every((i) => sel[i.id])}
+            onChange={(e) => { const s = {}; if (e.target.checked) shown.forEach((i) => (s[i.id] = true)); setSel(s); }} /></th>
+          <Sortable label="Name" k="full_name" sort={sort} setSort={setSort} w="19%" />
+          <Sortable label="Type" k="type" sort={sort} setSort={setSort} w="7%" />
+          <th style={{ width: "17%" }}>Sub-accounts</th>
+          <Sortable label="Passport" k="passport_no" sort={sort} setSort={setSort} w="11%" />
+          <Sortable label="Nat." k="nationality" sort={sort} setSort={setSort} w="6%" />
+          <th style={{ width: "7%" }}>Posto</th><th style={{ width: "12%" }}>Comment</th>
+          <Sortable label="Created" k="created_at" sort={sort} setSort={setSort} w="10%" />
+        </tr></thead>
+        <tbody>{shown.map((i) => (
+          <tr key={i.id} className={`row-clickable${i.id === selectedId ? " row-selected" : ""}`}
+            onClick={() => openDetailPanel(i)}>
+            <td onClick={(e) => e.stopPropagation()}>
+              <input type="checkbox" checked={!!sel[i.id]} onChange={(e) => setSel({ ...sel, [i.id]: e.target.checked })} />
+            </td>
+            <td>{i.full_name}</td><td><span className="pill">{i.type}</span></td>
+            <td className="muted" style={{ fontSize: 13 }} title={i.status}>{summarizeSubAccounts(subsByIdentity[i.id])}</td>
+            <td className="muted">{i.passport_no || "—"}</td><td className="muted">{i.nationality || "—"}</td>
+            <td className="muted">{i.target_posto || "—"}</td>
+            <td className="muted">{i.comment || "—"}</td>
+            <td className="muted">{i.created_at ? i.created_at.slice(0, 10) : "—"}</td>
+          </tr>
+        ))}</tbody></table>
+      {shown.length === 0 && <div className="muted">No identities match this filter.</div>}
+    </div>
+  );
+}
+
+function IdentityCreatePanel({ me, onDone }) {
+  const op = me.is_operating;
+  const [f, setF] = useState({ full_name: "", type: "test", birthdate: "", gender: "M",
+                               passport_no: "", nationality: "CPV", comment: "", target_posto: "" });
+  const [msg, setMsg] = useState("");
+  const [gt, setGt] = useState({ count: 10, accounts_per_identity: 3, nationality: "CPV" });
+
+  async function create() {
+    setMsg("");
+    const body = { ...f, target_posto: f.type === "real" ? (f.target_posto || null) : null };
+    try { await api("/identities", { method: "POST", body }); onDone(); setF({ ...f, full_name: "", passport_no: "", comment: "", target_posto: "" }); }
+    catch (e) { setMsg(e.message); }
+  }
+  async function genTest() {
+    setMsg("");
+    try { await api("/identities/gen-test", { method: "POST", body: gt }); onDone(); }
+    catch (e) { setMsg(e.message); }
+  }
+
+  return (
+    <>
+      {msg && <div className="banner err">{msg}</div>}
+      <h4 style={{ margin: "0 0 8px" }}>New identity</h4>
+      <div className="field"><label>Full name</label><input value={f.full_name} onChange={(e) => setF({ ...f, full_name: e.target.value })} style={{ width: "100%" }} /></div>
+      <div className="field"><label>Type</label>
+        <select value={f.type} onChange={(e) => setF({ ...f, type: e.target.value })} style={{ width: "100%" }}>
+          <option value="test">test</option><option value="real">real</option>
+        </select></div>
+      <div className="field"><label>Birthdate</label>
+        <input type="date" value={f.birthdate} onChange={(e) => setF({ ...f, birthdate: e.target.value })} style={{ width: "100%" }} /></div>
+      <div className="field"><label>Gender</label>
+        <select value={f.gender} onChange={(e) => setF({ ...f, gender: e.target.value })} style={{ width: "100%" }}>
+          <option value="M">M</option><option value="F">F</option>
+        </select></div>
+      <div className="field"><label>Passport</label><input value={f.passport_no} onChange={(e) => setF({ ...f, passport_no: e.target.value })} style={{ width: "100%" }} /></div>
+      <div className="field"><label>Nationality</label><input value={f.nationality} onChange={(e) => setF({ ...f, nationality: e.target.value })} style={{ width: "100%" }} /></div>
+      {f.type === "real" && (
+        <div className="field"><label>Target posto</label><input value={f.target_posto} onChange={(e) => setF({ ...f, target_posto: e.target.value })} style={{ width: "100%" }} /></div>
+      )}
+      <div className="field"><label>Comment</label><input value={f.comment} onChange={(e) => setF({ ...f, comment: e.target.value })} style={{ width: "100%" }} /></div>
+      <button className="btn" disabled={!op || !f.full_name} onClick={create} style={{ width: "100%", marginBottom: 18 }}>Create identity</button>
+
+      <h4 style={{ margin: "0 0 8px" }}>Generate test identities</h4>
+      <div className="field"><label>Count</label><input type="number" value={gt.count} onChange={(e) => setGt({ ...gt, count: +e.target.value })} style={{ width: "100%" }} /></div>
+      <div className="field"><label>Sub-accounts / id</label><input type="number" value={gt.accounts_per_identity} onChange={(e) => setGt({ ...gt, accounts_per_identity: +e.target.value })} style={{ width: "100%" }} /></div>
+      <div className="field"><label>Nationality</label><input value={gt.nationality} onChange={(e) => setGt({ ...gt, nationality: e.target.value })} style={{ width: "100%" }} /></div>
+      <button className="btn" disabled={!op} onClick={genTest} style={{ width: "100%", marginBottom: 18 }}>Generate</button>
+
+      <h4 style={{ margin: "0 0 8px" }}>Import file</h4>
+      <IdentityImportPipeline me={me} onDone={onDone} />
+    </>
+  );
+}
+
+// Upload -> import -> (optional) generate sub-accounts -> (optional) start registration, as one
+// pipeline. Reading the file client-side and posting its text keeps the existing pure parser
+// (parse_identities, auto-detects the passport-OCR labeled block format vs CSV) unchanged -- only
+// how the text reaches it changes, from paste to upload. identity_ids/sub_account_ids returned by
+// each step let this chain onto exactly the rows just created, not a stale/racy re-query.
+function IdentityImportPipeline({ me, onDone }) {
+  const [fileName, setFileName] = useState("");
+  const [text, setText] = useState("");
+  const [defaultType, setDefaultType] = useState("real");
+  const [autoGen, setAutoGen] = useState(true);
+  const [subCount, setSubCount] = useState(3);
+  const [autoRegister, setAutoRegister] = useState(true);
+  const [provider, setProvider] = useState("soax");
+  const [kind, setKind] = useState("static");
+  const [concurrency, setConcurrency] = useState(10);
+  const [busy, setBusy] = useState(false);
+  const [steps, setSteps] = useState([]);
+  const [err, setErr] = useState("");
+  const op = me.is_operating;
+
+  function onFile(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    setFileName(file.name);
+    const reader = new FileReader();
+    reader.onload = () => setText(String(reader.result || ""));
+    reader.readAsText(file);
+  }
+
+  async function run() {
+    setErr(""); setSteps([]); setBusy(true);
+    const log = [];
+    try {
+      const imp = await api("/identities/import", { method: "POST", body: { csv: text, default_type: defaultType } });
+      log.push({ label: "Import", detail: `${imp.created} identities created, ${imp.sub_accounts} sub-accounts from file, ${imp.errors.length} skipped/errors` });
+      setSteps([...log]);
+
+      let subAccountIds = imp.sub_account_ids || [];
+      if (autoGen && imp.identity_ids.length > 0) {
+        const gen = await api("/identities/gen-subaccounts",
+          { method: "POST", body: { identity_ids: imp.identity_ids, count: Number(subCount) } });
+        log.push({ label: "Generate sub-accounts", detail: `${gen.sub_accounts} sub-accounts generated for ${imp.identity_ids.length} identities` });
+        setSteps([...log]);
+        subAccountIds = gen.sub_account_ids || [];
+      }
+
+      if (autoRegister && autoGen && subAccountIds.length > 0) {
+        const reg = await api("/registration/run",
+          { method: "POST", body: { sub_account_ids: subAccountIds, concurrency: Number(concurrency), provider, kind } });
+        log.push({ label: "Registration", detail: `run ${reg.run_id} started, ${reg.queued} queued -- watch progress on the Registration page` });
+        setSteps([...log]);
+      }
+      onDone && onDone();
+    } catch (e) {
+      setErr(e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <>
+      <div className="muted" style={{ fontSize: 12, marginBottom: 8 }}>
+        Upload a passport-OCR labeled .txt (<code>=== img === / First Name: ... / Passport Number: ...</code>)
+        or a CSV (identity_id, first_name, last_name, traveldoc/passport_no, nationality, account_type/type,
+        username, password, email, email_pass).
+      </div>
+      {err && <div className="banner err">{err}</div>}
+      <div className="field">
+        <label>File</label>
+        <input type="file" accept=".txt,.csv,text/plain,text/csv" onChange={onFile} disabled={!op} style={{ width: "100%" }} />
+      </div>
+      {fileName && (
+        <div className="muted" style={{ fontSize: 12, marginBottom: 8 }}>
+          {fileName} ({text ? text.split("\n").length : 0} lines) -- edit below if needed
+        </div>
+      )}
+      <textarea value={text} onChange={(e) => { setText(e.target.value); setFileName(""); }} rows={6} disabled={!op}
+        style={{ width: "100%", fontFamily: "monospace", fontSize: 12, background: "var(--panel2)", color: "var(--text)", border: "1px solid var(--border)", borderRadius: 8, padding: 8, marginBottom: 8 }}
+        placeholder="…or paste content here" />
+      <div className="field">
+        <label>Default type (CSV rows without an explicit type; labeled-block files always import as real)</label>
+        <select value={defaultType} onChange={(e) => setDefaultType(e.target.value)} disabled={!op} style={{ width: "100%" }}>
+          <option value="real">real</option><option value="test">test</option>
+        </select>
+      </div>
+
+      <div className="field" style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <input type="checkbox" id="pipe-autogen" checked={autoGen} disabled={!op} onChange={(e) => setAutoGen(e.target.checked)} />
+        <label htmlFor="pipe-autogen" style={{ margin: 0 }}>Auto-generate sub-accounts for imported identities</label>
+      </div>
+      {autoGen && (
+        <div className="field">
+          <label>Sub-accounts / identity</label>
+          <input type="number" value={subCount} disabled={!op} onChange={(e) => setSubCount(e.target.value)} style={{ width: "100%" }} />
+        </div>
+      )}
+
+      <div className="field" style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <input type="checkbox" id="pipe-autoreg" checked={autoRegister} disabled={!op || !autoGen}
+          onChange={(e) => setAutoRegister(e.target.checked)} />
+        <label htmlFor="pipe-autoreg" style={{ margin: 0 }}>Auto-start registration for generated sub-accounts</label>
+      </div>
+      {autoRegister && autoGen && (
+        <>
+          <div className="muted" style={{ fontSize: 12, marginBottom: 6 }}>
+            Hits the live portal and consumes CAPTCHA-solver credits.
+          </div>
+          <div className="row" style={{ flexWrap: "wrap", gap: 8, marginBottom: 8 }}>
+            <div className="field" style={{ margin: 0, flex: 1 }}>
+              <label>Proxy provider</label>
+              <select value={provider} onChange={(e) => setProvider(e.target.value)} disabled={!op} style={{ width: "100%" }}>
+                <option value="soax">soax</option><option value="webshare">webshare</option>
+              </select>
+            </div>
+            <div className="field" style={{ margin: 0, flex: 1 }}>
+              <label>Kind</label>
+              <select value={kind} onChange={(e) => setKind(e.target.value)} disabled={!op} style={{ width: "100%" }}>
+                <option value="rotating">rotating</option><option value="static">static</option>
+              </select>
+            </div>
+            <div className="field" style={{ margin: 0, flex: 1 }}>
+              <label>Concurrency</label>
+              <input type="number" value={concurrency} disabled={!op} onChange={(e) => setConcurrency(e.target.value)} style={{ width: "100%" }} />
+            </div>
+          </div>
+        </>
+      )}
+
+      <button className="btn" disabled={!op || !text.trim() || busy} onClick={run} style={{ width: "100%" }}>
+        {busy ? "Running…" : "Import" + (autoGen ? " + generate" : "") + (autoGen && autoRegister ? " + register" : "")}
+      </button>
+
+      {steps.length > 0 && (
+        <div style={{ marginTop: 10 }}>
+          {steps.map((s, i) => (
+            <div key={i} className="banner info" style={{ marginBottom: 6 }}><b>{s.label}</b>: {s.detail}</div>
+          ))}
+        </div>
+      )}
+    </>
+  );
+}
+
+function IdentityDetailPanel({ i, op, subs, onChanged, onClose }) {
+  const [comment, setComment] = useState(i.comment || "");
+  const [posto, setPosto] = useState(i.target_posto || "");
+  const [msg, setMsg] = useState("");
+
+  async function save() {
+    setMsg("");
+    try {
+      await api(`/identities/${i.id}`, { method: "PATCH",
+        body: { comment, target_posto: i.type === "real" ? posto : undefined } });
+      onChanged();
+    } catch (e) { setMsg(e.message); }
+  }
+  async function archive() {
+    setMsg("");
+    try { await api(`/identities/${i.id}/archive`, { method: "POST" }); onChanged(); }
+    catch (e) { setMsg(e.message); }
+  }
+  async function del() {
+    setMsg("");
+    try { await api(`/identities/${i.id}`, { method: "DELETE" }); onChanged(); onClose(); }
+    catch (e) { setMsg(e.message); }
+  }
+
+  return (
+    <>
+      {msg && <div className="banner err">{msg}</div>}
+      <div className="field"><label>Type</label><span className="pill">{i.type}</span></div>
+      <div className="field"><label>Status</label>{i.status}</div>
+      <div className="field"><label>Birthdate</label>{i.birthdate || "—"}</div>
+      <div className="field"><label>Gender</label>{i.gender || "—"}</div>
+      <div className="field"><label>Passport</label>{i.passport_no || "—"}</div>
+      <div className="field"><label>Nationality</label>{i.nationality || "—"}</div>
+      <div className="field"><label>Created</label>{i.created_at ? i.created_at.slice(0, 10) : "—"}</div>
+      {i.type === "real" && (
+        <div className="field"><label>Target posto</label>
+          <input value={posto} onChange={(e) => setPosto(e.target.value)} style={{ width: "100%" }} /></div>
+      )}
+      <div className="field"><label>Comment</label>
+        <input value={comment} onChange={(e) => setComment(e.target.value)} style={{ width: "100%" }} /></div>
+      <button className="btn" disabled={!op} onClick={save} style={{ width: "100%", marginBottom: 18 }}>Save</button>
+
+      <div className="row" style={{ gap: 8, marginBottom: 18 }}>
+        <button className="btn ghost" disabled={!op || i.status === "archived"} onClick={archive} style={{ flex: 1 }}>Archive</button>
+        <button className="btn ghost" disabled={!op} onClick={del} style={{ flex: 1 }}>Delete</button>
+      </div>
+
+      <h4 style={{ margin: "0 0 8px" }}>Sub-accounts ({subs.length})</h4>
+      {subs.length === 0 && <div className="muted" style={{ fontSize: 13 }}>None yet — generate some from the Identities table.</div>}
+      {subs.map((s) => (
+        <div key={s.id} className="field" style={{ borderBottom: "1px solid var(--border)", paddingBottom: 8 }}>
+          <div className="row" style={{ gap: 6 }}>
+            <span style={{ fontFamily: "monospace", fontSize: 13 }}>{s.username}</span>
+            <span className="grow" />
+            <span className={s.status === "verified" || s.status === "login_ok" || s.status === "booked" ? "ok"
+                            : s.status === "burned" ? "err" : "muted"} style={{ fontSize: 12 }}>{s.status}</span>
+          </div>
+          {s.email && <div className="muted" style={{ fontSize: 12 }}>{s.email}</div>}
+        </div>
+      ))}
+    </>
+  );
+}
+
+// apps/registrar emits verbose, developer-oriented progress strings (proxy URLs, raw HTML
+// snippets, stack-trace-ish timeout messages) meant for the Redis event log / audit trail --
+// exactly what you don't want staring back at you from a table cell. This maps them down to a
+// short, fixed vocabulary for the Live column; the raw string is still available via the cell's
+// title tooltip for anyone who needs to actually debug a specific row.
+function shortRegPhase(raw) {
+  if (!raw) return "—";
+  const msg = raw.includes(": ") ? raw.slice(raw.indexOf(": ") + 2) : raw; // strip "username: " prefix
+  const rules = [
+    [/^starting/i, "Starting"],
+    [/^creating email inbox/i, "Creating email…"],
+    [/^email=/i, "Email ready"],
+    [/^loading registration page/i, "Page loading…"],
+    [/^register form loaded/i, "Form loaded"],
+    [/^solving captcha/i, "Solving captcha…"],
+    [/CAPTCHA failed/i, "Captcha failed"],
+    [/^form filled/i, "Form filled"],
+    [/^submitting registration/i, "Submitting…"],
+    [/register SUCCESS/i, "Registered"],
+    [/already exists/i, "Already exists"],
+    [/register attempt failed/i, "Rejected — retrying"],
+    [/FAIL get_session/i, "Proxy connect failed"],
+    [/FAIL exhausted proxy retries/i, "Out of proxies"],
+    [/^waiting for verification email/i, "Email polling…"],
+    [/FAIL no email tokens/i, "Email timed out"],
+    [/^email tokens received/i, "Token received"],
+    [/^verifying \(attempt/i, "Verifying…"],
+    [/^verify attempt/i, "Verifying…"],
+    [/^VERIFIED/, "Completed"],
+    [/FAIL verify exhausted/i, "Verify failed"],
+    [/^FAIL /i, "Failed"],
+  ];
+  for (const [re, label] of rules) if (re.test(msg)) return label;
+  return "Working…";
+}
+
+const REG_OUTCOME_LABEL = { registered: "Registered", exists: "Already exists", verified: "Verified", failed: "Failed" };
+
+// Registration page: list not-yet-verified sub-accounts, multi-select + register/reset, live
+// per-step status during registration. Conversation_extract #223/#230/#236 -- the one dashboard
+// subsystem that was missing entirely (both backend and frontend) rather than just under-built.
+function Registration({ me, events }) {
+  const { rows, err, reload } = useList("/sub-accounts");
+  const [sel, setSel] = useState({});
+  const [statusFilter, setStatusFilter] = useState("not_verified"); // not_verified | all | new | registered | verified | failed
+  const [typeFilter, setTypeFilter] = useState("all");              // all | test | real
+  const [concurrency, setConcurrency] = useState(10);
+  const [provider, setProvider] = useState("soax");
+  const [kind, setKind] = useState("static");
+  const [msg, setMsg] = useState("");
+  const [runInfo, setRunInfo] = useState(null);
+  const op = me.is_operating;
+
+  const typeFiltered = rows.filter((s) => typeFilter === "all" || s.identity_type === typeFilter);
+  const statusFiltered = typeFiltered.filter((s) => {
+    if (statusFilter === "all") return true;
+    if (statusFilter === "not_verified") return s.status !== "verified" && s.status !== "login_ok"
+      && s.status !== "booked";
+    if (statusFilter === "failed") return s.registration_status === "failed";
+    return s.status === statusFilter;
+  });
+  const { q, setQ, sort, setSort, rows: shown } = useSortSearch(statusFiltered, { key: "created_at", dir: "desc" });
+
+  const selectedIds = Object.keys(sel).filter((k) => sel[k]);
+
+  async function register() {
+    setMsg(""); setRunInfo(null);
+    try {
+      const r = await api("/registration/run", {
+        method: "POST",
+        body: { sub_account_ids: selectedIds, concurrency: Number(concurrency), provider, kind },
+      });
+      setRunInfo(r);
+      setSel({});
+      reload();
+    } catch (e) { setMsg(e.message); }
+  }
+
+  async function reset() {
+    setMsg("");
+    try {
+      await api("/sub-accounts/reset", { method: "POST", body: { sub_account_ids: selectedIds } });
+      setSel({});
+      reload();
+    } catch (e) { setMsg(e.message); }
+  }
+
+  return (
+    <>
+      <div className="card">
+        <div className="row" style={{ marginBottom: 10, flexWrap: "wrap", gap: 10 }}>
+          <h2 style={{ margin: 0 }}>Registration ({shown.length}/{rows.length})</h2>
+          <span className="grow" />
+          <SearchBox q={q} setQ={setQ} placeholder="search accounts…" />
+          <div className="field" style={{ margin: 0 }}><label>Status</label>
+            <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
+              <option value="not_verified">not verified</option>
+              <option value="all">all</option>
+              <option value="new">new</option>
+              <option value="registered">registered</option>
+              <option value="verified">verified</option>
+              <option value="failed">failed last attempt</option>
+            </select></div>
+          <div className="field" style={{ margin: 0 }}><label>Type</label>
+            <select value={typeFilter} onChange={(e) => setTypeFilter(e.target.value)}>
+              <option value="all">all</option><option value="test">test</option><option value="real">real</option>
+            </select></div>
+          <button className="btn ghost" onClick={reload}>Refresh</button>
+        </div>
+        {err && <div className="banner err">{err}</div>}
+        {msg && <div className="banner err">{msg}</div>}
+        {runInfo && <div className="banner info">Run {runInfo.run_id} started — {runInfo.queued} account(s) queued.</div>}
+        {selectedIds.length > 0 && (
+          <div className="banner info row" style={{ flexWrap: "wrap", gap: 10 }}>
+            <span>{selectedIds.length} selected</span>
+            <span className="grow" />
+            <div className="field" style={{ margin: 0 }}><label>Provider</label>
+              <select value={provider} onChange={(e) => setProvider(e.target.value)} disabled={!op}>
+                <option value="soax">soax</option><option value="webshare">webshare</option>
+              </select></div>
+            <div className="field" style={{ margin: 0 }}><label>Kind</label>
+              <select value={kind} onChange={(e) => setKind(e.target.value)} disabled={!op}>
+                <option value="rotating">rotating</option><option value="static">static</option>
+              </select></div>
+            <div className="field" style={{ margin: 0 }}><label>Concurrency</label>
+              <input type="number" value={concurrency} onChange={(e) => setConcurrency(e.target.value)} disabled={!op} style={{ width: 60 }} /></div>
+            <button className="btn ghost" disabled={!op} onClick={reset}>Reset (regen credentials)</button>
+            <button className="btn" disabled={!op} onClick={register}>Register selected</button>
+          </div>
+        )}
+        <table>
+          <thead><tr>
+            <th style={{ width: 36 }}><input type="checkbox" checked={shown.length > 0 && shown.every((s) => sel[s.id])}
+              onChange={(e) => { const s = {}; if (e.target.checked) shown.forEach((r) => (s[r.id] = true)); setSel(s); }} /></th>
+            <Sortable label="Identity" k="identity_name" sort={sort} setSort={setSort} w="18%" />
+            <Sortable label="Type" k="identity_type" sort={sort} setSort={setSort} w="7%" />
+            <Sortable label="Username" k="username" sort={sort} setSort={setSort} w="13%" />
+            <Sortable label="Status" k="status" sort={sort} setSort={setSort} w="8%" />
+            <th style={{ width: "17%" }}>Live</th>
+            <Sortable label="Last run" k="registration_status" sort={sort} setSort={setSort} w="10%" />
+            <th style={{ width: "9%" }}>Attempts</th><th>Email</th>
+          </tr></thead>
+          <tbody>{shown.map((s) => {
+            const live = events.bySubAccount[s.id] || {};
+            return (
+              <tr key={s.id}>
+                <td><input type="checkbox" checked={!!sel[s.id]} onChange={(e) => setSel({ ...sel, [s.id]: e.target.checked })} /></td>
+                <td>{s.identity_name}</td>
+                <td><span className="pill">{s.identity_type}</span></td>
+                <td className="muted">{s.username}</td>
+                <td>{s.status}</td>
+                <td className={live.outcome === "verified" || live.outcome === "registered" ? "ok"
+                              : live.outcome === "failed" ? "err" : "muted"} style={{ fontSize: 12 }}
+                  title={live.phase || ""}>
+                  {live.outcome ? (REG_OUTCOME_LABEL[live.outcome] || live.outcome) : shortRegPhase(live.phase)}
+                </td>
+                <td className={s.registration_status === "failed" ? "err" : "muted"}>{s.registration_status || "—"}</td>
+                <td className="muted">{s.attempts}</td>
+                <td className="muted">{s.email || "—"}</td>
+              </tr>
+            );
+          })}</tbody></table>
+        {shown.length === 0 && <div className="muted">No sub-accounts match this filter.</div>}
+      </div>
+      <RegistrationJobHistory />
+    </>
+  );
+}
+
+function RegistrationJobHistory() {
+  const { rows, err, reload } = useList("/registration/jobs?limit=50");
+  return (
+    <div className="card">
+      <div className="row" style={{ marginBottom: 8 }}>
+        <h2 style={{ margin: 0 }}>Recent registration attempts</h2>
+        <span className="grow" />
+        <button className="btn ghost" onClick={reload}>Refresh</button>
+      </div>
+      {err && <div className="banner err">{err}</div>}
+      <table><thead><tr><th>Sub-account</th><th>Mode</th><th>Status</th><th>Attempts</th><th>When</th></tr></thead>
+        <tbody>{rows.map((j) => (
+          <tr key={j.id}>
+            <td className="muted">{j.sub_account_id.slice(0, 8)}</td>
+            <td>{j.mode}</td>
+            <td className={j.status === "failed" ? "err" : j.status === "verified" ? "ok" : ""}>{j.status}</td>
+            <td>{j.attempts}</td>
+            <td className="muted">{j.created_at ? j.created_at.replace("T", " ").slice(0, 19) : "—"}</td>
+          </tr>
+        ))}</tbody></table>
+      {rows.length === 0 && <div className="muted">No registration runs yet.</div>}
+    </div>
+  );
+}
+
+function ImportCsv({ me, path, label, hint, makeBody, onDone, compact }) {
   const [text, setText] = useState("");
   const [res, setRes] = useState(null);
   const [err, setErr] = useState("");
@@ -375,49 +1693,195 @@ function ImportCsv({ me, path, label, hint, makeBody, onDone }) {
     try { setRes(await api(path, { method: "POST", body: makeBody(text) })); onDone && onDone(); }
     catch (e) { setErr(e.message); }
   }
-  return (
-    <div className="card">
-      <h2>{label}</h2>
+  const body = (
+    <>
       {err && <div className="banner err">{err}</div>}
       {res && <div className="banner info">Created {res.created}{res.sub_accounts != null ? ` (+${res.sub_accounts} sub-accounts)` : ""}. {res.errors?.length ? `${res.errors.length} skipped/errors.` : ""}</div>}
       <div className="muted" style={{ marginBottom: 6, fontSize: 12 }}>{hint}</div>
       <textarea value={text} onChange={(e) => setText(e.target.value)} rows={6}
         style={{ width: "100%", fontFamily: "monospace", fontSize: 12, background: "var(--panel2)", color: "var(--text)", border: "1px solid var(--border)", borderRadius: 8, padding: 8 }}
         placeholder="paste CSV / lines here" />
-      <div style={{ marginTop: 8 }}><button className="btn" disabled={!me.is_operating || !text.trim()} onClick={go}>Import</button></div>
+      <div style={{ marginTop: 8 }}><button className="btn" disabled={!me.is_operating || !text.trim()} onClick={go} style={compact ? { width: "100%" } : undefined}>Import</button></div>
+    </>
+  );
+  if (compact) return body;
+  return (
+    <div className="card">
+      <h2>{label}</h2>
+      {body}
     </div>
   );
 }
 
-function Proxies({ me }) {
+function Proxies({ me, setLeftPanel }) {
   const { rows, err, reload } = useList("/proxies");
-  const [prov, setProv] = useState("isp");
-  const [kind, setKind] = useState("static_res");
+  const [selectedPool, setSelectedPool] = useState(null); // {provider, kind?} | null (null = all)
+  const [modal, setModal] = useState(null);               // "add" | "import" | null
+  const [msg, setMsg] = useState("");
+  const op = me.is_operating;
+
+  const filtered = rows.filter((p) => {
+    if (!selectedPool) return true;
+    if (selectedPool.kind) return p.provider === selectedPool.provider && p.kind === selectedPool.kind;
+    return p.provider === selectedPool.provider;
+  });
+  const { q, setQ, sort, setSort, rows: shown } = useSortSearch(filtered, { key: "created_at", dir: "desc" });
+
+  async function toggle(id) {
+    setMsg("");
+    try { await api(`/proxies/${id}/toggle-active`, { method: "POST" }); reload(); }
+    catch (e) { setMsg(e.message); }
+  }
+
+  // The pool tree is permanent page navigation for Proxies (unlike Identities'/Bookings' on-demand
+  // action panels), so it stays mounted in the left slot the whole time this page is active,
+  // re-set whenever the underlying data or selection changes.
+  useEffect(() => {
+    const tree = {};
+    for (const p of rows) {
+      tree[p.provider] = tree[p.provider] || {};
+      tree[p.provider][p.kind] = (tree[p.provider][p.kind] || 0) + 1;
+    }
+    setLeftPanel({
+      title: "Proxy pools",
+      closable: false,  // permanent page navigation, not an on-demand action panel
+      content: (
+        <ProxyPoolTree tree={tree} selected={selectedPool} onSelect={setSelectedPool} op={op}
+          onAdd={() => setModal("add")} onImport={() => setModal("import")} />
+      ),
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rows, selectedPool, op]);
+  useEffect(() => () => setLeftPanel(null), []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const poolLabel = selectedPool ? `${selectedPool.provider}${selectedPool.kind ? " / " + selectedPool.kind : ""}` : "All proxies";
+
   return (
     <>
+      {modal === "add" && (
+        <Modal title="Add proxy" onClose={() => setModal(null)}>
+          <ProxyAddForm me={me} defaultProvider={selectedPool?.provider} defaultKind={selectedPool?.kind}
+            onDone={() => { reload(); setModal(null); }} />
+        </Modal>
+      )}
+      {modal === "import" && (
+        <Modal title="Import proxies" onClose={() => setModal(null)}>
+          <ProxyImportForm me={me} defaultProvider={selectedPool?.provider} defaultKind={selectedPool?.kind}
+            onDone={() => { reload(); setModal(null); }} />
+        </Modal>
+      )}
       <div className="card">
-        <h2>Import proxies</h2>
-        <div className="row" style={{ marginBottom: 8 }}>
-          <div className="field"><label>Provider</label>
-            <select value={prov} onChange={(e) => setProv(e.target.value)}>
-              <option value="isp">isp</option><option value="soax">soax</option>
-            </select></div>
-          <div className="field"><label>Kind</label>
-            <select value={kind} onChange={(e) => setKind(e.target.value)}>
-              <option value="static_res">static_res</option><option value="datacenter">datacenter</option><option value="mobile">mobile</option>
-            </select></div>
+        <div className="row" style={{ marginBottom: 10 }}>
+          <h2 style={{ margin: 0 }}>{poolLabel} ({shown.length}/{rows.length})</h2>
+          <span className="grow" />
+          <SearchBox q={q} setQ={setQ} placeholder="search proxies…" />
         </div>
-        <ImportInline me={me} makeBody={(text) => ({ provider: prov, kind, text })} onDone={reload} />
-      </div>
-      <div className="card">
-        <h2>Proxies ({rows.length})</h2>
         {err && <div className="banner err">{err}</div>}
-        <table><thead><tr><th>Provider</th><th>Kind</th><th>Endpoint</th><th>Active</th><th>Max/IP</th></tr></thead>
-          <tbody>{rows.map((p) => (
+        {msg && <div className="banner err">{msg}</div>}
+        <table><thead><tr>
+          <Sortable label="Provider" k="provider" sort={sort} setSort={setSort} w="15%" />
+          <Sortable label="Kind" k="kind" sort={sort} setSort={setSort} w="15%" />
+          <Sortable label="Endpoint" k="endpoint" sort={sort} setSort={setSort} />
+          <Sortable label="Active" k="active" sort={sort} setSort={setSort} w="10%" />
+          <th style={{ width: "10%" }}>Max/IP</th><th style={{ width: "12%" }}></th></tr></thead>
+          <tbody>{shown.map((p) => (
             <tr key={p.id}><td><span className="pill">{p.provider}</span></td><td>{p.kind}</td>
-              <td className="muted">{p.endpoint}</td><td className={p.active ? "ok" : "muted"}>{String(p.active)}</td><td>{p.max_sessions}</td></tr>
+              <td className="muted">{p.endpoint}</td><td className={p.active ? "ok" : "muted"}>{String(p.active)}</td><td>{p.max_sessions}</td>
+              <td><button className="btn ghost" disabled={!op} onClick={() => toggle(p.id)}>{p.active ? "Deactivate" : "Activate"}</button></td></tr>
           ))}</tbody></table>
+        {shown.length === 0 && <div className="muted">No proxies in this pool yet.</div>}
       </div>
+    </>
+  );
+}
+
+function ProxyPoolTree({ tree, selected, onSelect, onAdd, onImport, op }) {
+  const providers = Object.keys(tree).sort();
+  const [collapsed, setCollapsed] = useState({});
+  const poolTotal = (kinds) => Object.values(kinds).reduce((a, b) => a + b, 0);
+  const grandTotal = providers.reduce((a, p) => a + poolTotal(tree[p]), 0);
+
+  return (
+    <>
+      <div className="row" style={{ marginBottom: 14, gap: 6 }}>
+        <button className="btn ghost" disabled={!op} onClick={onAdd} style={{ flex: 1 }}>+ Add</button>
+        <button className="btn ghost" disabled={!op} onClick={onImport} style={{ flex: 1 }}>⇩ Import</button>
+      </div>
+      <div className={`tree-node${!selected ? " tree-selected" : ""}`} onClick={() => onSelect(null)}>
+        All proxies <span className="muted">({grandTotal})</span>
+      </div>
+      {providers.length === 0 && <div className="muted" style={{ fontSize: 13, marginTop: 8 }}>No proxies yet — Add or Import to get started.</div>}
+      {providers.map((prov) => (
+        <div key={prov}>
+          <div className={`tree-node tree-parent${selected?.provider === prov && !selected.kind ? " tree-selected" : ""}`}
+            onClick={() => onSelect({ provider: prov })}>
+            <span className="tree-caret" onClick={(e) => {
+              e.stopPropagation();
+              setCollapsed((s) => ({ ...s, [prov]: !s[prov] }));
+            }}>{collapsed[prov] ? "▸" : "▾"}</span>
+            {prov} <span className="muted">({poolTotal(tree[prov])})</span>
+          </div>
+          {!collapsed[prov] && Object.keys(tree[prov]).sort().map((kind) => (
+            <div key={kind}
+              className={`tree-node tree-child${selected?.provider === prov && selected?.kind === kind ? " tree-selected" : ""}`}
+              onClick={() => onSelect({ provider: prov, kind })}>
+              {kind} <span className="muted">({tree[prov][kind]})</span>
+            </div>
+          ))}
+        </div>
+      ))}
+    </>
+  );
+}
+
+function ProxyAddForm({ me, onDone, defaultProvider, defaultKind }) {
+  const [f, setF] = useState({
+    provider: defaultProvider || "soax", kind: defaultKind || "static",
+    endpoint: "", credentials_ref: "", max_sessions: 2,
+  });
+  const [msg, setMsg] = useState("");
+  async function create() {
+    setMsg("");
+    try { await api("/proxies", { method: "POST", body: f }); onDone(); }
+    catch (e) { setMsg(e.message); }
+  }
+  return (
+    <>
+      {msg && <div className="banner err">{msg}</div>}
+      <div className="field"><label>Provider</label>
+        <select value={f.provider} onChange={(e) => setF({ ...f, provider: e.target.value })} style={{ width: "100%" }}>
+          <option value="soax">soax</option><option value="webshare">webshare</option>
+        </select></div>
+      <div className="field"><label>Kind</label>
+        <select value={f.kind} onChange={(e) => setF({ ...f, kind: e.target.value })} style={{ width: "100%" }}>
+          <option value="rotating">rotating</option><option value="static">static</option>
+        </select></div>
+      <div className="field"><label>Endpoint</label>
+        <input value={f.endpoint} onChange={(e) => setF({ ...f, endpoint: e.target.value })}
+          placeholder="host:port" style={{ width: "100%" }} /></div>
+      <div className="field"><label>Credentials (user:pass)</label>
+        <input value={f.credentials_ref} onChange={(e) => setF({ ...f, credentials_ref: e.target.value })} style={{ width: "100%" }} /></div>
+      <div className="field"><label>Max sessions</label>
+        <input type="number" value={f.max_sessions} onChange={(e) => setF({ ...f, max_sessions: +e.target.value })} style={{ width: "100%" }} /></div>
+      <button className="btn" disabled={!me.is_operating || !f.endpoint} onClick={create} style={{ width: "100%" }}>Add proxy</button>
+    </>
+  );
+}
+
+function ProxyImportForm({ me, onDone, defaultProvider, defaultKind }) {
+  const [prov, setProv] = useState(defaultProvider || "soax");
+  const [kind, setKind] = useState(defaultKind || "static");
+  return (
+    <>
+      <div className="field"><label>Provider</label>
+        <select value={prov} onChange={(e) => setProv(e.target.value)} style={{ width: "100%" }}>
+          <option value="soax">soax</option><option value="webshare">webshare</option>
+        </select></div>
+      <div className="field"><label>Kind</label>
+        <select value={kind} onChange={(e) => setKind(e.target.value)} style={{ width: "100%" }}>
+          <option value="rotating">rotating</option><option value="static">static</option>
+        </select></div>
+      <ImportInline me={me} makeBody={(text) => ({ provider: prov, kind, text })} onDone={onDone} />
     </>
   );
 }
@@ -531,18 +1995,36 @@ function ConfigJsonEditor({ me, ck }) {
 function Templates({ me }) {
   const { rows, err, reload } = useList("/templates");
   const [f, setF] = useState({ name: "", role: "scout", settings: "{}" });
+  const [editId, setEditId] = useState(null);
   const [msg, setMsg] = useState("");
-  async function create() {
+  const op = me.is_operating;
+
+  function startEdit(t) {
+    setEditId(t.id);
+    setF({ name: t.name, role: t.role, settings: JSON.stringify(t.settings_json || {}, null, 2) });
+  }
+  function cancelEdit() { setEditId(null); setF({ name: "", role: "scout", settings: "{}" }); }
+
+  async function save() {
     setMsg("");
     let settings;
     try { settings = JSON.parse(f.settings || "{}"); } catch { setMsg("settings must be valid JSON"); return; }
-    try { await api("/templates", { method: "POST", body: { name: f.name, role: f.role, settings } }); reload(); setF({ ...f, name: "" }); }
+    try {
+      if (editId) await api(`/templates/${editId}`, { method: "PUT", body: { name: f.name, role: f.role, settings } });
+      else await api("/templates", { method: "POST", body: { name: f.name, role: f.role, settings } });
+      reload(); cancelEdit();
+    } catch (e) { setMsg(e.message); }
+  }
+  async function del(id) {
+    setMsg("");
+    try { await api(`/templates/${id}`, { method: "DELETE" }); reload(); }
     catch (e) { setMsg(e.message); }
   }
+
   return (
     <>
       <div className="card">
-        <h2>New worker template</h2>
+        <h2>{editId ? "Edit worker template" : "New worker template"}</h2>
         {msg && <div className="banner err">{msg}</div>}
         <div className="row" style={{ flexWrap: "wrap", alignItems: "flex-start" }}>
           <div className="field"><label>Name</label><input value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} /></div>
@@ -554,16 +2036,23 @@ function Templates({ me }) {
             <textarea value={f.settings} onChange={(e) => setF({ ...f, settings: e.target.value })} rows={3}
               style={{ width: "100%", fontFamily: "monospace", fontSize: 12, background: "var(--panel2)", color: "var(--text)", border: "1px solid var(--border)", borderRadius: 8, padding: 8 }}
               placeholder='{"NAV_TIMEOUT_SCALE": 4, "KEEPALIVE_NO_RESTORE": true}' /></div>
-          <div className="field" style={{ alignSelf: "end" }}><button className="btn" disabled={!me.is_operating || !f.name} onClick={create}>Create</button></div>
+          <div className="field" style={{ alignSelf: "end" }}>
+            <button className="btn" disabled={!op || !f.name} onClick={save}>{editId ? "Save" : "Create"}</button>
+            {editId && <button className="btn ghost" style={{ marginLeft: 6 }} onClick={cancelEdit}>Cancel</button>}
+          </div>
         </div>
       </div>
       <div className="card">
         <h2>Templates ({rows.length})</h2>
         {err && <div className="banner err">{err}</div>}
-        <table><thead><tr><th>Name</th><th>Role</th><th>Settings</th></tr></thead>
+        <table><thead><tr><th>Name</th><th>Role</th><th>Settings</th><th></th></tr></thead>
           <tbody>{rows.map((t) => (
             <tr key={t.id}><td>{t.name}</td><td><span className="pill">{t.role}</span></td>
-              <td className="muted" style={{ fontFamily: "monospace", fontSize: 12 }}>{JSON.stringify(t.settings_json)}</td></tr>
+              <td className="muted" style={{ fontFamily: "monospace", fontSize: 12 }}>{JSON.stringify(t.settings_json)}</td>
+              <td className="row">
+                <button className="btn ghost" disabled={!op} onClick={() => startEdit(t)}>Edit</button>
+                <button className="btn ghost" disabled={!op} onClick={() => del(t.id)}>Delete</button>
+              </td></tr>
           ))}</tbody></table>
       </div>
     </>
@@ -584,7 +2073,8 @@ function Settings({ me }) {
       <ConfigJsonEditor me={me} ck="form_defaults" />
       <ConfigJsonEditor me={me} ck="quest_steps" />
       <div className="card"><h2>Settings taxonomy</h2>
-        <div className="muted">{cat._meta.total} settings · precedence: {cat._meta.precedence}</div></div>
+        <div className="muted">{cat._meta.total} settings · precedence: {cat._meta.precedence}</div>
+        <div className="muted" style={{ marginTop: 6 }}>Per-booking overrides (e.g. discovery window, poll gaps) are set from that booking's ⚙ Settings panel on the Bookings page, not here.</div></div>
       {layers.map((l) => (
         <div className="card" key={l}>
           <h2>{l} ({cat[l].length})</h2>
@@ -597,6 +2087,83 @@ function Settings({ me }) {
         </div>
       ))}
     </>
+  );
+}
+
+// Redis memory / stream lengths / disk / worker counts -- exists specifically because the whole
+// reconstruction effort started from a Redis memory-inflation incident that nobody noticed until it
+// was too late; this page is the always-on early-warning the incident postmortem called for.
+function Ops() {
+  const [status, setStatus] = useState(null);
+  const [err, setErr] = useState("");
+  const load = () => api("/ops/status").then(setStatus).catch((e) => setErr(e.message));
+  useEffect(() => {
+    load();
+    const t = setInterval(load, 5000);
+    return () => clearInterval(t);
+  }, []);
+  if (err) return <div className="banner err">{err}</div>;
+  if (!status) return <div className="muted">Loading…</div>;
+  return (
+    <div className="card">
+      <h2>Ops status <span className="muted">(auto-refreshes every 5s)</span></h2>
+      <div className="row" style={{ flexWrap: "wrap", gap: 24 }}>
+        <div>
+          <h3>Redis</h3>
+          <div className="muted">memory: <b className="ok">{status.redis?.used_memory_human || "—"}</b></div>
+          <div className="muted">evt stream length: <b>{status.evt_stream_len ?? "—"}</b></div>
+          <div className="muted">evicted keys: {status.redis?.evicted_keys ?? "—"}</div>
+          {status.redis?.error && <div className="banner err">{status.redis.error}</div>}
+        </div>
+        <div>
+          <h3>Disk</h3>
+          <div className="muted">free: <b className={status.disk?.free_pct < 15 ? "err" : "ok"}>{status.disk?.free_pct}%</b></div>
+          {status.disk?.error && <div className="banner err">{status.disk.error}</div>}
+        </div>
+        <div>
+          <h3>Workers</h3>
+          <div className="muted">running: <b>{status.workers?.running ?? "—"}</b></div>
+          <div className="muted">supervisor processes: {status.workers?.supervisor_processes ?? "—"}</div>
+          {status.workers?.by_role && Object.entries(status.workers.by_role).map(([k, v]) => (
+            <div className="muted" key={k}>{k}: {v}</div>
+          ))}
+          {status.workers?.error && <div className="banner err">{status.workers.error}</div>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Audit() {
+  const { rows, err, reload } = useList("/audit?limit=200");
+  const { q, setQ, sort, setSort, rows: shown } = useSortSearch(rows, { key: "ts", dir: "desc" });
+  return (
+    <div className="card">
+      <div className="row" style={{ marginBottom: 10 }}>
+        <h2 style={{ margin: 0 }}>Audit log <span className="muted">(most recent {rows.length})</span></h2>
+        <span className="grow" />
+        <SearchBox q={q} setQ={setQ} placeholder="search audit…" />
+        <button className="btn ghost" onClick={reload}>Refresh</button>
+      </div>
+      {err && <div className="banner err">{err}</div>}
+      <table><thead><tr>
+        <Sortable label="Time" k="ts" sort={sort} setSort={setSort} />
+        <Sortable label="Actor" k="actor" sort={sort} setSort={setSort} />
+        <Sortable label="Action" k="action" sort={sort} setSort={setSort} />
+        <Sortable label="Target" k="target" sort={sort} setSort={setSort} />
+        <th>IP</th><th>Status</th>
+      </tr></thead>
+        <tbody>{shown.map((r) => (
+          <tr key={r.id}>
+            <td className="muted">{r.ts ? r.ts.replace("T", " ").slice(0, 19) : "—"}</td>
+            <td>{r.actor || "—"}</td>
+            <td><span className="pill">{r.action}</span></td>
+            <td className="muted">{r.target || "—"}</td>
+            <td className="muted">{r.payload?.ip || "—"}</td>
+            <td className={r.payload?.status >= 400 ? "err" : "ok"}>{r.payload?.status ?? "—"}</td>
+          </tr>
+        ))}</tbody></table>
+    </div>
   );
 }
 

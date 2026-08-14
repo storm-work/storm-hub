@@ -1,0 +1,16 @@
+# Install to /etc/fail2ban/jail.d/storm-hub-auth.local
+#
+# Firewall-level backstop for storm-hub's own app-level login rate limiter (apps/hub/main.py's
+# /auth/login handler, keyed loginfail:{ip} in Redis). Two independent layers: this one still
+# protects if the app-level limiter or its Redis connection is ever down/misconfigured; the
+# app-level one still protects if fail2ban itself is stopped.
+[storm-hub-auth]
+enabled = true
+port = https
+filter = storm-hub-auth
+logpath = /var/log/caddy/storm-hub-access.log
+backend = auto
+maxretry = 5
+findtime = 900
+bantime = 3600
+action = %(action_)s

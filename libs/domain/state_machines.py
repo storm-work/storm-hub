@@ -58,6 +58,10 @@ SUBACCOUNT_TRANSITIONS = {
     SubAccountStatus.BOOKED:     frozenset(),
     SubAccountStatus.BURNED:     frozenset({SubAccountStatus.VERIFIED}),  # rehab allowed
 }
+# NOTE: registration-attempt failure is tracked on RegistrationJob.status (RegistrationStatus.FAILED),
+# not here -- SubAccountStatus only records durable/settled outcomes. A failed attempt leaves
+# SubAccount.status wherever it last settled (usually NEW), so the account is naturally re-selectable
+# for another registration run without needing a "failed" rung on this ladder.
 
 
 def subaccount_transition(frm: SubAccountStatus, to: SubAccountStatus) -> SubAccountStatus:
@@ -65,14 +69,26 @@ def subaccount_transition(frm: SubAccountStatus, to: SubAccountStatus) -> SubAcc
 
 
 # ── Booking ───────────────────────────────────────────────────────────────────
+# STOPPED mirrors WORKER_TRANSITIONS' STOPPED->RUNNING pattern below: a manual/timeout stop is
+# resumable, distinct from the terminal COMPLETED/ABORTED states (confirmed bug fix -- stopping a
+# booking was previously conflated with COMPLETED, a bug the transcript directly reported).
 BOOKING_TRANSITIONS = {
-    BookingStatus.DRAFT:     frozenset({BookingStatus.SCHEDULED, BookingStatus.ABORTED}),
+    BookingStatus.DRAFT:     frozenset({BookingStatus.SCHEDULED, BookingStatus.WARMING,
+                                        BookingStatus.ABORTED}),   # WARMING = direct "start now"
     BookingStatus.SCHEDULED: frozenset({BookingStatus.WARMING, BookingStatus.RUNNING,
-                                        BookingStatus.ABORTED}),
+                                        BookingStatus.STOPPED, BookingStatus.ABORTED}),
     BookingStatus.WARMING:   frozenset({BookingStatus.ARMED, BookingStatus.RUNNING,
+                                        BookingStatus.STOPPED, BookingStatus.ABORTED}),
+    BookingStatus.ARMED:     frozenset({BookingStatus.RUNNING, BookingStatus.STOPPED,
                                         BookingStatus.ABORTED}),
-    BookingStatus.ARMED:     frozenset({BookingStatus.RUNNING, BookingStatus.ABORTED}),
-    BookingStatus.RUNNING:   frozenset({BookingStatus.COMPLETED, BookingStatus.ABORTED}),
+    # RUNNING -> WARMING is the false-slot-open revert (operator spec 2026-08-14): slot-open fired,
+    # a long window passed with zero slots found, so the Hub acknowledges the open was false and
+    # drops back to plain holding rather than letting scouts grind discovery into rate-limiting.
+    # See apps/hub/scheduler.py's _maybe_inactivate_slot_open.
+    BookingStatus.RUNNING:   frozenset({BookingStatus.COMPLETED, BookingStatus.STOPPED,
+                                        BookingStatus.WARMING, BookingStatus.ABORTED}),
+    BookingStatus.STOPPED:   frozenset({BookingStatus.WARMING, BookingStatus.RUNNING,
+                                        BookingStatus.ABORTED}),   # resume, or give up entirely
     BookingStatus.COMPLETED: frozenset(),
     BookingStatus.ABORTED:   frozenset(),
 }
@@ -85,12 +101,34 @@ def booking_transition(frm: BookingStatus, to: BookingStatus) -> BookingStatus:
 # ── Worker (top-level status) ─────────────────────────────────────────────────
 WORKER_TRANSITIONS = {
     WorkerStatus.READY:     frozenset({WorkerStatus.RUNNING, WorkerStatus.STOPPED}),
-    WorkerStatus.RUNNING:   frozenset({WorkerStatus.STOPPED, WorkerStatus.COMPLETED,
-                                       WorkerStatus.FAILED}),
+    WorkerStatus.RUNNING:   frozenset({WorkerStatus.STOPPED, WorkerStatus.HELD,
+                                       WorkerStatus.COMPLETED, WorkerStatus.FAILED}),
     WorkerStatus.STOPPED:   frozenset({WorkerStatus.RUNNING}),          # resume from checkpoint
+    WorkerStatus.HELD:      frozenset({WorkerStatus.RUNNING}),          # relaunch: try for a slot again
     WorkerStatus.FAILED:    frozenset({WorkerStatus.RUNNING}),          # retry
     WorkerStatus.COMPLETED: frozenset(),
 }
+
+# Which statuses each operator action is legal from. The Hub endpoints enforce these and the
+# dashboard mirrors them (apps/dashboard/src/App.jsx's WORKER_ACTIONS), so a disabled button always
+# means "not applicable", never "will 409". COMPLETED is absent from launch/restart deliberately: a
+# worker that already booked a real appointment must never be re-run (confirmed 2026-08-14 -- both
+# buttons were live on booked workers, and launching one re-leased a proxy it never released).
+WORKER_ACTION_STATUSES = {
+    "launch":  frozenset({WorkerStatus.READY, WorkerStatus.STOPPED, WorkerStatus.HELD,
+                          WorkerStatus.FAILED}),
+    "stop":    frozenset({WorkerStatus.RUNNING}),
+    "restart": frozenset({WorkerStatus.READY, WorkerStatus.RUNNING, WorkerStatus.STOPPED,
+                          WorkerStatus.HELD, WorkerStatus.FAILED}),
+    "detach":  frozenset({WorkerStatus.READY, WorkerStatus.STOPPED, WorkerStatus.HELD,
+                          WorkerStatus.FAILED, WorkerStatus.COMPLETED}),
+}
+
+
+def can_worker_action(action: str, status: WorkerStatus) -> bool:
+    """Pure: is `action` legal from `status`? Single source of truth for endpoint guards and the
+    dashboard's button enablement."""
+    return status in WORKER_ACTION_STATUSES.get(action, frozenset())
 
 
 def worker_transition(frm: WorkerStatus, to: WorkerStatus) -> WorkerStatus:

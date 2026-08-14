@@ -16,6 +16,8 @@ _VENDOR_DIR = os.path.dirname(os.path.abspath(__file__))
 if _VENDOR_DIR not in sys.path:
     sys.path.insert(0, _VENDOR_DIR)
 
-from session import PlaywrightSession, get_session  # noqa: E402
+from session import PlaywrightSession, get_session, HEADERS_XHR  # noqa: E402
+from email_pool import CloudflareMail, MailTM  # noqa: E402
+from solver import race_all  # noqa: E402
 
-__all__ = ["get_session", "PlaywrightSession"]
+__all__ = ["get_session", "PlaywrightSession", "MailTM", "CloudflareMail", "race_all", "HEADERS_XHR"]

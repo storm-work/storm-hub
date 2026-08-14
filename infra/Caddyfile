@@ -1,0 +1,34 @@
+https://154.22.5.137 {
+	tls internal
+
+	# JSON access log -- required by the fail2ban jail in infra/fail2ban/storm-hub-auth.conf, which
+	# watches this file for repeated failed /auth/login attempts and bans the source IP at the
+	# firewall level. Rotated by Caddy itself (roll_size/roll_keep below); no logrotate needed.
+	log {
+		output file /var/log/caddy/storm-hub-access.log {
+			roll_size 20mb
+			roll_keep 5
+		}
+		format json
+	}
+
+	# --- IP allowlist (DESIGNED, NOT ENABLED) ---------------------------------------------------
+	# Currently permits any IP -- deliberate, per operator decision on 2026-08-12 (home/office IPs
+	# not yet confirmed static). To restrict access later: uncomment the block below, replace the
+	# placeholder IPs with the real ones, reload Caddy (see infra/README below), and delete this
+	# comment. remote_ip supports bare IPs and CIDR ranges, space-separated.
+	#
+	# @blocked not remote_ip 203.0.113.10 198.51.100.0/24
+	# respond @blocked 403
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "same-origin"
+		Permissions-Policy "geolocation=(), camera=(), microphone=()"
+		-Server
+	}
+
+	reverse_proxy 127.0.0.1:8123
+}

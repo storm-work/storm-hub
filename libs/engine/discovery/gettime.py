@@ -42,6 +42,24 @@ def parse_special_days(body: str) -> dict[int, dict[int, set[int]]]:
     return special
 
 
+def special_days_to_json(special_days: dict[int, dict[int, set[int]]]) -> dict:
+    """JSON-safe encoding for bus transport (Hub's shared gettime cache) -- sets aren't JSON-native,
+    so days become sorted lists. Int keys don't need manual str()'ing here since json.dumps does
+    that itself; special_days_from_json is what undoes it on the way back."""
+    return {
+        str(year): {str(month): sorted(days) for month, days in months.items()}
+        for year, months in special_days.items()
+    }
+
+
+def special_days_from_json(data: dict) -> dict[int, dict[int, set[int]]]:
+    """Inverse of special_days_to_json -- restores int keys and set-typed days after a json round trip."""
+    return {
+        int(year): {int(month): set(days) for month, days in months.items()}
+        for year, months in (data or {}).items()
+    }
+
+
 def candidate_dates(
     special_days: dict[int, dict[int, set[int]]],
     num_days: int,
