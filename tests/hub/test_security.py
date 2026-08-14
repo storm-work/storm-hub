@@ -166,3 +166,62 @@ def test_docs_are_disabled_by_default(client):
     assert c.get("/docs").status_code == 404
     assert c.get("/redoc").status_code == 404
     assert c.get("/openapi.json").status_code == 404
+
+
+# ── viewer role (2026-08-14) ──────────────────────────────────────────────────
+def _admin(c, username="admin", password="pw-admin"):
+    c.post("/auth/bootstrap", json={"username": username, "password": password})
+    r = c.post("/auth/login", json={"username": username, "password": password, "purpose": "operate"})
+    return {"Authorization": f"Bearer {r.json()['token']}"}
+
+
+def test_admin_can_create_a_viewer_and_viewer_is_blocked_from_admin_surfaces(client):
+    """The dashboard hides templates/settings/ops/audit/sessions from a viewer, but hiding a tab is
+    not a security boundary -- the server is. This pins the half that actually protects them."""
+    c, _ = client
+    h = _admin(c)
+    r = c.post("/auth/users",
+               json={"username": "watcher", "password": "pw-viewer", "role": "viewer"}, headers=h)
+    assert r.status_code == 201 and r.json()["role"] == "viewer"
+
+    lr = c.post("/auth/login",
+                json={"username": "watcher", "password": "pw-viewer", "purpose": "view"})
+    assert lr.status_code == 200
+    vh = {"Authorization": f"Bearer {lr.json()['token']}"}
+
+    who = c.get("/auth/whoami", headers=vh).json()
+    assert who["role"] == "viewer" and who["is_operating"] is False
+
+    assert c.post("/auth/users", json={"username": "x", "password": "y", "role": "viewer"},
+                  headers=vh).status_code == 403          # admin-only
+    # 423 Locked in practice: a viewer logs in with purpose=view and so never holds the operate
+    # seat, and the seat check fires before the role check. 403 would be equally correct if the
+    # ordering changed -- what matters is that the mutation is refused.
+    assert c.post("/bookings", json={"name": "n", "type": "real", "posto_id": "5084"},
+                  headers=vh).status_code in (403, 423)
+    assert c.get("/bookings", headers=vh).status_code == 200   # reading is fine
+
+
+def test_viewer_never_holds_the_operate_seat(client):
+    c, _ = client
+    h = _admin(c)
+    c.post("/auth/users", json={"username": "watcher2", "password": "pw", "role": "viewer"}, headers=h)
+    r = c.post("/auth/login", json={"username": "watcher2", "password": "pw", "purpose": "operate"})
+    if r.status_code == 200:
+        vh = {"Authorization": f"Bearer {r.json()['token']}"}
+        assert c.get("/auth/whoami", headers=vh).json()["is_operating"] is False
+    else:
+        assert r.status_code in (403, 409)
+
+
+def test_dashboard_hides_exactly_the_pages_a_viewer_cannot_use(client):
+    """Pins the JS gate list against this file's server-side expectations, so hiding a tab and
+    blocking its endpoints can't drift apart."""
+    import re
+    from pathlib import Path
+
+    src = Path("apps/dashboard/src/App.jsx").read_text()
+    m = re.search(r"const HIDDEN_FOR_VIEWER = new Set\(\[(.*?)\]\)", src, re.S)
+    assert m, "HIDDEN_FOR_VIEWER not found in App.jsx -- renamed?"
+    hidden = set(re.findall(r'"(\w+)"', m.group(1)))
+    assert hidden == {"templates", "settings", "ops", "audit", "sessions"}

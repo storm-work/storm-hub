@@ -144,6 +144,19 @@ export default function App() {
   if (!ready) return <div className="container muted">Loading…</div>;
   if (!me) return <Login onLogin={refreshMe} />;
 
+  // Pages a VIEWER may not reach. Everything here either mutates system-wide config (templates,
+  // settings), exposes infrastructure/credential-adjacent detail (ops), or is an administrative
+  // record (audit, sessions). A viewer keeps the run-watching pages: bookings, identities,
+  // registration, proxies.
+  //
+  // Enforcement still lives on the server -- require_operator / the admin checks on those endpoints
+  // are what actually protect them. This hides what a viewer cannot use, so the UI stops offering
+  // dead ends; it is not the security boundary.
+  const HIDDEN_FOR_VIEWER = new Set(["templates", "settings", "ops", "audit", "sessions"]);
+  const visiblePages = ["bookings", "identities", "registration", "proxies",
+                        "templates", "settings", "ops", "audit", "sessions"]
+    .filter((p) => me.role !== "viewer" || !HIDDEN_FOR_VIEWER.has(p));
+
   const panelProps = { setLeftPanel, setRightPanel };
   const pages = {
     bookings: <Bookings me={me} events={events} {...panelProps} />,
@@ -162,7 +175,7 @@ export default function App() {
       <div className="topbar">
         <span className="brand">⛈ storm-hub</span>
         <nav className="nav">
-          {["bookings", "identities", "registration", "proxies", "templates", "settings", "ops", "audit", "sessions"].map((p) => (
+          {visiblePages.map((p) => (
             <button key={p} className={page === p ? "active" : ""} onClick={() => goPage(p)}>
               {p[0].toUpperCase() + p.slice(1)}
             </button>
@@ -186,7 +199,9 @@ export default function App() {
               You're in <b>{me.purpose}</b> mode{me.session_status === "paused" ? " (seat held by another operator — request handover in Sessions)" : ""}. Viewing is read-only.
             </div>
           )}
-          {pages[page]}
+          {/* Never render a page the current role can't reach -- `page` is component state, so it
+              can outlive a role change or point at a hidden page after a re-login. */}
+          {visiblePages.includes(page) ? pages[page] : pages[visiblePages[0]]}
         </div>
         {rightPanel && <SidePanel side="right" title={rightPanel.title} onClose={() => setRightPanel(null)}>{rightPanel.content}</SidePanel>}
       </div>
@@ -231,10 +246,6 @@ function Login({ onLogin }) {
           </div>
           <button className="btn" disabled={busy}>{busy ? "…" : "Sign in"}</button>
         </form>
-        <p className="muted" style={{ marginTop: 12, fontSize: 13 }}>
-          First run? Bootstrap an admin from the server shell:
-          <br /><code>{"curl -X POST http://127.0.0.1:8123/auth/bootstrap -H 'Content-Type: application/json' -d '{\"username\":\"...\",\"password\":\"...\"}'"}</code>
-        </p>
       </div>
     </div>
   );
