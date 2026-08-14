@@ -573,6 +573,42 @@ def list_slots(booking_id: str, db: Session = Depends(get_db),
     ).all())
 
 
+@app.delete("/bookings/{booking_id}/slots")
+def clear_slots(booking_id: str, db: Session = Depends(get_db),
+                _op: Principal = Depends(require_operator)) -> dict:
+    """Retire this booking's discovered slots (dashboard Slots tab "Clear" button).
+
+    Same semantics as the retirement /start already performs, and for the same reason: slots are
+    per-run OBSERVATIONS of a portal that has moved on, and a stale pool makes the scheduler fire
+    slot_found on the very next tick and skip the whole discovery phase. Exposed as its own action
+    so the operator can drop a pool that has gone phantom without restarting the run.
+
+    CLOSED, not deleted: SlotStatus.CLOSED already means "no longer believed present" and reopens on
+    rediscovery, so history (and any BookedAppointment FK) stays intact. TAKEN is left alone -- that
+    is a real booking, not an observation, and is never something a cleanup click may erase."""
+    bk = db.get(M.Booking, booking_id)
+    if not bk:
+        raise HTTPException(404, "booking not found")
+    slots = db.scalars(select(M.Slot).where(
+        M.Slot.booking_id == booking_id,
+        M.Slot.status.notin_([SlotStatus.TAKEN, SlotStatus.CLOSED]))).all()
+    for slot in slots:
+        for lease in db.scalars(select(M.SlotLease).where(
+                M.SlotLease.slot_id == slot.id, M.SlotLease.released_at.is_(None))).all():
+            lease.released_at = _now()
+            lease.outcome = SlotLeaseOutcome.EXPIRED
+        slot.status = SlotStatus.CLOSED
+    # Clearing the pool means the found-phase is over as far as this booking is concerned: leave
+    # slot_found latched and the next tick just re-fires it off whatever is rediscovered.
+    bk.slot_found_fired_at = None
+    try:
+        _bus.r.delete(notified_key(booking_id, "slot_found"))
+    except Exception:
+        pass
+    db.commit()
+    return {"cleared": len(slots)}
+
+
 @app.get("/artifacts/{artifact_id}")
 def get_artifact_meta(artifact_id: str, db: Session = Depends(get_db),
                       me: Principal = Depends(current_principal)) -> ArtifactOut:
@@ -1861,39 +1897,47 @@ def start_booking(booking_id: str, db: Session = Depends(get_db),
     workers = list(db.scalars(select(M.Worker).where(
         M.Worker.booking_id == booking_id, M.Worker.status == WorkerStatus.READY)).all())
     jitter = float(_resolve_booking_setting(db, bk, "WARMUP_START_JITTER", 0.0) or 0.0)
-    if bk.status in (BookingStatus.DRAFT, BookingStatus.SCHEDULED, BookingStatus.STOPPED):
-        # Fresh run: re-anchor the booking timeout and clear the signal latch (both timestamps AND
-        # the per-worker "already notified" sets, which are keyed by booking+signal in Redis) so
-        # slot-open/slot-found can genuinely be fired again on this run.
-        bk.started_at = _now()
-        bk.slot_open_fired_at = None
-        bk.slot_found_fired_at = None
-        # Retire the previous run's discovered slots. They are per-run observations of a portal that
-        # has moved on, and leaving them AVAILABLE makes the scheduler fire slot_found on the very
-        # next tick -- confirmed live 2026-08-14: booking Test2 restarted at 08:44:22 and had
-        # slot_open AND slot_found stamped at 08:44:25, the same instant, purely because 24 slots
-        # from the prior run were still sitting in the table. The run skipped the entire slot-open
-        # discovery phase on stale data.
-        #
-        # CLOSED, not deleted: SlotStatus.CLOSED already means "no longer believed present" and
-        # reopens on rediscovery, so this keeps the history (and any BookedAppointment FK) intact
-        # while making the pool empty as far as _fire_slot_found_if_new and _assign_slots care.
-        # TAKEN is left alone -- that is a real booking, not an observation.
-        stale_slots = db.scalars(select(M.Slot).where(
-            M.Slot.booking_id == booking_id,
-            M.Slot.status.notin_([SlotStatus.TAKEN, SlotStatus.CLOSED]))).all()
-        for slot in stale_slots:
-            for lease in db.scalars(select(M.SlotLease).where(
-                    M.SlotLease.slot_id == slot.id, M.SlotLease.released_at.is_(None))).all():
-                lease.released_at = _now()
-                lease.outcome = SlotLeaseOutcome.EXPIRED
-            slot.status = SlotStatus.CLOSED
-        for signal_name in ("slot_open", "slot_found"):
-            try:
-                _bus.r.delete(notified_key(booking_id, signal_name))
-            except Exception:
-                pass
-        scheduler.reset_scout_pool(booking_id)
+    # EVERY Start is a fresh run -- not only one from DRAFT/SCHEDULED/STOPPED. Gating this on the
+    # prior status meant clicking Start on a booking that was already RUNNING/WARMING/ARMED silently
+    # skipped all of it, so the run inherited the previous one's fired-signal timestamps, its
+    # notified-sets and its slot pool. Confirmed live 2026-08-14: a restarted "Test 3018" showed
+    # "slot-open fired @15:25Z" carried over from the run before it, with the latch still set so the
+    # signal could not be genuinely re-fired.
+    # Re-anchor the booking timeout and clear the signal latch (both timestamps AND the
+    # per-worker "already notified" sets, which are keyed by booking+signal in Redis) so
+    # slot-open/slot-found can genuinely be fired again on this run.
+    bk.started_at = _now()
+    bk.slot_open_fired_at = None
+    bk.slot_found_fired_at = None
+    # Retire the previous run's discovered slots. They are per-run observations of a portal that
+    # has moved on, and leaving them AVAILABLE makes the scheduler fire slot_found on the very
+    # next tick -- confirmed live 2026-08-14: booking Test2 restarted at 08:44:22 and had
+    # slot_open AND slot_found stamped at 08:44:25, the same instant, purely because 24 slots
+    # from the prior run were still sitting in the table. The run skipped the entire slot-open
+    # discovery phase on stale data.
+    #
+    # CLOSED, not deleted: SlotStatus.CLOSED already means "no longer believed present" and
+    # reopens on rediscovery, so this keeps the history (and any BookedAppointment FK) intact
+    # while making the pool empty as far as _fire_slot_found_if_new and _assign_slots care.
+    # TAKEN is left alone -- that is a real booking, not an observation.
+    stale_slots = db.scalars(select(M.Slot).where(
+        M.Slot.booking_id == booking_id,
+        M.Slot.status.notin_([SlotStatus.TAKEN, SlotStatus.CLOSED]))).all()
+    for slot in stale_slots:
+        for lease in db.scalars(select(M.SlotLease).where(
+                M.SlotLease.slot_id == slot.id, M.SlotLease.released_at.is_(None))).all():
+            lease.released_at = _now()
+            lease.outcome = SlotLeaseOutcome.EXPIRED
+        slot.status = SlotStatus.CLOSED
+    for signal_name in ("slot_open", "slot_found"):
+        try:
+            _bus.r.delete(notified_key(booking_id, signal_name))
+        except Exception:
+            pass
+    scheduler.reset_scout_pool(booking_id)
+    # Already WARMING means the fresh-run reset above has put it exactly where a restart wants it;
+    # there is no self-transition in the table and asking for one is a 409, not a state change.
+    if bk.status != BookingStatus.WARMING:
         try:
             bk.status = booking_transition(bk.status, BookingStatus.WARMING)
         except IllegalTransition as e:

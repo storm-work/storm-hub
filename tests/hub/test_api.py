@@ -371,3 +371,86 @@ def test_global_settings_roundtrip_and_masking(client):
                       headers=h).status_code == 200
     got = client.get("/settings/global", headers=h).json()
     assert got["CAPSOLVER_KEYS"] == "•••set" and got["HOST_SESSION_CAP"] == "200"
+
+
+# ── Slots tab "Clear" + every-start-is-a-fresh-run (operator request 2026-08-14) ──────────────
+def _booking_with_slots(client, h, *, name="ClearB"):
+    from libs.domain.enums import SlotStatus
+
+    import apps.hub.main as main
+    from libs.db import models as M
+
+    bid = client.post("/bookings", json={"name": name, "type": "test", "posto_id": "3018",
+                                         "nationality": "CPV", "residence": "FRA"},
+                      headers=h).json()["id"]
+    db = main.SessionLocal()
+    db.add_all([
+        M.Slot(booking_id=bid, posto_id="3018", date="2026-09-01", period=1,
+               status=SlotStatus.AVAILABLE),
+        M.Slot(booking_id=bid, posto_id="3018", date="2026-09-02", period=2,
+               status=SlotStatus.LEASED),
+        M.Slot(booking_id=bid, posto_id="3018", date="2026-09-03", period=3,
+               status=SlotStatus.TAKEN),
+    ])
+    db.commit(); db.close()
+    return bid
+
+
+def test_clear_slots_retires_observations_but_never_a_booked_slot(client):
+    """Slots are per-run OBSERVATIONS; a stale pool makes the scheduler fire slot_found on the next
+    tick and skip discovery. Clear drops one without restarting the run -- retiring to CLOSED (which
+    reopens on rediscovery) and leaving TAKEN alone, because that is a real appointment and never
+    something a cleanup click may erase."""
+    import apps.hub.main as main
+    from sqlalchemy import select
+
+    from libs.db import models as M
+
+    h = _operate_headers(client)
+    bid = _booking_with_slots(client, h)
+
+    r = client.request("DELETE", f"/bookings/{bid}/slots", headers=h)
+    assert r.status_code == 200 and r.json()["cleared"] == 2
+
+    db = main.SessionLocal()
+    got = {(s.date, str(s.status)) for s in db.scalars(
+        select(M.Slot).where(M.Slot.booking_id == bid)).all()}
+    assert got == {("2026-09-01", "closed"), ("2026-09-02", "closed"), ("2026-09-03", "taken")}
+    assert db.get(M.Booking, bid).slot_found_fired_at is None
+    db.close()
+
+
+def test_clear_slots_requires_the_operate_seat(client):
+    h = _operate_headers(client)
+    bid = _booking_with_slots(client, h, name="ClearB2")
+    assert client.request("DELETE", f"/bookings/{bid}/slots").status_code in (401, 403)
+
+
+def test_start_clears_stale_signal_state_even_when_already_running(client):
+    """Gating the fresh-run reset on DRAFT/SCHEDULED/STOPPED meant clicking Start on a booking that
+    was already RUNNING silently skipped all of it, so the run inherited the previous one's fired
+    signal timestamps and slot pool. Confirmed live: a restarted "Test 3018" still showed
+    "slot-open fired @15:25Z" from the run before, latch included, so it could not be re-fired."""
+    import apps.hub.main as main
+    from sqlalchemy import select
+
+    from libs.db import models as M
+    from libs.domain.enums import BookingStatus
+
+    h = _operate_headers(client)
+    bid = _booking_with_slots(client, h, name="FreshRun")
+    db = main.SessionLocal()
+    bk = db.get(M.Booking, bid)
+    bk.status = BookingStatus.RUNNING
+    bk.slot_open_fired_at = bk.slot_found_fired_at = main._now()
+    db.commit(); db.close()
+
+    assert client.post(f"/bookings/{bid}/start", headers=h).status_code == 200
+
+    db = main.SessionLocal()
+    bk = db.get(M.Booking, bid)
+    assert bk.slot_open_fired_at is None and bk.slot_found_fired_at is None
+    # the previous run's observations are retired too -- but never the booked one
+    left = {str(s.status) for s in db.scalars(select(M.Slot).where(M.Slot.booking_id == bid)).all()}
+    assert left == {"closed", "taken"}
+    db.close()

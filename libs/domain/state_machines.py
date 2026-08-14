@@ -79,8 +79,11 @@ BOOKING_TRANSITIONS = {
                                         BookingStatus.STOPPED, BookingStatus.ABORTED}),
     BookingStatus.WARMING:   frozenset({BookingStatus.ARMED, BookingStatus.RUNNING,
                                         BookingStatus.STOPPED, BookingStatus.ABORTED}),
-    BookingStatus.ARMED:     frozenset({BookingStatus.RUNNING, BookingStatus.STOPPED,
-                                        BookingStatus.ABORTED}),
+    # ARMED -> WARMING: every Start is a fresh run (apps/hub/main.py's start_booking), which clears
+    # the signal latch and retires the previous run's slots -- so a booking restarted while ARMED
+    # goes back to plain warming rather than staying armed on state that has just been wiped.
+    BookingStatus.ARMED:     frozenset({BookingStatus.RUNNING, BookingStatus.WARMING,
+                                        BookingStatus.STOPPED, BookingStatus.ABORTED}),
     # RUNNING -> WARMING is the false-slot-open revert (operator spec 2026-08-14): slot-open fired,
     # a long window passed with zero slots found, so the Hub acknowledges the open was false and
     # drops back to plain holding rather than letting scouts grind discovery into rate-limiting.

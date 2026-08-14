@@ -455,31 +455,50 @@ function actionTitle(action, status) {
   return `cannot ${action} from status "${status}"`;
 }
 
-// The operator's requested run-summary layout: 8 named substates in a fixed 2-column grid, always
-// shown (including zeros) so the panel's shape stays stable at a glance rather than reflowing as
-// workers move between phases.
-const RUN_SUMMARY_SUBSTATES = [
-  ["idle", "discovering"],
+// The operator's requested run-summary layout (2026-08-14): 8 named phases in a fixed 2-column
+// grid, always shown (including zeros) so the panel's shape stays stable at a glance rather than
+// reflowing as workers move between phases. Left column = session lifecycle, right = what the
+// worker is actually doing.
+const RUN_SUMMARY_ROWS = [
+  ["failed", "discovering"],
   ["logging_in", "polling"],
-  ["warmed", "applying"],
-  ["holding", "failed"],
+  ["warming_up", "applying"],
+  ["holding", "booked"],
 ];
+
+// `failed` and `booked` are STATUSES, not substates -- and counting them off substates (as the
+// first version of this panel did for `failed`) shows a permanent 0: the backend NULLs substate on
+// any non-running worker, a failed worker's status is FAILED with no substate, and a worker that
+// books becomes COMPLETED. Both have to be read from status/outcome instead.
+const STATUS_COUNTED = { failed: true, booked: true };
+
+function countRunSummary(rows, events) {
+  const counts = {};
+  for (const w of rows) {
+    const v = workerView(w, events);
+    if (v.substate && !STATUS_COUNTED[v.substate]) {
+      counts[v.substate] = (counts[v.substate] || 0) + 1;
+    }
+    // A booking is worth showing whether the worker is still finishing up (live outcome) or has
+    // already exited COMPLETED -- either way this fleet has that many appointments.
+    if (v.outcome === "booked" || w.status === "completed") {
+      counts.booked = (counts.booked || 0) + 1;
+    } else if (w.status === "failed") {
+      counts.failed = (counts.failed || 0) + 1;
+    }
+  }
+  return counts;
+}
 
 function BookingRunSummary({ workers, events }) {
   const rows = workers.rows;
-  // Only RUNNING workers have a substate (workerView), so this can no longer report "holding: 12"
-  // for a fleet that is entirely stopped -- which is exactly what it did when first added.
-  const counts = rows.reduce((a, w) => {
-    const s = workerView(w, events).substate;
-    if (s) a[s] = (a[s] || 0) + 1;
-    return a;
-  }, {});
+  const counts = countRunSummary(rows, events);
   const active = rows.filter((w) => w.status === "running").length;
   return (
     <div style={{ marginBottom: 12 }}>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(150px, 220px))",
                     gap: "2px 24px", fontSize: 13 }}>
-        {RUN_SUMMARY_SUBSTATES.flat().map((s) => (
+        {RUN_SUMMARY_ROWS.flat().map((s) => (
           <div key={s} className="row" style={{ gap: 6, justifyContent: "space-between" }}>
             <span className="muted">{s}:</span>
             <b style={{ opacity: counts[s] ? 1 : 0.35 }}>{counts[s] || 0}</b>
@@ -740,16 +759,39 @@ function BookingOpsTabs({ me, booking, events, workers, setRightPanel, onBooking
         <button className={tab === "settings" ? "active" : ""} onClick={() => setTab("settings")}>Settings</button>
       </div>
       {tab === "workers" && <BookingWorkers me={me} booking={booking} events={events} workers={workers} setRightPanel={setRightPanel} />}
-      {tab === "slots" && <BookingSlots booking={booking} />}
+      {tab === "slots" && <BookingSlots booking={booking} me={me} />}
       {tab === "appointments" && <BookingAppointments booking={booking} />}
       {tab === "settings" && <BookingFullSettingsPanel me={me} booking={booking} onSaved={onBookingChanged} />}
     </div>
   );
 }
 
-function BookingSlots({ booking }) {
-  const { rows, err } = useList(`/bookings/${booking.id}/slots`, { pollMs: 5000 });
+function BookingSlots({ booking, me }) {
+  const { rows, err, reload } = useList(`/bookings/${booking.id}/slots`, { pollMs: 5000 });
   const [statusFilter, setStatusFilter] = useState("all");
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState("");
+  // Slots are per-run OBSERVATIONS, and a stale pool makes the scheduler fire slot_found on the
+  // next tick and skip discovery entirely. This drops one without restarting the run. Retires to
+  // CLOSED rather than deleting (reopens on rediscovery), and never touches TAKEN -- that is a real
+  // booking, not an observation.
+  const clearable = rows.filter((s) => s.status !== "taken" && s.status !== "closed").length;
+  const clearSlots = async () => {
+    if (!window.confirm(
+      `Clear ${clearable} slot(s) for "${booking.name}"?\n\n` +
+      "They are retired to CLOSED, not deleted, and reopen if a scout rediscovers them. " +
+      "Booked (taken) slots are left untouched.")) return;
+    setBusy(true); setMsg("");
+    try {
+      const r = await api(`/bookings/${booking.id}/slots`, { method: "DELETE" });
+      setMsg(`Cleared ${r.cleared} slot(s).`);
+      reload();
+    } catch (e) {
+      setMsg(e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
   const filtered = rows.filter((s) => statusFilter === "all" || s.status === statusFilter);
   const { q, setQ, sort, setSort, rows: shown } = useSortSearch(filtered, { key: "date", dir: "asc" });
   const statuses = [...new Set(rows.map((s) => s.status))].sort();
@@ -765,7 +807,14 @@ function BookingSlots({ booking }) {
             <option value="all">all</option>
             {statuses.map((s) => <option key={s} value={s}>{s}</option>)}
           </select></div>
+        <button className="btn ghost" onClick={clearSlots}
+                disabled={!me?.is_operating || busy || clearable === 0}
+                title={clearable === 0 ? "nothing to clear (booked slots are never cleared)"
+                                       : `retire ${clearable} slot(s) to CLOSED`}>
+          {busy ? "Clearing…" : "Clear"}
+        </button>
       </div>
+      {msg && <div className="banner">{msg}</div>}
       {err && <div className="banner err">{err}</div>}
       <table className="table-compact"><thead><tr>
         <Sortable label="Date" k="date" sort={sort} setSort={setSort} w="20%" />
