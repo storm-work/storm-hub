@@ -5,7 +5,7 @@ from libs.domain.enums import SettingsLayer as L
 from libs.domain.settings import resolve
 from libs.engine.config import EngineConfig
 from libs.engine.phases import EngineOps
-from apps.worker.ops_live import LiveEngineOps, _extract_csrf
+from apps.worker.ops_live import LiveEngineOps, _extract_csrf, _submit_bounce_reason
 
 
 def _cfg(**template):
@@ -997,9 +997,14 @@ def test_storm_autos_original_signal_still_wins():
 def test_a_bounce_is_still_a_bounce_when_the_url_is_not_the_pdf():
     """The URL check must not turn genuine bounces into phantom bookings."""
     home = "https://pedidodevistos.mne.gov.pt/VistosOnline/"
-    assert LiveEngineOps._classify_submit_response("<html>questionario</html>", home) == "no_slot"
+    # A bounce to the site root with NO schedule marker is the dashboard -> form_stale (see the
+    # English-portal tests below). With a schedule marker it stays no_slot however it was reached.
+    assert LiveEngineOps._classify_submit_response("<html>questionario</html>", home) == "form_stale"
     assert LiveEngineOps._classify_submit_response("<html>getSlots</html>", home) == "no_slot"
     assert LiveEngineOps._classify_submit_response(_HOME_DASHBOARD, home) == "form_stale"
+    # ...and at a deeper URL, without the Portuguese markers, it is not the dashboard.
+    assert LiveEngineOps._classify_submit_response(
+        "<html>questionario</html>", "https://x/VistosOnline/SubmeterVistoCriaPDF") == "no_slot"
 
 
 # ── verify_pdf resolution: only real %PDF bytes may promote a bounce to a booking ─────────────
@@ -1087,3 +1092,47 @@ def test_release_slot_carries_the_penalty_tier():
     ops.release_slot({"date": "d", "period": 1})                    # default
     ops.release_slot({"date": "d", "period": 1}, "form_stale")
     assert [p["reason"] for _, p in events] == ["bounce", "form_stale"]
+
+
+# ── the home-dashboard test must survive an English-rendered portal (confirmed live 2026-08-14) ──
+_ROOT = "https://pedidodevistos.mne.gov.pt/VistosOnline/"
+_SUBMIT_URL = "https://pedidodevistos.mne.gov.pt/VistosOnline/SubmeterVistoCriaPDF?posto_id=3018"
+
+
+def test_home_dashboard_detected_by_url_when_the_portal_renders_in_english():
+    """storm-auto matches only the PORTUGUESE nav text. We send lang=ENG in both the warmup and the
+    booking payload, so those strings can be absent from an English dashboard and a genuine
+    form-state expiry gets mis-read as "the slot was taken" -- no re-warm, and the slot pool wrongly
+    blamed for our own lapsed session. Live: 20 of 24 bounces landed on the bare /VistosOnline/
+    root, and only 6 matched the Portuguese markers.
+
+    A page the portal served AT its own site root IS the dashboard, whatever language it rendered."""
+    assert LiveEngineOps._classify_submit_response(
+        "<html>questionario Request Visa Application</html>", _ROOT) == "form_stale"
+
+
+def test_portuguese_markers_still_detect_home_without_any_url():
+    assert LiveEngineOps._classify_submit_response(
+        "<html>questionario Solicitar Pedido de Visto Consultar Pedidos</html>", "") == "form_stale"
+
+
+def test_schedule_markers_veto_the_home_verdict_even_at_the_root_url():
+    """The veto is absolute: a page carrying cmbPeriodo/getSlots is the schedule form, not the
+    dashboard, and stays no_slot however it was reached. Without this the URL check would sweep up
+    genuine slot-taken bounces and stop them ever being retried against another slot."""
+    assert LiveEngineOps._classify_submit_response(
+        "<html>questionario cmbPeriodo</html>", _ROOT) == "no_slot"
+    assert LiveEngineOps._classify_submit_response(
+        "<html>questionario getSlots</html>", _ROOT) == "no_slot"
+
+
+def test_a_deeper_url_is_not_the_home_dashboard():
+    assert LiveEngineOps._classify_submit_response(
+        "<html>questionario</html>", _SUBMIT_URL) == "no_slot"
+
+
+def test_bounce_reason_reports_both_halves_of_the_home_test():
+    """With nothing logged there was no way to tell why 14 bounces at the home URL weren't detected
+    as home. Every bounce now spells out which markers were and weren't found."""
+    r = _submit_bounce_reason("<html><title>Portal</title>questionario cmbPeriodo</html>")
+    assert "home_markers=none" in r and "cmbperiodo" in r and "title=" in r

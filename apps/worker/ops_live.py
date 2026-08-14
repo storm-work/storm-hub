@@ -74,14 +74,6 @@ _CSRF_RE_ALT = re.compile(
 # Known error/bounce markers, ported verbatim from the confirmed classification (storm-auto
 # batch_apply.py apply_book) -- see do_apply()'s docstring for the full reasoning.
 _ERROR_KEYWORDS = ("indisponivel", "unavailable", "bd_problm")
-_BOUNCE_KEYWORDS = ("questionario", "getslots", "captchadiv", "authentication.jsp")
-# storm-auto's confirmed apply_book contract distinguishes two very different bounces, and treating
-# them alike is what made a bounce look terminal here:
-#   form_stale -- landed back on the questionnaire / home dashboard / auth page. The server-side
-#                 workflow anchor lapsed. THE SLOT IS STILL REAL. Re-POSTing is futile; the fix is a
-#                 RE-WARM (and, if that keeps failing, a fresh login) and then retry the SAME slot.
-#   no_slot    -- landed back on the schedule form / slots page. Somebody else took it, or every
-#                 period is leased. The session is fine; ask for a different slot.
 # storm-auto's confirmed two-flavour bounce, read verbatim from batch_apply.apply_book (the code
 # behind 113 real bookings). BOTH flavours are "bounced_back"; what separates them is WHERE:
 #   (a) back to the schedule/questionario FORM (questionario / getslots / captchadiv / auth page)
@@ -94,10 +86,29 @@ _BOUNCE_KEYWORDS = ("questionario", "getslots", "captchadiv", "authentication.js
 # storm-auto. That is why worker e5dfc1b1 clung to one slot and paid five full login+warmup cycles
 # on it instead of soft-releasing and moving to the next slot.
 _BOUNCE_KEYWORDS = ("questionario", "getslots", "captchadiv", "authentication.jsp")
-# Flavour (b) is identified positively, by the home dashboard's own nav text AND the absence of any
-# schedule marker -- never by a single keyword.
+# Flavour (b) is identified positively -- by the home dashboard's own nav text, or by the portal
+# having redirected us to the bare site root -- AND by the absence of any schedule marker. Never by
+# a single keyword.
+#
+# storm-auto matches only the PORTUGUESE nav text. We send lang=ENG in both the warmup and the
+# booking payload, so those strings can simply be absent from an English-rendered dashboard, and a
+# genuine form-state expiry then gets mis-read as "the slot was taken" -- no re-warm, and the pool
+# wrongly blamed. Confirmed live 2026-08-14: 20 of 24 bounces landed on the bare /VistosOnline/
+# root, but only 6 matched the Portuguese markers.
+#
+# So the final URL is accepted as equivalent evidence: a page the portal served AT its own site root
+# IS the dashboard, whatever language it rendered in. The schedule-marker veto below stays absolute
+# in both cases -- a page carrying cmbPeriodo/getSlots is the schedule form, not the dashboard, and
+# must remain no_slot however it was reached.
 _HOME_MARKERS = ("solicitar pedido de visto", "consultar pedidos")
 _SCHEDULE_MARKERS = ("getperiodosocupados", "cmbperiodo", "getslots")
+
+
+def _is_home_url(final_url: str) -> bool:
+    """True only for the portal's bare site root (…/VistosOnline or …/VistosOnline/), never for a
+    deeper path -- SubmeterVistoCriaPDF, Schedule.jsp and friends all say something different."""
+    path = (final_url or "").split("?", 1)[0].split("#", 1)[0].rstrip("/")
+    return path.endswith("/VistosOnline")
 
 # storm-auto bounds its equivalent restore<->re-warm chain with MAX_WARMUP_RESTORES=3 ("a session
 # whose re-warm keeps bouncing to home can't churn fresh proxies forever"). Mirrored here as the
@@ -130,7 +141,17 @@ def _submit_bounce_reason(html: str) -> str:
     if errs:
         return f"portal error marker(s) {errs}"
     if hits:
-        return f"bounced back to {hits} (session/form state lost, or the slot was taken)"
+        # Which flavour of bounce this is decides the whole recovery (re-warm vs try another slot),
+        # and it hinges on markers we otherwise never see. Confirmed live 2026-08-14: 20 of 24
+        # bounces landed on the bare /VistosOnline/ root -- the home dashboard -- but only 6 were
+        # detected as such, and with nothing logged there was no way to tell why the other 14
+        # weren't. Spell out both halves of the home-dashboard test on every bounce.
+        home = [m for m in _HOME_MARKERS if m in low]
+        sched = [m for m in _SCHEDULE_MARKERS if m in low]
+        title = re.search(r"<title[^>]*>(.*?)</title>", low, re.S)
+        return (f"bounced back to {hits} (session/form state lost, or the slot was taken) "
+                f"| home_markers={home or 'none'} schedule_markers={sched or 'none'} "
+                f"| {len(html)}B title={(title.group(1).strip()[:60] if title else '?')!r}")
     if "mostrarpdf" not in low:
         return f"no MostrarPdf confirmation form; {len(html)}B response, head={html[:160]!r}"
     return f"unclassified; {len(html)}B response, head={html[:160]!r}"
@@ -1098,8 +1119,9 @@ class LiveEngineOps(EngineOps):
         if overshot_to_pdf:
             return "verify_pdf"      # "I can't tell from here" -- go read the actual PDF bytes
         if has_error_kw or bounced_back:
-            home_dashboard = (all(m in low for m in _HOME_MARKERS)
-                              and not any(m in low for m in _SCHEDULE_MARKERS))
+            on_schedule_page = any(m in low for m in _SCHEDULE_MARKERS)
+            looks_like_home = all(m in low for m in _HOME_MARKERS) or _is_home_url(final_url)
+            home_dashboard = looks_like_home and not on_schedule_page
             return "form_stale" if home_dashboard else "no_slot"
         # No confirmation marker and no bounce marker at all: genuinely unexpected, not a bounce.
         return "error"
