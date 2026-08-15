@@ -355,8 +355,9 @@ class EventHub:
             slot_ids = {le.slot_id for le in leases}
             for le in leases:
                 le.released_at = now
-                le.outcome = (SlotLeaseOutcome.FORM_STALE if reason == "form_stale"
-                              else SlotLeaseOutcome.BOUNCED)
+                le.outcome = {"form_stale": SlotLeaseOutcome.FORM_STALE,
+                              "session": SlotLeaseOutcome.SESSION}.get(
+                                  reason, SlotLeaseOutcome.BOUNCED)
             db.flush()
             for s in db.scalars(select(M.Slot).where(M.Slot.id.in_(slot_ids))).all():
                 if s.status == SlotStatus.LEASED:

@@ -328,6 +328,21 @@ class PhaseMachine:
                 self._to(WorkerSubstate.BOOKED)
                 return PhaseResult("booked", self._sub, str(slot), self.visited)
 
+            if outcome == "session":
+                # do_apply never got as far as talking to the portal about this slot -- its own
+                # re-warm failed (dead proxy, dropped tunnel). The slot is untouched and blameless:
+                # hand it back WITHOUT a penalty and rebuild the session, exactly as for form_stale.
+                # Treating this as a bounce is what let a dead proxy manufacture 5082 "bounced"
+                # leases against a pool that was never phantom, park every applier on "5 consecutive
+                # bounces", and drive the Hub's false-slot revert on real slots (live 2026-08-15).
+                self.ops.release_slot(slot, "session")
+                slot = None
+                self._to(WorkerSubstate.HOLDING, detail="re-warm failed; rebuilding session")
+                if not self._rebuild_session("apply re-warm failed"):
+                    return self._fail("session unrecoverable")
+                self.ops.poll_gap()
+                continue
+
             if outcome == "form_stale":
                 # storm-auto releases the lease here too -- with a DIFFERENT penalty, not by
                 # hoarding it. My previous version kept the slot to avoid "poisoning the pool";

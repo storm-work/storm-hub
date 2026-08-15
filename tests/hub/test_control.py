@@ -407,3 +407,30 @@ def test_the_pdf_event_attaches_to_the_existing_appointment_not_a_duplicate(slot
     art = db.scalars(select(M.Artifact)).one()
     assert appt.pdf_artifact_id == art.id
     db.close()
+
+
+def test_a_session_release_is_recorded_distinctly_from_a_bounce(slots_db):
+    """A worker whose own re-warm failed never spoke to the portal about that slot. Recording it as
+    BOUNCED both penalises a blameless slot and feeds the Hub's false-slot revert with evidence of
+    OUR failure -- which is exactly how a real pool got condemned repeatedly on 2026-08-15."""
+    from sqlalchemy import select
+
+    import apps.hub.events as ev
+    from libs.db import models as M
+    from libs.domain.enums import SlotLeaseOutcome, SlotStatus
+
+    bid, wid = _seed_scout(slots_db)
+    db = slots_db()
+    slot = M.Slot(booking_id=bid, posto_id="5084", date="2026-09-06", period=1,
+                  status=SlotStatus.LEASED)
+    db.add(slot); db.commit()
+    db.add(M.SlotLease(slot_id=slot.id, worker_id=wid)); db.commit()
+    db.close()
+
+    ev.EventHub.__new__(ev.EventHub)._release_slot_lease(
+        wid, {"date": "2026-09-06", "period": 1}, "session")
+
+    db = slots_db()
+    assert db.scalars(select(M.SlotLease)).one().outcome == SlotLeaseOutcome.SESSION
+    assert db.scalars(select(M.Slot)).one().status == SlotStatus.AVAILABLE
+    db.close()

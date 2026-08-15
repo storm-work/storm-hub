@@ -316,3 +316,30 @@ def test_scout_does_not_rebuild_while_rounds_are_merely_empty():
     )
     PhaseMachine(_cfg(booking={"SCOUT_REBUILD_AFTER_FAILED_ROUNDS": 2}, ROLE="scout"), ops).run()
     assert ops.logins == 1                   # no rebuild
+
+
+def test_a_failed_rewarm_is_a_session_problem_not_a_slot_bounce():
+    """do_apply returns "session" when its OWN re-warm fails -- it never spoke to the portal about
+    this slot. Blaming the slot is what let a dead proxy manufacture 5082 "bounced" leases against a
+    pool that was never phantom, park every applier on "5 consecutive bounces", and drive the Hub's
+    false-slot revert on real slots (live 2026-08-15)."""
+    ops = SimEngineOps(assignment={"date": "d1", "period": 3},
+                       apply_outcome=["session", "booked"], stop_after_polls=8)
+    res = PhaseMachine(_cfg(ROLE="apply"), ops).run()
+
+    assert res.outcome == "booked"
+    assert ops.release_reasons == ["session"]     # released, and NOT as a bounce
+    assert ops.logins == 2                        # the session was rebuilt in place
+
+
+def test_repeated_session_failures_never_park_the_worker_on_bounces():
+    """The park exists for a degraded session churning the shared POOL. A worker whose own re-warm
+    keeps failing has consumed nothing, so it must rebuild rather than be counted out on bounces."""
+    ops = SimEngineOps(assignment={"date": "d1", "period": 3}, apply_outcome="session",
+                       stop_after_polls=10)
+    details = []
+    PhaseMachine(_cfg(booking={"APPLY_MAX_ATTEMPTS": 2}, ROLE="apply"), ops,
+                 on_transition=lambda sub, d: details.append(d)).run()
+
+    assert not [d for d in details if d.startswith("parked:")], details
+    assert set(ops.release_reasons) == {"session"}

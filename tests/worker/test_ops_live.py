@@ -1292,3 +1292,37 @@ def test_the_home_lang_post_failure_names_itself(monkeypatch):
     ops.session = _DeadHomeSession(_SCHED_OK)
     assert ops._run_warmup_steps() is False
     assert any("home-lang POST failed" in m for m in logged), logged
+
+
+class _FlakyHomeSession(_WarmupSession):
+    """The home-lang POST fails `fail_n` times, then succeeds."""
+    def __init__(self, sched_html, fail_n):
+        super().__init__(sched_html)
+        self.fail_n = fail_n
+        self.home_calls = 0
+
+    def browser_eval(self, js, timeout=30):
+        if "lang=ENG&lang=PT" in js:
+            self.home_calls += 1
+            if self.home_calls <= self.fail_n:
+                raise RuntimeError("Page.evaluate: TypeError: Failed to fetch")
+            return 200
+        return super().browser_eval(js, timeout)
+
+
+def test_the_home_lang_post_is_retried_like_every_other_in_page_fetch(monkeypatch):
+    """When the labelling went in, this one raised on the FIRST failure while the quest steps below
+    it got three attempts -- and it is by far the most common failure point: 377 aborted warmups in
+    one live run, 370 from just two workers, none of which ever reached ScheduleController."""
+    monkeypatch.setattr("apps.worker.ops_live.time.sleep", lambda s: None)
+    ops = _make_ops()
+    ops.session = _FlakyHomeSession(_SCHED_OK, fail_n=2)
+    assert ops._run_warmup_steps() is True
+    assert ops.session.home_calls == 3
+
+
+def test_the_home_lang_post_still_fails_the_warmup_when_it_never_recovers(monkeypatch):
+    monkeypatch.setattr("apps.worker.ops_live.time.sleep", lambda s: None)
+    ops = _make_ops()
+    ops.session = _FlakyHomeSession(_SCHED_OK, fail_n=99)
+    assert ops._run_warmup_steps() is False

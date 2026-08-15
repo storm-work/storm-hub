@@ -583,17 +583,25 @@ class LiveEngineOps(EngineOps):
         """Questionnaire -> Formulario -> ScheduleController -> Schedule.jsp (confirmed URLs/flow,
         ported from storm-auto batch_apply._run_steps_2_to_6)."""
         try:
-            try:
-                self.session.browser_eval(
-                    "(async()=>{const r=await fetch('%s',{method:'POST',credentials:'include',"
-                    "headers:{'Content-Type':'application/x-www-form-urlencoded'},"
-                    "body:'lang=ENG&lang=PT'});return r.status;})()" % HOME_URL
-                )
-            except Exception as e:
-                # "TypeError: Failed to fetch" is a NETWORK failure inside the page (dead proxy,
-                # dropped tunnel), and the bare message names no step -- 306 of them in one live run
-                # with no way to tell which fetch died. Say which.
-                raise RuntimeError(f"home-lang POST failed: {e}") from e
+            # Retried like every other in-page fetch in this chain. When the labelling went in I
+            # made this one raise on the FIRST failure while giving the quest steps below three
+            # attempts -- and it is by far the most common failure point: 377 aborted warmups in one
+            # live run, 370 of them from just two workers stuck in a hot retry loop, none of which
+            # ever reached ScheduleController. "TypeError: Failed to fetch" is a transient network
+            # failure inside the page (dead proxy, dropped tunnel), exactly what a retry is for.
+            for attempt in range(1, _QUEST_STEP_RETRIES + 1):
+                try:
+                    self.session.browser_eval(
+                        "(async()=>{const r=await fetch('%s',{method:'POST',credentials:'include',"
+                        "headers:{'Content-Type':'application/x-www-form-urlencoded'},"
+                        "body:'lang=ENG&lang=PT'});return r.status;})()" % HOME_URL
+                    )
+                    break
+                except Exception as e:
+                    self._log(f"home-lang POST attempt {attempt}/{_QUEST_STEP_RETRIES} failed: {e}")
+                    if attempt == _QUEST_STEP_RETRIES:
+                        raise RuntimeError(f"home-lang POST failed: {e}") from e
+                    time.sleep(1.5)
             self.session.browser_nav(QUEST_URL, timeout=35, skip_cookie_sync=True)
 
             quest_key = self.residence if self.residence != self.nationality else self.nationality
@@ -1056,8 +1064,13 @@ class LiveEngineOps(EngineOps):
                 return "bounced"
 
             if not self._run_warmup_steps():
-                self._log("do_apply: re-warm at round start failed")
-                return "bounced"
+                # NOT "bounced". This is OUR session failing before we ever spoke to the portal
+                # about this slot, and calling it a bounce blames the slot for our dead proxy:
+                # the lease is released WITH a penalty, that penalty feeds the Hub's false-slot
+                # revert, and the worker parks on "5 consecutive bounces". All three were observed
+                # live 2026-08-15 -- 5082 bounced leases against a pool that was never phantom.
+                self._log("do_apply: re-warm at round start failed -- session problem, not the slot")
+                return "session"
 
             try:
                 self.session.browser_form_post(

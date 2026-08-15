@@ -122,6 +122,10 @@ class SlotLeaseOutcome(StrEnum):
     # never counts against the slot -- neither toward retiring it nor toward the Hub's false-slot
     # verdict, which must be evidence that the POOL is phantom, not that our session lapsed.
     FORM_STALE = "form_stale"
+    # The worker's own session/network failed before it could even submit (a dead proxy tunnel, a
+    # failed re-warm). Like FORM_STALE this says nothing about the slot, so it must never count
+    # against it -- recorded distinctly so reports can tell "we broke" from "our form lapsed".
+    SESSION = "session"
 
 
 # ── Registration jobs (C5) ────────────────────────────────────────────────────
