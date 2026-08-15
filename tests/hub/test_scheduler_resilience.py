@@ -1403,3 +1403,47 @@ def test_false_slot_revert_releases_the_leases_of_the_slots_it_closes(db):
     open_leases = db.scalars(select(M.SlotLease).where(
         M.SlotLease.released_at.is_(None))).all()
     assert open_leases == [], "left an orphan lease on a slot it retired"
+
+
+# ── one worker's failed relaunch must not kill the tick (confirmed live 2026-08-15) ───────────
+def test_a_relaunch_failure_does_not_abort_the_whole_tick(db):
+    """A relaunch that can't get a proxy is ORDINARY -- the pool is finite and a booking routinely
+    wants more workers than there are healthy proxies.
+
+    Live: lease_proxy raised ProxyLeaseError, _do_launch_worker re-raised it as an HTTPException (an
+    HTTP-layer error, raised in a background thread where nothing can answer it), and it propagated
+    out of _hold_respawn -> _tick_once -> the catch-all. That killed slot assignment, signal
+    latching and every watchdog, for EVERY booking, on that tick."""
+    r = fakeredis.FakeStrictRedis(decode_responses=True)
+
+    def _boom(db_, w):
+        raise RuntimeError("no healthy webshare proxy available after probing 5 candidate(s)")
+
+    sched = _scheduler(redis_client=r, supervisor=_FakeSupervisor(), bus=_FakeBus(),
+                       on_relaunch=_boom)
+    bk = _make_booking(db)
+    _make_worker(db, bk, _make_identity(db), status=WorkerStatus.FAILED)
+
+    sched._hold_respawn(db, bk, NOW)      # must return normally, not raise
+
+
+def test_a_relaunch_failure_still_lets_the_other_workers_relaunch(db):
+    """One unlucky worker must not deny the rest their retry."""
+    r = fakeredis.FakeStrictRedis(decode_responses=True)
+    done = []
+
+    def _flaky(db_, w):
+        if not done:
+            done.append(("failed", w.id))
+            raise RuntimeError("no healthy proxy")
+        done.append(("ok", w.id))
+
+    sched = _scheduler(redis_client=r, supervisor=_FakeSupervisor(), bus=_FakeBus(),
+                       on_relaunch=_flaky)
+    bk = _make_booking(db)
+    for _ in range(3):
+        _make_worker(db, bk, _make_identity(db), status=WorkerStatus.FAILED)
+
+    sched._hold_respawn(db, bk, NOW)
+
+    assert len(done) == 3 and [d[0] for d in done] == ["failed", "ok", "ok"]

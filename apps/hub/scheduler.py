@@ -278,7 +278,19 @@ class Scheduler:
             self._redis.hset(key, mapping={"attempt": attempt + 1, "next_eligible": time.time() + backoff})
             self._redis.expire(key, 86400)
             if self._on_relaunch is not None:
-                self._on_relaunch(db, w)
+                try:
+                    self._on_relaunch(db, w)
+                except Exception:
+                    # A relaunch that can't get a proxy is ORDINARY -- the pool is finite and a
+                    # booking routinely wants more workers than there are healthy proxies. It must
+                    # not be fatal to the tick. Confirmed live 2026-08-15: lease_proxy raised
+                    # ProxyLeaseError, _do_launch_worker re-raised it as an HTTPException (an
+                    # HTTP-layer error, in a background thread, where nothing can answer it), and it
+                    # propagated out of _hold_respawn -> _tick_once -> the catch-all -- killing slot
+                    # assignment, signal latching and every watchdog, for EVERY booking, that tick.
+                    # The worker's own row is already left FAILED by _do_launch_worker.
+                    logger.warning("relaunch of worker %s failed; continuing this tick",
+                                   w.id, exc_info=True)
 
     # ── D3: dead-process + stall watchdogs ───────────────────────────────────
     def _reap_dead_workers(self, db, now: datetime) -> None:

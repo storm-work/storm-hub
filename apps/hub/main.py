@@ -380,7 +380,13 @@ async def lifespan(app: FastAPI):
         # negative set is_healthy=False, which _candidate_query filters on, permanently removing a
         # good proxy from the pool. Applied from the GLOBAL layer: process-wide env can't be
         # per-booking, and global is the layer that isn't a per-run choice.
-        exported = vendor_env.apply(get_global(db))
+        # RESOLVED, not the raw stored rows. The settings table holds only what an operator
+        # explicitly set (credentials, here), never the catalog's defaults -- so this passed a dict
+        # containing none of the 13 vendor knobs and apply() exported {}, leaving the probe on the
+        # vendor's own defaults: stealth_harden=0 det_fp=0 webrtc_block=0 human=0 headless=old
+        # fp_seed=NONE. Exactly the harsher-instrument problem this block was written to prevent,
+        # still happening. Confirmed live 2026-08-15 in the session banner of a Hub-side probe.
+        exported = vendor_env.apply(resolve({L.GLOBAL: get_global(db)}))
         logger.info("vendor env applied for Hub-side proxy probes: %s", exported)
         db.close()
         supervisor.reconcile({wid: "apps.worker" for wid in running_ids})
