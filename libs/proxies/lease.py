@@ -36,10 +36,25 @@ def _active_lease_counts(db: Session) -> dict[str, int]:
 
 
 def _candidate_query(provider: str, kind: str | None, exclude_ids: set[str] | None):
+    """Least-recently-used first -- this ordering IS the pool cursor.
+
+    It used to be (score DESC, created_at ASC): fully deterministic, so every lease walked the pool
+    from the SAME starting point. The first few proxies were leased and re-probed endlessly while
+    the rest of a 1000-strong pool sat untouched, and a failing candidate stayed at the head of the
+    queue -- which is why "no healthy proxy after probing 5 candidate(s)" kept naming the identical
+    five UUIDs. After a health reset it degenerates completely: every score is 0.0, leaving pure
+    creation order.
+
+    `last_used_at` is stamped on every lease AND every probe attempt, so a proxy that just failed
+    rotates to the BACK rather than being retried first next time. NULLS FIRST means a never-used
+    proxy outranks any used one, so a fresh pool is walked end to end before anything repeats.
+    Score still breaks ties among equally-idle proxies, so reliability is preferred without ever
+    pinning selection to one favourite."""
     q = (
         select(M.Proxy)
         .where(M.Proxy.provider == provider, M.Proxy.active.is_(True), M.Proxy.is_healthy.is_(True))
-        .order_by(M.Proxy.score.desc(), M.Proxy.created_at.asc())
+        .order_by(M.Proxy.last_used_at.asc().nullsfirst(),
+                  M.Proxy.score.desc(), M.Proxy.created_at.asc())
     )
     if kind:
         q = q.where(M.Proxy.kind == kind)
@@ -61,8 +76,9 @@ def _claim_locked(db: Session, proxy_id: str, worker_id: str, is_pg: bool) -> tu
         return None   # SKIP LOCKED found it locked by someone else right now, or it's gone
     if _active_lease_counts(db).get(proxy.id, 0) >= proxy.max_sessions:
         return None
-    lease = M.ProxyLease(proxy_id=proxy.id, worker_id=worker_id, leased_at=datetime.now(timezone.utc))
-    db.add(lease)
+    now = datetime.now(timezone.utc)
+    proxy.last_used_at = now          # advance the pool cursor -- see _candidate_query
+    db.add(M.ProxyLease(proxy_id=proxy.id, worker_id=worker_id, leased_at=now))
     db.commit()
     return proxy, conn_url(proxy)
 
@@ -101,9 +117,9 @@ def lease_proxy(db: Session, worker_id: str, provider: str, *, kind: str | None 
             q = q.with_for_update(skip_locked=True)
         for proxy in db.scalars(q):
             if counts.get(proxy.id, 0) < proxy.max_sessions:
-                lease = M.ProxyLease(proxy_id=proxy.id, worker_id=worker_id,
-                                     leased_at=datetime.now(timezone.utc))
-                db.add(lease)
+                now = datetime.now(timezone.utc)
+                proxy.last_used_at = now      # advance the pool cursor -- see _candidate_query
+                db.add(M.ProxyLease(proxy_id=proxy.id, worker_id=worker_id, leased_at=now))
                 db.commit()
                 return proxy, conn_url(proxy)
         raise ProxyLeaseError(f"no free {provider} proxy available (pool exhausted)")
@@ -123,6 +139,11 @@ def lease_proxy(db: Session, worker_id: str, provider: str, *, kind: str | None 
         tried_ids.append(proxy.id)
         ok, detail = health_check(conn_url(proxy))
         apply_result(proxy, ok, detail)
+        # Stamped on the ATTEMPT, not just on success: a candidate that just failed its probe must
+        # rotate to the BACK of the queue. Otherwise it stays at the head and the next lease probes
+        # the very same dead proxies again -- the reason "no healthy proxy after probing 5
+        # candidate(s)" kept naming an identical five UUIDs.
+        proxy.last_used_at = datetime.now(timezone.utc)
         db.commit()
         if not ok:
             continue

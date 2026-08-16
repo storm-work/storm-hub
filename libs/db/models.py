@@ -131,6 +131,11 @@ class Proxy(Base, PKMixin, TimestampMixin):
     is_healthy: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     score: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     max_sessions: Mapped[int] = mapped_column(Integer, default=2, nullable=False)
+    # The pool cursor. Stamped on every lease AND every probe attempt, and ordered on NULLS-FIRST
+    # ascending, so selection is least-recently-used: the pool is walked end to end before anything
+    # repeats. Without it _candidate_query was deterministic (score, created_at) and hammered the
+    # same handful of proxies forever while the rest of the pool sat idle.
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class ProxyLease(Base, PKMixin, TimestampMixin):

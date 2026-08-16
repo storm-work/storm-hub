@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -15,6 +17,14 @@ def db():
     s = sessionmaker(bind=e)()
     yield s
     s.close()
+
+
+def _proxy(db, *, endpoint, provider="soax", kind="datacenter", max_sessions=1):
+    """One pool proxy. Used by the cursor tests below, which care about ORDER rather than identity."""
+    p = M.Proxy(provider=provider, kind=kind, endpoint=endpoint,
+                credentials_ref="u:p", max_sessions=max_sessions)
+    db.add(p); db.commit()
+    return p
 
 
 def _worker(db, wid="w1"):
@@ -190,3 +200,72 @@ def test_health_check_does_not_affect_a_different_kind_pool(db):
     px, _ = lease_proxy(db, "w1", "soax", kind="static", health_check=lambda url: (True, "ok"))
     assert px.id == "stat"
     assert db.get(M.Proxy, "rot").health is None   # never probed -- different kind
+
+
+# ── the pool cursor (operator request 2026-08-16) ─────────────────────────────────────────────
+def test_leases_walk_the_whole_pool_before_repeating_any_proxy(db):
+    """_candidate_query was (score DESC, created_at ASC): fully deterministic, so every lease
+    started from the SAME point and the first few proxies were used forever while the rest of the
+    pool sat idle. LRU ordering IS the cursor -- each lease resumes where the last one left off."""
+    from libs.proxies.lease import lease_proxy, release_proxy
+
+    made = [_proxy(db, endpoint=f"p{i}:80", max_sessions=1) for i in range(5)]
+    seen = []
+    for i in range(5):
+        p, _ = lease_proxy(db, f"w{i}", "soax")
+        seen.append(p.endpoint)
+        release_proxy(db, f"w{i}")
+
+    assert sorted(seen) == sorted(p.endpoint for p in made), seen
+    assert len(set(seen)) == 5, f"repeated a proxy before exhausting the pool: {seen}"
+
+
+def test_the_cursor_survives_release_so_the_next_lease_resumes_not_restarts(db):
+    """Releasing a lease must not send the cursor back to the start -- that is exactly the
+    'begins from the first point every time' behaviour being fixed."""
+    from libs.proxies.lease import lease_proxy, release_proxy
+
+    for i in range(3):
+        _proxy(db, endpoint=f"q{i}:80", max_sessions=1)
+
+    first, _ = lease_proxy(db, "w1", "soax")
+    release_proxy(db, "w1")
+    second, _ = lease_proxy(db, "w2", "soax")
+
+    assert second.endpoint != first.endpoint, "restarted from the head of the pool after a release"
+
+
+def test_a_failed_probe_rotates_that_proxy_to_the_back(db):
+    """A candidate that fails its probe must not stay at the head of the queue. It used to, which
+    is why 'no healthy proxy after probing 5 candidate(s)' kept naming the identical five UUIDs."""
+    from libs.proxies.lease import ProxyLeaseError, lease_proxy
+
+    for i in range(6):
+        _proxy(db, endpoint=f"r{i}:80", max_sessions=1)
+
+    tried_first, tried_second = [], []
+    for bucket in (tried_first, tried_second):
+        try:
+            lease_proxy(db, "w", "soax", max_probes=3,
+                        health_check=lambda url, b=bucket: (b.append(url), (False, "dead"))[1])
+        except ProxyLeaseError:
+            pass
+
+    assert tried_first and tried_second
+    assert not (set(tried_first) & set(tried_second)), (
+        f"probed the same dead proxies twice: {tried_first} then {tried_second}")
+
+
+def test_a_never_used_proxy_outranks_one_with_a_better_score(db):
+    """NULLS FIRST: a fresh proxy is preferred over a proven one until the pool has been walked
+    once, so a newly imported batch actually gets used instead of being stuck behind favourites."""
+    from libs.proxies.lease import lease_proxy
+
+    veteran = _proxy(db, endpoint="veteran:80", max_sessions=5)
+    veteran.score = 99.0
+    veteran.last_used_at = datetime(2026, 8, 1, tzinfo=timezone.utc)
+    fresh = _proxy(db, endpoint="fresh:80", max_sessions=5)      # last_used_at is NULL
+    db.commit()
+
+    got, _ = lease_proxy(db, "w1", "soax")
+    assert got.endpoint == fresh.endpoint
