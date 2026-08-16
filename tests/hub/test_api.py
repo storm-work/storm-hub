@@ -454,3 +454,99 @@ def test_start_clears_stale_signal_state_even_when_already_running(client):
     left = {str(s.status) for s in db.scalars(select(M.Slot).where(M.Slot.booking_id == bid)).all()}
     assert left == {"closed", "taken"}
     db.close()
+
+
+# ── Proxies page "Reset pool health" (operator request 2026-08-16) ────────────────────────────
+def _seed_proxies(healthy=2, condemned=3):
+    import apps.hub.main as main
+    from libs.db import models as M
+
+    db = main.SessionLocal()
+    for i in range(healthy):
+        db.add(M.Proxy(provider="webshare", kind="rotating", endpoint=f"ok{i}:80",
+                       credentials_ref="u:p", max_sessions=2, is_healthy=True, health=None))
+    for i in range(condemned):
+        db.add(M.Proxy(provider="webshare", kind="rotating", endpoint=f"bad{i}:80",
+                       credentials_ref="u:p", max_sessions=2, is_healthy=False,
+                       health="ERR_CONNECTION_CLOSED", score=-3.0))
+    db.commit(); db.close()
+
+
+def test_reset_proxy_health_dry_run_reports_scope_and_writes_nothing(client):
+    """lease_proxy filters on is_healthy and health.apply_result sets it False on ANY probe failure,
+    so a bad prober condemns good proxies permanently (639 of 2000 on 2026-08-15). This is the only
+    way to undo that, which is exactly why it must show the scope before writing."""
+    from sqlalchemy import select
+
+    import apps.hub.main as main
+    from libs.db import models as M
+
+    h = _operate_headers(client)
+    _seed_proxies()
+
+    r = client.post("/proxies/reset-health", headers=h)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["confirmed"] is False
+    assert body["probed"] == 3 and body["total"] == 5 and body["leasable_before"] == 2
+
+    db = main.SessionLocal()
+    assert len(db.scalars(select(M.Proxy).where(M.Proxy.is_healthy.is_(False))).all()) == 3
+    db.close()
+
+
+def test_reset_proxy_health_confirm_clears_every_verdict_to_unprobed(client):
+    """Unprobed, NOT known-good: the next lease re-probes each one -- now with the same browser
+    configuration a worker uses."""
+    from sqlalchemy import select
+
+    import apps.hub.main as main
+    from libs.db import models as M
+
+    h = _operate_headers(client)
+    _seed_proxies()
+
+    r = client.post("/proxies/reset-health?confirm=true", headers=h)
+    assert r.status_code == 200 and r.json()["confirmed"] is True
+
+    db = main.SessionLocal()
+    rows = db.scalars(select(M.Proxy)).all()
+    assert all(p.is_healthy and p.health is None and p.score == 0.0 for p in rows)
+    db.close()
+
+
+def test_reset_proxy_health_refuses_while_workers_are_running(client):
+    """A running worker re-probes and would immediately re-condemn what this clears."""
+    import apps.hub.main as main
+    from libs.db import models as M
+    from libs.domain.enums import BookingStatus, WorkerRole, WorkerStatus
+
+    h = _operate_headers(client)
+    _seed_proxies()
+    db = main.SessionLocal()
+    bk = M.Booking(name="RunningB", type="test", posto_id="3018", status=BookingStatus.RUNNING)
+    i = M.Identity(full_name="W", type="real")
+    db.add_all([bk, i]); db.commit()
+    db.add(M.Worker(booking_id=bk.id, identity_id=i.id, role=WorkerRole.APPLY,
+                    status=WorkerStatus.RUNNING))
+    db.commit(); db.close()
+
+    assert client.post("/proxies/reset-health?confirm=true", headers=h).status_code == 409
+    # ...and force is the documented escape hatch, matching the script's own
+    assert client.post("/proxies/reset-health?confirm=true&force=true",
+                       headers=h).status_code == 200
+
+
+def test_reset_proxy_health_requires_the_operate_seat(client):
+    _seed_proxies()
+    assert client.post("/proxies/reset-health").status_code in (401, 403)
+
+
+def test_proxy_list_exposes_health_so_the_page_can_show_what_is_condemned(client):
+    """is_healthy decides whether a proxy is leasable at all -- the most consequential field on the
+    row, and it was not being returned by the API."""
+    h = _operate_headers(client)
+    _seed_proxies()
+    rows = client.get("/proxies", headers=h).json()
+    assert sum(1 for p in rows if p["is_healthy"] is False) == 3
+    assert any(p["health"] == "ERR_CONNECTION_CLOSED" for p in rows)

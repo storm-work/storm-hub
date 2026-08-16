@@ -164,6 +164,11 @@ class ProxyOut(BaseModel):
     endpoint: str
     active: bool
     health: str | None = None
+    # Surfaced so the Proxies page can show WHAT is condemned, not just how many. lease_proxy
+    # filters on is_healthy, so a False here means the proxy is out of the pool entirely -- the
+    # single most consequential field on this row, and it was not being returned at all.
+    is_healthy: bool = True
+    score: float = 0.0
     max_sessions: int
     model_config = {"from_attributes": True}
 

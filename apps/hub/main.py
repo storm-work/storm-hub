@@ -1149,6 +1149,49 @@ def toggle_proxy_active(proxy_id: str, db: Session = Depends(get_db),
     return p
 
 
+@app.post("/proxies/reset-health")
+def reset_proxy_health(confirm: bool = False, force: bool = False,
+                       db: Session = Depends(get_db),
+                       _op: Principal = Depends(require_operator)) -> dict:
+    """Clear every proxy's health verdict back to unprobed (dashboard Proxies tab "Reset pool").
+
+    Same operation, same guards and same semantics as
+    `scripts/reset_run_state.py --proxy-health` -- exposed here because the situation it exists for
+    recurs and shelling into the box for it is friction the operator shouldn't need.
+
+    WHY it is ever needed: lease_proxy filters on is_healthy, and health.apply_result sets
+    is_healthy=False on ANY probe failure, so every false negative removes a good proxy from the
+    pool PERMANENTLY. Confirmed live 2026-08-15: the Hub's own probe ran with anti-detection off
+    (it exported an empty vendor env), screening proxies far more harshly than the workers that
+    would use them, and condemned 639 of 2000. Fixing the probe does not un-condemn them; only this
+    does.
+
+    Resets to is_healthy=True / health=None / score=0.0 -- "unprobed", not "known good": the next
+    lease re-probes, now with the same browser configuration a worker uses.
+
+    Dry-run by default (`confirm=false`) so the operator sees the scope before writing, and refuses
+    while workers are RUNNING because they would immediately re-dirty exactly these rows. `force`
+    overrides that, matching the script's own escape hatch."""
+    running = db.scalars(select(M.Worker).where(M.Worker.status == WorkerStatus.RUNNING)).all()
+    if running and not force:
+        raise HTTPException(409, f"{len(running)} worker(s) are RUNNING and would immediately "
+                                 f"re-dirty this state -- stop the booking first, or pass force")
+    total = db.scalar(select(func.count()).select_from(M.Proxy)) or 0
+    probed = db.scalar(select(func.count()).select_from(M.Proxy)
+                       .where(M.Proxy.health.isnot(None))) or 0
+    leasable_before = db.scalar(select(func.count()).select_from(M.Proxy).where(
+        M.Proxy.active.is_(True), M.Proxy.is_healthy.is_(True))) or 0
+    if confirm:
+        for pr in db.scalars(select(M.Proxy).where(M.Proxy.health.isnot(None))).all():
+            pr.is_healthy, pr.health, pr.score = True, None, 0.0
+        db.commit()
+        logger.warning("proxy pool health reset by operator: %d probed row(s) cleared", probed)
+    return {"confirmed": confirm, "total": total, "probed": probed,
+            "leasable_before": leasable_before,
+            "leasable_after": total if confirm else leasable_before,
+            "running_workers": len(running)}
+
+
 # ── Registration subsystem (apps/registrar) ────────────────────────────────────
 @app.get("/sub-accounts", response_model=list[SubAccountOut])
 def list_sub_accounts(db: Session = Depends(get_db),

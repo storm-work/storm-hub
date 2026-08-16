@@ -1920,10 +1920,39 @@ function Proxies({ me, setLeftPanel }) {
   });
   const { q, setQ, sort, setSort, rows: shown } = useSortSearch(filtered, { key: "created_at", dir: "desc" });
 
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState("");
+
   async function toggle(id) {
     setMsg("");
     try { await api(`/proxies/${id}/toggle-active`, { method: "POST" }); reload(); }
     catch (e) { setMsg(e.message); }
+  }
+
+  // Dry run first, ALWAYS. lease_proxy filters on is_healthy and health.apply_result sets it False
+  // on any probe failure, so a bad prober condemns good proxies permanently (639 of 2000 on
+  // 2026-08-15). This is the only way to undo that -- and it clears every verdict in the pool, so
+  // the operator sees the exact scope before anything is written.
+  async function resetHealth() {
+    setMsg(""); setNote(""); setBusy(true);
+    try {
+      const dry = await api("/proxies/reset-health", { method: "POST" });
+      const ok = window.confirm(
+        `Reset health for ${dry.probed} probed proxy/proxies?\n\n` +
+        `Leasable now: ${dry.leasable_before} of ${dry.total}  ->  after: ${dry.total}\n\n` +
+        "They are set back to UNPROBED, not to known-good: the next lease re-probes each one. " +
+        "Nothing has been written yet.");
+      if (!ok) return;
+      const res = await api("/proxies/reset-health?confirm=true", { method: "POST" });
+      setNote(`Reset ${res.probed} proxy health verdict(s); ${res.total} now leasable.`);
+      reload();
+    } catch (e) {
+      // 409 = workers are RUNNING. Say what to do about it rather than just echoing the status.
+      setMsg(e.message.startsWith("409")
+        ? `${e.message}\n\nStop the booking run first -- a running worker re-probes and would ` +
+          "immediately re-condemn what this clears."
+        : e.message);
+    } finally { setBusy(false); }
   }
 
   // The pool tree is permanent page navigation for Proxies (unlike Identities'/Bookings' on-demand
@@ -1968,18 +1997,38 @@ function Proxies({ me, setLeftPanel }) {
           <h2 style={{ margin: 0 }}>{poolLabel} ({shown.length}/{rows.length})</h2>
           <span className="grow" />
           <SearchBox q={q} setQ={setQ} placeholder="search proxies…" />
+          <button className="btn ghost" disabled={!op || busy} onClick={resetHealth}
+                  title="Clear every health verdict back to unprobed — undoes proxies wrongly
+condemned by a failed probe. Shows the scope before writing.">
+            {busy ? "Checking…" : "Reset pool health"}
+          </button>
         </div>
         {err && <div className="banner err">{err}</div>}
-        {msg && <div className="banner err">{msg}</div>}
+        {msg && <div className="banner err" style={{ whiteSpace: "pre-line" }}>{msg}</div>}
+        {note && <div className="banner">{note}</div>}
+        {rows.length > 0 && (() => {
+          const dead = rows.filter((p) => p.is_healthy === false).length;
+          return dead > 0 ? (
+            <div className="banner err">
+              {dead} of {rows.length} proxies are marked unhealthy and are excluded from leasing.
+            </div>
+          ) : null;
+        })()}
         <table><thead><tr>
           <Sortable label="Provider" k="provider" sort={sort} setSort={setSort} w="15%" />
           <Sortable label="Kind" k="kind" sort={sort} setSort={setSort} w="15%" />
           <Sortable label="Endpoint" k="endpoint" sort={sort} setSort={setSort} />
           <Sortable label="Active" k="active" sort={sort} setSort={setSort} w="10%" />
+          <Sortable label="Health" k="is_healthy" sort={sort} setSort={setSort} w="16%" />
           <th style={{ width: "10%" }}>Max/IP</th><th style={{ width: "12%" }}></th></tr></thead>
           <tbody>{shown.map((p) => (
             <tr key={p.id}><td><span className="pill">{p.provider}</span></td><td>{p.kind}</td>
-              <td className="muted">{p.endpoint}</td><td className={p.active ? "ok" : "muted"}>{String(p.active)}</td><td>{p.max_sessions}</td>
+              <td className="muted">{p.endpoint}</td><td className={p.active ? "ok" : "muted"}>{String(p.active)}</td>
+              <td className={p.is_healthy === false ? "err" : "muted"}
+                  title={p.health || "unprobed"}>
+                {p.is_healthy === false ? (p.health || "unhealthy") : (p.health ? "ok" : "unprobed")}
+              </td>
+              <td>{p.max_sessions}</td>
               <td><button className="btn ghost" disabled={!op} onClick={() => toggle(p.id)}>{p.active ? "Deactivate" : "Activate"}</button></td></tr>
           ))}</tbody></table>
         {shown.length === 0 && <div className="muted">No proxies in this pool yet.</div>}
