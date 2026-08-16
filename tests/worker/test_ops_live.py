@@ -1074,16 +1074,17 @@ def _ops_with_submit(body, url="https://x/VistosOnline/"):
     return ops
 
 
-def test_blank_chrome_error_page_is_not_read_as_a_slot_rejection():
-    """A blank/chrome-error page is not the portal answering -- blaming the slot for it would
-    soft-release a perfectly good slot and feed the Hub's false-slot counter with noise."""
+def test_blank_page_is_not_read_as_a_slot_rejection():
+    """A blank page is not the portal answering. It returns "session", not "bounced": a bounce
+    releases the slot WITH a penalty and feeds the Hub's false-slot verdict, and none of these
+    responses are the slot's fault -- the request never reached the portal at all."""
     ops = _ops_with_submit("<html><head></head><body></body></html>")
-    assert ops.do_apply({"date": "2026-09-01", "period": 4}) == "bounced"
+    assert ops.do_apply({"date": "2026-09-01", "period": 4}) == "session"
 
 
 def test_datadome_interstitial_is_not_read_as_a_slot_rejection():
     ops = _ops_with_submit("<html><head>datadome challenge</head><body>x</body></html>")
-    assert ops.do_apply({"date": "2026-09-01", "period": 4}) == "bounced"
+    assert ops.do_apply({"date": "2026-09-01", "period": 4}) == "session"
 
 
 def test_release_slot_carries_the_penalty_tier():
@@ -1326,3 +1327,51 @@ def test_the_home_lang_post_still_fails_the_warmup_when_it_never_recovers(monkey
     ops = _make_ops()
     ops.session = _FlakyHomeSession(_SCHED_OK, fail_n=99)
     assert ops._run_warmup_steps() is False
+
+
+# ── Chrome's network-error page is not a portal answer (confirmed live 2026-08-16) ────────────
+_CHROME_ERROR = ('<!DOCTYPE html><html dir="ltr" lang="en"><head>\n  <meta charset="utf-8">\n'
+                 '  <meta name="color-scheme" content="light dark">\n'
+                 '  <meta name="theme-color" content="#fff">\n</head><body>'
+                 + "x" * 180000 + '</body></html>')
+
+
+class _ChromeErrorSession(_FakeSession):
+    def __init__(self, url="chrome-error://chromewebdata/"):
+        super().__init__()
+        self._url = url
+
+    def browser_form_post(self, url, data, timeout=100):
+        return (self._url, _CHROME_ERROR)
+
+
+def test_a_chrome_network_error_page_is_a_session_failure_not_a_slot_bounce():
+    """Every one of the run's 7 submits came back as the SAME 187,732-byte chrome-error page, and
+    the login path logged 96 rejections at chrome-error://chromewebdata/ in the same window. It is
+    far too big to look blank and says nothing about DataDome, so it matched neither existing guard
+    and fell through as an unexplained "[error]" -- releasing the slot as BOUNCED. The request never
+    reached the portal; blaming the slot for our dead tunnel is the same misattribution that had a
+    dead proxy manufacturing phantom-slot votes."""
+    ops = _make_ops(emit=lambda t, **p: None)
+    ops.session = _ChromeErrorSession()
+    ops._run_warmup_steps = lambda: True
+    assert ops.do_apply({"date": "2026-09-14", "period": 3}) == "session"
+
+
+def test_the_chrome_error_page_is_caught_even_without_the_chrome_error_url():
+    """browser_form_post does not always surface the chrome-error:// URL -- the page's own signature
+    has to be enough on its own."""
+    ops = _make_ops(emit=lambda t, **p: None)
+    ops.session = _ChromeErrorSession(url="https://pedidodevistos.mne.gov.pt/VistosOnline/")
+    ops._run_warmup_steps = lambda: True
+    assert ops.do_apply({"date": "2026-09-14", "period": 3}) == "session"
+
+
+def test_a_real_portal_bounce_is_still_a_real_bounce():
+    """The new guard must not swallow genuine portal responses -- a schedule-form bounce still has
+    to come back as no_slot so another slot gets tried."""
+    ops = _make_ops(emit=lambda t, **p: None)
+    ops.session = _SubmitBodySession("<html>questionario getSlots cmbPeriodo</html>",
+                                     "https://pedidodevistos.mne.gov.pt/VistosOnline/")
+    ops._run_warmup_steps = lambda: True
+    assert ops.do_apply({"date": "2026-09-14", "period": 3}) == "no_slot"

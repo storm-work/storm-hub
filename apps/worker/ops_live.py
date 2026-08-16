@@ -1099,12 +1099,26 @@ class LiveEngineOps(EngineOps):
             _snip = (html or "")[:300]
             _blank = (html or "").strip() in ("", "<html><head></head><body></body></html>")
             _blocked = "body{margin:0;background:#fff}" in _snip or "datadome" in _snip.lower()
-            if _blank or _blocked:
-                why = "blank/chrome-error page" if _blank else "DataDome interstitial"
-                self._log(f"do_apply: submit response is a {why} -- not a portal answer | slot={slot}")
+            # Chrome's own network-error page ("This site can't be reached"). Confirmed live
+            # 2026-08-16: every one of the run's 7 submits came back as the SAME 187,732-byte
+            # chrome-error page, and the login path logged 96 rejections at
+            # chrome-error://chromewebdata/ in the same window. It matched neither guard above --
+            # it is far too big to look blank and says nothing about DataDome -- so it fell through
+            # as an unexplained "[error]" and the slot was released as BOUNCED. The request never
+            # reached the portal at all; blaming the slot for our dead tunnel is the same
+            # misattribution that had a dead proxy manufacturing phantom-slot votes.
+            _chrome_error = ("chrome-error://" in (_final_url or "")
+                             or ('color-scheme' in _snip and 'theme-color' in _snip
+                                 and 'dir="ltr"' in _snip))
+            if _blank or _blocked or _chrome_error:
+                why = ("Chrome network-error page" if _chrome_error else
+                       "blank page" if _blank else "DataDome interstitial")
+                self._log(f"do_apply: submit response is a {why} ({len(html or '')}B) -- the request "
+                          f"never reached the portal | slot={slot} | final_url={_final_url}")
                 if self._breaker is not None:
                     self._breaker.record_portal_down()
-                return "bounced"
+                # OUR network, not the slot: released without penalty, session rebuilt.
+                return "session"
 
             outcome = self._classify_submit_response(html, _final_url)
             if outcome == "verify_pdf":
