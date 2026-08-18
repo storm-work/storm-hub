@@ -136,6 +136,10 @@ class Proxy(Base, PKMixin, TimestampMixin):
     # repeats. Without it _candidate_query was deterministic (score, created_at) and hammered the
     # same handful of proxies forever while the rest of the pool sat idle.
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Exit country, backfilled from credentials_ref. Login success against this portal varies ~8x
+    # by geo (DE 23.7% / IT 23.4% ... CZ 2.9%, measured over 1392 real attempts), so this is the
+    # single highest-leverage selector on the pool. NULL = unknown, never excluded by a filter.
+    geo: Mapped[str | None] = mapped_column(String(8))
 
 
 class ProxyLease(Base, PKMixin, TimestampMixin):

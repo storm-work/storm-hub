@@ -169,6 +169,7 @@ class ProxyOut(BaseModel):
     # single most consequential field on this row, and it was not being returned at all.
     is_healthy: bool = True
     score: float = 0.0
+    geo: str | None = None
     max_sessions: int
     model_config = {"from_attributes": True}
 

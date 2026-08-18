@@ -245,9 +245,16 @@ class EventHub:
             if phase == "hold":
                 provider = str(eff.get("HOLD_PROXY_PROVIDER", "soax"))
                 kind = eff.get("HOLD_PROXY_KIND") or None
+                geo_setting = eff.get("HOLD_PROXY_GEOS")
             else:
                 provider = str(eff.get("PROXY_PROVIDER", "soax"))
                 kind = eff.get("PROXY_KIND") or None
+                geo_setting = eff.get("PROXY_GEOS")
+            # A rotation must honour the same geo restriction as the original lease -- otherwise the
+            # first proxy failure quietly drops the worker back into the full pool, and the geos
+            # that clear the login wall stop being the ones it uses.
+            from apps.hub.main import _geos
+            geos = _geos(geo_setting)
 
             old_q = select(M.ProxyLease).join(M.Proxy, M.ProxyLease.proxy_id == M.Proxy.id).where(
                 M.ProxyLease.worker_id == worker_id, M.ProxyLease.released_at.is_(None),
@@ -260,11 +267,11 @@ class EventHub:
 
             try:
                 proxy, url = lease_proxy(db, worker_id, provider=provider, kind=kind,
-                                         exclude_ids=old_proxy_ids, health_check=hc)
+                                         exclude_ids=old_proxy_ids, health_check=hc, geos=geos)
             except ProxyLeaseError:
                 try:
                     proxy, url = lease_proxy(db, worker_id, provider=provider, kind=kind,
-                                             health_check=hc)
+                                             health_check=hc, geos=geos)
                 except ProxyLeaseError as e:
                     bus.send_command(worker_id, "proxy_unavailable", reason=str(e))
                     return

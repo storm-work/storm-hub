@@ -269,3 +269,43 @@ def test_a_never_used_proxy_outranks_one_with_a_better_score(db):
 
     got, _ = lease_proxy(db, "w1", "soax")
     assert got.endpoint == fresh.endpoint
+
+
+# ── geo filtering (measured 2026-08-18: DE 23.7% / IT 23.4% ... CZ 2.9% login success) ────────
+def test_geo_filter_restricts_the_pool_to_the_named_countries(db):
+    """An 8x spread in login success by exit geo, and the pool was being spent almost backwards --
+    CZ took the MOST attempts at the WORST rate. This is the selector that fixes that."""
+    from libs.proxies.lease import lease_proxy, release_proxy
+
+    for geo in ("CZ", "DE", "IT", "LU"):
+        for i in range(2):
+            p = _proxy(db, endpoint=f"{geo}{i}:80", max_sessions=1)
+            p.geo = geo
+    db.commit()
+
+    got = []
+    for i in range(4):
+        p, _ = lease_proxy(db, f"w{i}", "soax", geos={"DE", "IT"})
+        got.append(p.geo)
+        release_proxy(db, f"w{i}")
+    assert set(got) == {"DE", "IT"}, got
+
+
+def test_a_geo_filter_never_excludes_a_proxy_whose_geo_is_unknown(db):
+    """soax credentials carry no country, so geo is NULL there. A filter narrows the pool; it must
+    not silently empty it for a provider that cannot be classified."""
+    from libs.proxies.lease import lease_proxy
+
+    p = _proxy(db, endpoint="nogeo:80", max_sessions=1)   # geo stays NULL
+    db.commit()
+    got, _ = lease_proxy(db, "w1", "soax", geos={"DE"})
+    assert got.endpoint == "nogeo:80"
+
+
+def test_no_geo_filter_leaves_selection_untouched(db):
+    from libs.proxies.lease import lease_proxy
+
+    p = _proxy(db, endpoint="cz0:80", max_sessions=1); p.geo = "CZ"
+    db.commit()
+    got, _ = lease_proxy(db, "w1", "soax")
+    assert got.endpoint == "cz0:80"

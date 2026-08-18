@@ -1747,6 +1747,12 @@ def _pick_live_sub_account(db: Session, identity_id: str) -> M.SubAccount | None
     return candidates[0] if candidates else None
 
 
+def _geos(value) -> set[str] | None:
+    """Parse a PROXY_GEOS setting ("DE,IT") into a set. Blank/absent -> None = no restriction."""
+    parts = {g.strip().upper() for g in str(value or "").replace(";", ",").split(",") if g.strip()}
+    return parts or None
+
+
 def _do_launch_worker(db: Session, w: M.Worker) -> None:
     """Resolve + FREEZE effective settings (global<booking<template), spawn, send launch command.
 
@@ -1799,6 +1805,7 @@ def _do_launch_worker(db: Session, w: M.Worker) -> None:
             proxy, warm_proxy = lease_proxy(
                 db, w.id, provider=str(eff.get("PROXY_PROVIDER", "soax")),
                 kind=eff.get("PROXY_KIND") or None, health_check=check_proxy,
+                geos=_geos(eff.get("PROXY_GEOS")),
             )
         except ProxyLeaseError as e:
             raise HTTPException(409, f"worker {w.id}: {e}")
@@ -1812,6 +1819,7 @@ def _do_launch_worker(db: Session, w: M.Worker) -> None:
                 _hold_proxy_row, hold_proxy = lease_proxy(
                     db, w.id, provider=str(eff.get("HOLD_PROXY_PROVIDER", "soax")),
                     kind=eff.get("HOLD_PROXY_KIND") or None, health_check=check_proxy,
+                    geos=_geos(eff.get("HOLD_PROXY_GEOS")),
                 )
             except ProxyLeaseError as e:
                 # The phase-1 lease already succeeded -- release it, otherwise it's stranded (this

@@ -35,7 +35,8 @@ def _active_lease_counts(db: Session) -> dict[str, int]:
     return {pid: n for pid, n in rows}
 
 
-def _candidate_query(provider: str, kind: str | None, exclude_ids: set[str] | None):
+def _candidate_query(provider: str, kind: str | None, exclude_ids: set[str] | None,
+                     geos: set[str] | None = None):
     """Least-recently-used first -- this ordering IS the pool cursor.
 
     It used to be (score DESC, created_at ASC): fully deterministic, so every lease walked the pool
@@ -58,6 +59,10 @@ def _candidate_query(provider: str, kind: str | None, exclude_ids: set[str] | No
     )
     if kind:
         q = q.where(M.Proxy.kind == kind)
+    if geos:
+        # NULL geo is never excluded: a filter narrows the pool, it must not silently empty it for
+        # a provider whose credentials carry no country (soax).
+        q = q.where(M.Proxy.geo.in_(geos) | M.Proxy.geo.is_(None))
     if exclude_ids:
         q = q.where(M.Proxy.id.notin_(exclude_ids))
     return q
@@ -85,12 +90,18 @@ def _claim_locked(db: Session, proxy_id: str, worker_id: str, is_pg: bool) -> tu
 
 def lease_proxy(db: Session, worker_id: str, provider: str, *, kind: str | None = None,
                 exclude_ids: set[str] | None = None, health_check=None,
-                max_probes: int = 5) -> tuple[M.Proxy, str]:
+                max_probes: int = 5, geos: set[str] | None = None) -> tuple[M.Proxy, str]:
     """Lease a healthy proxy of `provider` (e.g. 'soax' or 'webshare') with free capacity. Returns
     (proxy, conn_url). Raises ProxyLeaseError if the pool is exhausted. `exclude_ids` (P3, proxy
     rotation): a worker asking the Hub to ROTATE off a proxy must not just get handed the same one
     back -- without this, a still-has-capacity proxy sorted first by score/created_at is exactly what
     a rotation request would otherwise re-lease, defeating the point of asking for a fresh one.
+
+    `geos` restricts selection to those exit countries (PROXY_GEOS). Login success against this
+    portal varies ~8x by geo -- DE 23.7% / IT 23.4% / PT 10.8% / NL 10.6% / ES 8.1% / LU 4.9% /
+    CZ 2.9%, measured over 1392 real attempts on 2026-08-18 -- and the pool was being spent almost
+    backwards, with CZ taking the most attempts at the worst rate. A proxy whose geo is unknown
+    (NULL) is never filtered out.
 
     `health_check` (P4, operator-specified 2026-08-13): an optional `callable(conn_url) ->
     (ok: bool, detail: str)` probed against each candidate BEFORE it's claimed -- a live
@@ -112,7 +123,7 @@ def lease_proxy(db: Session, worker_id: str, provider: str, *, kind: str | None 
 
     if health_check is None:
         counts = _active_lease_counts(db)
-        q = _candidate_query(provider, kind, exclude_ids)
+        q = _candidate_query(provider, kind, exclude_ids, geos)
         if is_pg:
             q = q.with_for_update(skip_locked=True)
         for proxy in db.scalars(q):
@@ -127,7 +138,7 @@ def lease_proxy(db: Session, worker_id: str, provider: str, *, kind: str | None 
     from .health import apply_result
 
     counts = _active_lease_counts(db)
-    q = _candidate_query(provider, kind, exclude_ids)   # no lock -- see docstring
+    q = _candidate_query(provider, kind, exclude_ids, geos)   # no lock -- see docstring
     probed = 0
     tried_ids: list[str] = []
     for proxy in db.scalars(q):

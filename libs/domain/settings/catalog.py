@@ -110,6 +110,16 @@ _BOOKING = [
        note="'sim' | 'live' -- explicit per-booking opt-in; live is never inferred/defaulted"),
     _s("PROXY_PROVIDER", L.BOOKING, str, "soax", group="mode",
        note="phase-1 (login/warmup) leased-proxy provider: 'soax' | 'webshare'"),
+    # Exit countries the phase-1 pool may draw from, comma-separated (e.g. "DE,IT"); blank = all.
+    # Measured over 1392 real login attempts 2026-08-18: DE 23.7% / IT 23.4% / PT 10.8% / NL 10.6%
+    # / ES 8.1% / LU 4.9% / CZ 2.9%. An 8x spread, and the pool was being spent almost backwards --
+    # CZ took the MOST attempts (277) at the WORST rate. Narrowing to the top geos is the single
+    # highest-leverage change available against the login wall, which is where ~90% of this fleet's
+    # time goes. Left blank by default: it trades pool breadth for pass rate, and how far to push
+    # that is an operator call, not a default.
+    _s("PROXY_GEOS", L.BOOKING, str, "", group="mode"),
+    _s("HOLD_PROXY_GEOS", L.BOOKING, str, "", group="mode",
+       note="same, for the phase-2 (hold/apply) pool; blank = all"),
     _s("PROXY_KIND", L.BOOKING, str, group="mode",
        note="optional phase-1 proxy kind filter (Proxy.kind): 'rotating' | 'static'; blank = no filter"),
     _s("HOLD_PROXY_PROVIDER", L.BOOKING, str, "webshare", group="mode",
