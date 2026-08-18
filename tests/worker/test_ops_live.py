@@ -1079,12 +1079,12 @@ def test_blank_page_is_not_read_as_a_slot_rejection():
     releases the slot WITH a penalty and feeds the Hub's false-slot verdict, and none of these
     responses are the slot's fault -- the request never reached the portal at all."""
     ops = _ops_with_submit("<html><head></head><body></body></html>")
-    assert ops.do_apply({"date": "2026-09-01", "period": 4}) == "session"
+    assert ops.do_apply({"date": "2026-09-01", "period": 4}) == "portal_unreachable"
 
 
 def test_datadome_interstitial_is_not_read_as_a_slot_rejection():
     ops = _ops_with_submit("<html><head>datadome challenge</head><body>x</body></html>")
-    assert ops.do_apply({"date": "2026-09-01", "period": 4}) == "session"
+    assert ops.do_apply({"date": "2026-09-01", "period": 4}) == "portal_unreachable"
 
 
 def test_release_slot_carries_the_penalty_tier():
@@ -1355,7 +1355,7 @@ def test_a_chrome_network_error_page_is_a_session_failure_not_a_slot_bounce():
     ops = _make_ops(emit=lambda t, **p: None)
     ops.session = _ChromeErrorSession()
     ops._run_warmup_steps = lambda: True
-    assert ops.do_apply({"date": "2026-09-14", "period": 3}) == "session"
+    assert ops.do_apply({"date": "2026-09-14", "period": 3}) == "portal_unreachable"
 
 
 def test_the_chrome_error_page_is_caught_even_without_the_chrome_error_url():
@@ -1364,7 +1364,7 @@ def test_the_chrome_error_page_is_caught_even_without_the_chrome_error_url():
     ops = _make_ops(emit=lambda t, **p: None)
     ops.session = _ChromeErrorSession(url="https://pedidodevistos.mne.gov.pt/VistosOnline/")
     ops._run_warmup_steps = lambda: True
-    assert ops.do_apply({"date": "2026-09-14", "period": 3}) == "session"
+    assert ops.do_apply({"date": "2026-09-14", "period": 3}) == "portal_unreachable"
 
 
 def test_a_real_portal_bounce_is_still_a_real_bounce():

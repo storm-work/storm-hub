@@ -328,6 +328,17 @@ class PhaseMachine:
                 self._to(WorkerSubstate.BOOKED)
                 return PhaseResult("booked", self._sub, str(slot), self.visited)
 
+            if outcome == "portal_unreachable":
+                # The request never left the machine (Chrome network-error page / blank / DataDome).
+                # The SESSION is fine -- do_apply re-warms at the top of every attempt, so simply
+                # taking the next assignment is the whole recovery. Rebuilding here threw away a
+                # healthy login and ~10 minutes of warmup for a transient dropped POST.
+                self.ops.release_slot(slot, "session")
+                slot = None
+                self._to(WorkerSubstate.HOLDING, detail="portal unreachable; retrying")
+                self.ops.poll_gap()
+                continue
+
             if outcome == "session":
                 # do_apply never got as far as talking to the portal about this slot -- its own
                 # re-warm failed (dead proxy, dropped tunnel). The slot is untouched and blameless:

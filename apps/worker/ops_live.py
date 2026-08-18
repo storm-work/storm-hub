@@ -1117,8 +1117,12 @@ class LiveEngineOps(EngineOps):
                           f"never reached the portal | slot={slot} | final_url={_final_url}")
                 if self._breaker is not None:
                     self._breaker.record_portal_down()
-                # OUR network, not the slot: released without penalty, session rebuilt.
-                return "session"
+                # OUR network, not the slot -- but ALSO not our session: ScheduleController had
+                # just returned 200 seconds earlier. Distinct from "session" so the caller does not
+                # tear down a demonstrably healthy login: confirmed live 2026-08-18, one dropped
+                # submit POST cost a full re-login and ~10 MINUTES back to bookable, three times
+                # over, while the run's real constraint is how rarely a login succeeds at all.
+                return "portal_unreachable"
 
             outcome = self._classify_submit_response(html, _final_url)
             if outcome == "verify_pdf":

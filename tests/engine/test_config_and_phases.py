@@ -343,3 +343,27 @@ def test_repeated_session_failures_never_park_the_worker_on_bounces():
 
     assert not [d for d in details if d.startswith("parked:")], details
     assert set(ops.release_reasons) == {"session"}
+
+
+def test_an_unreachable_portal_does_not_cost_the_login():
+    """A Chrome network-error page on the SUBMIT means the request never left the machine -- the
+    session is fine (ScheduleController had returned 200 seconds earlier). Rebuilding it threw away
+    a healthy login and ~10 MINUTES of warmup for one dropped POST, three times in a single run,
+    while the run's real constraint is how rarely a login succeeds at all. do_apply re-warms at the
+    top of every attempt, so taking the next assignment IS the recovery."""
+    ops = SimEngineOps(assignment={"date": "d1", "period": 3},
+                       apply_outcome=["portal_unreachable", "booked"], stop_after_polls=8)
+    res = PhaseMachine(_cfg(ROLE="apply"), ops).run()
+
+    assert res.outcome == "booked"
+    assert ops.logins == 1                        # the login was NOT thrown away
+    assert ops.release_reasons == ["session"]     # still released without a slot penalty
+
+
+def test_a_failed_rewarm_still_rebuilds_the_session():
+    """The distinction must hold in the other direction: when OUR warmup is what failed, the
+    session really does need rebuilding."""
+    ops = SimEngineOps(assignment={"date": "d1", "period": 3},
+                       apply_outcome=["session", "booked"], stop_after_polls=8)
+    PhaseMachine(_cfg(ROLE="apply"), ops).run()
+    assert ops.logins == 2
