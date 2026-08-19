@@ -194,12 +194,18 @@ def release_worker_resources(db: Session, worker_id: str, bus=None) -> None:
     registrations/bookings could exhaust the pool for everyone. Shared here (libs/, not apps/hub/
     scheduler.py) so both the scheduler's reap paths and the event consumer's normal-termination
     path call the exact same cleanup, not two copies that can drift."""
-    from libs.domain.enums import SlotStatus
+    from libs.domain.enums import SlotLeaseOutcome, SlotStatus
 
     release_proxy(db, worker_id)
     for lease in db.scalars(select(M.SlotLease).where(
             M.SlotLease.worker_id == worker_id, M.SlotLease.released_at.is_(None))).all():
         lease.released_at = datetime.now(timezone.utc)
+        # Record WHY. This set released_at and left outcome NULL, so a worker that ended while
+        # holding a lease produced a row indistinguishable from one still in flight -- invisible to
+        # every outcome-based query and report. Found by auditing a real run: 2 of its leases had no
+        # outcome at all. EXPIRED is the honest label: the worker went away without using it, which
+        # is the same meaning /start's retirement already gives the column.
+        lease.outcome = SlotLeaseOutcome.EXPIRED
         slot = db.get(M.Slot, lease.slot_id)
         if slot and slot.status == SlotStatus.LEASED:
             slot.status = SlotStatus.AVAILABLE

@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -309,3 +309,25 @@ def test_no_geo_filter_leaves_selection_untouched(db):
     db.commit()
     got, _ = lease_proxy(db, "w1", "soax")
     assert got.endpoint == "cz0:80"
+
+
+def test_terminal_release_records_an_outcome_on_the_lease(db):
+    """release_worker_resources set released_at and left outcome NULL, so a worker that ended while
+    holding a slot lease produced a row indistinguishable from one still in flight -- invisible to
+    every outcome-based query. Found by auditing a real run: 2 leases had no outcome at all."""
+    from libs.db import models as M
+    from libs.domain.enums import SlotLeaseOutcome, SlotStatus
+    from libs.proxies.lease import release_worker_resources
+
+    w = _worker(db)
+    slot = M.Slot(booking_id="bk1", posto_id="2032", date="2026-09-10", period=3,
+                  status=SlotStatus.LEASED)
+    db.add(slot); db.commit()
+    db.add(M.SlotLease(slot_id=slot.id, worker_id=w.id)); db.commit()
+
+    release_worker_resources(db, w.id)
+
+    lease = db.scalars(select(M.SlotLease)).one()
+    assert lease.released_at is not None
+    assert lease.outcome == SlotLeaseOutcome.EXPIRED
+    assert db.get(M.Slot, slot.id).status == SlotStatus.AVAILABLE   # and the slot is freed
