@@ -18,6 +18,7 @@ import signal
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parents[2]
@@ -141,6 +142,12 @@ class Supervisor:
         try:
             _LOG_DIR.mkdir(parents=True, exist_ok=True)
             sink = open(log_path, "ab", buffering=0)
+            # A run boundary. The file is APPENDED to across every launch of this worker id, and
+            # its contents carry no timestamps, so a file spanning several runs is impossible to
+            # attribute -- reading one cost a wrong conclusion about which proxy pool a run had
+            # used (2026-08-19). One dated marker per launch makes the boundaries findable.
+            sink.write(f"\n===== launch {datetime.now(timezone.utc).isoformat()} "
+                       f"{module} {key} =====\n".encode())
         except OSError:
             sink = subprocess.DEVNULL   # never let logging failure stop a launch
         proc = subprocess.Popen(
