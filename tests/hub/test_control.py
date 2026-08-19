@@ -434,3 +434,63 @@ def test_a_session_release_is_recorded_distinctly_from_a_bounce(slots_db):
     assert db.scalars(select(M.SlotLease)).one().outcome == SlotLeaseOutcome.SESSION
     assert db.scalars(select(M.Slot)).one().status == SlotStatus.AVAILABLE
     db.close()
+
+
+def test_a_confirmed_booking_marks_the_identity_booked_and_logs_it(slots_db):
+    """The worker row is NOT a durable record of a booking. Detaching an identity deletes its worker
+    outright and nulls the artifact's worker_id, so re-attaching gives a fresh READY worker with no
+    trace -- exactly what was reported for RICARDO RONALDO CORREIA MATOS: a booked PDF on disk, an
+    appointment row, and a worker showing "ready" whose log had never seen a booking.
+
+    IdentityStatus.BOOKED and the identity_events table both existed for this and neither had a
+    single writer anywhere in the codebase."""
+    from sqlalchemy import select
+
+    import apps.hub.events as ev
+    from libs.db import models as M
+    from libs.domain.enums import IdentityEvent, IdentityStatus, SlotStatus
+
+    bid, wid = _seed_apply_worker(slots_db)
+    db = slots_db()
+    ident = db.scalars(select(M.Identity)).one()
+    ident.status = IdentityStatus.ACTIVE
+    db.add(M.Slot(booking_id=bid, posto_id="3018", date="2026-09-14", period=3,
+                  status=SlotStatus.LEASED))
+    db.commit(); db.close()
+
+    ev.EventHub.__new__(ev.EventHub)._persist_booking(wid, {"date": "2026-09-14", "period": 3})
+
+    db = slots_db()
+    assert db.scalars(select(M.Identity)).one().status == IdentityStatus.BOOKED
+    e = db.scalars(select(M.IdentityEvent)).one()
+    assert e.event == IdentityEvent.BOOKED and e.booking_id == bid
+    db.close()
+
+
+def test_identity_bookkeeping_never_costs_the_booking_record(slots_db, monkeypatch):
+    """If the status/history write fails, the APPOINTMENT must still be recorded -- it is the thing
+    the system exists to produce, and bookkeeping is not allowed to take it down."""
+    from sqlalchemy import select
+
+    import apps.hub.events as ev
+    from libs.db import models as M
+    from libs.domain.enums import SlotStatus
+
+    bid, wid = _seed_apply_worker(slots_db)
+    db = slots_db()
+    db.add(M.Slot(booking_id=bid, posto_id="3018", date="2026-09-14", period=3,
+                  status=SlotStatus.LEASED))
+    db.commit(); db.close()
+
+    hub = ev.EventHub.__new__(ev.EventHub)
+    monkeypatch.setattr(hub, "_mark_identity_booked",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")),
+                        raising=False)
+    try:
+        hub._persist_booking(wid, {"date": "2026-09-14", "period": 3})
+    except RuntimeError:
+        pass
+
+    db = slots_db()
+    assert len(db.scalars(select(M.BookedAppointment)).all()) == 1
+    db.close()

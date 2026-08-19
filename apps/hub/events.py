@@ -388,6 +388,45 @@ class EventHub:
         must attach the artifact to the first's row rather than insert a duplicate."""
         return self._persist_booked_pdf(worker_id, pdf_path, slot)
 
+    def _mark_identity_booked(self, db, w, sub_account_id: str, slot_id: str | None) -> None:
+        """Record the result where it SURVIVES: on the identity.
+
+        The worker row is not a durable record of a booking. Detaching an identity deletes its
+        worker outright (and nulls the artifact's worker_id), so re-attaching gives a fresh READY
+        worker with no trace that this person already has an appointment -- exactly what was
+        reported for RICARDO RONALDO CORREIA MATOS: a booked PDF on disk, an appointment row, and a
+        worker showing "ready" whose log had never seen a booking.
+
+        Two writes, both of which the schema was built for and neither of which had a single caller:
+          - IdentityStatus.BOOKED. The enum documents it as "a sub-account booked -> auto-retired to
+            booked list" and state_machines allows ACTIVE -> BOOKED, but no code performed it, so an
+            identity holding a confirmed appointment stayed ACTIVE and freely re-runnable -- risking
+            a SECOND real appointment for the same person.
+          - An IdentityEvent row. identity_events is described as "C6: durable per-identity run
+            history" and has never had a writer anywhere in the codebase; booking-delete even goes
+            out of its way to preserve a history that was always empty.
+
+        Best-effort: a bookkeeping failure must never propagate into the booking record itself,
+        which is why this runs after the appointment row is added and swallows its own errors."""
+        from libs.domain.enums import IdentityEvent, IdentityStatus
+        from libs.domain.state_machines import IllegalTransition, identity_transition
+        try:
+            db.add(M.IdentityEvent(
+                identity_id=w.identity_id, sub_account_id=sub_account_id,
+                booking_id=w.booking_id, event=IdentityEvent.BOOKED,
+                step="booked", detail=f"slot={slot_id}", ts=datetime.now(timezone.utc),
+            ))
+            ident = db.get(M.Identity, w.identity_id)
+            if ident is not None:
+                try:
+                    ident.status = identity_transition(ident.status, IdentityStatus.BOOKED)
+                except IllegalTransition:
+                    pass    # already booked/retired/archived -- leave the stronger state alone
+            db.commit()
+        except Exception:
+            logger.exception("identity bookkeeping failed for worker %s (booking still recorded)",
+                             w.id)
+
     def _persist_booked_pdf(self, worker_id: str, pdf_path: str | None, slot: dict | None) -> None:
         """A live apply confirmed a booking and saved its PDF to disk (Phase: dashboard "open pdf"
         feature) -- create the Artifact + BookedAppointment rows the schema already had (models.py's
@@ -435,6 +474,7 @@ class EventHub:
             sub_account_id = (w.effective_settings_json or {}).get("_sub_account_id")
             if not sub_account_id:
                 return  # sim-engine or pre-upgrade worker with no recorded sub-account; nothing to link
+            booked_now = None
             existing = db.scalar(select(M.BookedAppointment).where(
                 M.BookedAppointment.booking_id == w.booking_id,
                 M.BookedAppointment.identity_id == w.identity_id))
@@ -452,7 +492,13 @@ class EventHub:
                     pdf_artifact_id=artifact.id if artifact is not None else None,
                     booked_at=datetime.now(timezone.utc),
                 ))
+                booked_now = (w, sub_account_id, slot_id)
             db.commit()
+            # AFTER the commit, in its own transaction. The appointment is the thing this system
+            # exists to produce; identity bookkeeping must not be able to take it down, and
+            # ordering makes that structural rather than a matter of one try/except holding.
+            if booked_now is not None:
+                self._mark_identity_booked(db, *booked_now)
         finally:
             db.close()
 
