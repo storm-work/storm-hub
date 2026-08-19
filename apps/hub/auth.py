@@ -113,6 +113,16 @@ def require_operator(principal: Principal = Depends(current_principal)) -> Princ
     return principal
 
 
+def require_admin(principal: Principal = Depends(current_principal)) -> Principal:
+    """Guard for admin-only surfaces. Deliberately does NOT require the operate seat: reading
+    credentials is not an operation on the fleet, and making it contend for the single seat would
+    push an admin into taking control just to export a list."""
+    from libs.domain.enums import UserRole
+    if principal.user.role != UserRole.ADMIN:
+        raise HTTPException(403, "admin role required")
+    return principal
+
+
 # ── Session lifecycle helpers ─────────────────────────────────────────────────
 def active_operator(db: Session) -> M.UserSession | None:
     return db.scalars(

@@ -660,3 +660,93 @@ def test_a_single_created_proxy_gets_its_geo_too(client):
                                       "credentials_ref": "package-350716-country-de-sessionid-Z-opt-wb:pw"},
                     headers=h)
     assert r.status_code == 201 and r.json()["geo"] == "DE"
+
+
+# ── booked identities: one row per PERSON, and admin-only credentials (2026-08-19) ────────────
+def _book_identity(client, h, *, name, itype="real", posto="2032", booking="BK1"):
+    """Create an identity with TWO sub-accounts and book it on one of them."""
+    import apps.hub.main as main
+    from libs.db import models as M
+    from libs.domain.enums import SlotStatus
+
+    iid = client.post("/identities", json={"full_name": name, "type": itype}, headers=h).json()["id"]
+    client.post("/identities/gen-subaccounts", json={"identity_ids": [iid], "count": 2}, headers=h)
+    bid = client.post("/bookings", json={"name": booking, "type": "test", "posto_id": posto},
+                      headers=h).json()["id"]
+    db = main.SessionLocal()
+    from sqlalchemy import select as _sel
+    subs = db.scalars(_sel(M.SubAccount).where(M.SubAccount.identity_id == iid)).all()
+    slot = M.Slot(booking_id=bid, posto_id=posto, date="2026-09-14", period=3,
+                  status=SlotStatus.TAKEN)
+    db.add(slot); db.commit()
+    db.add(M.BookedAppointment(booking_id=bid, identity_id=iid, sub_account_id=subs[1].id,
+                               slot_id=slot.id, booked_at=main._now()))
+    db.commit(); db.close()
+    return iid, subs[1].username
+
+
+def test_booked_list_has_one_row_per_identity_naming_the_winning_subaccount(client):
+    """"If any one of the sub-accounts booked, that identity is mission completed." An identity is a
+    PERSON; its sub-accounts are login attempts on their behalf, so this lists the person once and
+    names the account that actually got through."""
+    h = _operate_headers(client)
+    iid, winner = _book_identity(client, h, name="ANA BOOKED")
+
+    rows = client.get("/identities/booked", headers=h).json()
+    assert len(rows) == 1
+    assert rows[0]["identity_id"] == iid
+    assert rows[0]["sub_account_username"] == winner
+    assert rows[0]["posto_id"] == "2032" and rows[0]["slot_date"] == "2026-09-14"
+
+
+def test_a_booked_identity_disappears_from_the_attach_list(client):
+    """The attach panel's only source is /identities. Offering a person who already HAS an
+    appointment invites a second one for the same person."""
+    h = _operate_headers(client)
+    iid, _ = _book_identity(client, h, name="BEA BOOKED")
+    client.post("/identities", json={"full_name": "CARL FREE", "type": "real"}, headers=h)
+
+    names = [i["full_name"] for i in client.get("/identities", headers=h).json()]
+    assert "BEA BOOKED" not in names
+    assert "CARL FREE" in names
+
+
+def test_booked_list_filters_by_type_posto_and_date(client):
+    h = _operate_headers(client)
+    _book_identity(client, h, name="REAL ONE", itype="real", posto="2032", booking="B-A")
+    _book_identity(client, h, name="TEST ONE", itype="test", posto="3018", booking="B-B")
+
+    assert len(client.get("/identities/booked?type=real", headers=h).json()) == 1
+    assert len(client.get("/identities/booked?posto_id=3018", headers=h).json()) == 1
+    assert len(client.get("/identities/booked?type=real&posto_id=3018", headers=h).json()) == 0
+    future = "2099-01-01T00:00:00"
+    assert client.get(f"/identities/booked?date_from={future}", headers=h).json() == []
+
+
+def test_credentials_export_is_admin_only(client):
+    """The ONE endpoint that returns stored passwords. An operator seat is not enough."""
+    h = _operate_headers(client)                       # bootstrapped admin holds the seat
+    iid, _ = _book_identity(client, h, name="DORA BOOKED")
+
+    client.post("/auth/users", json={"username": "op1", "password": "pw", "role": "operator"},
+                headers=h)
+    r = client.post("/auth/login", json={"username": "op1", "password": "pw", "purpose": "view"})
+    oph = {"Authorization": f"Bearer {r.json()['token']}"}
+
+    assert client.post("/identities/booked/credentials", json={"identity_ids": [iid]},
+                       headers=oph).status_code == 403
+    ok = client.post("/identities/booked/credentials", json={"identity_ids": [iid]}, headers=h)
+    assert ok.status_code == 200 and ok.json()["count"] == 1
+    assert ok.json()["rows"][0]["password"]
+
+
+def test_credentials_export_only_returns_identities_that_actually_booked(client):
+    """It must not be usable to dump the account pool -- only identities WITH a booking."""
+    h = _operate_headers(client)
+    unbooked = client.post("/identities", json={"full_name": "EVE FREE", "type": "real"},
+                           headers=h).json()["id"]
+    client.post("/identities/gen-subaccounts", json={"identity_ids": [unbooked], "count": 2},
+                headers=h)
+
+    r = client.post("/identities/booked/credentials", json={"identity_ids": [unbooked]}, headers=h)
+    assert r.status_code == 200 and r.json()["count"] == 0

@@ -44,6 +44,7 @@ from libs.domain.state_machines import IllegalTransition, booking_transition
 from libs.domain.enums import HandoverStatus
 
 from .auth import (
+    require_admin,
     Principal,
     active_operator,
     current_principal,
@@ -74,6 +75,8 @@ from .settings_store import get_global, set_layer
 from .scheduler import _LAUNCH_BLOCKED_BOOKING_STATUSES, _aware, Scheduler
 from .supervisor import Supervisor
 from .schemas import (
+    BookedCredentialsRequest,
+    BookedIdentityOut,
     ArtifactOut,
     AttachIdentity,
     AuditRowOut,
@@ -968,14 +971,104 @@ def list_identities(db: Session = Depends(get_db)) -> list[IdentityOut]:
             .where(M.IdentityAllocation.released_at.is_(None))
         ).all()
     }
+    # Identities that already booked are excluded from this list entirely. The attach panel is its
+    # only consumer, and offering a person who already HAS an appointment invites a second one --
+    # "if any one of the sub-accounts booked, that identity is mission completed" (operator,
+    # 2026-08-19). They remain visible in their own right via /identities/booked.
+    booked_ids = {i for (i,) in db.execute(
+        select(M.BookedAppointment.identity_id).distinct()).all()}
     out: list[IdentityOut] = []
     for ident in identities:
+        if ident.id in booked_ids:
+            continue
         row = IdentityOut.model_validate(ident)
         booking = held.get(ident.id)
         if booking:
             row.allocated_booking_id, row.allocated_booking_name = booking
         out.append(row)
     return out
+
+
+@app.get("/identities/booked", response_model=list[BookedIdentityOut])
+def list_booked_identities(type: str | None = None, posto_id: str | None = None,
+                           date_from: str | None = None, date_to: str | None = None,
+                           db: Session = Depends(get_db),
+                           me: Principal = Depends(current_principal)) -> list[BookedIdentityOut]:
+    """Identities that have completed their mission -- one row per identity, never per sub-account.
+
+    "If any one of the sub-accounts booked, that identity is mission completed" (operator, 2026-08-19).
+    An identity is a PERSON; the sub-accounts are just login attempts at the portal on their behalf,
+    so a second appointment for the same person is a defect, not a bonus. This lists them once,
+    naming the sub-account that actually got through.
+
+    Filters mirror how the list is used: `type` (real vs test), `posto_id`, and a booked-at date
+    range. Readable by any signed-in role -- it carries no credentials (see
+    /identities/booked/credentials for those)."""
+    q = (select(M.BookedAppointment, M.Identity, M.SubAccount, M.Booking, M.Slot)
+         .join(M.Identity, M.Identity.id == M.BookedAppointment.identity_id)
+         .join(M.SubAccount, M.SubAccount.id == M.BookedAppointment.sub_account_id)
+         .join(M.Booking, M.Booking.id == M.BookedAppointment.booking_id)
+         .outerjoin(M.Slot, M.Slot.id == M.BookedAppointment.slot_id)
+         .order_by(M.BookedAppointment.booked_at.desc()))
+    if type:
+        q = q.where(M.Identity.type == type)
+    if posto_id:
+        q = q.where(M.Booking.posto_id == posto_id)
+    if date_from:
+        q = q.where(M.BookedAppointment.booked_at >= datetime.fromisoformat(date_from))
+    if date_to:
+        q = q.where(M.BookedAppointment.booked_at <= datetime.fromisoformat(date_to))
+
+    out: list[BookedIdentityOut] = []
+    seen: set[str] = set()
+    for appt, ident, sub, bk, slot in db.execute(q).all():
+        if ident.id in seen:
+            continue      # one row per IDENTITY -- see the docstring
+        seen.add(ident.id)
+        out.append(BookedIdentityOut(
+            identity_id=ident.id, full_name=ident.full_name, type=str(ident.type),
+            nationality=ident.nationality, passport_no=ident.passport_no,
+            sub_account_id=sub.id, sub_account_username=sub.username,
+            booking_id=bk.id, booking_name=bk.name, posto_id=bk.posto_id,
+            booked_at=appt.booked_at,
+            slot_date=slot.date if slot else None, slot_period=slot.period if slot else None,
+            pdf_artifact_id=appt.pdf_artifact_id,
+        ))
+    return out
+
+
+@app.post("/identities/booked/credentials")
+def export_booked_credentials(body: BookedCredentialsRequest, db: Session = Depends(get_db),
+                              me: Principal = Depends(require_admin)) -> dict:
+    """Username + password for the sub-accounts that actually booked. ADMIN ONLY.
+
+    This is the one endpoint in the system that returns stored passwords, so it is deliberately
+    narrow: admin role only, restricted to identities that HAVE a booking (you cannot use it to dump
+    the account pool), and it logs who exported what. It exists because the appointment is useless
+    without the credentials to log in and manage it."""
+    if not body.identity_ids:
+        return {"rows": [], "count": 0}
+    rows = db.execute(
+        select(M.Identity, M.SubAccount, M.Booking, M.BookedAppointment)
+        .join(M.BookedAppointment, M.BookedAppointment.identity_id == M.Identity.id)
+        .join(M.SubAccount, M.SubAccount.id == M.BookedAppointment.sub_account_id)
+        .join(M.Booking, M.Booking.id == M.BookedAppointment.booking_id)
+        .where(M.Identity.id.in_(body.identity_ids))
+        .order_by(M.Identity.full_name)
+    ).all()
+    seen: set[str] = set()
+    out = []
+    for ident, sub, bk, appt in rows:
+        if ident.id in seen:
+            continue
+        seen.add(ident.id)
+        out.append({"full_name": ident.full_name, "username": sub.username,
+                    "password": sub.password, "posto_id": bk.posto_id,
+                    "booking": bk.name,
+                    "booked_at": appt.booked_at.isoformat() if appt.booked_at else None})
+    logger.warning("credentials export by admin %s: %d booked identity/identities",
+                   me.user.username, len(out))
+    return {"rows": out, "count": len(out)}
 
 
 @app.patch("/identities/{identity_id}", response_model=IdentityOut)

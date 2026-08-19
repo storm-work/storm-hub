@@ -93,6 +93,30 @@ class IdentityOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class BookedIdentityOut(BaseModel):
+    """One row per IDENTITY that has completed its mission -- never per sub-account. An identity is
+    a person; its sub-accounts are just login attempts on their behalf, so a second appointment for
+    the same person is a defect. Names the sub-account that actually got through."""
+    identity_id: str
+    full_name: str
+    type: str
+    nationality: str | None = None
+    passport_no: str | None = None
+    sub_account_id: str
+    sub_account_username: str
+    booking_id: str
+    booking_name: str
+    posto_id: str
+    booked_at: datetime | None = None
+    slot_date: str | None = None
+    slot_period: int | None = None
+    pdf_artifact_id: str | None = None
+
+
+class BookedCredentialsRequest(BaseModel):
+    identity_ids: list[str]
+
+
 # ── Bookings ──────────────────────────────────────────────────────────────────
 class BookingCreate(BaseModel):
     name: str

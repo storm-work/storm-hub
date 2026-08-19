@@ -1346,6 +1346,115 @@ function summarizeSubAccounts(subs) {
   return Object.entries(counts).map(([status, n]) => `${n} ${status}`).join(" + ");
 }
 
+
+// ── Booked identities ─────────────────────────────────────────────────────────────────────────
+// One row per IDENTITY, never per sub-account: an identity is a PERSON, its sub-accounts are just
+// login attempts on their behalf, so "if any one of the sub-accounts booked, that identity is
+// mission completed" (operator, 2026-08-19). A second appointment for the same person is a defect.
+function BookedIdentities({ me }) {
+  const [type, setType] = useState("all");
+  const [posto, setPosto] = useState("");
+  const [from, setFrom] = useState("");
+  const [to, setTo] = useState("");
+  const [sel, setSel] = useState({});
+  const [msg, setMsg] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const qs = new URLSearchParams();
+  if (type !== "all") qs.set("type", type);
+  if (posto) qs.set("posto_id", posto);
+  if (from) qs.set("date_from", `${from}T00:00:00`);
+  if (to) qs.set("date_to", `${to}T23:59:59`);
+  const { rows, err } = useList(`/identities/booked${qs.toString() ? "?" + qs : ""}`,
+                                { pollMs: 15000 });
+  const { q, setQ, sort, setSort, rows: shown } = useSortSearch(rows, { key: "booked_at", dir: "desc" });
+  const selectedIds = Object.keys(sel).filter((k) => sel[k]);
+  const postos = [...new Set(rows.map((r) => r.posto_id))].sort();
+
+  // Admin only, and it is the one place stored passwords leave the server -- the appointment is
+  // useless without the credentials to log in and manage it, but that is not an operator's to take.
+  async function download() {
+    setMsg(""); setBusy(true);
+    try {
+      const r = await api("/identities/booked/credentials",
+                          { method: "POST", body: { identity_ids: selectedIds } });
+      const head = "full_name,username,password,posto_id,booking,booked_at";
+      const csv = [head, ...r.rows.map((x) => [x.full_name, x.username, x.password,
+        x.posto_id, x.booking, x.booked_at || ""].map((v) => `"${String(v).replace(/"/g, '""')}"`).join(","))].join("\n");
+      const url = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `booked-credentials-${new Date().toISOString().slice(0, 10)}.csv`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 60_000);
+      setMsg(`Downloaded ${r.count} credential row(s).`);
+    } catch (e) { setMsg(e.message); } finally { setBusy(false); }
+  }
+
+  return (
+    <div className="card" style={{ marginTop: 12 }}>
+      <div className="row" style={{ marginBottom: 10, flexWrap: "wrap", gap: 10 }}>
+        <h3 style={{ margin: 0 }}>Booked ({shown.length}/{rows.length})</h3>
+        <span className="grow" />
+        <SearchBox q={q} setQ={setQ} placeholder="search booked…" />
+        <div className="field" style={{ margin: 0 }}><label>Type</label>
+          <select value={type} onChange={(e) => setType(e.target.value)}>
+            <option value="all">all</option><option value="real">real</option>
+            <option value="test">test</option>
+          </select></div>
+        <div className="field" style={{ margin: 0 }}><label>Posto</label>
+          <select value={posto} onChange={(e) => setPosto(e.target.value)}>
+            <option value="">all</option>
+            {postos.map((p) => <option key={p} value={p}>{p}</option>)}
+          </select></div>
+        <div className="field" style={{ margin: 0 }}><label>Booked from</label>
+          <input type="date" value={from} onChange={(e) => setFrom(e.target.value)} /></div>
+        <div className="field" style={{ margin: 0 }}><label>to</label>
+          <input type="date" value={to} onChange={(e) => setTo(e.target.value)} /></div>
+        {me.role === "admin" && (
+          <button className="btn ghost" disabled={!selectedIds.length || busy} onClick={download}
+                  title={!selectedIds.length ? "select rows to export"
+                         : `download username + password for ${selectedIds.length} identity/identities`}>
+            {busy ? "Preparing…" : `⬇ Credentials (${selectedIds.length})`}
+          </button>
+        )}
+      </div>
+      {err && <div className="banner err">{err}</div>}
+      {msg && <div className="banner">{msg}</div>}
+      <table className="table-compact"><thead><tr>
+        {me.role === "admin" && <th style={{ width: "3%" }}>
+          <input type="checkbox"
+                 checked={!!shown.length && shown.every((r) => sel[r.identity_id])}
+                 onChange={(e) => setSel(e.target.checked
+                   ? Object.fromEntries(shown.map((r) => [r.identity_id, true])) : {})} /></th>}
+        <Sortable label="Identity" k="full_name" sort={sort} setSort={setSort} w="22%" />
+        <Sortable label="Type" k="type" sort={sort} setSort={setSort} w="7%" />
+        <Sortable label="Booked sub-account" k="sub_account_username" sort={sort} setSort={setSort} w="16%" />
+        <Sortable label="Posto" k="posto_id" sort={sort} setSort={setSort} w="8%" />
+        <Sortable label="Appointment" k="slot_date" sort={sort} setSort={setSort} w="14%" />
+        <Sortable label="Booked at" k="booked_at" sort={sort} setSort={setSort} w="16%" />
+        <th style={{ width: "8%" }}>PDF</th></tr></thead>
+        <tbody>{shown.map((r) => (
+          <tr key={r.identity_id}>
+            {me.role === "admin" && <td><input type="checkbox" checked={!!sel[r.identity_id]}
+              onChange={(e) => setSel({ ...sel, [r.identity_id]: e.target.checked })} /></td>}
+            <td>{r.full_name}</td>
+            <td><span className="pill">{r.type}</span></td>
+            <td className="muted">{r.sub_account_username}</td>
+            <td>{r.posto_id}</td>
+            <td>{r.slot_date ? `${r.slot_date} p${r.slot_period}` : "—"}</td>
+            <td className="muted">{r.booked_at ? r.booked_at.slice(0, 19).replace("T", " ") : "—"}</td>
+            <td>{r.pdf_artifact_id
+              ? <button className="btn ghost btn-sm"
+                        onClick={() => openFile(`/artifacts/${r.pdf_artifact_id}/file`)}>open</button>
+              : <span className="muted">—</span>}</td>
+          </tr>
+        ))}</tbody></table>
+      {rows.length === 0 && <div className="muted">No booked identities yet.</div>}
+    </div>
+  );
+}
+
 function Identities({ me, setLeftPanel, setRightPanel }) {
   const { rows, err, reload } = useList("/identities");
   const { rows: subRows, reload: reloadSubs } = useList("/sub-accounts");
@@ -1395,6 +1504,7 @@ function Identities({ me, setLeftPanel, setRightPanel }) {
   }
 
   return (
+    <>
     <div className="card">
       <div className="row" style={{ marginBottom: 10, flexWrap: "wrap", gap: 10 }}>
         <h2 style={{ margin: 0 }}>Identities ({shown.length}/{rows.length})</h2>
@@ -1449,7 +1559,12 @@ function Identities({ me, setLeftPanel, setRightPanel }) {
           </tr>
         ))}</tbody></table>
       {shown.length === 0 && <div className="muted">No identities match this filter.</div>}
-    </div>
+      </div>
+      {/* Booked identities live in their own table: they are deliberately absent from the list
+          above (and so from the attach panel it feeds), because a person who already has an
+          appointment must not be offered for another one. */}
+      <BookedIdentities me={me} />
+    </>
   );
 }
 
