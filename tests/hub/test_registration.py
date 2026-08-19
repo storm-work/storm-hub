@@ -348,3 +348,69 @@ def test_reg_result_failed_leaves_subaccount_status_alone(client):
     assert updated["registration_status"] == "failed"
     jobs = c.get("/registration/jobs", headers=h).json()
     assert jobs[0]["status"] == "failed"
+
+
+# ── registration proxy selection (operator question 2026-08-19) ───────────────────────────────
+def _mk_proxy(db, M, *, provider, kind, geo, healthy=True):
+    p = M.Proxy(provider=provider, kind=kind, endpoint=f"{provider}-{geo}:5000",
+                credentials_ref=f"package-1-country-{(geo or 'xx').lower()}-sessionid-{geo}-opt-wb:pw",
+                max_sessions=2, active=True, is_healthy=healthy, geo=geo)
+    db.add(p); db.commit()
+    return p
+
+
+def test_registration_selects_proxies_by_provider_kind_and_geo(client):
+    """The endpoint always supported provider/kind; geo is new, and registration needs it for the
+    same reason booking does -- it hits the same portal behind the same reCAPTCHA, where the gate is
+    the reputation of the IP presenting the token."""
+    c, TestSession = client
+    import apps.hub.main as main
+    from libs.db import models as M
+
+    h = _op_headers(c)
+    db = TestSession()
+    _mk_proxy(db, M, provider="soax_mobile", kind="mobile", geo="DE")
+    _mk_proxy(db, M, provider="soax_mobile", kind="mobile", geo="IT")
+    _mk_proxy(db, M, provider="soax", kind="rotating", geo="CZ")
+    db.close()
+
+    iid = c.post("/identities", json={"full_name": "REG ONE", "type": "test"},
+                      headers=h).json()["id"]
+    c.post("/identities/gen-subaccounts", json={"identity_ids": [iid], "count": 1}, headers=h)
+    sid = c.get("/sub-accounts", headers=h).json()[0]["id"]
+
+    # a provider with no matching kind is refused, and says so
+    r = c.post("/registration/run",
+                    json={"sub_account_ids": [sid], "provider": "soax", "kind": "mobile"}, headers=h)
+    assert r.status_code == 409 and "kind=mobile" in r.json()["detail"]
+
+    # a geo with no members is refused too
+    r2 = c.post("/registration/run",
+                     json={"sub_account_ids": [sid], "provider": "soax_mobile", "kind": "mobile",
+                           "geos": "PT"}, headers=h)
+    assert r2.status_code == 409 and "geo=PT" in r2.json()["detail"]
+
+
+def test_registration_geo_filter_never_excludes_an_unclassified_proxy(client):
+    """Same rule as lease_proxy: a filter narrows the pool, it must not silently empty it for a
+    provider whose credentials carry no country."""
+    c, TestSession = client
+    import apps.hub.main as main
+    from libs.db import models as M
+
+    h = _op_headers(c)
+    db = TestSession()
+    p = _mk_proxy(db, M, provider="nogeo", kind="mobile", geo=None)
+    db.close()
+
+    iid = c.post("/identities", json={"full_name": "REG TWO", "type": "test"},
+                      headers=h).json()["id"]
+    c.post("/identities/gen-subaccounts", json={"identity_ids": [iid], "count": 1}, headers=h)
+    sid = c.get("/sub-accounts", headers=h).json()[0]["id"]
+
+    r = c.post("/registration/run",
+                    json={"sub_account_ids": [sid], "provider": "nogeo", "geos": "DE,IT"}, headers=h)
+    # It may still fail later (CAPSOLVER keys aren't configured in this fixture) -- what matters is
+    # that it did NOT fail on proxy selection, i.e. the NULL-geo proxy was not filtered out.
+    detail = r.json().get("detail", "") if r.status_code >= 400 else ""
+    assert "proxies available" not in detail, detail

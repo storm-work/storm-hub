@@ -264,6 +264,10 @@ class RegistrationRunRequest(BaseModel):
     provider: str = "soax"                   # proxy provider for registration (soax confirmed
                                               # preferred; see conversation_extract)
     kind: str | None = None
+    # Same selector the booking path has (PROXY_GEOS): comma-separated exit countries, blank = all.
+    # Registration hits the same portal behind the same reCAPTCHA, so the geo of the IP matters here
+    # for the same reason it does at login.
+    geos: str | None = None
     mode: str = "parallel"                   # RegistrationMode value
 
 

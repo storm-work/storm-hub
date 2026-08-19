@@ -1932,10 +1932,26 @@ function Registration({ me, events }) {
   const [typeFilter, setTypeFilter] = useState("all");              // all | test | real
   const [concurrency, setConcurrency] = useState(10);
   const [provider, setProvider] = useState("soax");
-  const [kind, setKind] = useState("mobile");
+  const [kind, setKind] = useState("");
+  const [geos, setGeos] = useState("");
   const [msg, setMsg] = useState("");
   const [runInfo, setRunInfo] = useState(null);
   const op = me.is_operating;
+
+  // Provider/kind/geo come from the POOL, not a hardcoded list. They used to be two fixed options
+  // ("soax", "webshare"), so a newly imported pool -- soax_mobile, say -- was simply unreachable
+  // from this page however many proxies it had. Deriving them also lets the count below tell you a
+  // selection is empty BEFORE you press Register, instead of a 409 afterwards.
+  const { rows: poolRows } = useList("/proxies");
+  const providers = [...new Set(poolRows.map((p) => p.provider))].sort();
+  const kinds = [...new Set(poolRows.filter((p) => p.provider === provider).map((p) => p.kind))].sort();
+  const geoOpts = [...new Set(poolRows.filter((p) => p.provider === provider && p.geo)
+                                      .map((p) => p.geo))].sort();
+  const wantGeos = geos.split(",").map((g) => g.trim().toUpperCase()).filter(Boolean);
+  const matching = poolRows.filter((p) =>
+    p.provider === provider && p.active && p.is_healthy !== false
+    && (!kind || p.kind === kind)
+    && (!wantGeos.length || !p.geo || wantGeos.includes(p.geo))).length;
 
   const typeFiltered = rows.filter((s) => typeFilter === "all" || s.identity_type === typeFilter);
   const statusFiltered = typeFiltered.filter((s) => {
@@ -1954,7 +1970,8 @@ function Registration({ me, events }) {
     try {
       const r = await api("/registration/run", {
         method: "POST",
-        body: { sub_account_ids: selectedIds, concurrency: Number(concurrency), provider, kind },
+        body: { sub_account_ids: selectedIds, concurrency: Number(concurrency), provider,
+                kind: kind || null, geos: geos || null },
       });
       setRunInfo(r);
       setSel({});
@@ -2001,13 +2018,25 @@ function Registration({ me, events }) {
             <span>{selectedIds.length} selected</span>
             <span className="grow" />
             <div className="field" style={{ margin: 0 }}><label>Provider</label>
-              <select value={provider} onChange={(e) => setProvider(e.target.value)} disabled={!op}>
-                <option value="soax">soax</option><option value="webshare">webshare</option>
+              <select value={provider} onChange={(e) => { setProvider(e.target.value); setKind(""); }}
+                      disabled={!op}>
+                {providers.map((p) => <option key={p} value={p}>{p}</option>)}
               </select></div>
             <div className="field" style={{ margin: 0 }}><label>Kind</label>
               <select value={kind} onChange={(e) => setKind(e.target.value)} disabled={!op}>
-                <option value="rotating">rotating</option><option value="mobile">mobile</option>
+                <option value="">any</option>
+                {kinds.map((k) => <option key={k} value={k}>{k}</option>)}
               </select></div>
+            <div className="field" style={{ margin: 0 }}><label>Geo</label>
+              <select value={geos} onChange={(e) => setGeos(e.target.value)} disabled={!op}
+                      title="exit country; registration hits the same portal behind the same reCAPTCHA">
+                <option value="">any</option>
+                {geoOpts.map((g) => <option key={g} value={g}>{g}</option>)}
+                {geoOpts.length > 1 && <option value={geoOpts.join(",")}>{geoOpts.join(",")}</option>}
+              </select></div>
+            <span className={matching ? "muted" : "err"} style={{ fontSize: 12 }}>
+              {matching} proxy{matching === 1 ? "" : "s"} match
+            </span>
             <div className="field" style={{ margin: 0 }}><label>Concurrency</label>
               <input type="number" value={concurrency} onChange={(e) => setConcurrency(e.target.value)} disabled={!op} style={{ width: 60 }} /></div>
             <button className="btn ghost" disabled={!op} onClick={reset}>Reset (regen credentials)</button>

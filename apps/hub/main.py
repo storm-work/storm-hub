@@ -1434,9 +1434,16 @@ def run_registration(body: RegistrationRunRequest, db: Session = Depends(get_db)
                               M.Proxy.is_healthy.is_(True))
     if body.kind:
         q = q.where(M.Proxy.kind == body.kind)
+    geos = _geos(body.geos)
+    if geos:
+        # NULL geo is never excluded, exactly as in lease_proxy: a filter narrows the pool, it must
+        # not silently empty it for a provider whose credentials carry no country.
+        q = q.where(M.Proxy.geo.in_(geos) | M.Proxy.geo.is_(None))
     proxy_rows = list(db.scalars(q).all())
     if not proxy_rows:
-        raise HTTPException(409, f"no active healthy {body.provider} proxies available")
+        raise HTTPException(409, f"no active healthy {body.provider} proxies available"
+                                 + (f" (kind={body.kind})" if body.kind else "")
+                                 + (f" (geo={body.geos})" if body.geos else ""))
     proxies = [{"id": p.id, "url": conn_url(p)} for p in proxy_rows]
 
     g = get_global(db)
