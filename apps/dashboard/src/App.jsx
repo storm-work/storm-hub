@@ -735,7 +735,7 @@ function BookingShortcutSettings({ me, booking, onSaved }) {
       <div className="field" style={{ margin: 0, display: "flex", alignItems: "center", gap: 8 }}>
         <input type="checkbox" id="hold-swap-toggle" checked={swapOn} disabled={!op}
           onChange={(e) => saveFields({ HOLD_SWAP_AFTER_FOUND: e.target.checked })} />
-        <label htmlFor="hold-swap-toggle" style={{ margin: 0 }}>Swap after slot found</label>
+        <label htmlFor="hold-swap-toggle" style={{ margin: 0 }}>Swap after warmup</label>
       </div>
       <div className="field" style={{ margin: 0, minWidth: 220 }}>
         <label>Post-hold phase proxy pool{!swapOn ? " (enabled when swap is on)" : ""}</label>

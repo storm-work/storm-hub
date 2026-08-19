@@ -749,12 +749,18 @@ class LiveEngineOps(EngineOps):
         truthiness, not its content; add one if a caller ever needs the real IP), or None if swap is
         off, unavailable, or every attempt failed its health check (in which case the ORIGINAL
         phase-1 session is left untouched and the worker keeps holding on it)."""
-        # Flipped unconditionally, before either early-return below -- a rotation request during
-        # holding must draw from the hold pool even when swap itself is off/unavailable (P3, the
-        # operator's explicit requirement).
-        self._current_phase = "hold"
-        if not self.cfg.hold_swap.swap_after_found:
+        # OFF means OFF: skip the swap step entirely and stay on the phase-1 proxy, so later
+        # rotation requests keep drawing from the phase-1 pool.
+        #
+        # This used to flip _current_phase unconditionally, on the reading that pool selection
+        # "will not be different when swap is off". That was wrong, and it silently overrode the
+        # booking's own choice of provider: HOLD_PROXY_PROVIDER defaults to webshare, so a booking
+        # configured PROXY_PROVIDER=soax spent most of its life on webshare instead. Confirmed live
+        # 2026-08-19 -- every worker had frozen PROXY_PROVIDER='soax' and the run still took 1427
+        # webshare leases against 552 soax, with every login going through p.webshare.io.
+        if not self.cfg.hold_swap.swap_after_warmup:
             return None
+        self._current_phase = "hold"
         if not self.hold_proxy:
             self._log("do_swap: HOLD_SWAP_AFTER_FOUND is on but no hold_proxy was provided -- skipping")
             return None

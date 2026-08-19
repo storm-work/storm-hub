@@ -66,13 +66,13 @@ class _FakeSession:
 def test_do_swap_off_by_default_returns_none():
     ops = _make_ops()
     ops.session = _FakeSession()
-    assert ops.cfg.hold_swap.swap_after_found is False   # catalog default
+    assert ops.cfg.hold_swap.swap_after_warmup is False   # catalog default
     assert ops.do_swap() is None
     assert ops.session.closed is False   # untouched
 
 
 def test_do_swap_on_but_no_hold_proxy_returns_none():
-    ops = _make_ops(cfg=_cfg(HOLD_SWAP_AFTER_FOUND=True))
+    ops = _make_ops(cfg=_cfg(HOLD_SWAP_AFTER_WARMUP=True))
     ops.session = _FakeSession()
     assert ops.do_swap() is None
 
@@ -80,7 +80,7 @@ def test_do_swap_on_but_no_hold_proxy_returns_none():
 def test_do_swap_success_replaces_session_and_closes_old(monkeypatch):
     import apps.worker.ops_live as ops_live_mod
 
-    ops = _make_ops(cfg=_cfg(HOLD_SWAP_AFTER_FOUND=True), hold_proxy="http://u:p@holdhost:9999")
+    ops = _make_ops(cfg=_cfg(HOLD_SWAP_AFTER_WARMUP=True), hold_proxy="http://u:p@holdhost:9999")
     old_session = _FakeSession()
     ops.session = old_session
     new_session = _FakeSession(alive=True)
@@ -98,7 +98,7 @@ def test_do_swap_reverts_on_failed_health_check(monkeypatch):
 
     # HOLD_SWAP_RETRIES=0 -- testing the single-attempt revert behavior in isolation from the retry
     # protocol (covered separately below).
-    ops = _make_ops(cfg=_cfg(HOLD_SWAP_AFTER_FOUND=True, HOLD_SWAP_RETRIES=0),
+    ops = _make_ops(cfg=_cfg(HOLD_SWAP_AFTER_WARMUP=True, HOLD_SWAP_RETRIES=0),
                     hold_proxy="http://u:p@holdhost:9999")
     old_session = _FakeSession()
     ops.session = old_session
@@ -130,7 +130,7 @@ def test_do_swap_retries_with_fresh_proxy_and_succeeds_on_final_attempt(monkeypa
     sleeps = []
     monkeypatch.setattr(ops_live_mod.time, "sleep", lambda s: sleeps.append(s))
 
-    ops = _make_ops(cfg=_cfg(HOLD_SWAP_AFTER_FOUND=True, HOLD_SWAP_RETRIES=1,
+    ops = _make_ops(cfg=_cfg(HOLD_SWAP_AFTER_WARMUP=True, HOLD_SWAP_RETRIES=1,
                              HOLD_SWAP_RETRY_HOLD_SECS=600.0),
                     hold_proxy="http://u:p@holdhost:9999", emit=lambda t, **p: None,
                     signals=_RotationSignals(proxy="http://u:p@freshhold:8888"))
@@ -150,7 +150,7 @@ def test_do_swap_gives_up_after_exhausting_retries_never_stops_worker(monkeypatc
     monkeypatch.setattr(ops_live_mod, "get_session", lambda **kw: _FakeSession(alive=False))
     monkeypatch.setattr(ops_live_mod.time, "sleep", lambda s: None)
 
-    ops = _make_ops(cfg=_cfg(HOLD_SWAP_AFTER_FOUND=True, HOLD_SWAP_RETRIES=2), emit=lambda t, **p: None,
+    ops = _make_ops(cfg=_cfg(HOLD_SWAP_AFTER_WARMUP=True, HOLD_SWAP_RETRIES=2), emit=lambda t, **p: None,
                     hold_proxy="http://u:p@holdhost:9999",
                     signals=_RotationSignals(proxy="http://u:p@freshhold:8888"))
     original_session = _FakeSession()
@@ -210,7 +210,7 @@ def test_do_swap_passes_stable_fp_seed(monkeypatch):
         return _FakeSession(alive=True)
 
     monkeypatch.setattr(ops_live_mod, "get_session", _spy)
-    ops = _make_ops(cfg=_cfg(HOLD_SWAP_AFTER_FOUND=True), hold_proxy="http://u:p@holdhost:9999")
+    ops = _make_ops(cfg=_cfg(HOLD_SWAP_AFTER_WARMUP=True), hold_proxy="http://u:p@holdhost:9999")
     ops.session = _FakeSession()
     ops.do_swap()
     assert captured.get("fp_seed") == "u"
@@ -262,16 +262,20 @@ def test_request_proxy_rotation_returns_none_when_pool_exhausted():
     assert ops._request_proxy_rotation("warmup") is None
 
 
-def test_do_swap_flips_current_phase_to_hold_even_when_swap_off():
-    """The operator's explicit requirement: phase-based proxy-pool selection for rotation "will not
-    be different when swap is off" -- do_swap() must flip the tracked phase unconditionally, before
-    its own early-return for HOLD_SWAP_AFTER_FOUND being off."""
+def test_do_swap_does_not_touch_the_pool_phase_when_swap_is_off():
+    """REVERSED by the operator 2026-08-19. This previously asserted the opposite -- that the phase
+    flips unconditionally because pool selection "will not be different when swap is off".
+
+    That reading was wrong in practice: HOLD_PROXY_PROVIDER defaults to webshare, so flipping the
+    phase with the swap OFF silently overrode the booking's own provider. A booking configured
+    PROXY_PROVIDER=soax took 1427 webshare leases against 552 soax, and every login went through
+    p.webshare.io. Off means off: skip the swap step and stay on the phase-1 pool."""
     ops = _make_ops()
     assert ops._current_phase == "warmup"
     ops.session = _FakeSession()
-    assert ops.cfg.hold_swap.swap_after_found is False   # catalog default: swap off
+    assert ops.cfg.hold_swap.swap_after_warmup is False   # catalog default: swap off
     assert ops.do_swap() is None
-    assert ops._current_phase == "hold"
+    assert ops._current_phase == "warmup"
 
 
 def test_fresh_login_requests_proxy_rotation_before_retry(monkeypatch):
@@ -1375,3 +1379,22 @@ def test_a_real_portal_bounce_is_still_a_real_bounce():
                                      "https://pedidodevistos.mne.gov.pt/VistosOnline/")
     ops._run_warmup_steps = lambda: True
     assert ops.do_apply({"date": "2026-09-14", "period": 3}) == "no_slot"
+
+
+# ── "swap after warmup" OFF must mean OFF (operator correction 2026-08-19) ────────────────────
+def test_swap_on_moves_the_worker_to_the_hold_pool(monkeypatch):
+    import apps.worker.ops_live as ops_live_mod
+
+    ops = _make_ops(cfg=_cfg(HOLD_SWAP_AFTER_WARMUP=True), hold_proxy="http://u:p@holdhost:9999")
+    ops.session = _FakeSession()
+    monkeypatch.setattr(ops_live_mod, "get_session", lambda **kw: _FakeSession(alive=True))
+    assert ops.do_swap() == "holdhost:9999"
+    assert ops._current_phase == "hold"
+
+
+def test_the_deprecated_setting_name_still_enables_the_swap():
+    """HOLD_SWAP_AFTER_FOUND named a trigger point the code never had -- the swap has always fired
+    right after warmup. The key is kept working because removing one an operator already stored
+    makes the resolver reject the whole layer and breaks every launch."""
+    cfg = _cfg(HOLD_SWAP_AFTER_FOUND=True)
+    assert cfg.hold_swap.swap_after_warmup is True

@@ -293,6 +293,14 @@ _TEMPLATE = [
        note="anti-herd: stagger checkpoint-restore attempts after a mass relaunch"),
     _s("SESSION_REFRESH_STAGGER", L.TEMPLATE, float, 120.0, _WRK, "keepalive"),
     # Hold / ISP swap
+    # Fires right after WARMUP completes (phases.py, between WARMED and HOLDING) -- the old name
+    # HOLD_SWAP_AFTER_FOUND described a trigger point the code never had. When OFF the swap step is
+    # skipped entirely and the worker stays on its phase-1 proxy for the whole run.
+    _s("HOLD_SWAP_AFTER_WARMUP", L.TEMPLATE, bool, False, _TPL_BK, "hold_swap",
+       note="swap to the hold proxy pool once warmup is done; off = never swap"),
+    # DEPRECATED spelling of HOLD_SWAP_AFTER_WARMUP, kept ONLY so stored booking/template settings
+    # still resolve -- removing a key an operator already saved makes the resolver reject the whole
+    # layer and breaks every launch. HOLD_SWAP_AFTER_WARMUP wins when both are present.
     _s("HOLD_SWAP_AFTER_FOUND", L.TEMPLATE, bool, False, _TPL_BK, "hold_swap",
        note="on/off switch for the phase-1->phase-2 proxy swap (LiveEngineOps.do_swap); off by "
             "default -- a worker just keeps its phase-1 (PROXY_PROVIDER) proxy for the whole run. "

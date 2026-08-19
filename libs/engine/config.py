@@ -45,7 +45,10 @@ class KeepaliveConfig:
 
 @dataclass(frozen=True)
 class HoldSwapConfig:
-    swap_after_found: bool = False
+    # Named for WHEN it happens: the swap fires immediately after warmup completes (phases.py runs
+    # it between WARMED and HOLDING), NOT after slot-found. The old name HOLD_SWAP_AFTER_FOUND
+    # described a trigger point that was never the code's.
+    swap_after_warmup: bool = False
     swap_retries: int = 3
     retry_hold_secs: float = 600.0
     verify: bool = True
@@ -137,7 +140,14 @@ class EngineConfig:
                 jitter=float(g("KEEPALIVE_JITTER", 30.0)),
             ),
             hold_swap=HoldSwapConfig(
-                swap_after_found=bool(g("HOLD_SWAP_AFTER_FOUND", False)),
+                # Either spelling enables it. HOLD_SWAP_AFTER_FOUND is the deprecated name, still
+                # honoured so bookings/templates that already store it keep working -- dropping a
+                # key an operator saved makes the resolver reject the whole layer and breaks every
+                # launch. A plain `g(new, g(old, False))` does NOT work here: resolve() populates
+                # every catalog key with its default, so the new key is always present and the
+                # fallback never fires. OR is the only reading that respects a stored old key.
+                swap_after_warmup=bool(g("HOLD_SWAP_AFTER_WARMUP", False))
+                                  or bool(g("HOLD_SWAP_AFTER_FOUND", False)),
                 swap_retries=int(g("HOLD_SWAP_RETRIES", 3)),
                 retry_hold_secs=float(g("HOLD_SWAP_RETRY_HOLD_SECS", 600.0)),
                 verify=bool(g("HOLD_VERIFY", True)),
