@@ -768,7 +768,11 @@ function BookingOpsTabs({ me, booking, events, workers, setRightPanel, onBooking
 
 function BookingSlots({ booking, me }) {
   const { rows, err, reload } = useList(`/bookings/${booking.id}/slots`, { pollMs: 5000 });
-  const [statusFilter, setStatusFilter] = useState("all");
+  // Default view hides CLOSED. "Clear" RETIRES slots rather than deleting them -- the row is live
+  // state, not junk: rediscovery flips CLOSED -> AVAILABLE, and it carries the slot's history. But
+  // showing retired rows at equal prominence made a successful Clear look like it had done nothing,
+  // which is exactly how it was reported. TAKEN always shows: that is a real booking.
+  const [statusFilter, setStatusFilter] = useState("live");
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
   // Slots are per-run OBSERVATIONS, and a stale pool makes the scheduler fire slot_found on the
@@ -784,7 +788,10 @@ function BookingSlots({ booking, me }) {
     setBusy(true); setMsg("");
     try {
       const r = await api(`/bookings/${booking.id}/slots`, { method: "DELETE" });
-      setMsg(`Cleared ${r.cleared} slot(s).`);
+      const taken = rows.filter((s) => s.status === "taken").length;
+      setMsg(`Retired ${r.cleared} slot(s) to closed \u2014 they leave the pool but keep their `
+        + `history, and reopen if a scout finds them again.`
+        + (taken ? ` ${taken} booked slot(s) left untouched.` : ""));
       reload();
     } catch (e) {
       setMsg(e.message);
@@ -792,18 +799,30 @@ function BookingSlots({ booking, me }) {
       setBusy(false);
     }
   };
-  const filtered = rows.filter((s) => statusFilter === "all" || s.status === statusFilter);
+  const closedCount = rows.filter((s) => s.status === "closed").length;
+  const filtered = rows.filter((s) => (
+    statusFilter === "all" ? true
+      : statusFilter === "live" ? s.status !== "closed"
+      : s.status === statusFilter));
   const { q, setQ, sort, setSort, rows: shown } = useSortSearch(filtered, { key: "date", dir: "asc" });
   const statuses = [...new Set(rows.map((s) => s.status))].sort();
 
   return (
     <>
       <div className="row" style={{ marginBottom: 10, flexWrap: "wrap", gap: 10 }}>
-        <h3 style={{ margin: 0 }}>Slots found ({shown.length}/{rows.length})</h3>
+        <h3 style={{ margin: 0 }}>
+          Slots found ({shown.length}/{rows.length})
+          {statusFilter === "live" && closedCount > 0 && (
+            <span className="muted" style={{ fontSize: 12, fontWeight: 400, marginLeft: 8 }}>
+              {closedCount} retired hidden
+            </span>
+          )}
+        </h3>
         <span className="grow" />
         <SearchBox q={q} setQ={setQ} placeholder="search slots…" />
         <div className="field" style={{ margin: 0 }}><label>Status</label>
           <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
+            <option value="live">live (hide retired)</option>
             <option value="all">all</option>
             {statuses.map((s) => <option key={s} value={s}>{s}</option>)}
           </select></div>
