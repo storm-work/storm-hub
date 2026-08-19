@@ -1633,15 +1633,38 @@ class PlaywrightSession:
                     except Exception as e:
                         print(f"[session] race_all failed: {e}")
                 else:
-                    print(f"[session] no audio token - race_best x3 external solvers (proxyless)")
-                    try:
-                        token = _solver.race_best(
-                            _rc_capsolver, _rc_anticaptcha, twocaptcha_keys, capmonster_keys,
-                            "LOGIN_EVISA", proxy=None, n_races=3, min_score=85,
-                        )
+                    # RECAPTCHA_SOLVE_PROXY is honoured HERE too. It used to be hardcoded
+                    # proxy=None, so the setting was silently ignored on the path the portal
+                    # actually forces us down (checkbox -> image challenge), and a booking whose
+                    # templates asked for proxy-aware solving quietly got proxyless.
+                    #
+                    # It falls BACK to proxyless if the proxy-mode solve fails, because as of
+                    # 2026-08-19 no pool we own supports proxy-mode: soax answers
+                    # ERROR_PROXY_CONNECT_REFUSED and webshare accepts the connection then returns
+                    # ERROR_CAPTCHA_SOLVE_FAILED (0/6 across both). Honouring the setting must never
+                    # mean producing NO token -- a low-scoring token still beats nothing.
+                    _fb_proxy = self.proxy if _recaptcha_solve_proxy() else None
+                    token = None
+                    if _fb_proxy:
+                        print("[session] no audio token - race_best x3 external solvers (PROXY-based)")
+                        try:
+                            token = _solver.race_best(
+                                _rc_capsolver, _rc_anticaptcha, twocaptcha_keys, capmonster_keys,
+                                "LOGIN_EVISA", proxy=_fb_proxy, n_races=3, min_score=85,
+                            )
+                        except Exception as e:
+                            print(f"[session] PROXY-based solve failed ({e}) — falling back to proxyless")
+                    if token is None:
+                        print("[session] no audio token - race_best x3 external solvers (proxyless)")
+                        try:
+                            token = _solver.race_best(
+                                _rc_capsolver, _rc_anticaptcha, twocaptcha_keys, capmonster_keys,
+                                "LOGIN_EVISA", proxy=None, n_races=3, min_score=85,
+                            )
+                        except Exception as e:
+                            print(f"[session] race_all failed: {e}")
+                    if token:
                         print(f"[session] race_best token obtained  len={len(token)}  score={_solver.score_token(token)}")
-                    except Exception as e:
-                        print(f"[session] race_all failed: {e}")
 
         # Last-resort: read injected textarea value
         if not token:
