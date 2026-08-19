@@ -21,6 +21,23 @@ class ParsedProxy:
 
 _URL_RE = re.compile(r"^(?:https?://)?(?:([^:@/]+):([^@/]+)@)?([^:/@]+):(\d+)/?$")
 
+# Both providers encode the exit country in the credential, in different shapes:
+#   soax     package-335959-country-pt-sessionid-...      -> PT
+#   webshare sodade2026-DE-17:sempre2026                  -> DE
+_GEO_RE = re.compile(r"-([A-Za-z]{2})-")
+
+
+def parse_geo(credentials_ref: str | None) -> str | None:
+    """Exit country from a proxy credential, or None if it carries no country.
+
+    Lives here, next to the line parser, because every path that CREATES a Proxy row needs it. The
+    geo column was backfilled by a one-time migration and the import/create endpoints were never
+    taught to populate it -- so every proxy added afterwards arrived with geo NULL, and a NULL geo
+    is deliberately never excluded by a PROXY_GEOS filter. A whole newly-imported pool would have
+    been unfilterable, which defeats the point of importing it to compare geos."""
+    m = _GEO_RE.search(credentials_ref or "")
+    return m.group(1).upper() if m else None
+
 
 def parse_proxies(text: str) -> tuple[list[ParsedProxy], list[str]]:
     """Parse proxy lines. Accepts `http://user:pass@host:port`, `host:port:user:pass`, or `host:port`.

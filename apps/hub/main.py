@@ -69,7 +69,7 @@ from .config_store import get_config, seed_defaults, seed_templates, set_config
 from .db import SessionLocal, engine, get_db
 from .events import EventHub
 from .genaccounts import gen_fake_identities, gen_subaccounts
-from .importers import parse_identities, parse_proxies
+from .importers import parse_geo, parse_identities, parse_proxies
 from .settings_store import get_global, set_layer
 from .scheduler import _LAUNCH_BLOCKED_BOOKING_STATUSES, _aware, Scheduler
 from .supervisor import Supervisor
@@ -1135,7 +1135,8 @@ def list_proxies(db: Session = Depends(get_db)) -> list[M.Proxy]:
 def create_proxy(body: ProxyCreate, db: Session = Depends(get_db),
                  _op: Principal = Depends(require_operator)) -> M.Proxy:
     p = M.Proxy(provider=body.provider, kind=body.kind, endpoint=body.endpoint,
-                credentials_ref=body.credentials_ref, max_sessions=body.max_sessions, active=True)
+                credentials_ref=body.credentials_ref, geo=parse_geo(body.credentials_ref),
+                max_sessions=body.max_sessions, active=True)
     db.add(p)
     db.commit()
     db.refresh(p)
@@ -1157,7 +1158,8 @@ def import_proxies(body: ProxyImport, db: Session = Depends(get_db),
             errors.append(f"skip duplicate {pp.endpoint}")
             continue
         db.add(M.Proxy(provider=body.provider, kind=body.kind, endpoint=pp.endpoint,
-                       credentials_ref=pp.credentials_ref, max_sessions=body.max_sessions, active=True))
+                       credentials_ref=pp.credentials_ref, geo=parse_geo(pp.credentials_ref),
+                       max_sessions=body.max_sessions, active=True))
         existing.add(key)
         created += 1
     db.commit()

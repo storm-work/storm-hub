@@ -620,3 +620,43 @@ def test_scheduling_still_refuses_a_live_booking(client):
     client.put(f"/bookings/{bid}", json={"warmup_start_at": _future(5)}, headers=h)
     client.post(f"/bookings/{bid}/start", headers=h)          # -> WARMING
     assert client.post(f"/bookings/{bid}/schedule", headers=h).status_code == 409
+
+
+def test_imported_proxies_get_their_geo(client):
+    """The geo column was backfilled by a ONE-TIME migration and the import endpoint was never
+    taught to populate it -- so every proxy added afterwards arrived with geo NULL. A NULL geo is
+    deliberately never excluded by a PROXY_GEOS filter, so a whole newly-imported pool would have
+    been unfilterable, which defeats the point of importing it to compare geos."""
+    from sqlalchemy import select
+
+    import apps.hub.main as main
+    from libs.db import models as M
+
+    h = _operate_headers(client)
+    text = "\n".join([
+        "package-350716-country-de-sessionid-AAAA-sessionlength-3600-bindttl-600-opt-wb:pw@proxy.soax.com:5000",
+        "package-350716-country-it-sessionid-BBBB-sessionlength-3600-bindttl-600-opt-wb:pw@proxy.soax.com:5000",
+        "p.webshare.io:80:sodade2026-PT-9:pw",
+    ])
+    r = client.post("/proxies/import",
+                    json={"provider": "soax_mobile", "kind": "rotating", "text": text}, headers=h)
+    assert r.status_code == 200 and r.json()["created"] == 3
+
+    db = main.SessionLocal()
+    geos = sorted(g for (g,) in db.execute(select(M.Proxy.geo)).all() if g)
+    assert geos == ["DE", "IT", "PT"]
+    db.close()
+
+
+def test_a_single_created_proxy_gets_its_geo_too(client):
+    from sqlalchemy import select
+
+    import apps.hub.main as main
+    from libs.db import models as M
+
+    h = _operate_headers(client)
+    r = client.post("/proxies", json={"provider": "soax_mobile", "kind": "rotating",
+                                      "endpoint": "proxy.soax.com:5000",
+                                      "credentials_ref": "package-350716-country-de-sessionid-Z-opt-wb:pw"},
+                    headers=h)
+    assert r.status_code == 201 and r.json()["geo"] == "DE"
