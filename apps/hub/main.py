@@ -71,7 +71,7 @@ from .events import EventHub
 from .genaccounts import gen_fake_identities, gen_subaccounts
 from .importers import parse_identities, parse_proxies
 from .settings_store import get_global, set_layer
-from .scheduler import _LAUNCH_BLOCKED_BOOKING_STATUSES, Scheduler
+from .scheduler import _LAUNCH_BLOCKED_BOOKING_STATUSES, _aware, Scheduler
 from .supervisor import Supervisor
 from .schemas import (
     ArtifactOut,
@@ -2074,8 +2074,28 @@ def schedule_booking(booking_id: str, db: Session = Depends(get_db),
         raise HTTPException(404, "booking not found")
     if not bk.warmup_start_at:
         raise HTTPException(400, "set warmup_start_at before scheduling")
-    if bk.status not in (BookingStatus.DRAFT, BookingStatus.SCHEDULED):
+    # STOPPED is schedulable. It was refused, and that made auto-start unreachable after the FIRST
+    # run of a booking: plan_booking_actions only emits "start" for a SCHEDULED booking, so an
+    # operator who stopped a run, edited the times and pressed Schedule got a 409 and a warmup that
+    # never fired. Confirmed 2026-08-19. STOPPED is documented as the resumable stop, and
+    # "stop, retime, schedule for tomorrow" is the ordinary way a booking gets reused.
+    if bk.status not in (BookingStatus.DRAFT, BookingStatus.SCHEDULED, BookingStatus.STOPPED):
         raise HTTPException(409, f"cannot schedule a {bk.status} booking")
+    if _aware(bk.warmup_start_at) <= _now():
+        raise HTTPException(400, "warmup_start_at is in the past -- it would fire on the next tick; "
+                                 "set a future time, or use Start now")
+    # A scheduled run is a FRESH run, exactly as /start is: clear the previous run's fired-signal
+    # timestamps and per-worker notified-sets, so slot-open/slot-found genuinely fire again on the
+    # clock instead of being suppressed by a latch left over from the last run.
+    bk.started_at = None
+    bk.slot_open_fired_at = None
+    bk.slot_found_fired_at = None
+    for signal_name in ("slot_open", "slot_found"):
+        try:
+            _bus.r.delete(notified_key(booking_id, signal_name))
+        except Exception:
+            pass
+    scheduler.reset_scout_pool(booking_id)
     bk.status = BookingStatus.SCHEDULED
     db.commit()
     db.refresh(bk)

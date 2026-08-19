@@ -133,7 +133,11 @@ class Scheduler:
                 M.Booking.status.notin_([BookingStatus.COMPLETED, BookingStatus.ABORTED,
                                          BookingStatus.DRAFT]))).all()
             for bk in live:
-                for action in plan_booking_actions(bk.status, bk.warmup_start_at, bk.slot_open_at, now):
+                # _aware(): a column that hands back a tz-naive datetime makes these comparisons
+                # raise TypeError, which kills the whole tick for every booking (see _aware's own
+                # docstring -- this is the third comparison site to need it).
+                for action in plan_booking_actions(bk.status, _aware(bk.warmup_start_at),
+                                                   _aware(bk.slot_open_at), now):
                     if action == "start":
                         bk.started_at = bk.started_at or now
                         db.commit()

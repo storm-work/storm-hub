@@ -550,3 +550,73 @@ def test_proxy_list_exposes_health_so_the_page_can_show_what_is_condemned(client
     rows = client.get("/proxies", headers=h).json()
     assert sum(1 for p in rows if p["is_healthy"] is False) == 3
     assert any(p["health"] == "ERR_CONNECTION_CLOSED" for p in rows)
+
+
+# ── scheduling a booking for a LATER run (operator report 2026-08-19) ─────────────────────────
+def _future(minutes):
+    from datetime import datetime, timedelta, timezone
+    return (datetime.now(timezone.utc) + timedelta(minutes=minutes)).isoformat()
+
+
+def test_a_stopped_booking_can_be_scheduled_for_a_later_run(client):
+    """THE reported bug. plan_booking_actions only emits "start" for a SCHEDULED booking, and
+    /schedule refused anything that wasn't DRAFT/SCHEDULED -- so after a booking's FIRST run, an
+    operator who stopped it, edited the times and pressed Schedule got a 409 and a warmup that never
+    fired again. "Stop, retime, schedule for tomorrow" is the ordinary way a booking gets reused."""
+    h = _operate_headers(client)
+    bid = client.post("/bookings", json={"name": "Sched1", "type": "test", "posto_id": "2032",
+                                         "nationality": "CPV", "residence": "IRL"},
+                      headers=h).json()["id"]
+    client.put(f"/bookings/{bid}", json={"warmup_start_at": _future(5),
+                                         "slot_open_at": _future(30)}, headers=h)
+    client.post(f"/bookings/{bid}/start", headers=h)
+    client.post(f"/bookings/{bid}/stop", headers=h)
+
+    client.put(f"/bookings/{bid}", json={"warmup_start_at": _future(10),
+                                         "slot_open_at": _future(40)}, headers=h)
+    r = client.post(f"/bookings/{bid}/schedule", headers=h)
+    assert r.status_code == 200, r.json()
+    assert r.json()["status"] == "scheduled"
+
+
+def test_scheduling_clears_the_previous_runs_signal_latch(client):
+    """A scheduled run is a FRESH run, exactly as /start is. Without this the new run inherits the
+    last one's fired-signal timestamps and per-worker notified-sets, and slot-open/slot-found are
+    suppressed by a latch rather than firing on the clock."""
+    import apps.hub.main as main
+    from libs.db import models as M
+
+    h = _operate_headers(client)
+    bid = client.post("/bookings", json={"name": "Sched2", "type": "test", "posto_id": "2032"},
+                      headers=h).json()["id"]
+    client.put(f"/bookings/{bid}", json={"warmup_start_at": _future(5)}, headers=h)
+    db = main.SessionLocal()
+    bk = db.get(M.Booking, bid)
+    bk.slot_open_fired_at = bk.slot_found_fired_at = main._now()
+    db.commit(); db.close()
+
+    assert client.post(f"/bookings/{bid}/schedule", headers=h).status_code == 200
+    db = main.SessionLocal()
+    bk = db.get(M.Booking, bid)
+    assert bk.slot_open_fired_at is None and bk.slot_found_fired_at is None
+    db.close()
+
+
+def test_scheduling_refuses_a_warmup_time_already_in_the_past(client):
+    """It would fire on the very next tick -- that is Start now wearing a schedule's clothing, and
+    it silently skips the whole hold phase."""
+    h = _operate_headers(client)
+    bid = client.post("/bookings", json={"name": "Sched3", "type": "test", "posto_id": "2032"},
+                      headers=h).json()["id"]
+    client.put(f"/bookings/{bid}", json={"warmup_start_at": _future(-60)}, headers=h)
+    r = client.post(f"/bookings/{bid}/schedule", headers=h)
+    assert r.status_code == 400 and "past" in r.json()["detail"]
+
+
+def test_scheduling_still_refuses_a_live_booking(client):
+    h = _operate_headers(client)
+    bid = client.post("/bookings", json={"name": "Sched4", "type": "test", "posto_id": "2032"},
+                      headers=h).json()["id"]
+    client.put(f"/bookings/{bid}", json={"warmup_start_at": _future(5)}, headers=h)
+    client.post(f"/bookings/{bid}/start", headers=h)          # -> WARMING
+    assert client.post(f"/bookings/{bid}/schedule", headers=h).status_code == 409

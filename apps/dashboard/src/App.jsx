@@ -581,7 +581,14 @@ function BookingOverview({ me, booking, events, workers, onBookingChanged, onDel
   const canFireSlotFound = !!booking.slot_open_fired_at && !booking.slot_found_fired_at;
   const canStart = !["completed", "aborted"].includes(booking.status);
   const canStop = !["draft", "stopped", "completed", "aborted"].includes(booking.status);
-  const canSchedule = !!booking.warmup_start_at && ["draft", "scheduled"].includes(booking.status);
+  // STOPPED is schedulable: "stop the run, retime it, schedule tomorrow" is the ordinary way a
+  // booking gets reused, and refusing it made auto-start unreachable after a booking's first run.
+  // A past warmup time is also rejected -- it would fire on the very next tick, which is Start now
+  // wearing a schedule's clothing.
+  const warmupInFuture = !!booking.warmup_start_at
+    && new Date(booking.warmup_start_at).getTime() > Date.now();
+  const canSchedule = warmupInFuture
+    && ["draft", "scheduled", "stopped"].includes(booking.status);
 
   return (
     <div className="card">
@@ -613,7 +620,13 @@ function BookingOverview({ me, booking, events, workers, onBookingChanged, onDel
           title={!canStart ? `booking is ${booking.status}` : "launch ready workers now"}>
           {busy === "starting" ? "Starting…" : "▶ Start now"}</button>
         <button className="btn ghost" disabled={!op || !canSchedule || !!busy} onClick={schedule}
-          title={!booking.warmup_start_at ? "set a warmup start time first" : "auto-start at warmup time"}>⏱ Scheduled</button>
+          title={!booking.warmup_start_at ? "set a warmup start time first"
+                 : !warmupInFuture ? "warmup time is in the past — set a future time, or use Start now"
+                 : ["draft", "scheduled", "stopped"].includes(booking.status)
+                   ? `auto-start at ${new Date(booking.warmup_start_at).toLocaleString()}, `
+                     + `then fire slot-open on its own schedule`
+                   : `booking is ${booking.status}`}>
+          {booking.status === "scheduled" ? "⏱ Rescheduled" : "⏱ Schedule run"}</button>
         <button className="btn ghost" disabled={!op || !canFireSlotOpen || !!busy} onClick={fireSlotOpen}
           title={booking.slot_open_fired_at ? "already fired" : "manually fire slot-open now"}>⚡ Fire slot-open</button>
         <button className="btn ghost" disabled={!op || !canFireSlotFound || !!busy} onClick={fireSlotFound}
