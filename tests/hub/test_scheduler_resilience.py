@@ -1447,3 +1447,49 @@ def test_a_relaunch_failure_still_lets_the_other_workers_relaunch(db):
     sched._hold_respawn(db, bk, NOW)
 
     assert len(done) == 3 and [d[0] for d in done] == ["failed", "ok", "ok"]
+
+
+# ── a SCHEDULED start must launch, not just transition (confirmed live 2026-08-19) ────────────
+def test_scheduled_start_requeues_stopped_workers_before_launching(db, monkeypatch):
+    """THE reported bug. The manual /start requeues STOPPED/HELD/FAILED to READY first (fixed
+    2026-08-13), but _sched_on_start selected READY workers directly. A scheduled run is normally
+    the SECOND or later run of a booking, so its workers are sitting STOPPED from last time and that
+    query returned nothing: warmup fired at 01:10:01 exactly on time, the booking moved to WARMING,
+    and ZERO of seven workers launched."""
+    import apps.hub.main as main
+
+    launched = {}
+    monkeypatch.setattr(main, "_begin_fleet_launch",
+                        lambda bid, ids, jitter_secs=0.0: launched.update(ids=list(ids)))
+    monkeypatch.setattr(main, "SessionLocal", lambda: db)
+
+    bk = _make_booking(db)
+    bk.status = BookingStatus.SCHEDULED
+    db.commit()
+    stopped = [_make_worker(db, bk, _make_identity(db), status=WorkerStatus.STOPPED)
+               for _ in range(3)]
+    done = _make_worker(db, bk, _make_identity(db), status=WorkerStatus.COMPLETED)
+
+    main._sched_on_start(db, bk)
+
+    assert set(launched.get("ids", [])) == {w.id for w in stopped}, launched
+    assert done.id not in launched.get("ids", []), "a COMPLETED worker is done, not stale"
+    assert bk.status == BookingStatus.WARMING
+
+
+def test_scheduled_start_leaves_a_completed_worker_alone(db, monkeypatch):
+    """A worker that already booked must not be dragged back into the next run."""
+    import apps.hub.main as main
+
+    launched = {}
+    monkeypatch.setattr(main, "_begin_fleet_launch",
+                        lambda bid, ids, jitter_secs=0.0: launched.update(ids=list(ids)))
+    bk = _make_booking(db)
+    bk.status = BookingStatus.SCHEDULED
+    db.commit()
+    done = _make_worker(db, bk, _make_identity(db), status=WorkerStatus.COMPLETED)
+
+    main._sched_on_start(db, bk)
+
+    assert launched.get("ids", []) == []
+    assert done.status == WorkerStatus.COMPLETED

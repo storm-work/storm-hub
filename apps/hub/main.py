@@ -238,10 +238,37 @@ def _launch_worker_fleet(worker_ids: list[str], *, jitter_secs: float = 0.0) -> 
 
 
 # ── auto-ops scheduler callbacks ──────────────────────────────────────────────
+def _requeue_stale_workers(db: Session, booking_id: str) -> int:
+    """Bring a previous run's workers back to READY so a start can actually launch them.
+
+    Both start paths need this and only ONE had it. The manual /start requeues STOPPED/HELD/FAILED
+    (fixed 2026-08-13: "Start Instantly did nothing, because every worker had drifted to
+    STOPPED/FAILED and this endpoint only ever looked at READY ones"), while _sched_on_start
+    selected READY workers directly -- so a SCHEDULED run fired on time, moved the booking to
+    WARMING, and launched ZERO workers. Confirmed live 2026-08-19: warmup fired at 01:10:01 and all
+    seven workers stayed `stopped`.
+
+    Shared here so the next fix to this rule cannot reach one caller and miss the other."""
+    stale = list(db.scalars(select(M.Worker).where(
+        M.Worker.booking_id == booking_id,
+        M.Worker.status.in_([WorkerStatus.STOPPED, WorkerStatus.HELD, WorkerStatus.FAILED]))).all())
+    for w in stale:
+        _reset_worker_bus_state(booking_id, w.id)
+        _set_worker_status(w, WorkerStatus.READY)
+    if stale:
+        db.commit()
+    return len(stale)
+
+
 def _sched_on_start(db: Session, bk: M.Booking) -> None:
     from libs.domain.state_machines import IllegalTransition, booking_transition
+    # Requeue FIRST -- a scheduled run is normally the SECOND or later run of a booking, so its
+    # workers are sitting STOPPED from last time and a READY-only query returns nothing.
+    requeued = _requeue_stale_workers(db, bk.id)
     worker_ids = [w.id for w in db.scalars(select(M.Worker).where(
         M.Worker.booking_id == bk.id, M.Worker.status == WorkerStatus.READY)).all()]
+    logger.info("scheduled start for booking %s: requeued %d, launching %d worker(s)",
+                bk.id, requeued, len(worker_ids))
     jitter = float(_resolve_booking_setting(db, bk, "WARMUP_START_JITTER", 0.0) or 0.0)
     # Backgrounded: this used to run inline and block the scheduler's whole tick thread for the
     # minutes a live fleet launch takes -- during which the status transition below never ran, so
@@ -1942,14 +1969,7 @@ def start_booking(booking_id: str, db: Session = Depends(get_db),
     bk = db.get(M.Booking, booking_id)
     if not bk:
         raise HTTPException(404, "booking not found")
-    stale = list(db.scalars(select(M.Worker).where(
-        M.Worker.booking_id == booking_id,
-        M.Worker.status.in_([WorkerStatus.STOPPED, WorkerStatus.HELD, WorkerStatus.FAILED]))).all())
-    for w in stale:
-        _reset_worker_bus_state(booking_id, w.id)
-        _set_worker_status(w, WorkerStatus.READY)
-    if stale:
-        db.commit()
+    _requeue_stale_workers(db, booking_id)
 
     workers = list(db.scalars(select(M.Worker).where(
         M.Worker.booking_id == booking_id, M.Worker.status == WorkerStatus.READY)).all())
