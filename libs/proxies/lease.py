@@ -51,9 +51,21 @@ def _candidate_query(provider: str, kind: str | None, exclude_ids: set[str] | No
     proxy outranks any used one, so a fresh pool is walked end to end before anything repeats.
     Score still breaks ties among equally-idle proxies, so reliability is preferred without ever
     pinning selection to one favourite."""
+    # NOTE: is_healthy is NOT a filter. Every pool here is ROTATING -- a row is a session template,
+    # not an IP. soax rows carry a sessionid whose exit address changes once sessionlength lapses or
+    # the bound IP drops (bindttl), and webshare's gateway picks an exit per connection. So a probe
+    # failure says "that exit was bad a moment ago", never "this row is bad": permanently excluding
+    # the row throws away a good session template over a transient IP, and the only recovery that
+    # actually works for a rotating pool is ROTATION -- which the LRU ordering below already gives.
+    #
+    # It was a filter, and it cost 639 rows at one point (a Hub-side prober running with
+    # anti-detection off condemned a third of the pool). That specific bug is fixed, but the
+    # mechanism was wrong for this pool shape regardless of how well-calibrated the probe is.
+    # health/score are still recorded, and still order ties below, so a consistently-bad row sinks
+    # without being cut.
     q = (
         select(M.Proxy)
-        .where(M.Proxy.provider == provider, M.Proxy.active.is_(True), M.Proxy.is_healthy.is_(True))
+        .where(M.Proxy.provider == provider, M.Proxy.active.is_(True))
         .order_by(M.Proxy.last_used_at.asc().nullsfirst(),
                   M.Proxy.score.desc(), M.Proxy.created_at.asc())
     )

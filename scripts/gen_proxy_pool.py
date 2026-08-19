@@ -37,7 +37,11 @@ _DATA_DIR = _ROOT / "data"
 # --package/--prefix) when the account/package changes.
 _SOAX_PACKAGE = "335959"
 _SOAX_SESSIONLENGTH = 3600
-_SOAX_BINDTTL = 600
+# 5, not 600. bindttl is how long SOAX keeps trying to re-bind the SAME exit IP after it drops
+# before handing over a new one -- so on a ROTATING pool a long value means a worker sits on a dead
+# address for that whole window. SOAX support recommended 5-10 for exactly this (2026-08-19); 600
+# was ten minutes of waiting for an IP that had already gone.
+_SOAX_BINDTTL = 5
 _WEBSHARE_PREFIX = "sodade2026"
 
 # Provider account passwords come from the environment (or .env, which is gitignored) -- never

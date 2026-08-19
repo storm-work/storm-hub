@@ -777,6 +777,56 @@ def test_do_discover_uses_cached_special_days_and_skips_gettime_fetch():
     assert [t for t, _p in events if t == "gettime_result"] == []   # cache hit never re-reports
 
 
+class _FlakySession(_RecordingSession):
+    """Fails browser_nav on the periodos endpoint the first `fail_times` calls, then succeeds --
+    tests do_discover's connection-level nav retry (DISCOVERY_NAV_RETRIES/_BACKOFF). Never fails the
+    gettime nav, so the retry path under test is isolated to the per-date loop."""
+    def __init__(self, fail_times):
+        super().__init__()
+        self.fail_times = fail_times
+        self.periodos_attempts = 0
+
+    def browser_nav(self, url, timeout=30):
+        if "gettime" not in url:
+            self.periodos_attempts += 1
+            if self.periodos_attempts <= self.fail_times:
+                raise RuntimeError("connection reset")
+        return super().browser_nav(url, timeout=timeout)
+
+
+def test_do_discover_retries_a_connection_level_nav_failure_and_recovers(monkeypatch):
+    monkeypatch.setattr("apps.worker.ops_live.time.sleep", lambda _s: None)
+    ops = _make_ops(cfg=_cfg(DISCOVERY_NAV_RETRIES=2, DISCOVERY_NAV_BACKOFF=0.01))
+    ops.session = _FlakySession(fail_times=1)   # fails once, succeeds on the retry
+
+    out = ops.do_discover(["2026-08-16"])
+
+    assert ops.session.periodos_attempts == 2   # 1 failure + 1 successful retry
+    assert out == [{"date": "2026-08-16", "outcome": "found", "periods": [3, 4, 5]}]
+
+
+def test_do_discover_exhausts_retries_then_marks_the_date_failed(monkeypatch):
+    monkeypatch.setattr("apps.worker.ops_live.time.sleep", lambda _s: None)
+    ops = _make_ops(cfg=_cfg(DISCOVERY_NAV_RETRIES=2, DISCOVERY_NAV_BACKOFF=0.01))
+    ops.session = _FlakySession(fail_times=99)   # never recovers
+
+    out = ops.do_discover(["2026-08-16"])
+
+    assert ops.session.periodos_attempts == 3   # initial attempt + 2 retries, then give up
+    assert out == [{"date": "2026-08-16", "outcome": "failed"}]
+
+
+def test_do_discover_default_is_a_single_attempt_no_retry():
+    """DISCOVERY_NAV_RETRIES defaults to 0 -- byte-identical to the pre-fix behavior when unset."""
+    ops = _make_ops()   # default cfg, no retry knobs set
+    ops.session = _FlakySession(fail_times=1)
+
+    out = ops.do_discover(["2026-08-16"])
+
+    assert ops.session.periodos_attempts == 1   # no retry attempted
+    assert out == [{"date": "2026-08-16", "outcome": "failed"}]
+
+
 # ── login-rejection log noise (confirmed live 2026-08-14) ─────────────────────
 def test_login_reject_reason_strips_the_captcha_token():
     """browser_login returns the solver's captcha_token alongside the response, and the whole dict

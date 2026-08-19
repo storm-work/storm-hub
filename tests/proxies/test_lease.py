@@ -104,15 +104,27 @@ def test_release_worker_resources_frees_proxy_and_slot_lease(db):
     assert px.id == "p"
 
 
-def test_unhealthy_and_inactive_skipped(db):
+def test_inactive_is_skipped_but_unhealthy_is_not(db):
+    """CHANGED 2026-08-19: this asserted that an unhealthy proxy is skipped too. On a ROTATING pool
+    that is wrong -- a row is a session template, not an IP, so a probe failure describes a
+    transient exit and excluding the row throws away a good template. `active` is an OPERATOR
+    decision ("stop using this") and still excludes; is_healthy is a MEASUREMENT and no longer
+    does."""
     _worker(db)
     db.add(M.Proxy(id="dead", provider="isp", kind="s", endpoint="h:1", credentials_ref="u:p",
                    max_sessions=2, is_healthy=False, score=100))
     db.add(M.Proxy(id="off", provider="isp", kind="s", endpoint="h:2", credentials_ref="u:p",
                    max_sessions=2, active=False, score=100))
     db.commit()
+
+    got, _ = lease_proxy(db, "w1", "isp")
+    assert got.id == "dead", "an unhealthy row must still be leasable on a rotating pool"
+
+    # ...and with only the deactivated one left, the pool really is exhausted.
+    db.query(M.Proxy).filter(M.Proxy.id == "dead").delete()
+    db.commit()
     with pytest.raises(ProxyLeaseError):
-        lease_proxy(db, "w1", "isp")
+        lease_proxy(db, "w2", "isp")
 
 
 # ── P4: live pre-lease screening -- an operator-specified design (2026-08-13): "select a proxy node
@@ -331,3 +343,36 @@ def test_terminal_release_records_an_outcome_on_the_lease(db):
     assert lease.released_at is not None
     assert lease.outcome == SlotLeaseOutcome.EXPIRED
     assert db.get(M.Slot, slot.id).status == SlotStatus.AVAILABLE   # and the slot is freed
+
+
+# ── rotating pools: a probe failure must not condemn the row (operator, 2026-08-19) ───────────
+def test_an_unhealthy_row_is_still_leasable(db):
+    """Every pool here is ROTATING -- a row is a session template, not an IP. soax rows carry a
+    sessionid whose exit changes once sessionlength lapses or the bound IP drops (bindttl), and
+    webshare's gateway picks an exit per connection. So a probe failure says "that exit was bad a
+    moment ago", never "this row is bad", and excluding the row throws away a good session template
+    over a transient IP. The only recovery that works on a rotating pool is ROTATION."""
+    from libs.proxies.lease import lease_proxy
+
+    p = _proxy(db, endpoint="condemned:80", max_sessions=1)
+    p.is_healthy, p.health, p.score = False, "ERR_CONNECTION_CLOSED", -5.0
+    db.commit()
+
+    got, _ = lease_proxy(db, "w1", "soax")
+    assert got.endpoint == "condemned:80"
+
+
+def test_score_still_orders_ties_without_excluding_anyone(db):
+    """health/score stay recorded and still break ties among equally-idle rows, so a consistently
+    bad row sinks -- it just never gets cut."""
+    from libs.proxies.lease import lease_proxy, release_proxy
+
+    good = _proxy(db, endpoint="good:80", max_sessions=1); good.score = 5.0
+    bad = _proxy(db, endpoint="bad:80", max_sessions=1)
+    bad.score, bad.is_healthy = -5.0, False
+    db.commit()
+
+    first, _ = lease_proxy(db, "w1", "soax"); release_proxy(db, "w1")
+    second, _ = lease_proxy(db, "w2", "soax")
+    assert first.endpoint == "good:80"      # better score wins the tie...
+    assert second.endpoint == "bad:80"      # ...but the other is still reachable

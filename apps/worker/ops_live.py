@@ -985,11 +985,28 @@ class LiveEngineOps(EngineOps):
                 out.append({"date": d, "outcome": "empty"})   # confirmed closed/special day
                 continue
             url = f"{GETPERIODOS_URL}?id_posto={self.posto_id}&data_agendamento={iso_date.strftime('%Y/%m/%d')}"
-            try:
-                self.session.browser_nav(url, timeout=30)
-                html = self.session.browser_eval("document.documentElement.outerHTML") or ""
-            except Exception as e:
-                self._log(f"do_discover: {d} nav error ({e}) -- FAILED, not empty")
+            # Retry a CONNECTION-level nav failure in the SAME warm session before giving up on this
+            # date -- no logout/restore/re-login. Ported from storm-auto's confirmed ace423a pattern
+            # (nav_retries/nav_backoff were parsed into EngineConfig but never read here -- dead
+            # setting until now). A 200-with-no-marker or untokenizable body is a CONTENT issue, not a
+            # connection failure, so those stay single-shot below, same as storm-auto.
+            html = None
+            last_err: Exception | None = None
+            for attempt in range(self.cfg.discovery.nav_retries + 1):
+                try:
+                    self.session.browser_nav(url, timeout=30)
+                    html = self.session.browser_eval("document.documentElement.outerHTML") or ""
+                    break
+                except Exception as e:
+                    last_err = e
+                    if attempt < self.cfg.discovery.nav_retries:
+                        backoff = self.cfg.discovery.nav_backoff * (attempt + 1) * random.uniform(0.7, 1.3)
+                        self._log(f"do_discover: {d} nav error ({e}) -- "
+                                  f"retry {attempt + 1}/{self.cfg.discovery.nav_retries} in {backoff:.1f}s")
+                        time.sleep(backoff)
+            if html is None:
+                self._log(f"do_discover: {d} nav error ({last_err}) -- "
+                          f"exhausted {self.cfg.discovery.nav_retries} retries -- FAILED, not empty")
                 out.append({"date": d, "outcome": "failed"})
                 continue
             m = re.search(r"periodos_ocupados='([0-9]*)", html)
