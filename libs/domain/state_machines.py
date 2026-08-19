@@ -146,8 +146,12 @@ WORKER_SUBSTATE_TRANSITIONS = {
     WorkerSubstate.LOGGING_IN:  frozenset({WorkerSubstate.LOGGED_IN, WorkerSubstate.LOGGING_IN,
                                            WorkerSubstate.FAILED}),
     WorkerSubstate.LOGGED_IN:   frozenset({WorkerSubstate.WARMING_UP, WorkerSubstate.FAILED}),
+    # WARMING_UP -> HOLDING added 2026-08-19: a re-warm that FAILS leaves the worker still holding
+    # a live authed session, just unwarmed -- it drops back to holding so the recovery ladder can
+    # escalate to a re-login from there (HOLDING -> LOGGING_IN). Routing that through FAILED would
+    # be a lie about a session that is still alive.
     WorkerSubstate.WARMING_UP:  frozenset({WorkerSubstate.WARMED, WorkerSubstate.WARMING_UP,
-                                           WorkerSubstate.FAILED}),
+                                           WorkerSubstate.HOLDING, WorkerSubstate.FAILED}),
     WorkerSubstate.WARMED:      frozenset({WorkerSubstate.SWAPPED, WorkerSubstate.HOLDING,
                                            WorkerSubstate.DISCOVERING, WorkerSubstate.FAILED}),
     WorkerSubstate.SWAPPED:     frozenset({WorkerSubstate.HOLDING, WorkerSubstate.DISCOVERING,

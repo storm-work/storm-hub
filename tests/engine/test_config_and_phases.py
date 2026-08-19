@@ -301,9 +301,10 @@ def test_scout_rebuilds_its_session_after_consecutive_all_failed_rounds():
     )
     res = PhaseMachine(_cfg(booking={"SCOUT_REBUILD_AFTER_FAILED_ROUNDS": 2}, ROLE="scout"), ops).run()
 
-    # 4 all-failed rounds at a cap of 2 = exactly 2 rebuilds, on top of the initial login.
-    assert ops.logins == 3
-    assert ops.warmups == 3
+    # 4 all-failed rounds at a cap of 2 = exactly 2 rebuilds. Each is a RE-WARM, not a re-login:
+    # the auth session is fine, only the booking form-state has lapsed.
+    assert ops.warmups == 3          # initial warmup + 2 re-warms
+    assert ops.logins == 1           # and not one extra login
     assert res.outcome in ("discovered", "stopped")   # never "failed": the rebuild worked
 
 
@@ -329,7 +330,8 @@ def test_a_failed_rewarm_is_a_session_problem_not_a_slot_bounce():
 
     assert res.outcome == "booked"
     assert ops.release_reasons == ["session"]     # released, and NOT as a bounce
-    assert ops.logins == 2                        # the session was rebuilt in place
+    assert ops.logins == 1                        # rebuilt by RE-WARM -- no login burned
+    assert ops.warmups == 2
 
 
 def test_repeated_session_failures_never_park_the_worker_on_bounces():
@@ -364,6 +366,37 @@ def test_a_failed_rewarm_still_rebuilds_the_session():
     """The distinction must hold in the other direction: when OUR warmup is what failed, the
     session really does need rebuilding."""
     ops = SimEngineOps(assignment={"date": "d1", "period": 3},
-                       apply_outcome=["session", "booked"], stop_after_polls=8)
+                       apply_outcome=["session", "booked"], stop_after_polls=8,
+                       warmup_ok=[True, False, True])      # the re-warm fails -> escalate
     PhaseMachine(_cfg(ROLE="apply"), ops).run()
     assert ops.logins == 2
+
+
+# ── recovery ladder: re-warm BEFORE re-login (operator correction 2026-08-19) ─────────────────
+def test_a_degraded_scout_rewarms_before_it_re_logins():
+    """A re-warm is ~40s and costs nothing scarce; a re-login is minutes, burns a CAPTCHA solve and
+    puts the sub-account back through a wall that rejects ~90% of attempts. Nearly always the auth
+    session is fine and only the booking form-state has lapsed -- exactly what a re-warm restores.
+
+    Live 2026-08-19: scouts whose gettime failed three rounds went STRAIGHT back to logging_in, and
+    so did every holding apply worker."""
+    ops = SimEngineOps(
+        discover_tasks=[["d1"], ["d2"], ["d3"], ["d4"]],
+        discover_outcomes={d: {"outcome": "failed"} for d in ("d1", "d2", "d3", "d4")},
+    )
+    PhaseMachine(_cfg(booking={"SCOUT_REBUILD_AFTER_FAILED_ROUNDS": 2}, ROLE="scout"), ops).run()
+
+    assert ops.warmups > 1, "never re-warmed"
+    assert ops.logins == 1, f"re-logged in when a re-warm would do (logins={ops.logins})"
+
+
+def test_it_still_re_logins_when_the_rewarm_cannot_recover():
+    """The escalation must survive: a re-warm that keeps failing means the workflow anchor is gone
+    and only a fresh login rebuilds it (abc5)."""
+    ops = SimEngineOps(
+        discover_tasks=[["d1"], ["d2"], ["d3"]],
+        discover_outcomes={d: {"outcome": "failed"} for d in ("d1", "d2", "d3")},
+        warmup_ok=[True, False, True],    # initial warmup OK; the RE-warm fails -> re-login
+    )
+    PhaseMachine(_cfg(booking={"SCOUT_REBUILD_AFTER_FAILED_ROUNDS": 2}, ROLE="scout"), ops).run()
+    assert ops.logins >= 2, "never escalated to a fresh login"

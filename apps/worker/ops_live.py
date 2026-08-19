@@ -888,11 +888,36 @@ class LiveEngineOps(EngineOps):
                 return
             self._attempt_keepalive_restore(context)
             return
+        # STATE-AWARE. This used to navigate HOME_URL unconditionally, which keeps the AUTH session
+        # alive and nothing else -- so a worker could hold for an hour, stay perfectly logged in, and
+        # still have a long-lapsed booking form-state. Its first gettime or first submit then failed,
+        # and the failure was counted toward a re-login rather than the re-warm that would fix it.
+        #
+        # Once a worker has warmed (posto_pdf set), the thing worth keeping alive is READINESS, not
+        # just the session: probe the schedule page and check it still carries the scheduling
+        # markers. Absent means the ScheduleController anchor is gone -- re-warm in place, which is
+        # ~40s and needs no login. Before warmup there is no form-state to hold, so home is right.
         probe = self.cfg.keepalive.probe or "home"
-        url = HOME_URL if probe == "home" else probe
+        warmed = self.posto_pdf is not None
+        if probe == "home" and warmed:
+            url = SCHED_JSP + "?posto_id=" + str(self.posto_pdf)
+        else:
+            url = HOME_URL if probe == "home" else probe
         try:
             self.session.browser_nav(url, timeout=30)
             self._keepalive_dead_streak = 0
+            if warmed and probe == "home":
+                page = self.session.browser_eval("document.documentElement.outerHTML") or ""
+                if not any(m in page for m in _SCHED_PAGE_MARKERS):
+                    self._log(f"keepalive: form-state lapsed ({len(page)}B, no scheduling markers) "
+                              f"-- re-warming in place ({context})")
+                    if self._run_warmup_steps():
+                        self._log(f"keepalive: re-warm restored the schedule form ({context})")
+                    else:
+                        # Leave it to the phase machine's ladder rather than escalating here: this
+                        # is a keepalive, and a login is not its decision to make.
+                        self._log(f"keepalive: re-warm failed -- still holding ({context})")
+                    return
             if self._emit is not None:
                 self._emit("log_line", text=f"keepalive: probe OK ({context})")
         except Exception as e:

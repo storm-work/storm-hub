@@ -211,11 +211,27 @@ class PhaseMachine:
 
     # ── apply: hold -> await assignment -> book; fallback self-scout ──────────
     def _rebuild_session(self, why: str) -> bool:
-        """Rebuild the authed session IN PROCESS: re-login, then re-warm. Used wherever a failure is
-        a property of this session rather than of the portal -- never by exiting, because the login
-        and the CAPTCHA solve are what's actually scarce. Returns False only if even a fresh login
-        can't recover, which is the one genuinely terminal case."""
-        self._to(WorkerSubstate.HOLDING, detail=f"rebuilding session: {why}")
+        """Recover a degraded session IN PROCESS, cheapest step first.
+
+        RE-WARM, then re-login only if that fails. This went straight to do_login(), which is the
+        wrong order and the expensive one: a re-warm is ~40s and costs nothing scarce, while a
+        re-login is minutes, burns a CAPTCHA solve, and puts the sub-account back through the wall
+        that rejects ~90% of attempts. Confirmed live 2026-08-19 -- scouts whose gettime failed
+        three rounds went straight back to logging_in, and so did every holding apply worker.
+
+        Nearly always the auth session is still fine and only the booking form-state has lapsed,
+        which is exactly what a re-warm restores. Same ladder the apply path already uses for
+        form_stale (REWARM_MAX_ATTEMPTS) and the one storm-auto uses. Returns False only when even a
+        fresh login can't recover -- the one genuinely terminal case."""
+        self._to(WorkerSubstate.HOLDING, detail=f"re-warming: {why}")
+        self._to(WorkerSubstate.WARMING_UP)
+        if self.ops.do_warmup():
+            self._to(WorkerSubstate.WARMED)
+            self._to(WorkerSubstate.HOLDING)
+            self.ops.poll_gap()
+            return True
+        # Re-warm couldn't rebuild the workflow anchor -- only a fresh login will (abc5).
+        self._to(WorkerSubstate.HOLDING, detail=f"re-warm failed; re-login: {why}")
         self._to(WorkerSubstate.LOGGING_IN)
         if not self.ops.do_login():
             return False

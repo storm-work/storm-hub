@@ -18,7 +18,9 @@ class SimEngineOps(EngineOps):
         self,
         *,
         login_ok: bool = True,
-        warmup_ok: bool = True,
+        # bool, or a scripted sequence (last entry repeats) -- the recovery ladder re-warms BEFORE
+        # it re-logins, so testing the escalation needs a warmup that succeeds and later fails.
+        warmup_ok: bool | list[bool] = True,
         swap_ip: str | None = None,
         discover_tasks: list[list[str]] | None = None,
         # date -> {"outcome": "found"|"empty"|"failed", "periods": [...]}  (periods only for "found")
@@ -36,7 +38,7 @@ class SimEngineOps(EngineOps):
         emit=None,                        # callable(type, **payload): emit an event (e.g. slots_found)
     ):
         self._login_ok = login_ok
-        self._warmup_ok = warmup_ok
+        self._warmup_oks = ([warmup_ok] if isinstance(warmup_ok, bool) else list(warmup_ok))
         self._swap_ip = swap_ip
         self._discover_tasks = (
             discover_tasks if discover_tasks is not None else [["2026-08-18"]]
@@ -76,7 +78,8 @@ class SimEngineOps(EngineOps):
         self._pause(); self.logins += 1; return self._login_ok
 
     def do_warmup(self) -> bool:
-        self._pause(); self.warmups += 1; return self._warmup_ok
+        self._pause(); self.warmups += 1
+        return self._warmup_oks[min(self.warmups - 1, len(self._warmup_oks) - 1)]
 
     def do_swap(self) -> str | None:
         self._pause(); return self._swap_ip

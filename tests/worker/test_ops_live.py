@@ -1448,3 +1448,63 @@ def test_the_deprecated_setting_name_still_enables_the_swap():
     makes the resolver reject the whole layer and breaks every launch."""
     cfg = _cfg(HOLD_SWAP_AFTER_FOUND=True)
     assert cfg.hold_swap.swap_after_warmup is True
+
+
+# ── keepalive must maintain READINESS, not just liveness (operator, 2026-08-19) ───────────────
+class _KeepaliveSession(_FakeSession):
+    """Records where the keepalive navigated, and serves `page` for the outerHTML read."""
+    def __init__(self, page):
+        super().__init__()
+        self._page = page
+        self.navs = []
+
+    def browser_nav(self, url, timeout=30, **kw):
+        self.navs.append(url)
+        return url
+
+    def browser_eval(self, js, timeout=30):
+        return self._page if "outerHTML" in js else {"status": 200, "fields": {"a": "1"}}
+
+
+def _keepalive_ops(page, warmed=True):
+    ops = _make_ops(emit=lambda t, **p: None)
+    ops.session = _KeepaliveSession(page)
+    ops._log = lambda t: None
+    ops.posto_pdf = "3018" if warmed else None
+    return ops
+
+
+def test_a_warmed_worker_probes_the_schedule_page_not_home():
+    """Probing home keeps the AUTH session alive and nothing else, so a worker could hold for an
+    hour, stay perfectly logged in, and still have a long-lapsed booking form-state -- its first
+    gettime or submit then failed, and that failure was counted toward a re-login rather than the
+    re-warm that fixes it."""
+    ops = _keepalive_ops(_SCHED_OK)
+    ops._do_keepalive("test")
+    assert any("Schedule.jsp" in u for u in ops.session.navs), ops.session.navs
+
+
+def test_a_lapsed_form_state_is_re_warmed_in_place():
+    """No login: the auth session is fine, only the ScheduleController anchor is gone."""
+    rewarmed = []
+    ops = _keepalive_ops("<html><title>E-VISA</title>no scheduling markers here</html>")
+    ops._run_warmup_steps = lambda: (rewarmed.append(1), True)[1]
+    ops.do_login = lambda: pytest.fail("keepalive must never re-login")
+    ops._do_keepalive("test")
+    assert rewarmed, "form-state was lapsed and the keepalive did not re-warm"
+
+
+def test_a_healthy_schedule_page_is_left_alone():
+    """It must not re-warm on every ping -- that is a full quest replay each interval."""
+    rewarmed = []
+    ops = _keepalive_ops(_SCHED_OK)
+    ops._run_warmup_steps = lambda: (rewarmed.append(1), True)[1]
+    ops._do_keepalive("test")
+    assert not rewarmed
+
+
+def test_an_unwarmed_worker_still_probes_home():
+    """Before warmup there is no form-state to hold, so home remains right."""
+    ops = _keepalive_ops(_SCHED_OK, warmed=False)
+    ops._do_keepalive("test")
+    assert ops.session.navs and "Schedule.jsp" not in ops.session.navs[0]
