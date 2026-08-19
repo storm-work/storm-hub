@@ -589,12 +589,35 @@ def list_audit(limit: int = 200, db: Session = Depends(get_db),
 
 
 @app.get("/bookings/{booking_id}/appointments", response_model=list[BookedAppointmentOut])
-def list_appointments(booking_id: str, db: Session = Depends(get_db),
-                      me: Principal = Depends(current_principal)) -> list[M.BookedAppointment]:
-    return list(db.scalars(
-        select(M.BookedAppointment).where(M.BookedAppointment.booking_id == booking_id)
-        .order_by(M.BookedAppointment.booked_at.desc())
-    ).all())
+def list_appointments(booking_id: str, since_started: bool = False,
+                      db: Session = Depends(get_db),
+                      me: Principal = Depends(current_principal)) -> list[BookedAppointmentOut]:
+    """Appointments for a booking, with the identity name and the sub-account that booked resolved
+    HERE rather than in the dashboard: it used to join against /identities, which no longer returns
+    identities that have booked -- and every appointment is by definition one of those.
+
+    `since_started` limits the list to the booking's CURRENT run (booked_at >= started_at), which is
+    what the booking page wants: appointments from previous runs are history, not this run's result.
+    """
+    bk = db.get(M.Booking, booking_id)
+    if not bk:
+        raise HTTPException(404, "booking not found")
+    # OUTER joins on purpose: these exist only to put a NAME on the row. An inner join would let a
+    # missing identity or sub-account row HIDE a real appointment, which is the one thing this
+    # endpoint must never do -- the appointment is the record, the name is decoration.
+    q = (select(M.BookedAppointment, M.Identity.full_name, M.SubAccount.username)
+         .outerjoin(M.Identity, M.Identity.id == M.BookedAppointment.identity_id)
+         .outerjoin(M.SubAccount, M.SubAccount.id == M.BookedAppointment.sub_account_id)
+         .where(M.BookedAppointment.booking_id == booking_id)
+         .order_by(M.BookedAppointment.booked_at.desc()))
+    if since_started and bk.started_at:
+        q = q.where(M.BookedAppointment.booked_at >= bk.started_at)
+    out = []
+    for appt, name, username in db.execute(q).all():
+        row = BookedAppointmentOut.model_validate(appt)
+        row.identity_name, row.sub_account_username = name, username
+        out.append(row)
+    return out
 
 
 @app.get("/bookings/{booking_id}/slots", response_model=list[SlotOut])

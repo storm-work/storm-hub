@@ -319,6 +319,11 @@ class BookedAppointmentOut(BaseModel):
     appointment_ref: str | None = None
     pdf_artifact_id: str | None = None
     booked_at: datetime | None = None
+    # Resolved server-side. The dashboard used to look these up in /identities, which no longer
+    # returns identities that have booked -- and every appointment is BY DEFINITION one of those,
+    # so every name silently degraded to an id fragment.
+    identity_name: str | None = None
+    sub_account_username: str | None = None
     model_config = {"from_attributes": True}
 
 

@@ -750,3 +750,61 @@ def test_credentials_export_only_returns_identities_that_actually_booked(client)
 
     r = client.post("/identities/booked/credentials", json={"identity_ids": [unbooked]}, headers=h)
     assert r.status_code == 200 and r.json()["count"] == 0
+
+
+def test_appointments_default_to_the_current_run(client):
+    """A booking page showing appointments from PREVIOUS runs makes a run that booked nothing look
+    like it booked three. The cut is booked_at >= started_at, done server-side."""
+    import apps.hub.main as main
+    from datetime import timedelta
+    from libs.db import models as M
+
+    h = _operate_headers(client)
+    iid, _ = _book_identity(client, h, name="OLD RUN", booking="RunFilter")
+    db = main.SessionLocal()
+    from sqlalchemy import select as _sel
+    bk = db.scalar(_sel(M.Booking).where(M.Booking.name == "RunFilter"))
+    appt = db.scalar(_sel(M.BookedAppointment).where(M.BookedAppointment.booking_id == bk.id))
+    appt.booked_at = main._now() - timedelta(days=2)          # a previous run's result
+    bk.started_at = main._now() - timedelta(minutes=10)       # this run started after it
+    db.commit(); bid = bk.id; db.close()
+
+    assert client.get(f"/bookings/{bid}/appointments?since_started=true", headers=h).json() == []
+    assert len(client.get(f"/bookings/{bid}/appointments", headers=h).json()) == 1
+
+
+def test_appointments_carry_the_identity_name_from_the_server(client):
+    """The dashboard used to resolve these against /identities, which no longer returns identities
+    that have booked -- and every appointment is by definition one of those, so every name silently
+    degraded to an id fragment."""
+    h = _operate_headers(client)
+    iid, winner = _book_identity(client, h, name="NAMED PERSON", booking="NameRes")
+
+    rows = client.get("/bookings/"
+                      + client.get("/bookings", headers=h).json()[0]["id"]
+                      + "/appointments", headers=h).json()
+    assert rows and rows[0]["identity_name"] == "NAMED PERSON"
+    assert rows[0]["sub_account_username"] == winner
+
+
+def test_an_appointment_is_never_hidden_by_a_missing_name(client):
+    """The name joins are decoration; the appointment is the record. An inner join would let a
+    missing identity or sub-account row hide a real booking -- caught by an existing test when this
+    endpoint first grew its joins."""
+    import apps.hub.main as main
+    from libs.db import models as M
+
+    h = _operate_headers(client)
+    bid = client.post("/bookings", json={"name": "Dangling", "type": "test", "posto_id": "2032"},
+                      headers=h).json()["id"]
+    db = main.SessionLocal()
+    i = M.Identity(full_name="GHOST", type="real")
+    db.add(i); db.commit()
+    db.add(M.BookedAppointment(booking_id=bid, identity_id=i.id,
+                               sub_account_id="no-such-sub-account", booked_at=main._now()))
+    db.commit(); db.close()
+
+    rows = client.get(f"/bookings/{bid}/appointments", headers=h).json()
+    assert len(rows) == 1
+    assert rows[0]["identity_name"] == "GHOST"
+    assert rows[0]["sub_account_username"] is None

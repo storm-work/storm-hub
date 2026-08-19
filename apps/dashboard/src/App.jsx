@@ -871,17 +871,35 @@ function BookingSlots({ booking, me }) {
 }
 
 function BookingAppointments({ booking }) {
-  const { rows, err } = useList(`/bookings/${booking.id}/appointments`);
-  const identities = useList("/identities");
-  const identityById = Object.fromEntries(identities.rows.map((i) => [i.id, i]));
-  const enriched = rows.map((a) => ({ ...a, identity_name: identityById[a.identity_id]?.full_name || a.identity_id.slice(0, 8) }));
+  // THIS RUN by default: appointments from previous runs are history, not this run's result, and
+  // mixing them makes a run that booked nothing look like it booked three. The server does the
+  // cut on booked_at >= started_at, and also resolves the identity name -- the dashboard used to
+  // look that up in /identities, which no longer returns identities that have booked, and every
+  // appointment is by definition one of those.
+  const [allRuns, setAllRuns] = useState(false);
+  const { rows, err } = useList(
+    `/bookings/${booking.id}/appointments${allRuns ? "" : "?since_started=true"}`, { pollMs: 10000 });
+  const { rows: allRows } = useList(`/bookings/${booking.id}/appointments`);
+  const enriched = rows.map((a) => ({
+    ...a, identity_name: a.identity_name || a.identity_id.slice(0, 8) }));
   const { q, setQ, sort, setSort, rows: shown } = useSortSearch(enriched, { key: "booked_at", dir: "desc" });
+  const earlier = Math.max(0, allRows.length - rows.length);
 
   return (
     <>
       <div className="row" style={{ marginBottom: 10, flexWrap: "wrap", gap: 10 }}>
-        <h3 style={{ margin: 0 }}>Appointments booked ({shown.length})</h3>
+        <h3 style={{ margin: 0 }}>
+          Appointments booked ({shown.length})
+          <span className="muted" style={{ fontSize: 12, fontWeight: 400, marginLeft: 8 }}>
+            {allRuns ? "all runs" : "this run"}
+          </span>
+        </h3>
         <span className="grow" />
+        {(earlier > 0 || allRuns) && (
+          <button className="btn ghost btn-sm" onClick={() => setAllRuns(!allRuns)}>
+            {allRuns ? "Show this run only" : `Show all runs (+${earlier} earlier)`}
+          </button>
+        )}
         <SearchBox q={q} setQ={setQ} placeholder="search appointments…" />
       </div>
       {err && <div className="banner err">{err}</div>}
@@ -1347,6 +1365,38 @@ function summarizeSubAccounts(subs) {
 }
 
 
+
+// Collapsible card. The Identities page carries two full tables now (all identities + booked), and
+// on a normal screen the second one is permanently below the fold; being able to fold either away
+// is what makes both usable at once. Open/closed persists per key, so a chosen layout survives
+// navigation and reloads rather than resetting every visit.
+function Collapsible({ storageKey, title, count, right, children, defaultOpen = true }) {
+  const [open, setOpen] = useState(() => {
+    const v = localStorage.getItem(`collapse:${storageKey}`);
+    return v === null ? defaultOpen : v === "1";
+  });
+  const toggle = () => {
+    setOpen((o) => {
+      localStorage.setItem(`collapse:${storageKey}`, o ? "0" : "1");
+      return !o;
+    });
+  };
+  return (
+    <div className="card">
+      <div className="row" style={{ marginBottom: open ? 10 : 0, flexWrap: "wrap", gap: 10 }}>
+        <h2 style={{ margin: 0, cursor: "pointer", userSelect: "none" }} onClick={toggle}
+            title={open ? "collapse" : "expand"}>
+          <span style={{ display: "inline-block", width: 16, opacity: 0.6 }}>{open ? "▾" : "▸"}</span>
+          {title}{count != null && ` (${count})`}
+        </h2>
+        <span className="grow" />
+        {open && right}
+      </div>
+      {open && children}
+    </div>
+  );
+}
+
 // ── Booked identities ─────────────────────────────────────────────────────────────────────────
 // One row per IDENTITY, never per sub-account: an identity is a PERSON, its sub-accounts are just
 // login attempts on their behalf, so "if any one of the sub-accounts booked, that identity is
@@ -1391,11 +1441,8 @@ function BookedIdentities({ me }) {
     } catch (e) { setMsg(e.message); } finally { setBusy(false); }
   }
 
-  return (
-    <div className="card" style={{ marginTop: 12 }}>
-      <div className="row" style={{ marginBottom: 10, flexWrap: "wrap", gap: 10 }}>
-        <h3 style={{ margin: 0 }}>Booked ({shown.length}/{rows.length})</h3>
-        <span className="grow" />
+  const controls = (
+    <>
         <SearchBox q={q} setQ={setQ} placeholder="search booked…" />
         <div className="field" style={{ margin: 0 }}><label>Type</label>
           <select value={type} onChange={(e) => setType(e.target.value)}>
@@ -1418,7 +1465,12 @@ function BookedIdentities({ me }) {
             {busy ? "Preparing…" : `⬇ Credentials (${selectedIds.length})`}
           </button>
         )}
-      </div>
+    </>
+  );
+
+  return (
+    <Collapsible storageKey="identities-booked" title="Booked"
+                 count={`${shown.length}/${rows.length}`} right={controls}>
       {err && <div className="banner err">{err}</div>}
       {msg && <div className="banner">{msg}</div>}
       <table className="table-compact"><thead><tr>
@@ -1451,7 +1503,7 @@ function BookedIdentities({ me }) {
           </tr>
         ))}</tbody></table>
       {rows.length === 0 && <div className="muted">No booked identities yet.</div>}
-    </div>
+    </Collapsible>
   );
 }
 
@@ -1503,12 +1555,8 @@ function Identities({ me, setLeftPanel, setRightPanel }) {
     });
   }
 
-  return (
+  const identityControls = (
     <>
-    <div className="card">
-      <div className="row" style={{ marginBottom: 10, flexWrap: "wrap", gap: 10 }}>
-        <h2 style={{ margin: 0 }}>Identities ({shown.length}/{rows.length})</h2>
-        <span className="grow" />
         <button className="btn ghost" onClick={openCreatePanel}>+ Add / import</button>
         <SearchBox q={q} setQ={setQ} placeholder="search identities…" />
         <div className="field" style={{ margin: 0 }}><label>Filter</label>
@@ -1520,7 +1568,13 @@ function Identities({ me, setLeftPanel, setRightPanel }) {
           <input type="date" value={dateFrom} onChange={(e) => setDateFrom(e.target.value)} /></div>
         <div className="field" style={{ margin: 0 }}><label>to</label>
           <input type="date" value={dateTo} onChange={(e) => setDateTo(e.target.value)} /></div>
-      </div>
+    </>
+  );
+
+  return (
+    <>
+    <Collapsible storageKey="identities-all" title="Identities"
+                 count={`${shown.length}/${rows.length}`} right={identityControls}>
       {msg && <div className="banner err">{msg}</div>}
       {err && <div className="banner err">{err}</div>}
       {selectedIds.length > 0 && (
@@ -1559,7 +1613,7 @@ function Identities({ me, setLeftPanel, setRightPanel }) {
           </tr>
         ))}</tbody></table>
       {shown.length === 0 && <div className="muted">No identities match this filter.</div>}
-      </div>
+    </Collapsible>
       {/* Booked identities live in their own table: they are deliberately absent from the list
           above (and so from the attach panel it feeds), because a person who already has an
           appointment must not be offered for another one. */}
