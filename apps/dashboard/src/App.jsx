@@ -932,8 +932,8 @@ const _SETTING_SELECT_OPTIONS = {
   ENGINE_MODE: ["sim", "live"],
   PROXY_PROVIDER: ["soax", "webshare"],
   HOLD_PROXY_PROVIDER: ["soax", "webshare"],
-  PROXY_KIND: ["", "rotating", "static"],
-  HOLD_PROXY_KIND: ["", "rotating", "static"],
+  PROXY_KIND: ["", "rotating", "mobile"],
+  HOLD_PROXY_KIND: ["", "rotating", "mobile"],
 };
 // Confirmed plain ISO dates (libs/engine/pool_manager.py's date.fromisoformat(CAL_START_DATE/...)).
 const _SETTING_DATE_KEYS = new Set(["CAL_START_DATE", "CAL_END_DATE"]);
@@ -1689,7 +1689,7 @@ function IdentityImportPipeline({ me, onDone }) {
   const [subCount, setSubCount] = useState(3);
   const [autoRegister, setAutoRegister] = useState(true);
   const [provider, setProvider] = useState("soax");
-  const [kind, setKind] = useState("static");
+  const [kind, setKind] = useState("mobile");
   const [concurrency, setConcurrency] = useState(10);
   const [busy, setBusy] = useState(false);
   const [steps, setSteps] = useState([]);
@@ -1794,7 +1794,7 @@ function IdentityImportPipeline({ me, onDone }) {
             <div className="field" style={{ margin: 0, flex: 1 }}>
               <label>Kind</label>
               <select value={kind} onChange={(e) => setKind(e.target.value)} disabled={!op} style={{ width: "100%" }}>
-                <option value="rotating">rotating</option><option value="static">static</option>
+                <option value="rotating">rotating</option><option value="mobile">mobile</option>
               </select>
             </div>
             <div className="field" style={{ margin: 0, flex: 1 }}>
@@ -1932,7 +1932,7 @@ function Registration({ me, events }) {
   const [typeFilter, setTypeFilter] = useState("all");              // all | test | real
   const [concurrency, setConcurrency] = useState(10);
   const [provider, setProvider] = useState("soax");
-  const [kind, setKind] = useState("static");
+  const [kind, setKind] = useState("mobile");
   const [msg, setMsg] = useState("");
   const [runInfo, setRunInfo] = useState(null);
   const op = me.is_operating;
@@ -2006,7 +2006,7 @@ function Registration({ me, events }) {
               </select></div>
             <div className="field" style={{ margin: 0 }}><label>Kind</label>
               <select value={kind} onChange={(e) => setKind(e.target.value)} disabled={!op}>
-                <option value="rotating">rotating</option><option value="static">static</option>
+                <option value="rotating">rotating</option><option value="mobile">mobile</option>
               </select></div>
             <div className="field" style={{ margin: 0 }}><label>Concurrency</label>
               <input type="number" value={concurrency} onChange={(e) => setConcurrency(e.target.value)} disabled={!op} style={{ width: 60 }} /></div>
@@ -2279,7 +2279,7 @@ function ProxyPoolTree({ tree, selected, onSelect, onAdd, onImport, op }) {
 
 function ProxyAddForm({ me, onDone, defaultProvider, defaultKind }) {
   const [f, setF] = useState({
-    provider: defaultProvider || "soax", kind: defaultKind || "static",
+    provider: defaultProvider || "soax", kind: defaultKind || "mobile",
     endpoint: "", credentials_ref: "", max_sessions: 2,
   });
   const [msg, setMsg] = useState("");
@@ -2297,7 +2297,7 @@ function ProxyAddForm({ me, onDone, defaultProvider, defaultKind }) {
         </select></div>
       <div className="field"><label>Kind</label>
         <select value={f.kind} onChange={(e) => setF({ ...f, kind: e.target.value })} style={{ width: "100%" }}>
-          <option value="rotating">rotating</option><option value="static">static</option>
+          <option value="rotating">rotating</option><option value="mobile">mobile</option>
         </select></div>
       <div className="field"><label>Endpoint</label>
         <input value={f.endpoint} onChange={(e) => setF({ ...f, endpoint: e.target.value })}
@@ -2313,7 +2313,7 @@ function ProxyAddForm({ me, onDone, defaultProvider, defaultKind }) {
 
 function ProxyImportForm({ me, onDone, defaultProvider, defaultKind }) {
   const [prov, setProv] = useState(defaultProvider || "soax");
-  const [kind, setKind] = useState(defaultKind || "static");
+  const [kind, setKind] = useState(defaultKind || "mobile");
   return (
     <>
       <div className="field"><label>Provider</label>
@@ -2322,7 +2322,7 @@ function ProxyImportForm({ me, onDone, defaultProvider, defaultKind }) {
         </select></div>
       <div className="field"><label>Kind</label>
         <select value={kind} onChange={(e) => setKind(e.target.value)} style={{ width: "100%" }}>
-          <option value="rotating">rotating</option><option value="static">static</option>
+          <option value="rotating">rotating</option><option value="mobile">mobile</option>
         </select></div>
       <ImportInline me={me} makeBody={(text) => ({ provider: prov, kind, text })} onDone={onDone} />
     </>

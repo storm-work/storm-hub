@@ -122,7 +122,7 @@ class IdentityEvent(Base, PKMixin, TimestampMixin):
 class Proxy(Base, PKMixin, TimestampMixin):
     __tablename__ = "proxies"
     provider: Mapped[str] = mapped_column(String(16), nullable=False)     # soax | isp
-    kind: Mapped[str] = mapped_column(String(24), nullable=False)         # datacenter|static_res|mobile
+    kind: Mapped[str] = mapped_column(String(24), nullable=False)         # rotating | mobile
     endpoint: Mapped[str] = mapped_column(String(255), nullable=False)
     credentials_ref: Mapped[str | None] = mapped_column(String(255))
     active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)

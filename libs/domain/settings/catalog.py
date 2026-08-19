@@ -121,14 +121,14 @@ _BOOKING = [
     _s("HOLD_PROXY_GEOS", L.BOOKING, str, "", group="mode",
        note="same, for the phase-2 (hold/apply) pool; blank = all"),
     _s("PROXY_KIND", L.BOOKING, str, group="mode",
-       note="optional phase-1 proxy kind filter (Proxy.kind): 'rotating' | 'static'; blank = no filter"),
+       note="optional phase-1 proxy kind filter (Proxy.kind): 'rotating' | 'mobile'; blank = no filter"),
     _s("HOLD_PROXY_PROVIDER", L.BOOKING, str, "webshare", group="mode",
        note="phase-2 (hold/apply/discovery) leased-proxy provider, used only when HOLD_SWAP_AFTER_FOUND "
             "is on -- default 'webshare' (long, ~24h session lifetime) vs phase-1's 'soax' default "
             "(~1h session lifetime): a long hold needs to outlive soax's own session cap, which a "
             "same-provider swap can't fix -- see libs.domain.settings.catalog's hold_swap group"),
     _s("HOLD_PROXY_KIND", L.BOOKING, str, group="mode",
-       note="optional phase-2 proxy kind filter; blank = no filter"),
+       note="optional phase-2 proxy kind filter ('rotating' | 'mobile'); blank = no filter"),
     # Timing (warmup_start_at / slot_open_at are booking timestamp columns)
     _s("WARMUP_START_JITTER", L.BOOKING, float, 0.0, group="timing",
        note="anti-herd (operator spec 2026-08-14: 'hub spawns worker processors -- concurrency "

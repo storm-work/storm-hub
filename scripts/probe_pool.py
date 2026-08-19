@@ -93,7 +93,7 @@ def main() -> int:
 
     by_geo: dict[str, list[str]] = collections.defaultdict(list)
     for row in parsed:      # ParsedProxy dataclass: .endpoint / .credentials_ref
-        url = _conn(M.Proxy(provider="soax", kind="static",
+        url = _conn(M.Proxy(provider="soax", kind="mobile",
                             endpoint=row.endpoint, credentials_ref=row.credentials_ref))
         by_geo[_geo_of(url)].append(url)
 

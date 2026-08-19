@@ -200,7 +200,7 @@ class ProxyOut(BaseModel):
 
 class ProxyCreate(BaseModel):
     provider: str = "soax"
-    kind: str = "static"
+    kind: str = "mobile"
     endpoint: str
     credentials_ref: str | None = None
     max_sessions: int = 2
@@ -208,7 +208,7 @@ class ProxyCreate(BaseModel):
 
 class ProxyImport(BaseModel):
     provider: str = "soax"
-    kind: str = "static"
+    kind: str = "mobile"
     max_sessions: int = 2
     text: str                    # newline-separated proxy lines
 
