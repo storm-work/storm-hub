@@ -400,3 +400,45 @@ def test_it_still_re_logins_when_the_rewarm_cannot_recover():
     )
     PhaseMachine(_cfg(booking={"SCOUT_REBUILD_AFTER_FAILED_ROUNDS": 2}, ROLE="scout"), ops).run()
     assert ops.logins >= 2, "never escalated to a fresh login"
+
+
+# ── operator-specified scout ladder (2026-08-20) ─────────────────────────────
+def test_scout_rewarms_after_a_SINGLE_failed_first_round():
+    """Step 1 of the operator's ladder: slot-open -> discover x1, and one failure is enough.
+
+    Traced on booking "Test 3059", scout 9e505283 (PEDRO TEIXEIRA RAMOS). slot-open fired 11:05:16,
+    the first gettime returned special_days={} (an unwarmed session), and the flat threshold of 3
+    made it re-run that broken probe for three rounds at ~68s each before permitting a re-warm. The
+    re-warm took 40s and discovery then worked immediately -- slot-found at 11:12:35, 7m18s after
+    slot-open, ~4.5 minutes of it spent on rounds that could not have succeeded.
+    """
+    ops = SimEngineOps(
+        discover_tasks=[["d1"]],
+        discover_outcomes={"d1": {"outcome": "failed"}},
+    )
+    PhaseMachine(_cfg(booking={"SCOUT_REBUILD_AFTER_FAILED_ROUNDS": 3}, ROLE="scout"), ops).run()
+    assert ops.warmups == 2, "one failed round after slot-open must trigger exactly one re-warm"
+    assert ops.logins == 1, "a re-warm, never a re-login -- the auth session is fine"
+
+
+def test_after_the_first_rewarm_the_steady_budget_applies():
+    """Step 2: once re-warmed, a working session is not re-warmed over a single unlucky round."""
+    ops = SimEngineOps(
+        discover_tasks=[["d1"], ["d2"], ["d3"], ["d4"]],
+        discover_outcomes={d: {"outcome": "failed"} for d in ("d1", "d2", "d3", "d4")},
+    )
+    PhaseMachine(_cfg(booking={"SCOUT_REBUILD_AFTER_FAILED_ROUNDS": 3}, ROLE="scout"), ops).run()
+    # round1 -> rebuild (budget 1), then budget 3: rounds 2,3,4 -> one more rebuild on round 4.
+    assert ops.warmups == 3, f"expected initial + 2 re-warms, got {ops.warmups}"
+    assert ops.logins == 1
+
+
+def test_a_successful_first_round_never_rewarms():
+    """Step 3: discovery that works goes straight to the normal discover/poll loop."""
+    ops = SimEngineOps(
+        discover_tasks=[["d1"], ["d2"]],
+        discover_outcomes={d: {"outcome": "empty"} for d in ("d1", "d2")},
+    )
+    PhaseMachine(_cfg(booking={"SCOUT_REBUILD_AFTER_FAILED_ROUNDS": 3}, ROLE="scout"), ops).run()
+    assert ops.warmups == 1, "an 'empty' answer is news about the calendar, not a broken session"
+    assert ops.logins == 1

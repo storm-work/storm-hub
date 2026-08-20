@@ -305,8 +305,18 @@ class EventHub:
         earlier run -- all 48 pushes were dropped, slot_found never fired, and the apply workers sat
         holding with nothing to do while the pool showed "24 slots, all closed".
 
-        LEASED and TAKEN are left alone: a slot being worked or already booked is not something a
-        discovery report should reset."""
+        A TAKEN row is ALSO reopened (2026-08-20). A slot is a date+period carrying multiple
+        capacity, not one seat, so a booking landing on it does not mean it is full -- and a scout
+        seeing it again afterwards is the portal itself saying capacity remains. That re-sighting is
+        the only evidence of spare capacity we can ever get, and it was being thrown away.
+
+        Confirmed on booking "Test 3059": slot f94b0b47 was leased CONCURRENTLY by four workers and
+        one booked it. The scout then re-found 09-15 and 09-18 at 11:13:02, both already TAKEN, and
+        both reports were dropped here -- while the last apply worker (EDER LUIS VIEIRA NEVES), out
+        of leasable slots, reverted to holding with that capacity sitting invisible in front of it.
+
+        LEASED is still left alone: a lease in flight is managed by the lease lifecycle, and a
+        re-sighting says nothing new about it -- only its freshness, which is updated below."""
         from sqlalchemy import select
         from libs.domain.enums import SlotStatus
         db = SessionLocal()
@@ -324,10 +334,16 @@ class EventHub:
                     M.Slot.booking_id == w.booking_id, M.Slot.date == str(date),
                     M.Slot.period == int(period)))
                 if exists is not None:
-                    if exists.status == SlotStatus.CLOSED:
+                    if exists.status in (SlotStatus.CLOSED, SlotStatus.TAKEN):
+                        reopened_from = exists.status
                         exists.status = SlotStatus.AVAILABLE
                         exists.discovered_by = worker_id
                         exists.miss_count = 0
+                        if reopened_from == SlotStatus.TAKEN:
+                            logger.info(
+                                "slot %s %s/%s re-discovered after a booking -- reopening as "
+                                "AVAILABLE (spare capacity confirmed by the portal)",
+                                exists.id, date, period)
                     if exists.status == SlotStatus.AVAILABLE:
                         exists.last_seen = now      # keep a live slot's freshness current
                     continue

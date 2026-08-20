@@ -107,5 +107,18 @@ def test_slot_reconcile_reopen():
     assert slot_transition(SlotStatus.AVAILABLE, SlotStatus.CLOSED)
     assert slot_transition(SlotStatus.CLOSED, SlotStatus.AVAILABLE)   # reappearance reopens
     assert slot_transition(SlotStatus.AVAILABLE, SlotStatus.LEASED)
+    # TAKEN is no longer terminal -- see test_a_taken_slot_can_reopen_when_rediscovered. What must
+    # still be impossible is inventing a booking out of an unseen slot.
     with pytest.raises(IllegalTransition):
-        slot_transition(SlotStatus.TAKEN, SlotStatus.AVAILABLE)       # taken is terminal
+        slot_transition(SlotStatus.CLOSED, SlotStatus.TAKEN)
+
+
+def test_a_taken_slot_can_reopen_when_rediscovered():
+    """TAKEN was terminal. A slot carries MULTIPLE capacity, so a booking landing on it is not the
+    same fact as it being full -- and the scout re-sighting it is the portal saying capacity remains
+    (booking "Test 3059", 2026-08-20: slot f94b0b47 leased concurrently by four workers, one
+    booked). Absence still never reopens anything; only an actual re-sighting does."""
+    from libs.domain.enums import SlotStatus
+    from libs.domain.state_machines import slot_transition
+
+    assert slot_transition(SlotStatus.TAKEN, SlotStatus.AVAILABLE) == SlotStatus.AVAILABLE

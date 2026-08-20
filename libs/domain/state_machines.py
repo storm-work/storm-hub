@@ -186,7 +186,18 @@ SLOT_TRANSITIONS = {
     SlotStatus.AVAILABLE: frozenset({SlotStatus.LEASED, SlotStatus.CLOSED, SlotStatus.TAKEN}),
     SlotStatus.LEASED:    frozenset({SlotStatus.AVAILABLE, SlotStatus.TAKEN, SlotStatus.CLOSED}),
     SlotStatus.CLOSED:    frozenset({SlotStatus.AVAILABLE}),   # reappearance reopens
-    SlotStatus.TAKEN:     frozenset(),
+    # TAKEN -> AVAILABLE (2026-08-20): a slot is a date+period with MULTIPLE capacity, not a single
+    # seat, so "someone booked it" and "it is full" are different facts. If discovery sees the slot
+    # AGAIN after a booking landed on it, the portal is still offering it -- which is direct evidence
+    # that capacity remains, and the only evidence available to us.
+    #
+    # Confirmed on booking "Test 3059": slot f94b0b47 was leased CONCURRENTLY by four workers and one
+    # of them booked it, so multi-capacity is real and already exploited. Then the scout re-found
+    # 09-15 and 09-18 at 11:13:02, both already marked TAKEN -- and _persist_slots dropped both
+    # reports because TAKEN was terminal here. The last apply worker (EDER LUIS VIEIRA NEVES) had
+    # already spent its two attempts (one `session`, one `bounced`), found every slot TAKEN, and
+    # reverted to holding with re-discovered capacity sitting right there, invisible.
+    SlotStatus.TAKEN:     frozenset({SlotStatus.AVAILABLE}),
 }
 
 

@@ -152,8 +152,62 @@ def test_rediscovery_reopens_a_closed_slot(slots_db):
     db.close()
 
 
-def test_rediscovery_never_disturbs_a_leased_or_taken_slot(slots_db):
-    """A slot being worked, or already booked, is not something a discovery report may reset."""
+def test_rediscovery_never_disturbs_a_leased_slot(slots_db):
+    """A lease in flight is managed by the lease lifecycle; a re-sighting says nothing new about it."""
+    from sqlalchemy import select
+
+    import apps.hub.events as ev
+    from libs.db import models as M
+    from libs.domain.enums import SlotStatus
+
+    bid, wid = _seed_scout(slots_db)
+    db = slots_db()
+    db.add(M.Slot(booking_id=bid, posto_id="5084", date="2026-09-02", period=4,
+                  status=SlotStatus.LEASED))
+    db.commit(); db.close()
+
+    ev.EventHub.__new__(ev.EventHub)._persist_slots(wid, [{"date": "2026-09-02", "period": 4}])
+
+    db = slots_db()
+    assert db.scalars(select(M.Slot)).one().status == SlotStatus.LEASED
+    db.close()
+
+
+def test_rediscovery_of_a_TAKEN_slot_reopens_it_as_spare_capacity(slots_db):
+    """A slot is a date+period with MULTIPLE capacity, not one seat -- so "booked" is not "full".
+
+    Seeing it again after a booking landed is the portal telling us capacity remains, and it is the
+    ONLY evidence of that we can ever get. This used to be discarded.
+
+    Confirmed on booking "Test 3059": slot f94b0b47 was leased CONCURRENTLY by four workers and one
+    booked it, so multi-capacity is real and already exploited. The scout then re-found 09-15 and
+    09-18 at 11:13:02, both already TAKEN, and both reports were dropped -- while the last apply
+    worker, having spent its two attempts and finding every slot TAKEN, reverted to holding with
+    that capacity sitting invisible in front of it."""
+    from sqlalchemy import select
+
+    import apps.hub.events as ev
+    from libs.db import models as M
+    from libs.domain.enums import SlotStatus
+
+    bid, wid = _seed_scout(slots_db)
+    db = slots_db()
+    db.add(M.Slot(booking_id=bid, posto_id="5084", date="2026-09-01", period=3,
+                  status=SlotStatus.TAKEN, miss_count=2))
+    db.commit(); db.close()
+
+    ev.EventHub.__new__(ev.EventHub)._persist_slots(wid, [{"date": "2026-09-01", "period": 3}])
+
+    db = slots_db()
+    slot = db.scalars(select(M.Slot)).one()
+    assert slot.status == SlotStatus.AVAILABLE, "a re-sighted TAKEN slot must become leasable again"
+    assert slot.miss_count == 0
+    assert slot.last_seen is not None
+    db.close()
+
+
+def test_a_taken_slot_NOT_rediscovered_stays_taken(slots_db):
+    """Only an actual re-sighting reopens it -- absence must never be read as spare capacity."""
     from sqlalchemy import select
 
     import apps.hub.events as ev
@@ -164,16 +218,13 @@ def test_rediscovery_never_disturbs_a_leased_or_taken_slot(slots_db):
     db = slots_db()
     db.add(M.Slot(booking_id=bid, posto_id="5084", date="2026-09-01", period=3,
                   status=SlotStatus.TAKEN))
-    db.add(M.Slot(booking_id=bid, posto_id="5084", date="2026-09-02", period=4,
-                  status=SlotStatus.LEASED))
     db.commit(); db.close()
 
-    ev.EventHub.__new__(ev.EventHub)._persist_slots(
-        wid, [{"date": "2026-09-01", "period": 3}, {"date": "2026-09-02", "period": 4}])
+    ev.EventHub.__new__(ev.EventHub)._persist_slots(wid, [{"date": "2026-09-05", "period": 9}])
 
     db = slots_db()
-    got = {(s.date, str(s.status)) for s in db.scalars(select(M.Slot)).all()}
-    assert got == {("2026-09-01", "taken"), ("2026-09-02", "leased")}
+    taken = db.scalars(select(M.Slot).where(M.Slot.date == "2026-09-01")).one()
+    assert taken.status == SlotStatus.TAKEN
     db.close()
 
 

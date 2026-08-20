@@ -198,7 +198,26 @@ class PhaseMachine:
             return PhaseResult("stopped", self._sub, "stopped before slot_open", self.visited)
         pushed_total = 0
         failed_rounds = 0
-        rebuild_after = max(1, int(self.cfg.raw.get("SCOUT_REBUILD_AFTER_FAILED_ROUNDS", 3)))
+        # Operator-specified ladder (2026-08-20), and the FIRST round is deliberately cheaper:
+        #
+        #   step 1  slot-open -> discover x1   fail -> re-warm
+        #   step 2  re-warm   -> discover x3   fail -> re-warm, repeat step 2
+        #   step 3  on success -> slot-found, normal discover/poll loop
+        #
+        # The threshold used to be a flat 3, which is right for a session that has ALREADY proven it
+        # can discover and then degrades, and wrong for the very first round after slot-open -- when
+        # the likeliest explanation for failure is simply that this session was never in a warm
+        # enough state to call gettime at all.
+        #
+        # Traced live on booking "Test 3059", scout 9e505283 (PEDRO TEIXEIRA RAMOS): slot-open fired
+        # at 11:05:16, the first gettime returned special_days={} (empty -- an unwarmed session), and
+        # three full rounds then reported EVERY date "failed" at ~68s each. Only at 11:10:31 did the
+        # flat-3 threshold permit a re-warm; that re-warm took 40s, gettime came back populated, and
+        # discovery found 5 slots immediately. slot-found landed at 11:12:35 -- 7m18s after
+        # slot-open, of which roughly 4.5 minutes was spent re-running a probe that could not work.
+        # One failed round is all the evidence needed to justify a 40s re-warm.
+        steady_rebuild_after = max(1, int(self.cfg.raw.get("SCOUT_REBUILD_AFTER_FAILED_ROUNDS", 3)))
+        rebuild_after = 1
         while True:
             dates = self.ops.await_discover_task()
             if dates is None:               # orchestrator says stop (booking done / applies closed)
@@ -230,6 +249,10 @@ class PhaseMachine:
                 failed_rounds += 1
                 if failed_rounds >= rebuild_after:
                     failed_rounds = 0
+                    # Step 1 spends ONE round before re-warming; every cycle after that gets the
+                    # steady budget, so a session that is genuinely working is not re-warmed over a
+                    # single unlucky round.
+                    rebuild_after = steady_rebuild_after
                     self._to(WorkerSubstate.POLLING)
                     if not self._rebuild_session("discovery failing every round"):
                         return self._fail("scout session unrecoverable")
