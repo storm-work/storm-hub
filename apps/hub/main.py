@@ -72,7 +72,8 @@ from .events import EventHub
 from .genaccounts import gen_fake_identities, gen_subaccounts
 from .importers import parse_geo, parse_identities, parse_proxies
 from .settings_store import get_global, set_layer
-from .scheduler import _LAUNCH_BLOCKED_BOOKING_STATUSES, _aware, Scheduler
+from .scheduler import (LAUNCH_FAILED_PREFIX, _LAUNCH_BLOCKED_BOOKING_STATUSES, _aware,
+                        Scheduler)
 from .supervisor import Supervisor
 from .schemas import (
     BookedCredentialsRequest,
@@ -233,7 +234,7 @@ def _launch_worker_fleet(worker_ids: list[str], *, jitter_secs: float = 0.0) -> 
                 try:
                     w = db.get(M.Worker, wid)
                     if w is not None:
-                        w.substate_detail = f"launch failed: {str(reason)[:200]}"
+                        w.substate_detail = f"{LAUNCH_FAILED_PREFIX} {str(reason)[:200]}"
                         db.commit()
                 finally:
                     db.close()
@@ -2057,6 +2058,12 @@ def _do_launch_worker(db: Session, w: M.Worker) -> None:
     # have emitted several real status_change events, and clearing substate would resurrect the
     # 2026-08-13 race. The requeue-to-READY that preceded this launch already cleared the stale one.
     w.status = WorkerStatus.RUNNING
+    # Clear any LAUNCH_FAILED_PREFIX marker from a previous attempt. It is what _hold_respawn keys
+    # its retry off, so leaving it behind on a NOW-SUCCESSFUL launch would both mislead the operator
+    # ("launch failed" next to a running worker) and re-arm the retry the moment this worker next
+    # touches READY for an unrelated reason.
+    if (w.substate_detail or "").startswith(LAUNCH_FAILED_PREFIX):
+        w.substate_detail = None
     db.commit()
 
 

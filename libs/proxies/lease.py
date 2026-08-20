@@ -7,6 +7,7 @@ same slot; on SQLite (tests) the lock is skipped. `release_proxy` frees the leas
 """
 from __future__ import annotations
 
+import random
 from datetime import datetime, timezone
 
 from sqlalchemy import func, select
@@ -14,9 +15,52 @@ from sqlalchemy.orm import Session
 
 from libs.db import models as M
 
+# How many extra candidates one lease may try when it keeps LOSING claim races. A lost race is not
+# evidence the pool is bad -- it means a concurrent leaser got there first -- so it must not be
+# charged against `max_probes`, which exists to bound a mostly-DEAD pool. It still costs a browser
+# probe, though, so the total is capped at max_probes * this.
+_LOST_RACE_ALLOWANCE = 3
+
+# Candidates are shuffled within a window of this size (see _spread_candidates). Big enough that
+# concurrent leasers rarely pick the same row, small enough that selection stays essentially
+# least-recently-used.
+_CANDIDATE_SPREAD = 24
+
 
 class ProxyLeaseError(RuntimeError):
     pass
+
+
+def _spread_candidates(rows, max_probes: int):
+    """LRU order, shuffled within a sliding window -- decorrelates CONCURRENT leasers.
+
+    `_candidate_query`'s last_used_at ordering is a cursor, and a cursor only helps leases that
+    happen one after another: it advances when a probe commits. A whole fleet launching at once
+    reads the identical head of the queue before any of them has stamped anything, so all N workers
+    walk the SAME candidates in the SAME order and pile onto the same rows -- each one probing
+    (a real headless browser nav, seconds long) only to lose the claim to whoever committed first.
+
+    Confirmed live 2026-08-20: 4 of 9 workers failed to launch with "no healthy proxy after probing
+    5 candidate(s)" naming an identical five UUIDs, every one of which was is_healthy=True with
+    health='ok' recorded during that very launch window. They were healthy; the workers just kept
+    losing the race for them.
+
+    Shuffling within a window keeps selection least-recently-used in aggregate (the window advances
+    through the LRU-ordered stream) while making it very unlikely that two simultaneous leasers try
+    the same row first. Deliberately a generator over the lazy stream, not a LIMIT: a pool whose
+    head is entirely at capacity must still fall through to the rest of the pool, as before.
+    """
+    window = max(max_probes * 4, _CANDIDATE_SPREAD)
+    buf: list = []
+    for row in rows:
+        buf.append(row)
+        if len(buf) >= window:
+            random.shuffle(buf)
+            yield from buf
+            buf = []
+    if buf:
+        random.shuffle(buf)
+        yield from buf
 
 
 def conn_url(proxy: M.Proxy, scheme: str = "http") -> str:
@@ -151,14 +195,23 @@ def lease_proxy(db: Session, worker_id: str, provider: str, *, kind: str | None 
 
     counts = _active_lease_counts(db)
     q = _candidate_query(provider, kind, exclude_ids, geos)   # no lock -- see docstring
-    probed = 0
+    unhealthy = 0     # candidates that FAILED their probe -- the pool-badness signal max_probes bounds
+    lost_races = 0    # healthy candidates a concurrent leaser claimed first -- NOT pool badness
+    probes = 0        # browser probes actually run -- the real cost ceiling
     tried_ids: list[str] = []
-    for proxy in db.scalars(q):
+    max_attempts = max_probes * _LOST_RACE_ALLOWANCE
+    for proxy in _spread_candidates(db.scalars(q), max_probes):
         if counts.get(proxy.id, 0) >= proxy.max_sessions:
             continue
-        if probed >= max_probes:
+        # Only a FAILED PROBE counts against max_probes. Losing a claim race used to consume the
+        # same budget, so under a concurrent fleet launch a worker could burn all 5 of its probes on
+        # candidates that were perfectly healthy and then report "no healthy proxy available" --
+        # blaming the pool for what was really contention. Confirmed live 2026-08-20 (4 of 9 workers
+        # stuck at READY, every named candidate is_healthy=True). Lost races get their own, larger
+        # allowance because retrying one is likely to succeed; `probes` still caps the total cost.
+        if unhealthy >= max_probes or probes >= max_attempts:
             break
-        probed += 1
+        probes += 1
         tried_ids.append(proxy.id)
         ok, detail = health_check(conn_url(proxy))
         apply_result(proxy, ok, detail)
@@ -169,14 +222,18 @@ def lease_proxy(db: Session, worker_id: str, provider: str, *, kind: str | None 
         proxy.last_used_at = datetime.now(timezone.utc)
         db.commit()
         if not ok:
+            unhealthy += 1
             continue
         claimed = _claim_locked(db, proxy.id, worker_id, is_pg)
         if claimed is not None:
             return claimed
-        # lost the claim race to a concurrent leaser -- try the next candidate
+        lost_races += 1   # healthy, but someone else committed first -- try the next candidate
+    # Say WHICH of the two it was. "no healthy proxy" sent the last investigation looking at proxy
+    # health for a contention bug, with the DB showing every named candidate as healthy.
     raise ProxyLeaseError(
-        f"no healthy {provider} proxy available after probing {probed} candidate(s) "
-        f"({', '.join(tried_ids) or 'none eligible'})"
+        f"no {provider} proxy leased after {probes} probe(s): "
+        f"{unhealthy} failed health, {lost_races} lost to a concurrent leaser "
+        f"({', '.join(tried_ids[:5]) or 'none eligible'})"
     )
 
 

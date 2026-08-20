@@ -60,7 +60,9 @@ def apply_result(proxy, ok: bool, detail: str) -> None:
     lease_proxy()'s own `order_by(score.desc(), ...)` then naturally prefers the more-reliable proxy
     among healthy ones with zero further changes needed there."""
     proxy.is_healthy = ok
-    proxy.health = "ok" if ok else detail[:24]
+    # 160, matching the column (migration cc000healthdetail). At 24 the net::ERR_* code -- the
+    # only part that says WHICH failure this is -- was always the part cut off.
+    proxy.health = "ok" if ok else detail[:160]
     if ok:
         proxy.score = min(SCORE_MAX, proxy.score + SCORE_STEP_UP)
     else:

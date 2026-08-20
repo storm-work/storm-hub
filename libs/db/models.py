@@ -127,7 +127,7 @@ class Proxy(Base, PKMixin, TimestampMixin):
     credentials_ref: Mapped[str | None] = mapped_column(String(255))
     active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     exit_ip: Mapped[str | None] = mapped_column(String(64))
-    health: Mapped[str | None] = mapped_column(String(24))
+    health: Mapped[str | None] = mapped_column(String(160))
     is_healthy: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     score: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     max_sessions: Mapped[int] = mapped_column(Integer, default=2, nullable=False)

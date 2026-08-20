@@ -22,7 +22,7 @@ from datetime import datetime, timedelta, timezone
 
 import logging
 
-from sqlalchemy import func, select, update
+from sqlalchemy import and_, func, or_, select, update
 
 from libs.db import models as M
 from libs.bus.names import notified_key
@@ -60,6 +60,19 @@ _ACTIVE_BOOKING_STATUSES = frozenset({
 _LAUNCH_BLOCKED_BOOKING_STATUSES = frozenset({
     BookingStatus.STOPPED, BookingStatus.COMPLETED, BookingStatus.ABORTED,
 })
+
+# Marker written into Worker.substate_detail when a launch raises before the process is spawned
+# (_launch_worker_fleet). Such a worker correctly stays READY -- nothing was started, so there is
+# nothing to fail -- but READY is a status no watchdog looks at, which made it a DEAD END: the
+# worker sat there indefinitely, looking healthy rather than broken.
+#
+# Confirmed live 2026-08-20: 4 of 9 workers on "Test 3018" failed their proxy lease at 05:39 and
+# were still sitting at READY when the operator noticed, with the other 5 running normally. The
+# operator's question was exactly "others will not launch?" -- and the answer was no, not without
+# clicking Start again. A launch failure is transient and retryable (a bad run of proxy candidates),
+# so _hold_respawn now picks these up with the same backoff/cap/kill-before-relaunch it already
+# applies to FAILED and HELD.
+LAUNCH_FAILED_PREFIX = "launch failed:"
 
 
 def plan_booking_actions(status: str, warmup_start_at, slot_open_at, now: datetime) -> list[str]:
@@ -256,9 +269,18 @@ class Scheduler:
         # slot, or whose apply bounced, is exactly the case hold-respawn exists to retry. It used to
         # land here only because `held` was mis-mapped to FAILED -- now that it has its own status,
         # it has to be named explicitly or the retry would silently disappear with the mis-mapping.
+        # READY-with-a-launch-failure joins FAILED/HELD (2026-08-20). A launch that raises before
+        # spawn leaves the worker READY -- correct, nothing started -- but no watchdog watches READY,
+        # so those workers never retried and never surfaced as a problem. See LAUNCH_FAILED_PREFIX.
+        # Scoped to the marker, NOT to READY generally: a plain READY worker is one an operator has
+        # armed but not started, and auto-launching those would start a booking nobody asked to run.
         failed = db.scalars(select(M.Worker).where(
             M.Worker.booking_id == bk.id,
-            M.Worker.status.in_([WorkerStatus.FAILED, WorkerStatus.HELD]))).all()
+            or_(
+                M.Worker.status.in_([WorkerStatus.FAILED, WorkerStatus.HELD]),
+                and_(M.Worker.status == WorkerStatus.READY,
+                     M.Worker.substate_detail.like(f"{LAUNCH_FAILED_PREFIX}%")),
+            ))).all()
         if not failed:
             return
         max_attempts = int(self._effective_booking_setting(db, bk, "MAX_RESPAWN_ATTEMPTS", 5))

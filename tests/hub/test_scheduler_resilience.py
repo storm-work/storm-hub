@@ -1493,3 +1493,70 @@ def test_scheduled_start_leaves_a_completed_worker_alone(db, monkeypatch):
 
     assert launched.get("ids", []) == []
     assert done.status == WorkerStatus.COMPLETED
+
+
+# ── launch-failure retry (live incident 2026-08-20) ──────────────────────────
+def _launch_failed_db():
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    metadata.create_all(engine)
+    return sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)()
+
+
+def test_hold_respawn_retries_a_worker_whose_LAUNCH_failed():
+    """A launch that raises before spawn leaves the worker READY -- correct, nothing started -- but
+    READY is a status no watchdog looked at, so it was a dead end.
+
+    Confirmed live 2026-08-20: 4 of 9 workers on "Test 3018" failed their proxy lease and sat at
+    READY indefinitely while the other 5 ran. Nothing would ever have retried them.
+    """
+    from apps.hub.scheduler import LAUNCH_FAILED_PREFIX
+
+    r = fakeredis.FakeStrictRedis(decode_responses=True)
+    relaunched = []
+    sched = _scheduler(redis_client=r, on_relaunch=lambda db, w: relaunched.append(w.id))
+
+    db = _launch_failed_db()
+    bk = _make_booking(db)
+    w = _make_worker(db, bk, _make_identity(db), status=WorkerStatus.READY)
+    w.substate_detail = f"{LAUNCH_FAILED_PREFIX} no soax proxy leased after 5 probe(s)"
+    db.commit()
+
+    sched._hold_respawn(db, bk, NOW)
+
+    assert relaunched == [w.id]
+
+
+def test_hold_respawn_leaves_a_plain_READY_worker_alone():
+    """Scoped to the marker, NOT to READY generally. A plain READY worker is one an operator armed
+    but deliberately has not started -- auto-launching those would start a booking nobody ran."""
+    r = fakeredis.FakeStrictRedis(decode_responses=True)
+    relaunched = []
+    sched = _scheduler(redis_client=r, on_relaunch=lambda db, w: relaunched.append(w.id))
+
+    db = _launch_failed_db()
+    bk = _make_booking(db)
+    _make_worker(db, bk, _make_identity(db), status=WorkerStatus.READY)
+
+    sched._hold_respawn(db, bk, NOW)
+
+    assert relaunched == []
+
+
+def test_launch_failure_retry_still_honours_the_respawn_cap():
+    """It reuses the same backoff/cap machinery -- a permanently unleasable worker must not spin."""
+    from apps.hub.scheduler import LAUNCH_FAILED_PREFIX
+
+    r = fakeredis.FakeStrictRedis(decode_responses=True)
+    relaunched = []
+    sched = _scheduler(redis_client=r, on_relaunch=lambda db, w: relaunched.append(w.id))
+
+    db = _launch_failed_db()
+    bk = _make_booking(db)
+    w = _make_worker(db, bk, _make_identity(db), status=WorkerStatus.READY)
+    w.substate_detail = f"{LAUNCH_FAILED_PREFIX} pool exhausted"
+    db.commit()
+
+    r.hset(f"respawn:{w.id}", mapping={"attempt": 5, "next_eligible": 0})
+    sched._hold_respawn(db, bk, NOW)
+
+    assert relaunched == []
