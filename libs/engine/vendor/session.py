@@ -1403,8 +1403,6 @@ class PlaywrightSession:
         anticaptcha_keys  = cmd.get("anticaptcha_keys", [])
         twocaptcha_keys   = cmd.get("twocaptcha_keys", [])
         capmonster_keys   = cmd.get("capmonster_keys", [])
-        min_score         = cmd.get("min_score", 0)   # default 0: scoring removed (solver score ≠ portal
-                                                       # accept — confirmed). First usable token wins.
         pre_token_holder  = cmd.get("pre_token", [])   # mutable list; worker's pre-solve thread writes here
 
         _proxy_short = (self.proxy or "none")[:60]
@@ -1569,12 +1567,13 @@ class PlaywrightSession:
         # this eliminates the serial solver wait on successful pre-solve hits.
         if not token and pre_token_holder and pre_token_holder[0]:
             import solver as _solver
-            _pre_score = _solver.score_token(pre_token_holder[0])
-            if _pre_score >= min_score:
-                token = pre_token_holder[0]
-                print(f"[session] pre-solved token accepted  len={len(token)}  score={_pre_score}")
-            else:
-                print(f"[session] pre-solved token score {_pre_score} < min_score {min_score} — solving fresh")
+            # ALWAYS accepted. There used to be a `>= min_score` gate here, which discarded the
+            # pre-solve and paid for a fresh solve -- at the threshold ops_live passed (50) that
+            # fired on the overwhelming majority of tokens, since ours score 10-25. It threw away
+            # the exact work the pre-solve exists to save, to buy a re-solve that scores the same.
+            token = pre_token_holder[0]
+            print(f"[session] pre-solved token accepted  len={len(token)}  "
+                  f"score={_solver.score_token(token)}")
 
         if not token:
             # A/B lever: when LOGIN_ANTICAPTCHA_ONLY=1, drop capsolver from the reCAPTCHA RACE ONLY so
@@ -1609,22 +1608,22 @@ class PlaywrightSession:
                 _rc_proxy = self.proxy if _recaptcha_solve_proxy() else None
                 token = None
                 if _rc_proxy:
-                    print(f"[session] race_all (min_score={min_score}, PROXY-based"
+                    print(f"[session] race_all (PROXY-based"
                           f"{', ANTICAPTCHA-ONLY' if _login_ac_only else ''})")
                     try:
                         token = _solver.race_all(
                             _rc_capsolver, _rc_anticaptcha, twocaptcha_keys, capmonster_keys,
-                            "LOGIN_EVISA", proxy=_rc_proxy, min_score=min_score,
+                            "LOGIN_EVISA", proxy=_rc_proxy,
                         )
                     except Exception as e:
                         print(f"[session] PROXY-based solve failed ({e}) — falling back to proxyless")
                 if not token:
-                    print(f"[session] race_all (min_score={min_score}, proxyless"
+                    print(f"[session] race_all (proxyless"
                           f"{', ANTICAPTCHA-ONLY' if _login_ac_only else ''})")
                     try:
                         token = _solver.race_all(
                             _rc_capsolver, _rc_anticaptcha, twocaptcha_keys, capmonster_keys,
-                            "LOGIN_EVISA", proxy=None, min_score=min_score,
+                            "LOGIN_EVISA", proxy=None,
                         )
                     except Exception as e:
                         print(f"[session] race_all failed: {e}")
@@ -1814,7 +1813,7 @@ class PlaywrightSession:
             _dd_result = self._try_datadome_bypass(
                 page, html_content, final_url,
                 capsolver_keys, anticaptcha_keys, twocaptcha_keys, capmonster_keys,
-                min_score, username, password, lang,
+                username, password, lang,
             )
             if _dd_result:
                 return _dd_result
@@ -1960,7 +1959,6 @@ class PlaywrightSession:
         self, page, html_content: str, website_url: str,
         capsolver_keys: list, anticaptcha_keys: list,
         twocaptcha_keys: list, capmonster_keys: list,
-        min_score: int,
         username: str, password: str, lang: str,
     ):
         """
@@ -2044,11 +2042,11 @@ class PlaywrightSession:
 
         # Fresh CAPTCHA token (previous one is consumed / expired)
         retry_token = ""
-        print(f"[session] datadome: retry race_all (min_score={min_score})")
+        print("[session] datadome: retry race_all")
         try:
             retry_token = _solver.race_all(
                 capsolver_keys, anticaptcha_keys, twocaptcha_keys, capmonster_keys,
-                "LOGIN_EVISA", proxy=None, min_score=min_score,
+                "LOGIN_EVISA", proxy=None,
             )
             print(f"[session] datadome: retry token len={len(retry_token)}  score={_solver.score_token(retry_token)}")
         except Exception as _te:
@@ -2241,12 +2239,10 @@ class PlaywrightSession:
                       twocaptcha_keys: list | None = None,
                       capmonster_keys: list | None = None,
                       timeout: int = 300,
-                      min_score: int = 80,
                       pre_token: list | None = None) -> dict:
         """
         Type credentials into the login form to build behavioral signals, click the
         reCAPTCHA token silently (no checkbox click). Races all solver services for token.
-        min_score: minimum reCAPTCHA score to accept (0=any).
         pre_token: mutable list[str] — if [0] is non-empty when the token injection point
             is reached, it is used directly and the solver race is skipped entirely.
             Worker pre-solves in parallel with browser launch to eliminate serial wait.
@@ -2263,7 +2259,6 @@ class PlaywrightSession:
             "anticaptcha_keys": anticaptcha_keys or [],
             "twocaptcha_keys": twocaptcha_keys or ([twocaptcha_key] if twocaptcha_key else []),
             "capmonster_keys": capmonster_keys or [],
-            "min_score":       min_score,
             "pre_token":       pre_token or [],
         })
         try:

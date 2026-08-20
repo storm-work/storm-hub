@@ -1832,7 +1832,20 @@ def detach_identity(booking_id: str, identity_id: str, db: Session = Depends(get
     worker = db.scalar(select(M.Worker).where(
         M.Worker.booking_id == booking_id, M.Worker.identity_id == identity_id))
     if worker:
+        # Detach was the ONE action in WORKER_ACTION_STATUSES that no endpoint enforced (launch/
+        # stop/restart all call this; detach did not). Both other layers already said detach is
+        # illegal from RUNNING -- the table declares it and the dashboard disables the button -- so
+        # the invariant state_machines.py states in its own comment ("a disabled button always means
+        # 'not applicable', never 'will 409'") was only true for three of the four actions.
+        #
+        # Enforced rather than widened because detach is destructive in a way the others are not: it
+        # DELETES the ProxyLease/SlotLease rows outright. Doing that to a live worker both rips the
+        # leases out from under it and destroys the only record of which proxy/slot it was using --
+        # which is exactly how a previous investigation lost its evidence. Stop it first, explicitly.
+        _require_worker_action(worker, "detach")
         if worker.status == WorkerStatus.RUNNING:
+            # Unreachable via the guard above; kept for the race where a worker reports RUNNING
+            # between the guard and here, so we never delete a worker whose process is still live.
             _bus.send_command(worker.id, "stop")
             supervisor.stop(worker.id)
         db.execute(delete(M.ProxyLease).where(M.ProxyLease.worker_id == worker.id))

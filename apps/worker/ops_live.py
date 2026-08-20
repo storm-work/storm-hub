@@ -449,10 +449,13 @@ class LiveEngineOps(EngineOps):
             try:
                 self.session = get_session(proxy=self.warm_proxy, headless=self.headless,
                                            fp_seed=self.account.get("username"))
+                # No min_score: the parameter is gone. It gated the pre-solved token and forced
+                # race_all down its "wait for a good-enough score" path, which is what produced the
+                # 180s solver stalls -- to chase a score our tokens essentially never reach and that
+                # does not predict portal acceptance anyway. First usable token wins.
                 result = self.session.browser_login(
                     self.account["username"], self.account["password"],
                     capsolver_keys=self.capsolver_keys,
-                    min_score=50,
                 )
             except Exception as e:
                 if transient < max_transient and self._is_transient_login_failure(str(e)):

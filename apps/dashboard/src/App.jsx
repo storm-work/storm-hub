@@ -494,6 +494,8 @@ function BookingRunSummary({ workers, events }) {
   const rows = workers.rows;
   const counts = countRunSummary(rows, events);
   const active = rows.filter((w) => w.status === "running").length;
+  const shown = new Set(RUN_SUMMARY_ROWS.flat());
+  const otherPhases = Object.entries(counts).filter(([s, n]) => !shown.has(s) && n > 0);
   return (
     <div style={{ marginBottom: 12 }}>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(150px, 220px))",
@@ -505,6 +507,16 @@ function BookingRunSummary({ workers, events }) {
           </div>
         ))}
       </div>
+      {/* The 8 rows above are the operator's fixed layout, but WorkerSubstate has 12 values --
+          idle/logged_in/warmed/swapped have no row. countRunSummary still counts them, so those
+          workers were being silently dropped from the tally and the phases visibly failed to add up
+          to "N running" with no way to tell where the rest went. Shown only when non-zero, so the
+          panel keeps its stable 8-row shape in the normal case. */}
+      {otherPhases.length > 0 && (
+        <div className="muted" style={{ fontSize: 12, marginTop: 4 }}>
+          also: {otherPhases.map(([s, n]) => `${s} ${n}`).join(", ")}
+        </div>
+      )}
       {/* Substates only exist for running workers, so an all-zero grid is ambiguous between "idle
           fleet" and "nothing running" -- say which. */}
       <div className="muted" style={{ fontSize: 12, marginTop: 4 }}>
