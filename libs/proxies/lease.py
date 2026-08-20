@@ -31,7 +31,22 @@ class ProxyLeaseError(RuntimeError):
     pass
 
 
-def _spread_candidates(rows, max_probes: int):
+def _spread_window(n_candidates: int, max_probes: int) -> int:
+    """How wide the shuffle window may be for a pool of this size.
+
+    Bounded by a FRACTION of the pool, because shuffling must never span the whole thing. The LRU
+    ordering carries a second guarantee besides fairness: a proxy that just failed its probe was
+    stamped to the back, so the next lease does not retry it. That only holds while the window is
+    small relative to the pool -- shuffle everything and the just-failed proxy is as likely to come
+    first as anything else, which is precisely the behaviour the cursor exists to prevent.
+
+    So: a 6-row pool gets window 1 (strict LRU, no shuffling, rotation guarantee intact), and a
+    600-row pool gets the full spread. Both invariants hold at both ends.
+    """
+    return max(1, min(_CANDIDATE_SPREAD, n_candidates // 4, max(1, max_probes * 4)))
+
+
+def _spread_candidates(rows, window: int):
     """LRU order, shuffled within a sliding window -- decorrelates CONCURRENT leasers.
 
     `_candidate_query`'s last_used_at ordering is a cursor, and a cursor only helps leases that
@@ -49,8 +64,9 @@ def _spread_candidates(rows, max_probes: int):
     through the LRU-ordered stream) while making it very unlikely that two simultaneous leasers try
     the same row first. Deliberately a generator over the lazy stream, not a LIMIT: a pool whose
     head is entirely at capacity must still fall through to the rest of the pool, as before.
+
+    `window` comes from _spread_window -- see there for why it must stay a fraction of the pool.
     """
-    window = max(max_probes * 4, _CANDIDATE_SPREAD)
     buf: list = []
     for row in rows:
         buf.append(row)
@@ -200,7 +216,10 @@ def lease_proxy(db: Session, worker_id: str, provider: str, *, kind: str | None 
     probes = 0        # browser probes actually run -- the real cost ceiling
     tried_ids: list[str] = []
     max_attempts = max_probes * _LOST_RACE_ALLOWANCE
-    for proxy in _spread_candidates(db.scalars(q), max_probes):
+    # Counted, not guessed: the shuffle window has to stay a fraction of the pool or it defeats the
+    # LRU rotation guarantee (see _spread_window). Cheap -- a COUNT over the same indexed filters.
+    n_candidates = db.scalar(select(func.count()).select_from(q.subquery())) or 0
+    for proxy in _spread_candidates(db.scalars(q), _spread_window(n_candidates, max_probes)):
         if counts.get(proxy.id, 0) >= proxy.max_sessions:
             continue
         # Only a FAILED PROBE counts against max_probes. Losing a claim race used to consume the

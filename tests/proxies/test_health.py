@@ -29,7 +29,9 @@ def test_apply_result_failure_lowers_score_and_marks_unhealthy():
     p = _proxy(score=50.0, is_healthy=True)
     apply_result(p, False, "TimeoutError: nav timed out")
     assert p.is_healthy is False
-    assert p.health == "TimeoutError: nav timed out"[:24]
+    # 160 now, not 24 (migration cc000healthdetail): at 24 the net::ERR_* code -- the only part
+    # saying WHICH failure this was -- is exactly what got cut off.
+    assert p.health == "TimeoutError: nav timed out"
     assert p.score == 25.0
 
 

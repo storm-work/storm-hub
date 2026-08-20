@@ -386,7 +386,9 @@ def test_handle_proxy_request_sends_unavailable_when_pool_exhausted(client):
         events_mod.SessionLocal = orig
 
     assert bus.sent == [(wid, "proxy_unavailable", {"reason": bus.sent[0][2]["reason"]})]
-    assert "no healthy" in bus.sent[0][2]["reason"]
+    # Message reworded 2026-08-20 to separate a dead pool from lost claim races; the reason
+    # still has to name the provider and say the lease could not be satisfied.
+    assert "no webshare proxy leased" in bus.sent[0][2]["reason"]
 
 
 def test_persist_booked_pdf_creates_artifact_and_appointment(client, tmp_path):

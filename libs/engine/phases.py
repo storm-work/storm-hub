@@ -123,6 +123,42 @@ class PhaseMachine:
         self._to(WorkerSubstate.FAILED)
         return PhaseResult("failed", self._sub, step, self.visited)
 
+    def _warm_with_recovery(self, why: str) -> bool:
+        """Recover a FAILED warm-up WITHOUT discarding the authenticated session.
+
+        A warm-up failure says the server-side booking workflow anchor isn't where we need it. It
+        does NOT say the auth session is dead -- login has already succeeded by this point, and that
+        session is the expensive thing: a fresh one costs a new proxy lease, a new CAPTCHA solve, and
+        a new login against a portal that rate-limits sub-accounts. Re-warming reuses all of it.
+
+        Confirmed live 2026-08-20, worker 8fc9bdfe (identity ERNESTO PIRES, booking "Test 3018"):
+        login succeeded, Formulario?copy=true returned 862KB, the ScheduleController POST came back
+        200 -- and then `browser closed - primp session active` and the process exited, to be
+        relaunched three minutes later and redo the whole login from scratch. The recovery ladder
+        already existed for exactly this failure in the hold/apply loop (_rebuild_session,
+        form_stale); the INITIAL warm-up was simply never given it, so the one moment the session is
+        newest and most valuable was the one moment a single failure threw it away.
+
+        Same ladder, same in-process/same-proxy principle: re-warm up to REWARM_MAX_ATTEMPTS, and
+        only if re-warming is genuinely not rebuilding the anchor escalate to a fresh login. Leaves
+        substate at WARMING_UP on success so the caller owns what happens next.
+        """
+        max_rewarms = max(1, int(self.cfg.raw.get("REWARM_MAX_ATTEMPTS", 1)))
+        for attempt in range(max_rewarms):
+            self._to(WorkerSubstate.WARMING_UP,
+                     detail=f"re-warm {attempt + 1}/{max_rewarms}: {why}")
+            if self.ops.do_warmup():
+                return True
+        # Re-warm alone has stopped rebuilding the anchor -- only a fresh login will (storm-auto
+        # abc5). Still in-process: same worker, same proxy, same sub-account.
+        self._to(WorkerSubstate.HOLDING, detail=f"re-warm exhausted; re-login in place: {why}")
+        self._to(WorkerSubstate.LOGGING_IN)
+        if not self.ops.do_login():
+            return False
+        self._to(WorkerSubstate.LOGGED_IN)
+        self._to(WorkerSubstate.WARMING_UP)
+        return self.ops.do_warmup()
+
     # ── shared warm-up: login -> warmup -> swap -> hold ───────────────────────
     def _warmup(self) -> PhaseResult | None:
         self._to(WorkerSubstate.LOGGING_IN)
@@ -130,7 +166,9 @@ class PhaseMachine:
             return self._fail("login")
         self._to(WorkerSubstate.LOGGED_IN)
         self._to(WorkerSubstate.WARMING_UP)
-        if not self.ops.do_warmup():
+        # NOT terminal on the first failure any more -- see _warm_with_recovery. Terminating here
+        # threw away a session that had just authenticated successfully.
+        if not self.ops.do_warmup() and not self._warm_with_recovery("initial warm-up failed"):
             return self._fail("warmup")
         self._to(WorkerSubstate.WARMED)
         if self.cfg.warmup_only:

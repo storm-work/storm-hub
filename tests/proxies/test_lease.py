@@ -162,7 +162,7 @@ def test_health_check_skips_unhealthy_candidate_and_leases_next(db):
     # the failed candidate's health bookkeeping was updated even though it wasn't leased
     bad = db.get(M.Proxy, "bad")
     assert bad.is_healthy is False
-    assert bad.health == "TimeoutError: nav timed out"[:24]
+    assert bad.health == "TimeoutError: nav timed out"   # full detail now, see cc000healthdetail
     assert bad.score == 100 - 25.0   # SCORE_STEP_DOWN
 
     good = db.get(M.Proxy, "good")
@@ -178,7 +178,10 @@ def test_health_check_all_candidates_dead_raises_and_still_persists_results(db):
                    max_sessions=2, score=5))
     db.commit()
 
-    with pytest.raises(ProxyLeaseError, match="no healthy isp proxy"):
+    # The message now separates a dead pool from losing claim races to a concurrent leaser --
+    # "no healthy proxy" for a contention failure sent a live investigation looking at health
+    # while the DB showed every named candidate healthy.
+    with pytest.raises(ProxyLeaseError, match=r"no isp proxy leased after \d+ probe"):
         lease_proxy(db, "w1", "isp", health_check=lambda url: (False, "dead"))
 
     assert db.get(M.Proxy, "p1").is_healthy is False
