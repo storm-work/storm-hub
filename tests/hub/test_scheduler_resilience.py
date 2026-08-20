@@ -1611,3 +1611,118 @@ def test_a_sweep_failure_never_kills_the_tick():
     sched = _scheduler(redis_client=None, bus=_BoomBus())
     db = _launch_failed_db()
     sched._sweep_orphan_streams(db, NOW)           # must not raise
+
+
+# ── Phase 2: pre-warm before a scheduled slot-open ───────────────────────────
+def _prewarm_sched(r, bus):
+    return _scheduler(redis_client=r, bus=bus)
+
+
+def test_prewarm_fires_inside_the_lead_window_only():
+    """The portal's form state dies on a ~16.1-minute clock, so each worker sits at a random point
+    in its own keepalive cycle when slot-open arrives. slot_open_at is known in advance."""
+    import fakeredis
+    from libs.bus.bus import Bus
+    r = fakeredis.FakeStrictRedis(decode_responses=True)
+    sent = []
+    bus = Bus(r)
+    orig = bus.send_command
+    bus.send_command = lambda wid, t, **p: (sent.append((wid, t, p)), orig(wid, t, **p))[1]
+
+    db = _launch_failed_db()
+    bk = _make_booking(db)
+    bk.slot_open_at = NOW + timedelta(seconds=600)     # well outside a 120s lead
+    bk.settings_json = {"PREWARM_BEFORE_SLOT_OPEN": 120.0}
+    w = _make_worker(db, bk, _make_identity(db), status=WorkerStatus.RUNNING)
+    w.substate = WorkerSubstate.HOLDING
+    db.commit()
+
+    sched = _prewarm_sched(r, bus)
+    sched._maybe_prewarm(db, bk, NOW)
+    assert sent == [], "must not pre-warm 10 minutes early"
+
+    sched._maybe_prewarm(db, bk, NOW + timedelta(seconds=540))   # 60s before -> inside the lead
+    assert [t for _, t, _ in sent] == ["signal"]
+    assert sent[0][2]["name"] == "prewarm"
+
+
+def test_prewarm_is_sent_once_per_worker():
+    import fakeredis
+    from libs.bus.bus import Bus
+    r = fakeredis.FakeStrictRedis(decode_responses=True)
+    sent = []
+    bus = Bus(r)
+    orig = bus.send_command
+    bus.send_command = lambda wid, t, **p: (sent.append(wid), orig(wid, t, **p))[1]
+
+    db = _launch_failed_db()
+    bk = _make_booking(db)
+    bk.slot_open_at = NOW + timedelta(seconds=60)
+    w = _make_worker(db, bk, _make_identity(db), status=WorkerStatus.RUNNING)
+    w.substate = WorkerSubstate.HOLDING
+    db.commit()
+
+    sched = _prewarm_sched(r, bus)
+    sched._maybe_prewarm(db, bk, NOW)
+    sched._maybe_prewarm(db, bk, NOW)      # a tick later, same window
+    assert len(sent) == 1, f"pre-warmed {len(sent)} times; every tick would re-warm the fleet"
+
+
+def test_prewarm_skips_a_booking_whose_slot_open_already_fired():
+    import fakeredis
+    from libs.bus.bus import Bus
+    r = fakeredis.FakeStrictRedis(decode_responses=True)
+    sent = []
+    bus = Bus(r); orig = bus.send_command
+    bus.send_command = lambda wid, t, **p: (sent.append(wid), orig(wid, t, **p))[1]
+
+    db = _launch_failed_db()
+    bk = _make_booking(db)
+    bk.slot_open_at = NOW + timedelta(seconds=60)
+    bk.slot_open_fired_at = NOW
+    w = _make_worker(db, bk, _make_identity(db), status=WorkerStatus.RUNNING)
+    w.substate = WorkerSubstate.HOLDING
+    db.commit()
+
+    _prewarm_sched(r, bus)._maybe_prewarm(db, bk, NOW)
+    assert sent == []
+
+
+def test_prewarm_needs_a_scheduled_time_to_act_on():
+    """A manually fired slot-open gives no advance notice -- there is nothing to be early for."""
+    import fakeredis
+    from libs.bus.bus import Bus
+    r = fakeredis.FakeStrictRedis(decode_responses=True)
+    sent = []
+    bus = Bus(r); orig = bus.send_command
+    bus.send_command = lambda wid, t, **p: (sent.append(wid), orig(wid, t, **p))[1]
+
+    db = _launch_failed_db()
+    bk = _make_booking(db)
+    bk.slot_open_at = None
+    w = _make_worker(db, bk, _make_identity(db), status=WorkerStatus.RUNNING)
+    w.substate = WorkerSubstate.HOLDING
+    db.commit()
+
+    _prewarm_sched(r, bus)._maybe_prewarm(db, bk, NOW)
+    assert sent == []
+
+
+def test_prewarm_can_be_disabled_with_zero():
+    import fakeredis
+    from libs.bus.bus import Bus
+    r = fakeredis.FakeStrictRedis(decode_responses=True)
+    sent = []
+    bus = Bus(r); orig = bus.send_command
+    bus.send_command = lambda wid, t, **p: (sent.append(wid), orig(wid, t, **p))[1]
+
+    db = _launch_failed_db()
+    bk = _make_booking(db)
+    bk.slot_open_at = NOW + timedelta(seconds=10)
+    bk.settings_json = {"PREWARM_BEFORE_SLOT_OPEN": 0.0}
+    w = _make_worker(db, bk, _make_identity(db), status=WorkerStatus.RUNNING)
+    w.substate = WorkerSubstate.HOLDING
+    db.commit()
+
+    _prewarm_sched(r, bus)._maybe_prewarm(db, bk, NOW)
+    assert sent == []

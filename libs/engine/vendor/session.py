@@ -218,6 +218,44 @@ def _recaptcha_solve_proxy() -> bool:
     return on
 
 
+# Seconds the CALLER waits beyond the work's own budget. The caller must always outlive the worker
+# thread: if it gives up first, the thread keeps running and its eventual reply lands in the result
+# queue, where the NEXT unrelated call consumes it. Only browser_nav had this margin.
+_QUEUE_MARGIN = 5.0
+
+
+class _StampedResultQueue:
+    """Result queue that tags every reply with the sequence number of the command that produced it.
+
+    Risk F17, and the reason a slow portal hurt us out of all proportion to how slow it actually was.
+    The session is a threaded command queue: the caller pushes a command and blocks on the result
+    queue. Page operations inside the worker thread scale with NAV_TIMEOUT_SCALE; the CALLER-side
+    waits mostly did not (measured 2026-08-20: 2 of 12 entry points scaled, while the worker
+    templates run NAV_TIMEOUT_SCALE=4). So under load the caller abandoned a call that was still
+    running, the thread finished, and its reply was handed to whatever asked next -- silently, since
+    an untagged reply is indistinguishable from the right one. That is how portal slowness turned
+    into state corruption instead of just waiting.
+
+    Wrapping the queue rather than editing ~20 put() sites in the dispatch loop keeps the worker
+    thread's code untouched: it still puts plain ("ok", ...) / ("err", ...) tuples, and the stamp is
+    applied here from whichever command is currently being served.
+    """
+    __slots__ = ("_q", "_session")
+
+    def __init__(self, session):
+        self._q = queue.Queue()
+        self._session = session
+
+    def put(self, item):
+        self._q.put((self._session._current_seq, item))
+
+    def get(self, timeout=None):
+        return self._q.get(timeout=timeout)
+
+    def get_nowait(self):
+        return self._q.get_nowait()
+
+
 def _nav_scale() -> float:
     """NAV_TIMEOUT_SCALE (default 1.0): multiply browser nav/form-post timeouts for traffic-heavy
     ('storm') periods when the portal renders slowly and a normal timeout would abandon a still-alive
@@ -532,7 +570,10 @@ class PlaywrightSession:
         self._primp   = None
         self._cookie_header: str = ""
         self._cmd_q:  queue.Queue = queue.Queue()
-        self._res_q:  queue.Queue = queue.Queue()
+        self._seq_lock = threading.Lock()
+        self._next_seq = 0      # command sequence, assigned by _send
+        self._current_seq = 0   # the command the worker thread is serving right now
+        self._res_q = _StampedResultQueue(self)
         self._driver_pid = None    # Playwright driver (node) pid — its subtree is THIS session's chromium;
                                    # force-killed if a hung worker prevents graceful close (see _kill_proc_tree)
         self._thread  = threading.Thread(target=self._worker, daemon=True)
@@ -743,6 +784,8 @@ class PlaywrightSession:
                 cmd = self._cmd_q.get()
                 if cmd is None or cmd.get("action") == self._CMD_CLOSE:
                     break
+                # Every reply this iteration puts is stamped with this seq (_StampedResultQueue).
+                self._current_seq = cmd.get("_seq", 0)
 
                 if cmd.get("action") == self._CMD_VERIFY:
                     try:
@@ -2169,6 +2212,47 @@ class PlaywrightSession:
                              follow_redirects=follow_redirects)
         return _FakeResponse(r.status_code, r.text, str(r.url))
 
+    # ── command/reply correlation (F17) ───────────────────────────────────────
+    def _send(self, cmd: dict) -> int:
+        """Queue a command and return its sequence number, for _await to match the reply against."""
+        with self._seq_lock:
+            self._next_seq += 1
+            seq = self._next_seq
+        cmd["_seq"] = seq
+        self._cmd_q.put(cmd)
+        return seq
+
+    def _await(self, seq: int, timeout: float):
+        """Wait for the reply to OUR command, discarding replies to calls that already gave up.
+
+        Raises queue.Empty on timeout -- deliberately the same exception the bare _res_q.get() this
+        replaces used to raise, so every call site keeps its own message and handling.
+
+        `timeout` is the work's own budget; _QUEUE_MARGIN is added on top so the caller always
+        outlives the worker thread. A reply carrying any other seq belongs to an abandoned earlier
+        call and is dropped here rather than handed to the wrong caller.
+        """
+        deadline = time.monotonic() + timeout + _QUEUE_MARGIN
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise queue.Empty
+            got, payload = self._res_q.get(timeout=remaining)
+            if got == seq:
+                return payload
+            print(f"[session] discarded stale reply seq={got} while awaiting seq={seq} "
+                  f"-- an earlier call had already timed out (F17 guard)")
+
+    def _drain_replies(self) -> None:
+        """Drop anything already queued. Belt-and-braces beside the seq check: it bounds the queue
+        after a burst of abandoned calls. The seq check is the real guard, since a reply arriving
+        AFTER a drain still has to match."""
+        while True:
+            try:
+                self._res_q.get_nowait()
+            except queue.Empty:
+                return
+
     def browser_fetch(self, url: str, data: dict, method: str = "POST",
                       headers: dict | None = None, timeout: int = 30,
                       params: dict | None = None,
@@ -2182,7 +2266,8 @@ class PlaywrightSession:
         params             -> appended to URL as query string
         Returns {"status": int, "body": str}.
         """
-        self._cmd_q.put({
+        timeout = int(timeout * _nav_scale())   # storm tolerance (NAV_TIMEOUT_SCALE); increase-only
+        _seq = self._send({
             "action":      self._CMD_FETCH,
             "url":         url,
             "method":      method,
@@ -2193,7 +2278,7 @@ class PlaywrightSession:
             "file_fields": file_fields or [],
         })
         try:
-            status, result = self._res_q.get(timeout=timeout)
+            status, result = self._await(_seq, timeout)
         except queue.Empty:
             raise RuntimeError(f"browser_fetch timed out after {timeout}s")
         if status == "err":
@@ -2217,13 +2302,14 @@ class PlaywrightSession:
         outer timeout would abandon the call while the solver is still polling, and the
         late result would corrupt the next unrelated call's result-queue read.
         """
-        self._cmd_q.put({
+        timeout = int(timeout * _nav_scale())   # storm tolerance (NAV_TIMEOUT_SCALE); increase-only
+        _seq = self._send({
             "action":        self._CMD_DATADOME_UNBLOCK,
             "challenge_url": challenge_url,
             "capsolver_keys": capsolver_keys,
         })
         try:
-            status, result = self._res_q.get(timeout=timeout)
+            status, result = self._await(_seq, timeout)
         except queue.Empty:
             print(f"[session] unblock_datadome timed out after {timeout}s")
             return False
@@ -2248,7 +2334,8 @@ class PlaywrightSession:
             Worker pre-solves in parallel with browser launch to eliminate serial wait.
         Returns {"status": int, "body": str}.
         """
-        self._cmd_q.put({
+        timeout = int(timeout * _nav_scale())   # storm tolerance (NAV_TIMEOUT_SCALE); increase-only
+        _seq = self._send({
             "action":          self._CMD_LOGIN,
             "username":        username,
             "password":        password,
@@ -2262,7 +2349,7 @@ class PlaywrightSession:
             "pre_token":       pre_token or [],
         })
         try:
-            status, result = self._res_q.get(timeout=timeout)
+            status, result = self._await(_seq, timeout)
         except queue.Empty:
             raise RuntimeError(f"browser_login timed out after {timeout}s")
         if status == "err":
@@ -2271,9 +2358,10 @@ class PlaywrightSession:
 
     def browser_eval(self, js: str, timeout: int = 30):
         """Execute arbitrary JS in the live browser page and return the result."""
-        self._cmd_q.put({"action": self._CMD_EVAL, "js": js})
+        timeout = int(timeout * _nav_scale())   # storm tolerance (NAV_TIMEOUT_SCALE); increase-only
+        _seq = self._send({"action": self._CMD_EVAL, "js": js})
         try:
-            status, result = self._res_q.get(timeout=timeout)
+            status, result = self._await(_seq, timeout)
         except queue.Empty:
             raise RuntimeError(f"browser_eval timed out after {timeout}s")
         if status == "err":
@@ -2287,11 +2375,11 @@ class PlaywrightSession:
         skip_cookie_sync=True preserves the browser's current cookies instead of overwriting with primp's.
         """
         timeout = int(timeout * _nav_scale())   # storm tolerance (NAV_TIMEOUT_SCALE); increase-only
-        self._cmd_q.put({"action": self._CMD_NAV, "url": url,
+        _seq = self._send({"action": self._CMD_NAV, "url": url,
                          "nav_timeout": timeout * 1000, "fast_nav": fast_nav,
                          "skip_cookie_sync": skip_cookie_sync})
         try:
-            status, result = self._res_q.get(timeout=timeout + 5)
+            status, result = self._await(_seq, timeout)
         except queue.Empty:
             raise RuntimeError(f"browser_nav timed out after {timeout}s")
         if status == "err":
@@ -2310,9 +2398,9 @@ class PlaywrightSession:
         call's .get() wrongly consumes it, corrupting that call's state. Always keep this
         margin above the real worst-case duration of the underlying _CMD_FORM_POST handler."""
         timeout = int(timeout * _nav_scale())   # storm tolerance (NAV_TIMEOUT_SCALE); increase-only
-        self._cmd_q.put({"action": self._CMD_FORM_POST, "url": url, "data": data})
+        _seq = self._send({"action": self._CMD_FORM_POST, "url": url, "data": data})
         try:
-            result = self._res_q.get(timeout=timeout)
+            result = self._await(_seq, timeout)
             if result[0] == "ok":
                 _, final_url, html = result
                 return final_url, html
@@ -2326,9 +2414,10 @@ class PlaywrightSession:
         """Submit the existing on-page form (populated by questionnaire XHR steps).
         Does NOT inject a new form. Returns (final_url, html).
         See browser_form_post's timeout docstring — same outer/inner timeout-margin reasoning."""
-        self._cmd_q.put({"action": self._CMD_SUBMIT_PAGE_FORM, "action_contains": action_contains})
+        timeout = int(timeout * _nav_scale())   # storm tolerance (NAV_TIMEOUT_SCALE); increase-only
+        _seq = self._send({"action": self._CMD_SUBMIT_PAGE_FORM, "action_contains": action_contains})
         try:
-            result = self._res_q.get(timeout=timeout)
+            result = self._await(_seq, timeout)
             if result[0] == "ok":
                 _, final_url, html = result
                 return final_url, html
@@ -2345,9 +2434,10 @@ class PlaywrightSession:
         application/pdf) where page.content() would only return Chromium's built-in
         PDF-viewer shell, not the actual file.
         Returns {"status": int, "content_type": str, "url": str, "body": bytes}."""
-        self._cmd_q.put({"action": self._CMD_SUBMIT_FORM_BINARY, "action_contains": action_contains})
+        timeout = int(timeout * _nav_scale())   # storm tolerance (NAV_TIMEOUT_SCALE); increase-only
+        _seq = self._send({"action": self._CMD_SUBMIT_FORM_BINARY, "action_contains": action_contains})
         try:
-            status, result = self._res_q.get(timeout=timeout)
+            status, result = self._await(_seq, timeout)
         except queue.Empty:
             raise RuntimeError(f"submit_form_binary timed out after {timeout}s")
         if status == "err":
@@ -2359,9 +2449,9 @@ class PlaywrightSession:
         _SCREENSHOTS_DIR.mkdir(exist_ok=True)
         ts   = int(time.time())
         path = str(_SCREENSHOTS_DIR / f"{username}_{stage}_{ts}.png")
-        self._cmd_q.put({"action": self._CMD_SCREENSHOT, "path": path})
+        _seq = self._send({"action": self._CMD_SCREENSHOT, "path": path})
         try:
-            status, result = self._res_q.get(timeout=timeout)
+            status, result = self._await(_seq, timeout)
             if status == "ok":
                 print(f"[session] screenshot: {Path(result).name}")
                 return result
@@ -2372,9 +2462,9 @@ class PlaywrightSession:
 
     def close_browser(self, timeout: int = 10) -> None:
         """Shut down the Playwright browser after login. primp carries the session forward."""
-        self._cmd_q.put({"action": self._CMD_CLOSE_BROWSER})
+        _seq = self._send({"action": self._CMD_CLOSE_BROWSER})
         try:
-            self._res_q.get(timeout=timeout)
+            self._await(_seq, timeout)
             print("[session] browser closed - primp session active")
         except queue.Empty:
             # Graceful shutdown hung (worker stuck in a browser op) → force-kill the driver subtree so the
@@ -2384,9 +2474,9 @@ class PlaywrightSession:
 
     def save_state(self, path) -> None:
         """Export cookies + localStorage to a JSON file via Playwright storage_state."""
-        self._cmd_q.put({"action": self._CMD_SAVE_STATE, "path": str(path)})
+        _seq = self._send({"action": self._CMD_SAVE_STATE, "path": str(path)})
         try:
-            status, result = self._res_q.get(timeout=30)
+            status, result = self._await(_seq, 30)
         except queue.Empty:
             raise RuntimeError("save_state timed out after 30s")
         if status == "err":
@@ -2401,7 +2491,8 @@ class PlaywrightSession:
         Returns {"status": int, "body": str} from the VerificarEmail POST.
         Blocks until done or timeout.
         """
-        self._cmd_q.put({
+        timeout = int(timeout * _nav_scale())   # storm tolerance (NAV_TIMEOUT_SCALE); increase-only
+        _seq = self._send({
             "action":       self._CMD_VERIFY,
             "token_url":    token_url,
             "insert_jsp":   insert_jsp,
@@ -2411,7 +2502,7 @@ class PlaywrightSession:
             "lang":         lang,
         })
         try:
-            status, result = self._res_q.get(timeout=timeout)
+            status, result = self._await(_seq, timeout)
         except queue.Empty:
             raise RuntimeError(f"verify_email timed out after {timeout}s")
         if status == "err":
@@ -2431,8 +2522,8 @@ class PlaywrightSession:
         Playwright cookie dicts. Unlike get_cookies(url) (primp, URL-scoped) this misses nothing —
         used by the SOAX→ISP migration probe to carry the complete warm jar to the new browser."""
         try:
-            self._cmd_q.put({"action": self._CMD_GET_ALL_COOKIES})
-            status, result = self._res_q.get()
+            _seq = self._send({"action": self._CMD_GET_ALL_COOKIES})
+            status, result = self._await(_seq, 30)
             return result if status == "ok" and result else []
         except Exception:
             return []

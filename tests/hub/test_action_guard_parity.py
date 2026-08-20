@@ -140,3 +140,40 @@ def test_dashboard_action_table_matches_the_backend():
 
     backend = {a: {s.value for s in st} for a, st in WORKER_ACTION_STATUSES.items()}
     assert ui == backend, f"dashboard/backend action tables disagree:\n  ui={ui}\n  backend={backend}"
+
+
+# ── HOST_SESSION_CAP (audit finding 2026-08-20) ──────────────────────────────
+def test_host_session_cap_blocks_a_launch_past_the_limit(client):
+    """The setting sat in the catalog with a documented meaning and no reader -- the recurring trap
+    here. One live worker is one Chromium tree (~50-60 processes measured), on a host also running
+    Postgres and Redis, and two concurrent bookings each size themselves without knowing about the
+    other. Counted across ALL bookings for that reason."""
+    h = _headers(client)
+    bid, iid, wid = _bk_with_worker(client, h)
+
+    client.put("/settings/global", json={"values": {"HOST_SESSION_CAP": 1}}, headers=h)
+    _force_status(client, wid, WorkerStatus.RUNNING)      # one running == the cap
+
+    bid2 = client.post("/bookings", json={"name": "b2", "type": "real", "posto_id": "5084"},
+                       headers=h).json()["id"]
+    iid2 = client.post("/identities", json={"full_name": "Y", "type": "real"}, headers=h).json()["id"]
+    w2 = client.post(f"/bookings/{bid2}/identities", json={"identity_id": iid2}, headers=h).json()
+
+    r = client.post(f"/workers/{w2['id']}/launch", headers=h)
+    assert r.status_code == 409, r.text
+    assert "cap" in r.text.lower()
+
+
+def test_host_session_cap_of_zero_means_unlimited(client):
+    h = _headers(client)
+    bid, iid, wid = _bk_with_worker(client, h)
+    client.put("/settings/global", json={"values": {"HOST_SESSION_CAP": 0}}, headers=h)
+    _force_status(client, wid, WorkerStatus.RUNNING)
+
+    bid2 = client.post("/bookings", json={"name": "b3", "type": "real", "posto_id": "5084"},
+                       headers=h).json()["id"]
+    iid2 = client.post("/identities", json={"full_name": "Z", "type": "real"}, headers=h).json()["id"]
+    w2 = client.post(f"/bookings/{bid2}/identities", json={"identity_id": iid2}, headers=h).json()
+
+    r = client.post(f"/workers/{w2['id']}/launch", headers=h)
+    assert r.status_code != 409, "0 must disable the cap, not block everything"

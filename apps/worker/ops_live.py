@@ -971,6 +971,18 @@ class LiveEngineOps(EngineOps):
             result = self._signals.wait_slot_open(timeout=self._keepalive_window())
             if result in ("slot_open", "stop"):
                 return result
+            if getattr(self._signals, "prewarm_requested", False):
+                # The Hub says slot-open is imminent. Re-warm NOW rather than waiting for this
+                # worker's own keepalive cycle to come round: the portal's form state dies on a
+                # ~16-minute clock (measured 2026-08-20), so without this a worker enters the
+                # decisive window at whatever point in that cycle it happens to be. Confirmed cost
+                # of getting it wrong -- worker EDER's re-warm failed 38s AFTER slot-open fired and
+                # it spent eight minutes recovering, while a worker whose state happened to be fresh
+                # booked in 47 seconds.
+                self._signals.prewarm_requested = False
+                self._log("prewarm: slot-open imminent -- re-warming now")
+                self._run_warmup_steps()
+                continue
             self._do_keepalive("await_slot_open")
 
     # ── scout ─────────────────────────────────────────────────────────────────
@@ -1461,6 +1473,19 @@ class LiveEngineOps(EngineOps):
         if self.session is not None:
             try:
                 self.session.close_browser()
-            except Exception:
-                pass
+            except Exception as e:
+                # NOT silent. A close that fails leaves a Chromium tree alive, and this project has
+                # a documented 2600-leaked-process incident from exactly that. Swallowing is still
+                # right -- a cleanup failure must not mask the real error -- but it has to be
+                # visible, and the vendored session's own kill path is the fallback.
+                # close_browser already force-kills the driver subtree when the graceful path
+                # HANGS. This branch is the other case -- it raised for some other reason -- and it
+                # used to be `pass`, so a failed close left a Chromium tree alive with no trace. The
+                # project has a documented 2600-leaked-process incident from exactly this.
+                self._log(f"close_browser failed ({e}) -- force-killing the driver tree")
+                try:
+                    from libs.engine.vendor.session import _kill_proc_tree
+                    _kill_proc_tree(getattr(self.session, "_driver_pid", None))
+                except Exception as ke:
+                    self._log(f"force-kill also failed ({ke}) -- possible leaked browser")
             self.session = None

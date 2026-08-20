@@ -48,6 +48,10 @@ class BusSignals:
         # Set by an `inactivate` signal (the Hub's false-slot-open revert). Passively observed in
         # _drain like slot_found_seen, so whichever wait_* call happens to see the batch records it.
         self.inactivated = False
+        # Set by a `prewarm` signal the Hub sends shortly BEFORE the scheduled slot-open, so a
+        # holding worker enters the window with fresh form state instead of wherever it happens to
+        # sit in its own keepalive cycle. Consumed once by ops_live's await_slot_open loop.
+        self.prewarm_requested = False
         # An `assign` that arrives while some OTHER wait_* is blocked. _drain acks the whole batch,
         # so a command not matched by the currently-running wait used to be acked and dropped on the
         # floor. Confirmed live 2026-08-14: the scheduler assigns a slot (creating a SlotLease) to
@@ -82,6 +86,8 @@ class BusSignals:
                 # Confirmed live 2026-08-14: scouts stuck in HOLDING while the booking was already
                 # past slot-found. Same class as the `assign` drop fixed earlier the same day.
                 self.slot_open_seen = True
+            if m.type == "signal" and m.payload.get("name") == "prewarm":
+                self.prewarm_requested = True
             if m.type == "signal" and m.payload.get("name") == "slot_found":
                 self.slot_found_seen = True
             if m.type == "assign":

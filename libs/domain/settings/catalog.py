@@ -197,6 +197,12 @@ _BOOKING = [
             "of grinding discovery (which risks portal rate-limiting/detection for nothing). "
             "Slot-open can then be re-fired, manually or on schedule. 0 disables the guard entirely; "
             "never fires once slot_found has fired (there ARE slots -- the open was real)."),
+    # Seconds BEFORE the scheduled slot_open_at to tell every holding worker to re-warm, so the
+    # fleet enters the window with fresh form state rather than scattered across their own
+    # ~16-minute keepalive cycles. 0 disables. Only meaningful when slot_open_at is set --
+    # a manually fired slot-open has no advance notice to act on.
+    _s("PREWARM_BEFORE_SLOT_OPEN", L.BOOKING, float, 120.0, group="discovery",
+       note="re-warm holding workers this many seconds before the scheduled slot-open"),
     _s("SLOT_LEASE_TTL", L.BOOKING, float, 180.0, group="discovery",
        note="seconds a worker may hold a slot lease without converting it into an apply before the "
             "scheduler reclaims it and returns the slot to the pool. A lease is a promise to attempt "
@@ -284,7 +290,16 @@ _TEMPLATE = [
     _s("REWARM_MAX_ATTEMPTS", L.TEMPLATE, int, 1, _WRK, "login_resilience"),
     _s("REWARM_EXPIRED_CAP", L.TEMPLATE, int, 0, _WRK, "login_resilience"),
     # Keepalive
-    _s("KEEPALIVE_INTERVAL", L.TEMPLATE, float, 900.0, _WRK, "keepalive", min_value=1.0),
+    # 600, not 900. MEASURED 2026-08-20 across 28 keepalive cycles on booking "Test 3018": the
+    # portal's scheduling form state dies on a 16.1-minute median clock (min 15.8, max 33.6). A
+    # 900s interval left a 60-second margin against a 15.8-minute worst case -- and the re-warm
+    # itself takes longer exactly when the portal is slow, so the margin closes from both ends.
+    #
+    # That is not theoretical: worker EDER's keepalive re-warm failed 38 seconds AFTER slot-open
+    # fired, and it spent the next eight minutes recovering while a worker whose form state happened
+    # to be fresh booked in 47 seconds. 600s leaves ~6 minutes of headroom and costs one extra
+    # lightweight probe per worker per hour.
+    _s("KEEPALIVE_INTERVAL", L.TEMPLATE, float, 600.0, _WRK, "keepalive", min_value=1.0),
     _s("KEEPALIVE_DECAY_MIN", L.TEMPLATE, float, 30.0, _WRK, "keepalive"),
     _s("KEEPALIVE_DECAY_MAX", L.TEMPLATE, float, 60.0, _WRK, "keepalive"),
     _s("KEEPALIVE_NO_RESTORE", L.TEMPLATE, bool, False, _WRK, "keepalive"),

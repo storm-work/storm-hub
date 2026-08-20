@@ -157,6 +157,7 @@ class Scheduler:
                         self._on_start(db, bk)
                     elif action == "slot_open":
                         self._fire_slot_open(db, bk, now)
+                self._maybe_prewarm(db, bk, now)
 
                 if self._settings_timeout_hours(db, bk) and should_timeout_booking(
                     bk.status, bk.started_at, self._settings_timeout_hours(db, bk), now
@@ -799,6 +800,50 @@ class Scheduler:
                 self._bus.send_command(worker_id, "discover", dates=chunk, special_days=cached_special_days)
             else:
                 self._bus.send_command(worker_id, "discover", dates=chunk)
+
+    def _maybe_prewarm(self, db, bk: M.Booking, now: datetime) -> None:
+        """Tell holding workers to re-warm shortly before a SCHEDULED slot-open.
+
+        The portal's scheduling form state expires on a ~16.1-minute median clock (measured over 28
+        keepalive cycles, 2026-08-20). Each worker re-warms on its own KEEPALIVE_INTERVAL, so at any
+        given instant the fleet is scattered across that cycle -- and whoever happens to be at the
+        wrong end of it enters the decisive window with dead form state.
+
+        That is not theoretical: worker EDER's keepalive re-warm failed 38 seconds AFTER slot-open
+        fired and it spent the next eight minutes recovering, while EUNICE, whose state happened to
+        be fresh, booked in 47 seconds. slot_open_at is known in advance, so this is free to fix.
+
+        Fires once per booking per run, tracked with the same notified-set the signal latch uses, and
+        only when slot_open_at is actually set -- a manually fired slot-open gives no advance notice.
+        """
+        if self._bus is None or bk.slot_open_fired_at is not None:
+            return
+        slot_open_at = _aware(bk.slot_open_at)
+        if slot_open_at is None:
+            return
+        lead = float(self._effective_booking_setting(db, bk, "PREWARM_BEFORE_SLOT_OPEN", 120.0))
+        if lead <= 0 or now < slot_open_at - timedelta(seconds=lead):
+            return
+        key = notified_key(bk.id, "prewarm")
+        holding = db.scalars(select(M.Worker).where(
+            M.Worker.booking_id == bk.id, M.Worker.status == WorkerStatus.RUNNING,
+            M.Worker.substate == WorkerSubstate.HOLDING)).all()
+        sent = 0
+        for w in holding:
+            if self._redis is not None and self._redis.sismember(key, w.id):
+                continue
+            try:
+                self._bus.send_command(w.id, "signal", name="prewarm")
+            except Exception:
+                logger.warning("prewarm send failed for worker %s", w.id, exc_info=True)
+                continue
+            if self._redis is not None:
+                self._redis.sadd(key, w.id)
+                self._redis.expire(key, 86400)
+            sent += 1
+        if sent:
+            logger.info("booking %s: pre-warmed %d holding worker(s) %.0fs before slot-open",
+                        bk.id, sent, lead)
 
     def _reclaim_stale_slot_leases(self, db, bk: M.Booking, now: datetime) -> None:
         """Return a slot to the pool when the worker holding it never converted it into an apply.

@@ -1946,6 +1946,19 @@ def _do_launch_worker(db: Session, w: M.Worker) -> None:
         logger.warning("launch aborted for worker %s: it was stopped while the launch was in flight",
                        w.id)
         return
+    # HOST_SESSION_CAP: one live worker is one Chromium tree (~50-60 processes, measured), and this
+    # is a shared host running Postgres and Redis too. The setting existed in the catalog with a
+    # documented meaning and NO READER anywhere -- the recurring trap in this codebase, and the one
+    # guardrail that actually matters when two bookings run at once, since each is sized without
+    # knowing about the other. Counted across ALL bookings for that reason.
+    cap = int(get_global(db).get("HOST_SESSION_CAP", 175) or 0)
+    if cap > 0:
+        live = db.scalar(select(func.count()).select_from(M.Worker).where(
+            M.Worker.status == WorkerStatus.RUNNING)) or 0
+        if live >= cap:
+            logger.warning("launch aborted for worker %s: HOST_SESSION_CAP reached (%d running >= %d)",
+                           w.id, live, cap)
+            raise HTTPException(409, f"host session cap reached ({live}/{cap} sessions running)")
     tpl = db.get(M.WorkerTemplate, w.template_id) if w.template_id else None
     layers = {L.GLOBAL: get_global(db), L.BOOKING: (bk.settings_json or {})}
     if tpl:
