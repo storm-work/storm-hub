@@ -197,6 +197,53 @@ def _extract_csrf(html: str) -> str | None:
     return m.group(1) if m else None
 
 
+# Portuguese validation vocabulary the portal uses when it re-renders a rejected form.
+_ERR_WORDS = ("obrigat", "inválid", "invalid", "erro", "preencha", "não é válid",
+              "deve ser", "incorrect", "incorret")
+_ERR_TAG_RE = re.compile(
+    r"<(?:span|div|li|p|td)[^>]*(?:class|id)\s*=\s*[\"'][^\"']*(?:erro|error|alert|msg)[^\"']*[\"'][^>]*>(.*?)</",
+    re.I | re.S,
+)
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _form_error_text(html: str, limit: int = 5) -> list[str]:
+    """Pull the validation messages out of a form page the portal re-rendered after rejecting it.
+
+    ScheduleController answers 200 either way; the ONLY thing distinguishing acceptance from
+    rejection was the response SIZE (~54KB accepted vs ~1.27MB rejected -- perfectly bimodal across
+    17 live warm-ups on 2026-08-20). The body was fetched and discarded, so a deterministic,
+    per-identity rejection looked like an unexplained "ScheduleController was rejected".
+
+    Deliberately text-only and capped: this goes into the event stream, which is a capped Redis
+    stream shared by every worker -- dumping a 1.27MB body would age out real history in seconds.
+    """
+    if not html:
+        return []
+    body = re.sub(r"(?is)<(script|style)\b.*?</\1>", " ", html)
+    out: list[str] = []
+    seen: set[str] = set()
+    for chunk in _ERR_TAG_RE.findall(body):
+        txt = " ".join(_TAG_RE.sub(" ", chunk).split())
+        if 3 < len(txt) <= 200 and txt.lower() not in seen:
+            seen.add(txt.lower())
+            out.append(txt)
+            if len(out) >= limit:
+                return out
+    if out:
+        return out
+    # No error-classed element matched -- fall back to any line carrying the vocabulary.
+    for line in _TAG_RE.sub("\n", body).splitlines():
+        txt = " ".join(line.split())
+        low = txt.lower()
+        if 3 < len(txt) <= 200 and any(w in low for w in _ERR_WORDS) and low not in seen:
+            seen.add(low)
+            out.append(txt)
+            if len(out) >= limit:
+                break
+    return out
+
+
 class LiveEngineOps(EngineOps):
     def __init__(
         self,
@@ -691,9 +738,11 @@ class LiveEngineOps(EngineOps):
                 headers={"Referer": FORMULARIO}, encode="multipart",
                 file_fields=["foto", "file1", "file2", "file3", "file4"], timeout=45,
             )
+            sc_body = str(sc.get("body") or "") if isinstance(sc, dict) else ""
+            sc_len = (sc.get("len") if isinstance(sc, dict) else None) or len(sc_body)
             if isinstance(sc, dict):
                 self._log(f"ScheduleController -> status={sc.get('status')} "
-                          f"url={str(sc.get('url'))[:90]} len={sc.get('len') or len(str(sc.get('body') or ''))}")
+                          f"url={str(sc.get('url'))[:90]} len={sc_len}")
             # THE guard this file was missing, and the root cause of "applying doesn't work".
             # storm-auto: "ScheduleController POST can return 200 yet the server silently fails to
             # set up form state, causing Schedule.jsp to redirect to authenticated_index. Absence
@@ -710,10 +759,28 @@ class LiveEngineOps(EngineOps):
             sched_html = self.session.browser_eval("document.documentElement.outerHTML") or ""
             if not any(m in sched_html for m in _SCHED_PAGE_MARKERS):
                 title = re.search(r"<title[^>]*>(.*?)</title>", sched_html, re.S | re.I)
+                # SAY WHY. ScheduleController answers 200 whether it accepted the form or bounced
+                # it, and the body was fetched then discarded -- so the only signal a rejection left
+                # behind was the response SIZE. Measured across 17 live warm-ups on 2026-08-20 that
+                # split perfectly bimodally: every acceptance ~54KB, every rejection ~1.27MB (the
+                # form page re-rendered with its validation errors), and the SAME identities failed
+                # every single time. A deterministic, per-identity data problem was showing up as an
+                # unexplained "ScheduleController was rejected".
+                errs = _form_error_text(sc_body)
                 self._log(f"do_warmup: Schedule.jsp has no scheduling markers "
                           f"(len={len(sched_html)} title="
                           f"{(title.group(1).strip()[:60] if title else '?')!r}) -- ScheduleController "
-                          f"was rejected; NOT warmed")
+                          f"was rejected (response {sc_len}B); NOT warmed")
+                if errs:
+                    self._log("do_warmup: ScheduleController validation errors: "
+                              + " | ".join(e[:120] for e in errs))
+                else:
+                    # No recognisable error markup: record enough of the body to identify the page,
+                    # so "rejected with no errors found" is still actionable rather than a dead end.
+                    body_title = re.search(r"<title[^>]*>(.*?)</title>", sc_body, re.S | re.I)
+                    self._log("do_warmup: ScheduleController rejected but no validation text found "
+                              f"(body title={(body_title.group(1).strip()[:60] if body_title else '?')!r}, "
+                              f"{sc_len}B)")
                 return False
             # posto_pdf can legitimately differ from posto_id, and the submit URL must use the one
             # the schedule page itself advertises -- we hardcoded posto_id and never read this.
