@@ -164,3 +164,39 @@ def test_the_cap_is_generous_enough_for_transient_session_trouble():
     cfg = EngineConfig.from_settings({"ROLE": "apply", "APPLY_MAX_ATTEMPTS": 5})
     PhaseMachine(cfg, ops).run()
     assert ops.applies == 15, "5 * 3 = 15 chances before giving up"
+
+
+# ── Phase 3: a slow portal must not be escalated into a re-login ─────────────
+class _SlowPortalOps(_Ops):
+    """Warm-up keeps failing, and the engine reports the cause as SLOW rather than broken."""
+    def __init__(self, kind="slow", **kw):
+        super().__init__(warmup_failures=99, **kw)
+        self._kind = kind
+
+    def warmup_failure_kind(self):
+        return self._kind
+
+
+def test_a_slow_portal_never_costs_a_re_login():
+    """A re-login cannot make the portal faster. It spends a CAPTCHA solve and a slice of the
+    sub-account rate limit -- the binding constraint -- to arrive back at the same slow portal."""
+    ops = _SlowPortalOps(kind="slow")
+    res = _machine(ops, REWARM_MAX_ATTEMPTS=2).run()
+
+    assert ops.logins == 1, f"re-logged in {ops.logins}x over portal slowness"
+    assert res.outcome == "failed"      # still terminal -- resilience is not "never fail"
+
+
+def test_an_unreachable_portal_still_escalates():
+    """The opposite case: the request never landed, so the session/proxy really is the problem."""
+    ops = _SlowPortalOps(kind="unreachable")
+    _machine(ops, REWARM_MAX_ATTEMPTS=2).run()
+    assert ops.logins == 2, "an unreachable portal must still reach the re-login rung"
+
+
+def test_an_engine_without_the_classifier_keeps_the_old_behaviour():
+    """SimEngineOps and older doubles have no warmup_failure_kind -- they must not silently change."""
+    ops = _Ops(warmup_failures=99)
+    assert not hasattr(ops, "warmup_failure_kind")
+    _machine(ops, REWARM_MAX_ATTEMPTS=2).run()
+    assert ops.logins == 2

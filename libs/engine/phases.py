@@ -149,6 +149,18 @@ class PhaseMachine:
                      detail=f"re-warm {attempt + 1}/{max_rewarms}: {why}")
             if self.ops.do_warmup():
                 return True
+        # A SLOW portal is not a broken session, and a re-login cannot make the portal faster --
+        # it just spends a CAPTCHA solve and a slice of the sub-account rate limit, which is already
+        # the binding constraint, to arrive back at the same slow portal. Keep re-warming instead;
+        # the booking-wide breaker (fed by ops_live's _note_portal) is what backs the fleet off when
+        # slowness turns out to be systemic rather than this worker's bad luck.
+        kind = getattr(self.ops, "warmup_failure_kind", lambda: "unknown")()
+        if kind == "slow":
+            self._to(WorkerSubstate.HOLDING,
+                     detail=f"portal slow, not broken -- holding rather than re-logging in: {why}")
+            self.ops.poll_gap()
+            return False
+
         # Re-warm alone has stopped rebuilding the anchor -- only a fresh login will (storm-auto
         # abc5). Still in-process: same worker, same proxy, same sub-account.
         self._to(WorkerSubstate.HOLDING, detail=f"re-warm exhausted; re-login in place: {why}")

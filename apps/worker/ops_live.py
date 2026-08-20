@@ -37,6 +37,7 @@ from libs.bus.breaker import RedisBreaker
 from libs.bus.semaphore import RedisSemaphore
 from libs.engine import checkpoint as ckpt
 from libs.engine.config import EngineConfig
+from libs.engine.portal_health import PortalHealth, classify_failure
 from libs.engine.discovery.gettime import (
     GettimeStatus,
     classify_gettime_body,
@@ -325,6 +326,10 @@ class LiveEngineOps(EngineOps):
         self.session = None
         self.posto_pdf: str | None = None
         self._restore_stage: str | None = None   # "alive" | "rewarmed" | "none", set by do_login
+        # Rolling view of how the portal is behaving FOR THIS WORKER: per-phase durations plus
+        # consecutive slow/unreachable streaks. Lets a slow window be waited out instead of
+        # escalated into re-logins, which cost CAPTCHA solves and sub-account rate limit.
+        self._health = PortalHealth()
         # Hub's shared gettime cache (special_days), stashed by await_discover_task() from the
         # discover command payload, consumed once by the next do_discover() call.
         self._pending_special_days: dict | None = None
@@ -676,9 +681,63 @@ class LiveEngineOps(EngineOps):
             return True   # checkpoint restore already got us to a bookable state
         return self._run_warmup_steps()
 
+    # ── portal health: slow is not broken (Phase 3) ───────────────────────────
+    # What a healthy portal costs, measured on live runs 2026-08-20. Used only as the baseline that
+    # "materially slower than usual" is judged against -- not as a timeout.
+    _PHASE_BASELINE = {"warmup": 38.0, "apply": 47.0, "discover": 24.0}
+
+    def _note_portal(self, phase: str, seconds: float, *, ok: bool, error: str = "") -> None:
+        """Record one portal interaction, and act on what it says.
+
+        A failure here used to be logged as a flat "do_warmup failed: <exc>", which the recovery
+        ladder then treated identically whatever the cause. But the right responses are opposite:
+
+          slow         the portal answered, eventually. WAIT. Rebuilding the session over slowness
+                       spends a CAPTCHA solve and sub-account rate limit to arrive at the same slow
+                       portal, and the rate limit is already the binding constraint.
+          unreachable  the request never landed. The proxy/session really is the problem.
+
+        Sustained slowness is also reported to the booking-wide RedisBreaker, so a degraded window
+        makes the whole fleet back off together rather than each worker independently deciding to
+        re-login into the same wall.
+        """
+        self._health.observe(phase, seconds, ok=ok)
+        if ok:
+            base = self._PHASE_BASELINE.get(phase, 0.0)
+            if self._health.is_slow_against(phase, base):
+                self._log(f"portal: {phase} running slow -- median "
+                          f"{self._health.median(phase):.0f}s vs ~{base:.0f}s baseline")
+            return
+
+        kind = classify_failure(error)
+        self._health.observe_failure(kind)
+        self._log(f"{phase} failed [{kind}] after {seconds:.0f}s: {error[:140]}")
+
+        if kind == "slow" and self._health.is_degraded():
+            # Not this worker's bad luck any more -- the window is degraded.
+            if self._breaker is not None:
+                self._breaker.record_portal_down()
+            self._log(f"portal: {self._health.slow_streak} consecutive slow failures -- "
+                      f"reporting the window as degraded so the booking backs off together")
+        if self._emit is not None:
+            self._emit("portal_health", phase=phase, kind=kind, seconds=round(seconds, 1),
+                       **self._health.snapshot())
+
+    def warmup_failure_kind(self) -> str:
+        """How the last portal interaction failed -- "slow" | "unreachable" | "portal" | "unknown".
+
+        The phase machine uses this to keep a SLOW window from escalating into a re-login.
+        """
+        if self._health.slow_streak:
+            return "slow"
+        if self._health.unreachable_streak:
+            return "unreachable"
+        return "unknown"
+
     def _run_warmup_steps(self) -> bool:
         """Questionnaire -> Formulario -> ScheduleController -> Schedule.jsp (confirmed URLs/flow,
         ported from storm-auto batch_apply._run_steps_2_to_6)."""
+        _t0 = time.time()
         try:
             # Retried like every other in-page fetch in this chain. When the labelling went in I
             # made this one raise on the FIRST failure while giving the quest steps below three
@@ -855,9 +914,10 @@ class LiveEngineOps(EngineOps):
             self.posto_pdf = m_pdf.group(1) if m_pdf else self.posto_id
             if self.posto_pdf != self.posto_id:
                 self._log(f"do_warmup: posto_pdf={self.posto_pdf} differs from posto_id={self.posto_id}")
+            self._note_portal("warmup", time.time() - _t0, ok=True)
             return True
         except Exception as e:
-            self._log(f"do_warmup failed: {e}")
+            self._note_portal("warmup", time.time() - _t0, ok=False, error=str(e))
             return False
 
     def do_swap(self) -> str | None:
