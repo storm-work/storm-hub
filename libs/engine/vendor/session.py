@@ -1638,11 +1638,19 @@ class PlaywrightSession:
                     # actually forces us down (checkbox -> image challenge), and a booking whose
                     # templates asked for proxy-aware solving quietly got proxyless.
                     #
-                    # It falls BACK to proxyless if the proxy-mode solve fails, because as of
-                    # 2026-08-19 no pool we own supports proxy-mode: soax answers
-                    # ERROR_PROXY_CONNECT_REFUSED and webshare accepts the connection then returns
-                    # ERROR_CAPTCHA_SOLVE_FAILED (0/6 across both). Honouring the setting must never
-                    # mean producing NO token -- a low-scoring token still beats nothing.
+                    # It falls BACK to proxyless if the proxy-mode solve fails. Measured 2026-08-20,
+                    # 5 solves per mode against LOGIN_EVISA:
+                    #
+                    #   soax/rotating proxied   2/5 solved (score 10), 2x PROXY_CONNECT_REFUSED,
+                    #                           1x CAPTCHA_SOLVE_FAILED
+                    #   soax/mobile   proxied   0/1 solved (CAPTCHA_SOLVE_FAILED)
+                    #   proxyless               5/5 solved, score 10
+                    #
+                    # So proxy-mode is not broken (an earlier note here claimed it was -- that was
+                    # measured only against mobile/webshare and was wrong for soax/rotating, which
+                    # is the pool the 342 verified registrations actually ran on). It is simply
+                    # WORSE: it loses ~60% of solve attempts and buys no score. Both modes score 10.
+                    # Honouring the setting must never mean producing NO token.
                     _fb_proxy = self.proxy if _recaptcha_solve_proxy() else None
                     token = None
                     if _fb_proxy:
