@@ -206,6 +206,30 @@ _ERR_TAG_RE = re.compile(
 )
 _TAG_RE = re.compile(r"<[^>]+>")
 
+# The posto dropdown on the Formulario page. `f0sf1` is the field ScheduleController receives the
+# posto in, so the options rendered here are the definitive list of postos the portal will accept
+# for the residence the questionnaire just declared.
+_POSTO_SELECT_RE = re.compile(
+    r"<select[^>]*\bname\s*=\s*[\"']f0sf1[\"'][^>]*>(.*?)</select>", re.I | re.S)
+_OPTION_RE = re.compile(r"<option[^>]*\bvalue\s*=\s*[\"']([^\"']*)[\"'][^>]*>(.*?)</option>", re.I | re.S)
+
+
+def _posto_options(form_html: str) -> list[tuple[str, str]]:
+    """(value, label) pairs from the Formulario page's posto dropdown, or [] if it isn't there.
+
+    Returning [] for "couldn't find the select" is deliberate: the caller must not treat an unparsed
+    page as evidence the posto is invalid. Only a dropdown we actually found can prove that.
+    """
+    m = _POSTO_SELECT_RE.search(form_html or "")
+    if not m:
+        return []
+    out = []
+    for value, label in _OPTION_RE.findall(m.group(1)):
+        value = value.strip()
+        if value:
+            out.append((value, " ".join(_TAG_RE.sub(" ", label).split())[:60]))
+    return out
+
 
 def _form_error_text(html: str, limit: int = 5) -> list[str]:
     """Pull the validation messages out of a form page the portal re-rendered after rejecting it.
@@ -721,6 +745,26 @@ class LiveEngineOps(EngineOps):
             if not csrf:
                 self._log("do_warmup: csrf_missing after Formulario POST")
                 return False
+
+            # Is this posto even on offer for the residence the questionnaire just declared?
+            #
+            # The portal filters the posto list by declared residence, and ScheduleController answers
+            # 200 whether it accepted the posto or rejected it -- so a booking configured with a
+            # posto/residence pair the portal does not recognise fails identically to a lapsed
+            # session, with nothing anywhere saying which. Measured 2026-08-20: booking "Test2"
+            # (residence IRL, posto 2032) warmed 9/10, while "Test 3018" (residence FRA, posto 3018)
+            # warmed 1/9 -- same code, same pool, same nationality, same 7-step questionnaire shape.
+            #
+            # Checked but NOT enforced: an empty list means the dropdown could not be parsed, which
+            # is not evidence of anything, and a portal that renders the field some other way must
+            # not become a hard launch failure. Say it loudly and continue.
+            postos = _posto_options(form_html)
+            if postos and self.posto_id not in {v for v, _ in postos}:
+                offered = ", ".join(f"{v}({lbl})" for v, lbl in postos[:12])
+                self._log(f"do_warmup: posto_id={self.posto_id} is NOT offered for residence "
+                          f"{self.residence!r} -- the Formulario page lists {len(postos)}: {offered}"
+                          f"{' ...' if len(postos) > 12 else ''}. ScheduleController will reject "
+                          f"this; fix the booking's posto/residence pairing.")
 
             sc_payload = schedule_controller_payload(
                 self.account, self.form_defaults, posto_id=self.posto_id, csrf=csrf,

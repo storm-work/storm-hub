@@ -73,3 +73,40 @@ def test_an_accepted_page_yields_nothing():
     """No false positives on a normal page -- otherwise the log lies about why a warm-up failed."""
     html = "<html><body><div id='cmbPeriodo'>ok</div><a href='getSlots'>x</a></body></html>"
     assert _form_error_text(html) == []
+
+
+# ── posto/residence pairing (live finding 2026-08-20) ────────────────────────
+from apps.worker.ops_live import _posto_options
+
+
+def test_posto_options_parsed_from_the_formulario_dropdown():
+    html = """<form><select name="f0sf1" id="posto">
+        <option value="">-- escolha --</option>
+        <option value="2032">Dublin</option>
+        <option value="5084">Praia</option>
+      </select></form>"""
+    assert _posto_options(html) == [("2032", "Dublin"), ("5084", "Praia")]
+
+
+def test_blank_value_placeholder_is_skipped():
+    html = '<select name="f0sf1"><option value="">choose</option><option value="1">A</option></select>'
+    assert _posto_options(html) == [("1", "A")]
+
+
+def test_missing_dropdown_returns_empty_not_a_false_verdict():
+    """[] must mean "could not parse", never "the posto is invalid" -- the caller keys a loud
+    operator-facing message off this, and a portal that renders the field differently must not
+    turn into a spurious "your booking is misconfigured"."""
+    assert _posto_options("<html><body>no select here</body></html>") == []
+    assert _posto_options("") == []
+
+
+def test_label_markup_is_stripped_and_capped():
+    html = ('<select name="f0sf1"><option value="7"> <b>Paris</b>\n  (FR) </option></select>')
+    assert _posto_options(html) == [("7", "Paris (FR)")]
+
+
+def test_other_selects_are_ignored():
+    html = ('<select name="cmbPeriodo"><option value="99">nope</option></select>'
+            '<select name="f0sf1"><option value="3018">Real</option></select>')
+    assert _posto_options(html) == [("3018", "Real")]
