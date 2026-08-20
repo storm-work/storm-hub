@@ -30,6 +30,15 @@ function useEvents(enabled) {
       setByWorker((prev) => {
         const cur = prev[m.worker_id] || { substate: null, logs: [] };
         const next = { ...cur };
+        // A `started` event is a NEW process for this worker id, so everything the previous life
+        // reported is stale from this moment on. Nothing used to clear it, so a worker that once
+        // terminated `failed` carried outcome:"failed" for the rest of the session -- and the row
+        // then rendered the new process's live substate next to the dead one's outcome, e.g.
+        // "logging_in (failed)". Confirmed 2026-08-20 on booking "Test 3018": six workers were
+        // actively relaunching and re-attempting login (FELICIANO VARELA had 10 starts, ERNESTO
+        // PIRES 10) while the dashboard showed every one of them permanently failed, which is what
+        // made a fleet that was retrying look like a fleet that was stuck.
+        if (m.type === "started") { next.outcome = null; next.substate = null; }
         if (m.type === "status_change" && m.substate) next.substate = m.substate;
         if (m.type === "terminal") { next.substate = m.substate || next.substate; next.outcome = m.outcome; }
         if (m.type === "log_line" && m.text) next.logs = [...cur.logs.slice(-100), m.text];
