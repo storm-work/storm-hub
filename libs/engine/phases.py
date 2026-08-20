@@ -366,9 +366,24 @@ class PhaseMachine:
         # single degraded session must not be able to manufacture the bounce volume that convinces
         # the Hub its genuinely-real slots are false.
         max_bounces = max(1, int(self.cfg.raw.get("APPLY_MAX_ATTEMPTS", 5)))
+        # Consecutive `session` outcomes. The bounce cap above deliberately does NOT cover these --
+        # treating a session failure as a bounce is what let one dead proxy manufacture 5082
+        # "bounced" leases and park every applier (2026-08-15). But uncapping it entirely left the
+        # other failure mode wide open: if _rebuild_session keeps REPORTING success while the
+        # session stays broken, this loop never exits.
+        #
+        # That is not hypothetical. Traced live 2026-08-20 on "Test 3018", worker CARLOS FURTADO:
+        # 121 leases in 55 minutes, 120 of them `session`, ~26s per cycle, still going when found.
+        # The specific cause (do_warmup short-circuiting forever on a consumed checkpoint-restore
+        # flag) is fixed in ops_live, but "a rebuild that always claims success" is a class, and an
+        # unbounded retry loop is the exact shape that cost this project four days once already.
+        # Generous on purpose -- 3x the bounce budget -- so a genuinely transient dead proxy still
+        # gets many chances; failing here is terminal and hold-respawn relaunches with backoff.
+        max_session_failures = max_bounces * 3
         attempts = 0
         stale_streak = 0
         bounce_streak = 0
+        session_streak = 0
         slot = None                      # a form_stale retry KEEPS its slot across iterations
         while True:
             if self.ops.is_stopped():
@@ -401,6 +416,8 @@ class PhaseMachine:
                 return PhaseResult("dry_run", self._sub, "no_book: not submitted", self.visited)
             attempts += 1
             outcome = self.ops.do_apply(slot)
+            if outcome != "session":
+                session_streak = 0      # any other answer means the session reached the portal
             if outcome == "booked":
                 self._to(WorkerSubstate.BOOKED)
                 return PhaseResult("booked", self._sub, str(slot), self.visited)
@@ -425,7 +442,13 @@ class PhaseMachine:
                 # bounces", and drive the Hub's false-slot revert on real slots (live 2026-08-15).
                 self.ops.release_slot(slot, "session")
                 slot = None
+                session_streak += 1
                 self._to(WorkerSubstate.HOLDING, detail="re-warm failed; rebuilding session")
+                if session_streak >= max_session_failures:
+                    # The rebuild keeps claiming success and the session keeps failing. Stop
+                    # churning slot leases over it -- respawn gets a clean process.
+                    return self._fail(
+                        f"session unrecoverable ({session_streak} consecutive re-warm failures)")
                 if not self._rebuild_session("apply re-warm failed"):
                     return self._fail("session unrecoverable")
                 self.ops.poll_gap()

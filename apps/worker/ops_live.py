@@ -650,6 +650,29 @@ class LiveEngineOps(EngineOps):
 
     def do_warmup(self) -> bool:
         if self._restore_stage in ("alive", "rewarmed"):
+            # CONSUMED, not just read. This short-circuit is true exactly ONCE -- for the warm-up
+            # that immediately follows a checkpoint restore, which already left the session bookable
+            # so redoing the questionnaire chain would be waste. It was never cleared, so it stayed
+            # true for the worker's entire life, and every LATER do_warmup() -- all of which come
+            # from the recovery ladder asking for a genuine re-warm -- returned True instantly
+            # without touching the portal.
+            #
+            # That turned the ladder into a no-op and produced a perfect infinite loop. Traced live
+            # 2026-08-20 on booking "Test 3018", worker CARLOS FURTADO, ~26s per cycle, 120 slot
+            # leases deep and still going:
+            #
+            #   do_warmup: csrf_missing after Formulario POST
+            #   do_apply: re-warm at round start failed -- session problem, not the slot
+            #   [slot_released]
+            #   -> holding (re-warming: apply re-warm failed)
+            #   -> warming_up
+            #   -> warmed          <- SAME SECOND; a real warm-up takes ~38s
+            #   -> holding
+            #   -> applying        <- leases another slot, fails identically, forever
+            #
+            # The worker could never recover, and each cycle churned a slot lease: leased, released
+            # (reopening the slot), re-leased. Consuming the flag makes the second call do real work.
+            self._restore_stage = "none"
             return True   # checkpoint restore already got us to a bookable state
         return self._run_warmup_steps()
 

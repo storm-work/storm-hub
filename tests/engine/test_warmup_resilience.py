@@ -116,3 +116,51 @@ def test_the_recovery_path_never_routes_through_FAILED():
     ops = _Ops(warmup_failures=2)
     res = _machine(ops, REWARM_MAX_ATTEMPTS=3).run()
     assert WorkerSubstate.FAILED not in res.visited, res.visited
+
+
+# ── consecutive session-failure cap (live incident 2026-08-20) ───────────────
+class _AlwaysSessionOps(_Ops):
+    """Apply always fails with `session`, and the rebuild always CLAIMS success.
+
+    That combination is what produced the live loop: worker CARLOS FURTADO on booking "Test 3018"
+    took 121 slot leases in 55 minutes, 120 of them `session`, ~26s per cycle, and would never have
+    stopped. The specific cause is fixed in ops_live (a consumed checkpoint-restore flag), but "a
+    rebuild that always reports success" is a class, and this cap is the backstop for it.
+    """
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.applies = 0
+        self.released = 0
+
+    def await_slot_open(self): return "ok"
+    def slot_found_seen(self): return True
+    def scouts_invalid(self): return False
+    def is_stopped(self): return False
+    def await_assignment(self): return {"date": "2026-09-01", "period": 5}
+
+    def do_apply(self, slot):
+        self.applies += 1
+        return "session"
+
+    def release_slot(self, slot, reason="bounce"):
+        self.released += 1
+
+
+def test_endless_session_failures_terminate_instead_of_looping_forever():
+    ops = _AlwaysSessionOps()
+    cfg = EngineConfig.from_settings({"ROLE": "apply", "APPLY_MAX_ATTEMPTS": 2})
+    res = PhaseMachine(cfg, ops).run()
+
+    assert res.outcome == "failed"
+    assert "session unrecoverable" in res.detail
+    # APPLY_MAX_ATTEMPTS=2 -> cap of 6 consecutive session failures.
+    assert ops.applies == 6, f"looped {ops.applies} times instead of stopping at the cap"
+    assert ops.released == 6, "every attempt must still hand its slot back, unpenalised"
+
+
+def test_the_cap_is_generous_enough_for_transient_session_trouble():
+    """A dead proxy that recovers must not be terminal -- that regression parked every applier once."""
+    ops = _AlwaysSessionOps()
+    cfg = EngineConfig.from_settings({"ROLE": "apply", "APPLY_MAX_ATTEMPTS": 5})
+    PhaseMachine(cfg, ops).run()
+    assert ops.applies == 15, "5 * 3 = 15 chances before giving up"
