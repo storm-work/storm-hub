@@ -25,6 +25,7 @@ from ..enums import SettingsLayer as L
 _TPL = frozenset({L.TEMPLATE, L.WORKER})   # global default, override-ok at template (and worker)
 _WRK = frozenset({L.WORKER})               # template knob, rare per-worker instance override
 _TPL_BK = frozenset({L.BOOKING, L.WORKER}) # template knob exposed as a per-booking operator shortcut
+_BK_TPL = frozenset({L.BOOKING, L.TEMPLATE, L.WORKER})  # settable at every operator-facing layer
 
 
 @dataclass(frozen=True)
@@ -80,7 +81,18 @@ _GLOBAL = [
     # Solver defaults (override-ok at template for A/B)
     _s("LOGIN_CAPSOLVER_ONLY", L.GLOBAL, bool, False, _TPL, "solver"),
     _s("LOGIN_ANTICAPTCHA_ONLY", L.GLOBAL, bool, False, _TPL, "solver"),
-    _s("RECAPTCHA_SOLVE_PROXY", L.GLOBAL, bool, False, _TPL, "solver"),
+    # Settable at BOOKING so the proxied/proxyless choice is a per-run operator switch, not something
+    # you have to re-arm a whole fleet's templates to change. NOTE the precedence order
+    # (WORKER > TEMPLATE > BOOKING > GLOBAL): a template that PINS this key still outranks the
+    # booking switch, which is exactly how the "Apply/Scout Proxy-aware" templates silently made the
+    # booking-level value inert. scripts/unpin_template_setting.py strips it from those templates so
+    # the booking switch is the single control point; set it at TEMPLATE only for a deliberate A/B.
+    #
+    # Measured 2026-08-20, 5 solves/mode against LOGIN_EVISA: proxied via soax/rotating scored 10 on
+    # 2/5 attempts (3 failed outright); proxyless scored 10 on 5/5. Same score, far fewer tokens --
+    # so False is the better default and this switch exists to re-test that, not to escape it.
+    _s("RECAPTCHA_SOLVE_PROXY", L.GLOBAL, bool, False, _BK_TPL, "solver",
+       note="mint the login reCAPTCHA token through the worker's own proxy instead of the solver's IPs"),
     _s("NATIVE_SOLVE", L.GLOBAL, bool, False, _TPL, "solver"),
     # Defaults corrected 2026-08-14 to match the PROVEN values. Both are read by the vendored solver
     # from os.environ (libs/engine/vendor/solver.py), which until now nothing ever set -- so these

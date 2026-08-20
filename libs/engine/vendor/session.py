@@ -191,21 +191,30 @@ def _recaptcha_solve_proxy() -> bool:
     """RECAPTCHA_SOLVE_PROXY=1 mints the login reCAPTCHA token THROUGH the session's own proxy instead of
     proxyless (the solver's own IPs).
 
-    CONFIRMED DEAD (0728): every proxy pool we have REFUSES the external solver's connection —
-    `ERROR_PROXY_CONNECT_REFUSED` on both SOAX (session/bindttl-bound to our server) and ISP (IP-whitelisted
-    to our server). Result: 0 valid tokens, 0 warms. Proxy mode can only work on a proxy verified to accept
-    connections from capsolver's/anti-captcha's datacenters — none of ours do. So enabling this on our pools
-    silently zeroes login yield. Keep it OFF (proxyless is the confirmed-working mode). If you set it, we
-    still honour it but WARN loudly (set RECAPTCHA_SOLVE_PROXY=force to silence the warning on a pool you've
-    actually verified)."""
+    An older note here called this CONFIRMED DEAD ("every pool REFUSES the solver's connection"). That
+    was measured only against soax/mobile and webshare and was WRONG for soax/rotating -- the pool the
+    342 verified registrations actually ran on, all of them proxied.
+
+    Re-measured 2026-08-20, 5 solves/mode against LOGIN_EVISA:
+
+        soax/rotating proxied   2/5 solved (score 10), 2x PROXY_CONNECT_REFUSED, 1x SOLVE_FAILED
+        soax/mobile   proxied   0/1 solved (CAPTCHA_SOLVE_FAILED)
+        proxyless               5/5 solved, score 10
+
+    So proxy-mode WORKS on soax/rotating; it is just worse -- identical token score, ~60% fewer tokens
+    per attempt. Proxyless remains the better default, but this is now a real operator A/B switch
+    (settable per booking), not a broken knob, so the warning is informational rather than alarming.
+    The solve path falls back to proxyless whenever a proxy-mode solve fails, so turning this on can
+    cost latency but can no longer zero out login yield. `=force` still silences the note."""
     global _RC_PROXY_WARNED
     v = os.environ.get("RECAPTCHA_SOLVE_PROXY", "").strip().lower()
     on = v in ("1", "true", "yes", "on", "force")
     if on and v != "force" and not _RC_PROXY_WARNED:
         _RC_PROXY_WARNED = True
-        print("[session] WARNING: RECAPTCHA_SOLVE_PROXY is ON but proxy-mode solving is CONFIRMED BROKEN "
-              "on SOAX + ISP (ERROR_PROXY_CONNECT_REFUSED → 0 warms). Use proxyless unless you've verified "
-              "this pool accepts external solver connections. Set =force to silence.")
+        print("[session] NOTE: RECAPTCHA_SOLVE_PROXY is ON — minting login tokens through this "
+              "worker's own proxy. Measured 2026-08-20: works on soax/rotating but loses ~60% of "
+              "solve attempts for the same token score; falls back to proxyless on failure. "
+              "Set =force to silence.")
     return on
 
 
@@ -1394,7 +1403,6 @@ class PlaywrightSession:
         anticaptcha_keys  = cmd.get("anticaptcha_keys", [])
         twocaptcha_keys   = cmd.get("twocaptcha_keys", [])
         capmonster_keys   = cmd.get("capmonster_keys", [])
-        skip_checkbox     = cmd.get("skip_checkbox", False)
         min_score         = cmd.get("min_score", 0)   # default 0: scoring removed (solver score ≠ portal
                                                        # accept — confirmed). First usable token wins.
         pre_token_holder  = cmd.get("pre_token", [])   # mutable list; worker's pre-solve thread writes here
@@ -1545,53 +1553,15 @@ class PlaywrightSession:
             pass
 
         token = ""
-        challenge_detected = False
 
-        if skip_checkbox:
-            # Skip checkbox click and 25s polling - go straight to external solver.
-            # race_all() (single parallel race) is faster than race_best() (3 sequential
-            # races) and produces the same token quality for LOGIN_EVISA.
-            print(f"[session] browser_login: skip_checkbox=True - silent token injection")
-        else:
-            # Click the reCAPTCHA checkbox
-            print(f"[session] browser_login: clicking checkbox")
-            clicked = False
-            try:
-                rc_frame = page.frame_locator('iframe[title*="reCAPTCHA"]').first
-                rc_frame.locator("#recaptcha-anchor").click(timeout=10000)
-                clicked = True
-            except Exception as e:
-                print(f"[session] checkbox click 1 failed: {e}")
-            if not clicked:
-                try:
-                    rc_frame = page.frame_locator('iframe[src*="recaptcha"]').first
-                    rc_frame.locator(".recaptcha-checkbox").click(timeout=8000)
-                    clicked = True
-                except Exception as e2:
-                    print(f"[session] checkbox click 2 failed: {e2}")
-
-            # Poll for auto-solve token (checkbox goes green without image challenge)
-            for _ in range(25):
-                time.sleep(1)
-                try:
-                    token = page.evaluate("grecaptcha.enterprise.getResponse()") or ""
-                    if token:
-                        print(f"[session] NATIVE-SOLVE one-click PASS — reCAPTCHA token issued in-browser "
-                              f"WITHOUT a challenge grid (len={len(token)})")
-                        break
-                except Exception:
-                    pass
-                try:
-                    vis = page.locator(
-                        'iframe[title*="recaptcha challenge"], iframe[src*="bframe"]'
-                    ).is_visible(timeout=300)
-                    if vis:
-                        print(f"[session] NATIVE-SOLVE image challenge appeared (browser not trusted enough "
-                              f"for one-click) — falling back to proxyless inject")
-                        challenge_detected = True
-                        break
-                except Exception:
-                    pass
+        # The checkbox click + 25s one-click poll used to run here and was the DEFAULT
+        # (skip_checkbox defaulted to False and ops_live.py never passed it). Removed 2026-08-20 on
+        # the operator's call: our browsers are never trusted enough for the one-click pass, so the
+        # poll always ran its full 25 seconds and then landed in the image challenge -- whose tokens
+        # (~2400-2574 chars) are the low-scoring kind that the login endpoint rejects. It cost 25s of
+        # every login attempt plus 3 sequential solver races, to arrive at a token worse than the one
+        # a single silent injection produces. Now: always inject silently.
+        print("[session] browser_login: silent token injection (checkbox path removed)")
 
         # External solver — ProxyLess (solver-cloud IPs have high reCAPTCHA Enterprise trust).
         # Audio challenge is intentionally skipped: .mp3 download via proxy degrades IP trust.
@@ -1619,60 +1589,48 @@ class PlaywrightSession:
             any_keys = _rc_capsolver or _rc_anticaptcha or twocaptcha_keys or capmonster_keys
             if any_keys:
                 import solver as _solver
-                if skip_checkbox:
-                    _rc_proxy = self.proxy if _recaptcha_solve_proxy() else None
-                    print(f"[session] race_all (min_score={min_score}, skip_checkbox mode, "
-                          f"{'PROXY-based' if _rc_proxy else 'proxyless'}"
+                # ONE solve path now that the checkbox branch is gone: race_all (a single parallel
+                # race) rather than race_best (3 sequential races). race_best only earned its cost on
+                # the image-challenge tokens the removed path produced -- it ran all 3 races and
+                # picked the shortest. A silently-injected token doesn't need that.
+                #
+                # RECAPTCHA_SOLVE_PROXY is honoured here, and falls BACK to proxyless if the
+                # proxy-mode solve fails, because honouring the setting must never mean producing NO
+                # token. Measured 2026-08-20, 5 solves/mode against LOGIN_EVISA:
+                #
+                #   soax/rotating proxied   2/5 solved (score 10), 2x PROXY_CONNECT_REFUSED,
+                #                           1x CAPTCHA_SOLVE_FAILED
+                #   soax/mobile   proxied   0/1 solved (CAPTCHA_SOLVE_FAILED)
+                #   proxyless               5/5 solved, score 10
+                #
+                # Proxy-mode is not broken (an earlier note here claimed it was -- that was measured
+                # only against mobile/webshare and was wrong for soax/rotating, the pool the 342
+                # verified registrations ran on). It is simply WORSE: same score, ~60% fewer tokens.
+                _rc_proxy = self.proxy if _recaptcha_solve_proxy() else None
+                token = None
+                if _rc_proxy:
+                    print(f"[session] race_all (min_score={min_score}, PROXY-based"
                           f"{', ANTICAPTCHA-ONLY' if _login_ac_only else ''})")
                     try:
                         token = _solver.race_all(
                             _rc_capsolver, _rc_anticaptcha, twocaptcha_keys, capmonster_keys,
                             "LOGIN_EVISA", proxy=_rc_proxy, min_score=min_score,
                         )
-                        print(f"[session] race_all token obtained  len={len(token)}  score={_solver.score_token(token)}")
+                    except Exception as e:
+                        print(f"[session] PROXY-based solve failed ({e}) — falling back to proxyless")
+                if not token:
+                    print(f"[session] race_all (min_score={min_score}, proxyless"
+                          f"{', ANTICAPTCHA-ONLY' if _login_ac_only else ''})")
+                    try:
+                        token = _solver.race_all(
+                            _rc_capsolver, _rc_anticaptcha, twocaptcha_keys, capmonster_keys,
+                            "LOGIN_EVISA", proxy=None, min_score=min_score,
+                        )
                     except Exception as e:
                         print(f"[session] race_all failed: {e}")
-                else:
-                    # RECAPTCHA_SOLVE_PROXY is honoured HERE too. It used to be hardcoded
-                    # proxy=None, so the setting was silently ignored on the path the portal
-                    # actually forces us down (checkbox -> image challenge), and a booking whose
-                    # templates asked for proxy-aware solving quietly got proxyless.
-                    #
-                    # It falls BACK to proxyless if the proxy-mode solve fails. Measured 2026-08-20,
-                    # 5 solves per mode against LOGIN_EVISA:
-                    #
-                    #   soax/rotating proxied   2/5 solved (score 10), 2x PROXY_CONNECT_REFUSED,
-                    #                           1x CAPTCHA_SOLVE_FAILED
-                    #   soax/mobile   proxied   0/1 solved (CAPTCHA_SOLVE_FAILED)
-                    #   proxyless               5/5 solved, score 10
-                    #
-                    # So proxy-mode is not broken (an earlier note here claimed it was -- that was
-                    # measured only against mobile/webshare and was wrong for soax/rotating, which
-                    # is the pool the 342 verified registrations actually ran on). It is simply
-                    # WORSE: it loses ~60% of solve attempts and buys no score. Both modes score 10.
-                    # Honouring the setting must never mean producing NO token.
-                    _fb_proxy = self.proxy if _recaptcha_solve_proxy() else None
-                    token = None
-                    if _fb_proxy:
-                        print("[session] no audio token - race_best x3 external solvers (PROXY-based)")
-                        try:
-                            token = _solver.race_best(
-                                _rc_capsolver, _rc_anticaptcha, twocaptcha_keys, capmonster_keys,
-                                "LOGIN_EVISA", proxy=_fb_proxy, n_races=3, min_score=85,
-                            )
-                        except Exception as e:
-                            print(f"[session] PROXY-based solve failed ({e}) — falling back to proxyless")
-                    if token is None:
-                        print("[session] no audio token - race_best x3 external solvers (proxyless)")
-                        try:
-                            token = _solver.race_best(
-                                _rc_capsolver, _rc_anticaptcha, twocaptcha_keys, capmonster_keys,
-                                "LOGIN_EVISA", proxy=None, n_races=3, min_score=85,
-                            )
-                        except Exception as e:
-                            print(f"[session] race_all failed: {e}")
-                    if token:
-                        print(f"[session] race_best token obtained  len={len(token)}  score={_solver.score_token(token)}")
+                if token:
+                    print(f"[session] race_all token obtained  len={len(token)}  "
+                          f"score={_solver.score_token(token)}")
 
         # Last-resort: read injected textarea value
         if not token:
@@ -1681,11 +1639,9 @@ class PlaywrightSession:
             except Exception:
                 pass
 
-        print(f"[session] browser_login: token_len={len(token)}  challenge={challenge_detected}")
+        print(f"[session] browser_login: token_len={len(token)}")
         if not token:
-            raise RuntimeError(
-                f"reCAPTCHA: no token after all attempts (challenge_detected={challenge_detected})"
-            )
+            raise RuntimeError("reCAPTCHA: no token after all attempts")
 
         tok_js = _json.dumps(token)
 
@@ -1858,7 +1814,7 @@ class PlaywrightSession:
             _dd_result = self._try_datadome_bypass(
                 page, html_content, final_url,
                 capsolver_keys, anticaptcha_keys, twocaptcha_keys, capmonster_keys,
-                skip_checkbox, min_score, username, password, lang,
+                min_score, username, password, lang,
             )
             if _dd_result:
                 return _dd_result
@@ -2004,7 +1960,7 @@ class PlaywrightSession:
         self, page, html_content: str, website_url: str,
         capsolver_keys: list, anticaptcha_keys: list,
         twocaptcha_keys: list, capmonster_keys: list,
-        skip_checkbox: bool, min_score: int,
+        min_score: int,
         username: str, password: str, lang: str,
     ):
         """
@@ -2285,13 +2241,11 @@ class PlaywrightSession:
                       twocaptcha_keys: list | None = None,
                       capmonster_keys: list | None = None,
                       timeout: int = 300,
-                      skip_checkbox: bool = False,
                       min_score: int = 80,
                       pre_token: list | None = None) -> dict:
         """
         Type credentials into the login form to build behavioral signals, click the
-        reCAPTCHA checkbox, and submit. Races all solver services (ProxyLess) for token.
-        skip_checkbox=True: skip click + 25s poll, go straight to race_all() injection.
+        reCAPTCHA token silently (no checkbox click). Races all solver services for token.
         min_score: minimum reCAPTCHA score to accept (0=any).
         pre_token: mutable list[str] — if [0] is non-empty when the token injection point
             is reached, it is used directly and the solver race is skipped entirely.
@@ -2309,7 +2263,6 @@ class PlaywrightSession:
             "anticaptcha_keys": anticaptcha_keys or [],
             "twocaptcha_keys": twocaptcha_keys or ([twocaptcha_key] if twocaptcha_key else []),
             "capmonster_keys": capmonster_keys or [],
-            "skip_checkbox":   skip_checkbox,
             "min_score":       min_score,
             "pre_token":       pre_token or [],
         })
