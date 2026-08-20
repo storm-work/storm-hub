@@ -140,22 +140,48 @@ def resolve_slot_capacity(setting: str, capacity_estimate: int | None) -> int:
 
 
 def plan_slot_assignments(slots: list[tuple[str, int]], holding_apply_worker_ids: list[str]) -> list[tuple[str, str]]:
-    """Pair HOLDING apply workers with slot CAPACITY, in order -- a physical slot with remaining
-    capacity > 1 absorbs multiple concurrent worker leases before moving to the next slot (multi-
-    capacity leasing, operator spec: "a physical slot can absorb multiple concurrent apply-worker
-    leases"). `slots` is [(slot_id, remaining_capacity), ...] in priority order (already excludes
-    slots with zero room -- this function doesn't second-guess a 0 or negative entry, it just
-    contributes nothing). Returns [(worker_id, slot_id), ...], one pair per worker up to the total
-    capacity across `slots`, workers assigned in the given order."""
+    """Pair HOLDING apply workers with slot CAPACITY -- BREADTH FIRST across slots, then depth.
+
+    The bookable surface is an n x m matrix: n slots, each carrying m appointments. Priority runs
+    slots-first, appointments-second (operator spec 2026-08-20): give every distinct slot one worker
+    before giving any slot a second. With 10 slots and 15 workers that is 10 workers onto 10 slots,
+    then the remaining 5 onto slots 1-5.
+
+    This used to drain each slot's capacity before moving on, which is the wrong order under the
+    uncertainty we actually have: `remaining` is an ESTIMATE. Nobody knows how many appointments a
+    given slot still holds at a given instant -- the portal never tells us -- so stacking k workers
+    on one slot bets all k on that estimate, while spreading them bets one worker per independent
+    outcome.
+
+    Confirmed live on booking "Test 3059": at 11:14:17 all four free apply workers were leased onto
+    the SAME slot (f94b0b47) while bd8cfed2, 548b27ab and d61fd58d sat unassigned. One booked; the
+    other three came back bounced/session and had to retry other slots serially over the next two
+    minutes -- 548b27ab at 11:15:13, d61fd58d at 11:16:35 -- each of which then booked. Spreading
+    those four across four slots up front is the same leases against strictly more independent
+    chances.
+
+    `slots` is [(slot_id, remaining_capacity), ...] in priority order, already excluding slots with
+    no room; a 0 or negative entry simply contributes nothing rather than being second-guessed here.
+    Returns [(worker_id, slot_id), ...], one pair per worker up to total capacity, workers consumed
+    in the order given.
+    """
     out: list[tuple[str, str]] = []
     workers = iter(holding_apply_worker_ids)
-    for slot_id, remaining in slots:
-        for _ in range(max(0, remaining)):
+    # [slot_id, remaining] pairs we decrement as we deal rounds off the top.
+    rows = [[slot_id, max(0, remaining)] for slot_id, remaining in slots]
+    while True:
+        dealt = False
+        for row in rows:
+            if row[1] <= 0:
+                continue
             worker_id = next(workers, None)
             if worker_id is None:
                 return out
-            out.append((worker_id, slot_id))
-    return out
+            out.append((worker_id, row[0]))
+            row[1] -= 1
+            dealt = True
+        if not dealt:            # every slot exhausted -- capacity, not workers, ran out
+            return out
 
 
 def default_date_window(*, start_date: str, end_date: str, num_days: int, today: date) -> list[str]:

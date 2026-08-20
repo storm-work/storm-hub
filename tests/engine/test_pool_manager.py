@@ -98,9 +98,49 @@ def test_resolve_slot_capacity_non_positive_literal_falls_back_to_default():
     assert pm.resolve_slot_capacity("-1", 8) == pm.DEFAULT_SLOT_CAPACITY
 
 
-def test_plan_slot_assignments_fills_one_slots_full_capacity_before_the_next():
+def test_plan_slot_assignments_spreads_across_slots_before_doubling_up():
+    """Slots first, appointments second (operator spec 2026-08-20). `remaining` is an ESTIMATE --
+    the portal never tells us a slot's true remaining capacity -- so stacking k workers on one slot
+    bets all k on that estimate, while spreading them buys k independent outcomes.
+
+    Confirmed live on "Test 3059": at 11:14:17 all four free workers were leased onto the SAME slot
+    (f94b0b47) while three other slots sat unassigned. One booked; the other three came back
+    bounced/session and had to retry those other slots serially over the next two minutes -- and
+    each of those then booked."""
     out = pm.plan_slot_assignments([("s1", 2), ("s2", 3)], ["wA", "wB", "wC", "wD"])
-    assert out == [("wA", "s1"), ("wB", "s1"), ("wC", "s2"), ("wD", "s2")]
+    assert out == [("wA", "s1"), ("wB", "s2"), ("wC", "s1"), ("wD", "s2")]
+
+
+def test_plan_slot_assignments_operator_example_10_slots_15_workers():
+    """"when there are 10 slots and 15 apply workers, lease 10 slots to 10 workers each and first 5
+    slots again to the remaining 5 workers"."""
+    slots = [(f"s{i}", 2) for i in range(1, 11)]
+    workers = [f"w{i}" for i in range(1, 16)]
+    out = pm.plan_slot_assignments(slots, workers)
+
+    assert len(out) == 15
+    first_round = out[:10]
+    assert [w for w, _ in first_round] == [f"w{i}" for i in range(1, 11)]
+    assert [s for _, s in first_round] == [f"s{i}" for i in range(1, 11)], "one worker per slot first"
+    second_round = out[10:]
+    assert [s for _, s in second_round] == [f"s{i}" for i in range(1, 6)], "then wrap to slots 1-5"
+
+
+def test_plan_slot_assignments_skips_slots_whose_capacity_is_exhausted_mid_deal():
+    """A shallow slot drops out of later rounds instead of blocking them."""
+    out = pm.plan_slot_assignments([("s1", 1), ("s2", 3)], ["wA", "wB", "wC", "wD"])
+    assert out == [("wA", "s1"), ("wB", "s2"), ("wC", "s2"), ("wD", "s2")]
+
+
+def test_plan_slot_assignments_stops_when_capacity_runs_out_not_workers():
+    """Must terminate rather than spin once every slot is drained."""
+    out = pm.plan_slot_assignments([("s1", 1), ("s2", 1)], ["wA", "wB", "wC", "wD"])
+    assert out == [("wA", "s1"), ("wB", "s2")]
+
+
+def test_plan_slot_assignments_ignores_zero_and_negative_capacity():
+    out = pm.plan_slot_assignments([("s1", 0), ("s2", -3), ("s3", 2)], ["wA", "wB"])
+    assert out == [("wA", "s3"), ("wB", "s3")]
 
 
 def test_plan_slot_assignments_stops_when_workers_run_out():

@@ -840,8 +840,15 @@ class Scheduler:
         slots at cap=5 is 50 leasable units, not 10. AVAILABLE means "has room for at least one more
         lease" (not "zero leases") -- remaining capacity is computed per slot by subtracting its
         currently-active (unreleased) SlotLease count from its resolved cap."""
+        # ORDERED, earliest first. plan_slot_assignments documents its input as "in priority order"
+        # and deals one worker per slot across that order before doubling up on any -- but this query
+        # carried no ORDER BY at all, so the "priority" was whatever Postgres happened to return for
+        # an unordered scan, and could differ between ticks. Soonest date first is the right
+        # priority: a nearer appointment is both more valuable and the likeliest to be taken by
+        # someone else while we deliberate.
         avail = db.scalars(select(M.Slot).where(
-            M.Slot.booking_id == bk.id, M.Slot.status == SlotStatus.AVAILABLE)).all()
+            M.Slot.booking_id == bk.id, M.Slot.status == SlotStatus.AVAILABLE)
+            .order_by(M.Slot.date.asc(), M.Slot.period.asc())).all()
         if not avail:
             return
         active_counts = dict(db.execute(
