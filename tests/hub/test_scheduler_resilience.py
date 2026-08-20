@@ -1560,3 +1560,54 @@ def test_launch_failure_retry_still_honours_the_respawn_cap():
     sched._hold_respawn(db, bk, NOW)
 
     assert relaunched == []
+
+
+# ── F1: Redis state must not outlive its workers (audit finding 2026-08-20) ──
+def test_orphan_cmd_streams_are_swept():
+    """delete_worker_stream is called on reap/stop/release, but those are EVENT paths and only clean
+    up what they witness. Measured 2026-08-20: 2065 cmd:* streams against 54 worker rows -- 2036
+    (99%) orphaned, and Redis here runs maxmemory=0/noeviction so nothing bounds it."""
+    r = fakeredis.FakeStrictRedis(decode_responses=True)
+    from libs.bus.bus import Bus
+    bus = Bus(r)
+    sched = _scheduler(redis_client=r, bus=bus)
+
+    db = _launch_failed_db()
+    bk = _make_booking(db)
+    w = _make_worker(db, bk, _make_identity(db), status=WorkerStatus.RUNNING)
+
+    bus.send_command(w.id, "ping")                 # live worker's stream
+    bus.send_command("ghost-worker-1", "ping")     # orphan: no DB row
+    bus.send_command("ghost-worker-2", "ping")
+    assert len(list(r.scan_iter("cmd:*"))) == 3
+
+    sched._sweep_orphan_streams(db, NOW)
+
+    remaining = {k.split(":", 1)[1] for k in r.scan_iter("cmd:*")}
+    assert remaining == {w.id}, f"expected only the live worker's stream, got {remaining}"
+
+
+def test_the_sweep_is_time_gated_so_it_is_not_a_hot_path():
+    r = fakeredis.FakeStrictRedis(decode_responses=True)
+    from libs.bus.bus import Bus
+    bus = Bus(r)
+    sched = _scheduler(redis_client=r, bus=bus)
+    db = _launch_failed_db()
+
+    sched._sweep_orphan_streams(db, NOW)           # first call runs and stamps
+    bus.send_command("ghost-worker-3", "ping")
+    sched._sweep_orphan_streams(db, NOW)           # immediate second call must be skipped
+    assert list(r.scan_iter("cmd:*")), "a second sweep inside the window should not have run"
+
+
+def test_a_sweep_failure_never_kills_the_tick():
+    """Housekeeping must not be able to stop scheduling -- the failure mode this file exists about."""
+    class _BoomBus:
+        class _R:
+            def scan_iter(self, *a, **k): raise RuntimeError("redis down")
+        r = _R()
+        def delete_worker_stream(self, wid): pass
+
+    sched = _scheduler(redis_client=None, bus=_BoomBus())
+    db = _launch_failed_db()
+    sched._sweep_orphan_streams(db, NOW)           # must not raise

@@ -191,8 +191,52 @@ class Scheduler:
             self._reap_dead_workers(db, now)
             self._reap_stalled_workers(db, now)
             self._reap_runaway_workers(db, now)
+            self._sweep_orphan_streams(db, now)
         finally:
             db.close()
+
+    # ── F1: Redis state must not outlive the workers it belongs to ────────────
+    _STREAM_SWEEP_EVERY = 300.0      # seconds; this is reconciliation, not a hot path
+
+    def _sweep_orphan_streams(self, db, now: datetime) -> None:
+        """Delete cmd:<worker_id> streams whose worker row no longer exists.
+
+        delete_worker_stream() is already called on reap, on booking stop, and from
+        release_worker_resources -- but those are EVENT paths, and an event path only cleans up what
+        it witnesses. Anything that removes a worker without going through one of them (a detach,
+        a row deleted while the Hub was down, a worker that predates the cleanup) leaves its stream
+        and consumer group behind forever.
+
+        Measured 2026-08-20: 2065 cmd:* streams and 2037 consumer groups against 54 worker rows --
+        2036 of them (99%) orphaned. Small today (2571 entries, ~9MB of Redis) but strictly
+        monotonic, and Redis on this host runs maxmemory=0/noeviction, so nothing bounds it. That
+        combination -- unbounded key growth with no eviction policy -- is the shape of the incident
+        that cost this project four days.
+
+        Reconciliation rather than another event hook, on the F9 principle already used for
+        supervisor state: recompute the truth from DB+Redis periodically instead of trusting that
+        every path remembered to clean up after itself.
+        """
+        if self._bus is None:
+            return
+        last = getattr(self, "_last_stream_sweep", 0.0)
+        if time.time() - last < self._STREAM_SWEEP_EVERY:
+            return
+        self._last_stream_sweep = time.time()
+        try:
+            live = set(db.scalars(select(M.Worker.id)).all())   # scalars() yields ids, not rows
+            removed = 0
+            for key in self._bus.r.scan_iter("cmd:*", count=500):
+                worker_id = key.split(":", 1)[1] if ":" in key else ""
+                if worker_id and worker_id not in live:
+                    self._bus.delete_worker_stream(worker_id)
+                    removed += 1
+            if removed:
+                logger.info("swept %d orphaned cmd stream(s) from Redis", removed)
+        except Exception:
+            # Never let housekeeping kill the tick -- that is the failure mode this file's own
+            # catch-all comments are about.
+            logger.warning("orphan stream sweep failed; continuing", exc_info=True)
 
     # ── settings helpers ──────────────────────────────────────────────────────
     def _effective_booking_setting(self, db, bk: M.Booking, key: str, default):
