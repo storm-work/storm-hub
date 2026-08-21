@@ -65,8 +65,13 @@ _GLOBAL = [
     # are legitimate stored GLOBAL config recovered from the dump -- without a catalog entry,
     # resolve() rejects them and breaks EVERY worker launch, not just registration, since it
     # validates the whole GLOBAL layer regardless of what a given launch actually needs).
-    _s("EMAIL_PROVIDER", L.GLOBAL, str, "cloudflare", group="credentials",
-       note="where registration gets verification mailboxes: 'cloudflare' (CF_MAIL_DOMAIN below)"),
+    # "mailtm" | "cloudflare". Default matches apps/hub/main.py's own fallback
+    # (`g.get("EMAIL_PROVIDER", "") or "mailtm"`) -- a catalog default that disagreed with the code's
+    # fallback would mean the panel showed one provider while an unset install used the other.
+    # Both are fully implemented (libs/engine/vendor/email_pool.py: MailTM and CloudflareMail); the
+    # registrar picks between them in _mk_mail, so this really is just a switch.
+    _s("EMAIL_PROVIDER", L.GLOBAL, str, "mailtm", group="credentials",
+       note="mailbox source for registration: 'mailtm' (throwaway, no setup) or 'cloudflare' (CF_MAIL_DOMAIN)"),
     # The domain every generated sub-account address is created under. Worth calling out because it
     # is shared by EVERY registration: on 2026-08-21 the portal began refusing with "Dispoe de mais
     # 0 tentativas" (0 attempts remaining) after 528 registrations, and the mail domain is the only

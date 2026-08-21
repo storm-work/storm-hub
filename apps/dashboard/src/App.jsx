@@ -950,6 +950,10 @@ function BookingAppointments({ booking }) {
 // "" is a legitimate value for the two *_KIND keys (blank = no kind filter, see
 // apps/hub/main.py's `eff.get("...KIND") or None`), not a placeholder/unset marker.
 const _SETTING_SELECT_OPTIONS = {
+  // Both providers are fully implemented (libs/engine/vendor/email_pool.py) and the registrar
+  // switches on this in _mk_mail -- so it is genuinely a toggle, and typing the value by hand into
+  // a free-text box was the only thing making it look like a setting you could get wrong.
+  EMAIL_PROVIDER: ["mailtm", "cloudflare"],
   ENGINE_MODE: ["sim", "live"],
   PROXY_PROVIDER: ["soax", "webshare"],
   HOLD_PROXY_PROVIDER: ["soax", "webshare"],
@@ -2445,7 +2449,16 @@ function GlobalSettingsEditor({ me }) {
             <input value={key} onChange={(e) => setKey(e.target.value)} style={{ width: 260 }} />
           )}
         </div>
-        <div className="field grow"><label>Value</label><input value={val} onChange={(e) => setVal(e.target.value)} style={{ width: "100%" }} placeholder="value" /></div>
+        <div className="field grow"><label>Value</label>
+          {_SETTING_SELECT_OPTIONS[key] ? (
+            <select value={val} onChange={(e) => setVal(e.target.value)} style={{ width: "100%" }}>
+              <option value="">— choose —</option>
+              {_SETTING_SELECT_OPTIONS[key].map((o) => (<option key={o} value={o}>{o}</option>))}
+            </select>
+          ) : (
+            <input value={val} onChange={(e) => setVal(e.target.value)} style={{ width: "100%" }} placeholder="value" />
+          )}
+        </div>
         <div className="field" style={{ alignSelf: "end" }}><button className="btn" disabled={!me.is_operating || !key || !val} onClick={save}>Save</button></div>
       </div>
       <table><thead><tr><th>Key</th><th>Value</th></tr></thead>
