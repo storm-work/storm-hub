@@ -426,6 +426,9 @@ async def lifespan(app: FastAPI):
     event_hub.start()          # background thread tailing the evt stream -> DB + WS
     scheduler.start()          # auto-ops: scheduled start + slot-open + slot assignment
     yield
+    # Release open dashboard sockets FIRST: uvicorn will not complete shutdown while one is still
+    # being served, and ws_events blocks forever on its queue by construction.
+    event_hub.close_subscribers()
     scheduler.stop()
     event_hub.stop()
     supervisor.shutdown_all()
@@ -2411,6 +2414,8 @@ async def ws_events(ws: WebSocket) -> None:
     try:
         while True:
             item = await q.get()
+            if item is EventHub.CLOSE or item == EventHub.CLOSE:
+                break          # Hub is shutting down -- release the socket so uvicorn can finish
             await ws.send_json(item)
     except WebSocketDisconnect:
         pass

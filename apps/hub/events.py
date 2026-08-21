@@ -145,6 +145,29 @@ class EventHub:
     def unsubscribe(self, q: asyncio.Queue) -> None:
         self._subs.discard(q)
 
+    #: Pushed to every subscriber on shutdown so their `await q.get()` returns instead of blocking.
+    CLOSE = {"__close__": True}
+
+    def close_subscribers(self) -> None:
+        """Wake every open WS reader so it can exit.
+
+        ws_events is `while True: await q.get()`, which never returns on its own. Uvicorn will not
+        finish shutting down while a socket is still being served, so an open dashboard tab was
+        enough to hang the whole Hub on "Waiting for background tasks to complete" until systemd's
+        stop timeout expired and SIGKILLed it -- leaving the unit `failed` and, because the
+        scheduler never got to tick again, a worker row stranded in RUNNING with no process behind
+        it. Confirmed live 2026-08-21 03:42.
+
+        This is the F16 hazard the reconstruction plan names directly: never let an event-loop
+        pattern include a forever-blocking coroutine without an explicit exit path.
+        """
+        for q in list(self._subs):
+            try:
+                q.put_nowait(self.CLOSE)
+            except asyncio.QueueFull:
+                pass
+        self._subs.clear()
+
     def _broadcast(self, item: dict) -> None:
         for q in list(self._subs):
             try:
