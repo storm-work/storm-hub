@@ -84,9 +84,12 @@ class IdentityOut(BaseModel):
     comment: str | None = None
     target_posto: str | None = None
     created_at: datetime | None = None
-    # C2 exclusivity, surfaced so the UI can filter/explain instead of letting an operator pick an
-    # identity that attach_identity will 409. Set only when the identity currently holds an
-    # unreleased allocation to an ACTIVE booking; None means free to attach.
+    # C2 exclusivity, surfaced so the UI can filter instead of letting an operator pick an identity
+    # that attach_identity will 409. Set whenever the identity holds an UNRELEASED allocation, to
+    # any booking, whatever that booking's status -- which is what list_identities actually queries,
+    # and what the partial unique index enforces. (This said "to an ACTIVE booking", which was never
+    # what the endpoint did; the attach panel hides on this field, so the narrower claim described a
+    # panel that would have offered identities held by a stopped booking.) None means free.
     allocated_booking_id: str | None = None
     allocated_booking_name: str | None = None
 

@@ -1301,11 +1301,16 @@ function AttachPanel({ me, booking, identities, templates, attached, onAttached 
   const eligible = forThisBooking.filter(
     (i) => !attached.has(i.id) && !i.allocated_booking_id && i.status === "active");
 
-  // Counted, not listed -- so "why isn't X here?" is answerable without hunting through the
-  // identities page. Silently hiding rows is what made the old panel confusing in both directions.
-  const hiddenAttached = forThisBooking.filter((i) => attached.has(i.id)).length;
-  const hiddenElsewhere = forThisBooking.filter(
-    (i) => !attached.has(i.id) && i.allocated_booking_id);
+  // An identity attached ANYWHERE is not mentioned at all (operator, 2026-08-21). It was already
+  // excluded from the selectable list -- `attached` covers this booking, `allocated_booking_id`
+  // covers every other one, and the backend keys that on an unreleased allocation regardless of the
+  // holding booking's status. What remained was a "Not shown" footer that still counted and NAMED
+  // them, which is the part being removed: for an operator picking who to attach, an identity that
+  // is already spoken for is noise wherever it is spoken for.
+  //
+  // The one exclusion still worth reporting is "no usable sub-account", because that is the only
+  // one the operator can DO something about (register more sub-accounts) rather than simply live
+  // with. Counting it also keeps the panel from silently showing an empty list with no explanation.
   const hiddenNotReady = forThisBooking.filter(
     (i) => !attached.has(i.id) && !i.allocated_booking_id && i.status !== "active").length;
 
@@ -1359,16 +1364,9 @@ function AttachPanel({ me, booking, identities, templates, attached, onAttached 
         ))}</tbody>
       </table>
       {eligible.length === 0 && <div className="muted" style={{ padding: 8 }}>No eligible not-yet-attached identities with a usable sub-account.</div>}
-      {(hiddenAttached || hiddenElsewhere.length || hiddenNotReady) > 0 && (
+      {hiddenNotReady > 0 && (
         <div className="muted" style={{ fontSize: 12, padding: "8px 4px", borderTop: "1px solid var(--border)", marginTop: 8 }}>
-          <div style={{ marginBottom: 4 }}>Not shown:</div>
-          {hiddenAttached > 0 && <div>· {hiddenAttached} already attached to this booking</div>}
-          {hiddenNotReady > 0 && <div>· {hiddenNotReady} without a usable sub-account</div>}
-          {hiddenElsewhere.length > 0 && (
-            <div>· {hiddenElsewhere.length} held by another active booking
-              {" ("}{[...new Set(hiddenElsewhere.map((i) => i.allocated_booking_name).filter(Boolean))].join(", ")}{")"}
-            </div>
-          )}
+          Not shown: {hiddenNotReady} without a usable sub-account.
         </div>
       )}
     </>
