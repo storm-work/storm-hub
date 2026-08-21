@@ -408,6 +408,9 @@ class LiveEngineOps(EngineOps):
 
         self._log(f"restoring checkpoint for identity {self.identity_id} (sub_account={data.get('sub_account_id')})")
         try:
+            # Same reassignment hazard as the login retry loop: anything already open here would be
+            # orphaned rather than closed. Cheap to guard and correct whether or not a session exists.
+            self._close_session_quietly()
             self.session = get_session(
                 proxy=self.warm_proxy,
                 inject_cookies=data.get("cookies"),
@@ -523,6 +526,21 @@ class LiveEngineOps(EngineOps):
                 if new_proxy:
                     self.warm_proxy = new_proxy
             try:
+                # Close the PREVIOUS attempt's browser before opening another. This line used to
+                # simply reassign self.session, orphaning a whole Chromium tree on every retry --
+                # and this loop retries up to sticky_max(3) x max_transient(6) times per worker.
+                #
+                # Measured live 2026-08-21 on "Test 3018": 9 workers, all cycling on transient
+                # chrome-error failures, had produced 588 chromium and 656 node processes -- ~65 per
+                # worker against ~29 the day before. 9 workers x ~6 retries x ~11 processes is ~590,
+                # which is the number on the box.
+                #
+                # It is also self-amplifying, which is why it presented as "suddenly every login
+                # fails": orphaned browsers raise resource pressure, pressure produces more
+                # chrome-error navigation failures, each of those is classified transient, and every
+                # transient retry leaks another tree. The host had memory and CPU to spare the whole
+                # time -- this was never starvation, it was accumulation.
+                self._close_session_quietly()
                 self.session = get_session(proxy=self.warm_proxy, headless=self.headless,
                                            fp_seed=self.account.get("username"))
                 # No min_score: the parameter is gone. It gated the pre-solved token and forced
@@ -1528,6 +1546,26 @@ class LiveEngineOps(EngineOps):
             cookies_full=cookies_full, stage="schedule_jsp" if self.posto_pdf else "login",
             posto_pdf=self.posto_pdf,
         )
+
+    def _close_session_quietly(self) -> None:
+        """Tear down the current browser, if any, without letting cleanup mask the real error.
+
+        Used on every path that is about to REPLACE self.session. Failures are logged rather than
+        swallowed (see close()) because a close that silently fails leaks a Chromium tree, which is
+        the documented 2600-process incident and the 588-process one measured on 2026-08-21.
+        """
+        if self.session is None:
+            return
+        try:
+            self.session.close_browser()
+        except Exception as e:
+            self._log(f"close_browser failed while replacing the session ({e}) -- force-killing")
+            try:
+                from libs.engine.vendor.session import _kill_proc_tree
+                _kill_proc_tree(getattr(self.session, "_driver_pid", None))
+            except Exception:
+                pass
+        self.session = None
 
     def close(self) -> None:
         if self.session is not None:

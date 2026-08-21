@@ -45,3 +45,53 @@ def test_no_restore_means_every_call_does_real_work():
     ops = _Ops("none")
     ops.do_warmup(); ops.do_warmup()
     assert ops.warmup_calls == 2
+
+
+# ── browser-tree leak on session replacement (live incident 2026-08-21) ──────
+def test_replacing_a_session_closes_the_previous_one():
+    """self.session was reassigned on every login retry, orphaning a whole Chromium tree each time.
+
+    Measured live on "Test 3018": 9 workers cycling on transient chrome-error failures had produced
+    588 chromium and 656 node processes -- ~65 per worker against ~29 the day before, which is
+    9 workers x ~6 retries x ~11 processes. Self-amplifying, too: orphans raise resource pressure,
+    pressure produces more chrome-error navigation failures, each retry leaks another tree.
+    """
+    closed = []
+
+    class _Sess:
+        _driver_pid = 1234
+        def close_browser(self): closed.append("closed")
+
+    ops = _Ops("none")
+    ops.session = _Sess()
+    ops._log = lambda t: None
+    LiveEngineOps._close_session_quietly(ops)
+
+    assert closed == ["closed"], "the previous browser must be closed, not orphaned"
+    assert ops.session is None
+
+
+def test_closing_a_missing_session_is_a_no_op():
+    ops = _Ops("none")
+    ops.session = None
+    ops._log = lambda t: None
+    LiveEngineOps._close_session_quietly(ops)      # must not raise
+    assert ops.session is None
+
+
+def test_a_close_failure_still_clears_the_slot_and_is_logged():
+    """A cleanup failure must not mask the real error, but it must not be silent either -- a close
+    that quietly fails is exactly how a tree leaks."""
+    logged = []
+
+    class _BadSess:
+        _driver_pid = None
+        def close_browser(self): raise RuntimeError("hung")
+
+    ops = _Ops("none")
+    ops.session = _BadSess()
+    ops._log = lambda t: logged.append(t)
+    LiveEngineOps._close_session_quietly(ops)
+
+    assert ops.session is None
+    assert any("close_browser failed" in t for t in logged), logged
