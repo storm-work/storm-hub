@@ -162,3 +162,18 @@ def test_below_minimum_rejected_at_write_time_too():
         validate_layer(L.TEMPLATE, {"HOLD_POLL_GAP": 0.0})
     with pytest.raises(BelowMinimum):
         validate_layer(L.TEMPLATE, {"KEEPALIVE_INTERVAL": 0.0})
+
+
+def test_unimplemented_settings_say_so_in_their_note():
+    """auto_ops and persist_events have zero read sites (audited 2026-08-21). Keeping them is fine --
+    both name real intent -- but the operator sees these notes in the dashboard, and a checkbox that
+    silently does nothing is worse than no checkbox. If either is ever wired, drop the marker."""
+    import pathlib
+
+    from libs.domain.settings.catalog import CATALOG
+
+    src = pathlib.Path("apps").rglob("*.py")
+    body = "\n".join(p.read_text() for p in src if "test" not in str(p))
+    for key in ("auto_ops", "persist_events"):
+        assert "NOT IMPLEMENTED" in (CATALOG[key].note or ""), f"{key} note must flag it"
+        assert key not in body, f"{key} now HAS a read site -- wire it and drop the NOT IMPLEMENTED note"

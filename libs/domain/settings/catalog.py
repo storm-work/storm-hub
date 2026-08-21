@@ -128,9 +128,24 @@ _GLOBAL = [
 _BOOKING = [
     # Test-only / run mode
     _s("no_book", L.BOOKING, bool, False, group="mode", note="test dry-run: apply workers never submit"),
-    _s("auto_ops", L.BOOKING, bool, False, group="mode", note="R2-C1: auto-drive the full command flow"),
+    # NOT IMPLEMENTED -- audited 2026-08-21, zero read sites anywhere in the codebase (the only
+    # references are this line and a resolver test asserting the default). Kept rather than deleted
+    # because both name real intent, but the note must say so: an operator ticking a box that does
+    # nothing is worse than no box at all, and this is the recurring trap in this catalog.
+    #
+    # auto_ops was meant to gate auto-driving the command flow. The Scheduler now does that
+    # unconditionally for every live booking -- scheduled start, slot-open latching, slot
+    # assignment, hold-respawn -- so the behaviour it guarded became the default and the flag is
+    # vestigial. Wiring it now would mean adding an off switch for the main loop, which is probably
+    # not what anyone wants.
+    _s("auto_ops", L.BOOKING, bool, False, group="mode",
+       note="NOT IMPLEMENTED (nothing reads it) -- the scheduler already auto-drives every booking"),
+    # persist_events was meant to write raw worker logs/events to Postgres. They currently live ONLY
+    # in the capped Redis evt stream (maxlen 5000, shared by every booking) and the WS broadcast, so
+    # history ages out in hours -- which repeatedly cost us evidence mid-investigation on 2026-08-21.
+    # M.IdentityEvent persists identity MILESTONES (booked, etc.); there is no raw-event table.
     _s("persist_events", L.BOOKING, bool, False, group="mode",
-       note="R2-C2: persist raw logs/events to PG (heavy); TTL auto-release"),
+       note="NOT IMPLEMENTED (nothing reads it) -- raw events live only in the capped Redis stream"),
     _s("TEST_POSTO_ID", L.BOOKING, str, group="mode"),
     _s("ENGINE_MODE", L.BOOKING, str, "sim", group="mode",
        note="'sim' | 'live' -- explicit per-booking opt-in; live is never inferred/defaulted"),
