@@ -2386,6 +2386,42 @@ def stop_worker(worker_id: str, db: Session = Depends(get_db),
     return w
 
 
+@app.delete("/workers/{worker_id}/checkpoint")
+def clear_worker_checkpoint(worker_id: str, db: Session = Depends(get_db),
+                            _op: Principal = Depends(require_operator)) -> dict:
+    """Delete this worker's saved session checkpoint so its NEXT launch does a full fresh login.
+
+    Checkpoints are keyed by IDENTITY, not by worker (libs/engine/checkpoint.py) -- one identity has
+    one saved session, whichever worker last wrote it -- so this clears the identity's file.
+
+    Why an operator needs this: a checkpoint that restores into an unusable state is self-sustaining.
+    The worker restores it, fails, and (because the restore chain only discards the file on SOME
+    paths) can restore the very same dead cookies on the next launch. Seen live 2026-08-21:
+    "checkpoint restore: unusable after 25s -- discarding this checkpoint and doing a full
+    re-login", repeatedly, across relaunches. Clearing it by hand meant reaching into
+    var/checkpoints/ on the server, which is exactly the ad-hoc-rm-against-production habit that
+    cost this project four days once already (F8).
+
+    Deliberately allowed from ANY worker status, so it is NOT added to WORKER_ACTION_STATUSES: the
+    file is read at launch and written on healthy transitions, so deleting it never touches a live
+    session -- it only changes what the next launch starts from. Clearing it while the worker is
+    RUNNING is harmless but usually pointless, since a healthy worker will just save a new one; the
+    tooltip says so rather than disabling the button on a rule that isn't real.
+    """
+    from libs.engine import checkpoint as ckpt
+
+    w = db.get(M.Worker, worker_id)
+    if not w:
+        raise HTTPException(404, "worker not found")
+    if not w.identity_id:
+        raise HTTPException(409, "worker has no identity, so it has no checkpoint")
+    existed = ckpt.load_checkpoint(w.identity_id) is not None
+    ckpt.clear_checkpoint(w.identity_id)
+    logger.info("checkpoint cleared for identity %s (worker %s) by operator; existed=%s",
+                w.identity_id, worker_id, existed)
+    return {"cleared": existed, "identity_id": w.identity_id}
+
+
 @app.post("/workers/{worker_id}/restart", response_model=WorkerOut)
 def restart_worker(worker_id: str, db: Session = Depends(get_db),
                    _op: Principal = Depends(require_operator)) -> M.Worker:

@@ -1083,6 +1083,9 @@ function BookingWorkers({ me, booking, events, workers, setRightPanel }) {
   const op = me.is_operating;
 
   async function run(fn) { setMsg(""); try { await fn(); workers.reload(); } catch (e) { setMsg(e.message); } }
+  // Messages this panel raises ITSELF (rather than catching) are not failures, and its only banner
+  // is styled `err`. Same idiom the other panels here use: name the successes.
+  const _INFO_MSGS = new Set(["checkpoint cleared", "no checkpoint to clear"]);
 
   const identityById = Object.fromEntries(identities.rows.map((i) => [i.id, i]));
   const pdfByIdentity = Object.fromEntries(appointments.rows.map((a) => [a.identity_id, a.pdf_artifact_id]));
@@ -1153,7 +1156,7 @@ function BookingWorkers({ me, booking, events, workers, setRightPanel }) {
       <div className="row muted" style={{ fontSize: 13, marginBottom: 8, gap: 14 }}>
         {Object.entries(counts).map(([k, v]) => <span key={k}>{k}: {v}</span>)}
       </div>
-      {msg && <div className="banner err">{msg}</div>}
+      {msg && <div className={`banner ${_INFO_MSGS.has(msg) ? "info" : "err"}`}>{msg}</div>}
       <div className="row" style={{ marginBottom: 10, flexWrap: "wrap", gap: 10 }}>
         <button className="btn ghost" disabled={!op} onClick={openAttachPanel}>+ Attach identities</button>
         <span className="grow" />
@@ -1229,6 +1232,23 @@ function BookingWorkers({ me, booking, events, workers, setRightPanel }) {
                   {w.artifact_id && (
                     <button className="btn-sm btn ghost" onClick={() => openFile(`/artifacts/${w.artifact_id}/file`)}>📄 PDF</button>
                   )}
+                  {/* Checkpoints are keyed by IDENTITY, and a bad one is self-sustaining: the worker
+                      restores it, fails, and can restore the same dead cookies next launch ("checkpoint
+                      restore: unusable ... doing a full re-login", repeatedly, 2026-08-21). Clearing it
+                      used to mean an ad-hoc rm against var/checkpoints/ on the server. Enabled at ANY
+                      status on purpose -- the file is only read at launch, so this never touches a live
+                      session; the tooltip says when it is pointless rather than disabling it on a rule
+                      that does not exist. */}
+                  <button className="btn-sm btn ghost" disabled={!op}
+                    title={w.status === "running"
+                      ? "clear the saved session checkpoint -- takes effect on the NEXT launch (a running worker will save a new one)"
+                      : "clear the saved session checkpoint so the next launch does a full fresh login"}
+                    onClick={() => run(async () => {
+                      const r = await api(`/workers/${w.id}/checkpoint`, { method: "DELETE" });
+                      setMsg(r.cleared ? "checkpoint cleared" : "no checkpoint to clear");
+                    })}>
+                    Clear checkpoint
+                  </button>
                   <button className="btn-sm btn ghost" disabled={!op || !canWorkerAction("detach", w.status)}
                     onClick={() => run(() => api(`/bookings/${booking.id}/identities/${w.identity_id}`, { method: "DELETE" }))}
                     title={actionTitle("detach", w.status)}>

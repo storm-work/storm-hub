@@ -177,3 +177,56 @@ def test_host_session_cap_of_zero_means_unlimited(client):
 
     r = client.post(f"/workers/{w2['id']}/launch", headers=h)
     assert r.status_code != 409, "0 must disable the cap, not block everything"
+
+
+# ── clear-checkpoint button (operator request 2026-08-21) ────────────────────
+def test_clear_checkpoint_removes_the_identitys_saved_session(client, tmp_path, monkeypatch):
+    """Checkpoints are keyed by IDENTITY, not worker, and a bad one is self-sustaining: the worker
+    restores it, fails, and can restore the same dead cookies next launch. Clearing it by hand meant
+    an ad-hoc rm against var/checkpoints/ on the server -- the habit that cost this project four days."""
+    from libs.engine import checkpoint as ckpt
+
+    monkeypatch.setattr(ckpt, "_CHECKPOINTS_DIR", tmp_path)
+    h = _headers(client)
+    bid, iid, wid = _bk_with_worker(client, h)
+    ckpt.save_checkpoint(iid, cookies={"Vistos_sid": "x"}, sub_account_id="s1")
+    assert ckpt.load_checkpoint(iid) is not None
+
+    r = client.delete(f"/workers/{wid}/checkpoint", headers=h)
+    assert r.status_code == 200, r.text
+    assert r.json()["cleared"] is True
+    assert ckpt.load_checkpoint(iid) is None
+
+
+def test_clear_checkpoint_reports_when_there_was_none(client, tmp_path, monkeypatch):
+    """"cleared: false" is a real answer, not an error -- the operator needs to know the difference
+    between "removed it" and "there was nothing there"."""
+    from libs.engine import checkpoint as ckpt
+
+    monkeypatch.setattr(ckpt, "_CHECKPOINTS_DIR", tmp_path)
+    h = _headers(client)
+    bid, iid, wid = _bk_with_worker(client, h)
+
+    r = client.delete(f"/workers/{wid}/checkpoint", headers=h)
+    assert r.status_code == 200
+    assert r.json()["cleared"] is False
+
+
+def test_clear_checkpoint_works_from_any_worker_status(client, tmp_path, monkeypatch):
+    """Deliberately NOT status-gated: the file is read at launch and written on healthy transitions,
+    so deleting it never touches a live session -- it only changes what the next launch starts from."""
+    from libs.engine import checkpoint as ckpt
+
+    monkeypatch.setattr(ckpt, "_CHECKPOINTS_DIR", tmp_path)
+    h = _headers(client)
+    bid, iid, wid = _bk_with_worker(client, h)
+    _force_status(client, wid, WorkerStatus.RUNNING)
+    ckpt.save_checkpoint(iid, cookies={}, sub_account_id="s1")
+
+    assert client.delete(f"/workers/{wid}/checkpoint", headers=h).status_code == 200
+    assert ckpt.load_checkpoint(iid) is None
+
+
+def test_clear_checkpoint_404s_on_an_unknown_worker(client):
+    h = _headers(client)
+    assert client.delete("/workers/does-not-exist/checkpoint", headers=h).status_code == 404
