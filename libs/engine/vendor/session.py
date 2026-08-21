@@ -256,6 +256,34 @@ class _StampedResultQueue:
         return self._q.get_nowait()
 
 
+# The portal states WHY it refused a login in the page it serves back, and reading it is the only
+# way to tell "your CAPTCHA was rejected" from "wrong password" from "we are throttling you". Kept
+# as a module constant because BOTH rejection branches need it: this used to run only on the
+# Authentication.jsp redirect, while the OTHER branch -- a bounce back to /login, which was 63% of
+# rejections on 2026-08-21 -- recorded nothing but the URL and discarded the page.
+#
+# What the branch that DID look has been reporting all along, 554 times:
+#     'Por favor, confirma o reCAPTCHA.'   -- please confirm the reCAPTCHA
+#       8 times: 'Nao foi possivel de momento concretizar o seu pedido, por favor tente mais tarde'
+# So the login wall is the CAPTCHA being rejected, in the portal's own words, and occasionally an
+# explicit throttle. Not proxy quality, and not something inferable from a final URL.
+_PAGE_ERROR_JS = """
+() => {
+    const els = [...document.querySelectorAll('.alert,.error,.errorMessage,#errorMessage,.text-danger,.msg-error,[class*="error"],[id*="error"],td.text-center.font-weight-bold')];
+    for (const el of els) {
+        const t = el.textContent.trim();
+        if (t) return t.slice(0, 300);
+    }
+    const ps = document.querySelectorAll('p');
+    for (const p of ps) {
+        const t = p.textContent.trim();
+        if (t && t.length > 5) return t.slice(0, 300);
+    }
+    return null;
+}
+"""
+
+
 def _nav_scale() -> float:
     """NAV_TIMEOUT_SCALE (default 1.0): multiply browser nav/form-post timeouts for traffic-heavy
     ('storm') periods when the portal renders slowly and a normal timeout would abandon a still-alive
@@ -1864,33 +1892,43 @@ class PlaywrightSession:
         elif at_auth:
             # Extract the actual error message from Authentication.jsp
             try:
-                _auth_error = page.evaluate("""
-                () => {
-                    const els = [...document.querySelectorAll('.alert,.error,.errorMessage,#errorMessage,.text-danger,.msg-error,[class*="error"],[id*="error"],td.text-center.font-weight-bold')];
-                    for (const el of els) {
-                        const t = el.textContent.trim();
-                        if (t) return t.slice(0, 300);
-                    }
-                    const ps = document.querySelectorAll('p');
-                    for (const p of ps) {
-                        const t = p.textContent.trim();
-                        if (t && t.length > 5) return t.slice(0, 300);
-                    }
-                    return null;
-                }
-                """)
+                _auth_error = page.evaluate(_PAGE_ERROR_JS)
                 if _auth_error:
                     print(f"[session] auth-redirect error: {_auth_error!r:.300}")
                 else:
                     _auth_snip = html_content[3500:4000].replace('\n', ' ').replace('\r', '')
                     print(f"[session] auth-redirect body@3500: {_auth_snip!r:.300}")
             except Exception as _ae:
+                _auth_error = None
                 _auth_snip = html_content[3500:4000].replace('\n', ' ').replace('\r', '')
                 print(f"[session] auth-redirect body@3500: {_auth_snip!r:.300}")
-            body = '{"type":"error","description":"login_failed_auth_redirect"}'
+            # Carry the message, not just the label. It was scraped, printed to stdout, and then
+            # thrown away in favour of a fixed "login_failed_auth_redirect" -- so the reason reached
+            # a log file nobody aggregates and never the event stream, the classifier, or the
+            # operator. 554 of these said 'Por favor, confirma o reCAPTCHA.' and 8 said the portal
+            # was refusing the request outright; those are different problems with the same label.
+            if _auth_error:
+                _safe_auth = str(_auth_error)[:200].replace('"', "'").replace("\\", "")
+                body = f'{{"type":"error","description":"auth_redirect: {_safe_auth}"}}'
+            else:
+                body = '{"type":"error","description":"login_failed_auth_redirect"}'
         else:
             safe_url = final_url[:80].replace('"', '')
-            body = f'{{"type":"error","description":"unexpected_redirect_{safe_url}"}}'
+            # Read the page, don't just name the URL. This branch is the DOMINANT login rejection
+            # (63% on 2026-08-21) and it recorded nothing but where we landed -- so every one of
+            # those failures was indistinguishable from every other, and the portal's own
+            # explanation went in the bin. See _PAGE_ERROR_JS.
+            _page_error = None
+            try:
+                _page_error = page.evaluate(_PAGE_ERROR_JS)
+            except Exception:
+                pass
+            if _page_error:
+                print(f"[session] login-rejected error: {_page_error!r:.300}")
+                _safe_msg = str(_page_error)[:200].replace('"', "'").replace("\\", "")
+                body = f'{{"type":"error","description":"{_safe_msg}"}}'
+            else:
+                body = f'{{"type":"error","description":"unexpected_redirect_{safe_url}"}}'
 
         if body.startswith('{"type":"success'):
             # Sync browser cookies -> primp so keepalive GETs use the authenticated session.
