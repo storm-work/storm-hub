@@ -69,3 +69,39 @@ def test_the_default_still_ensures_opt_wb():
     from scripts.retune_soax_credentials import retune
     cred = "package-350716-country-it-sessionid-ABC-sessionlength-3600-bindttl-600:pw"
     assert "-opt-wb:" in retune(cred, 5)
+
+
+# ── idlettl covers the CAPTCHA-solve window (SOAX docs, 2026-08-21) ──────────
+def test_idlettl_is_added_when_absent():
+    """idlettl governs how long a node survives with NO activity -- exactly the CAPTCHA solve, during
+    which zero traffic flows through the node (the solver talks to CapSolver directly). Measured over
+    12,238 solves: median 6s, p90 12s, max 33s. We had never set this parameter."""
+    from scripts.retune_soax_credentials import retune
+    cred = "package-335959-country-nl-sessionid-ABC-sessionlength-3600-bindttl-5:pw"
+    out = retune(cred, 600, opt_wb=True, idlettl=300)
+    assert "-idlettl-300" in out
+    assert "-bindttl-600" in out
+    assert "-opt-wb:" in out
+    assert out.endswith(":pw")
+
+
+def test_idlettl_is_replaced_not_duplicated():
+    from scripts.retune_soax_credentials import retune
+    cred = "package-1-sessionid-A-sessionlength-3600-bindttl-5-idlettl-30-opt-wb:pw"
+    out = retune(cred, 600, opt_wb=True, idlettl=300)
+    assert out.count("-idlettl-") == 1
+    assert "-idlettl-300" in out
+
+
+def test_retune_is_idempotent():
+    """Re-running the script must not keep appending parameters."""
+    from scripts.retune_soax_credentials import retune
+    cred = "package-1-sessionid-A-sessionlength-3600-bindttl-5:pw"
+    once = retune(cred, 600, opt_wb=True, idlettl=300)
+    assert retune(once, 600, opt_wb=True, idlettl=300) == once
+
+
+def test_idlettl_is_left_alone_when_not_requested():
+    from scripts.retune_soax_credentials import retune
+    cred = "package-1-sessionid-A-sessionlength-3600-bindttl-5:pw"
+    assert "-idlettl-" not in retune(cred, 600, opt_wb=True)

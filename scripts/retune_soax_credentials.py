@@ -31,7 +31,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 _BINDTTL_RE = re.compile(r"-bindttl-(\d+)")
 
 
-def retune(cred: str, bindttl: int, *, opt_wb: bool = True) -> str:
+_IDLETTL_RE = re.compile(r"-idlettl-\d+")
+
+
+def _insert_opt(cred: str, token: str) -> str:
+    """Insert `token` immediately before the ':password' separator, matching the working format."""
+    user, sep, pw = cred.partition(":")
+    return f"{user}{token}{sep}{pw}" if sep else f"{cred}{token}"
+
+
+def retune(cred: str, bindttl: int, *, opt_wb: bool = True, idlettl: int | None = None) -> str:
     """Pure: the rewritten credential. Only touches bindttl and the -opt-wb flag.
 
     `opt_wb=False` STRIPS the flag. Measured 2026-08-21 against the real portal, soax/mobile,
@@ -45,6 +54,12 @@ def retune(cred: str, bindttl: int, *, opt_wb: bool = True) -> str:
     recommended turning opt-wb off (2026-08-19); this is the measurement that agrees with them.
     """
     out = _BINDTTL_RE.sub(f"-bindttl-{bindttl}", cred)
+    if idlettl is not None:
+        # idlettl governs how long a node stays connected WITH NO ACTIVITY -- which is exactly our
+        # CAPTCHA-solve window. The solver talks to CapSolver directly (RECAPTCHA_SOLVE_PROXY=False),
+        # so for its whole duration ZERO traffic flows through the SOAX node. Measured over 12,238
+        # solves: median 6s, p90 12s, max 33s. We have never set this parameter at all.
+        out = _IDLETTL_RE.sub(f"-idlettl-{idlettl}", out) if _IDLETTL_RE.search(out) else _insert_opt(out, f"-idlettl-{idlettl}")
     if opt_wb:
         if "-opt-wb" not in out:
             # opt-wb sits immediately before the ":password" separator, matching the working format.
@@ -59,6 +74,9 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--bindttl", type=int, default=5)
+    p.add_argument("--idlettl", type=int, default=None,
+                   help="set idlettl (seconds a node survives with NO traffic -- covers the "
+                        "CAPTCHA solve window, during which nothing flows through the node)")
     p.add_argument("--strip-opt-wb", action="store_true",
                    help="REMOVE -opt-wb instead of ensuring it (see retune()'s measurement)")
     p.add_argument("--confirm", action="store_true", help="actually write (default: dry run)")
@@ -85,7 +103,7 @@ def main() -> int:
         for pr in rows:
             m = _BINDTTL_RE.search(pr.credentials_ref or "")
             before[(m.group(1) if m else "none", "-opt-wb" in (pr.credentials_ref or ""))] += 1
-            new = retune(pr.credentials_ref, args.bindttl, opt_wb=not args.strip_opt_wb)
+            new = retune(pr.credentials_ref, args.bindttl, opt_wb=not args.strip_opt_wb, idlettl=args.idlettl)
             if new != pr.credentials_ref:
                 changed.append((pr, new))
 
