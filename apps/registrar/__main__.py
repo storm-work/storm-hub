@@ -163,7 +163,13 @@ async def _register_one(acct: dict, proxies_cycle, capsolver_keys: list[str], la
                 proxy_success = True
                 break
 
-            reg_result_detail = f"type={reg_type} desc={reg_desc[:80]}"
+            # 400, not 80. The portal states its refusal in full Portuguese sentences, and at 80
+            # chars every one of them was cut mid-word: "De forma a melhor garantir a
+            # possibilidade de agendamentos para todos os utiliza" -- which reads as a fair-use
+            # notice but never reaches the part that says WHICH limit was hit or for how long.
+            # Diagnosing the 2026-08-21 registration stoppage came down to guessing from a
+            # truncated sentence; same class as the 24-char proxies.health column.
+            reg_result_detail = f"type={reg_type} desc={reg_desc[:400]}"
             progress(f"register attempt failed ({reg_result_detail})")
             try: s.close()
             except Exception: pass
