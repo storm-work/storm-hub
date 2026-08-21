@@ -230,3 +230,34 @@ def test_clear_checkpoint_works_from_any_worker_status(client, tmp_path, monkeyp
 def test_clear_checkpoint_404s_on_an_unknown_worker(client):
     h = _headers(client)
     assert client.delete("/workers/does-not-exist/checkpoint", headers=h).status_code == 404
+
+
+# ── an API path must 404, never fall through to the SPA (2026-08-21) ────────
+def test_unknown_api_path_404s_instead_of_serving_the_dashboard(client):
+    """The SPA catch-all is GET-only, so an API route the server does not have answered
+    misleadingly: GET returned 200 + index.html (a JSON client then dies on "Unexpected token '<'")
+    and every other method returned 405 Method Not Allowed.
+
+    Confirmed live when the dashboard's Clear-checkpoint button hit a Hub predating the endpoint --
+    the operator saw 405, which reads as "wrong method", i.e. a bug in the request, when the truth
+    was "this server does not have that route yet". 404 says the route is missing; 405 sends you
+    hunting a bug that is not there."""
+    r = client.get("/workers/some-id/no-such-action")
+    assert r.status_code == 404, f"got {r.status_code}: {r.text[:120]}"
+    assert "no such API route" in r.text
+
+
+def test_a_real_spa_route_still_serves_the_dashboard(client):
+    """The fallback must keep doing its job for genuine client-side routes."""
+    r = client.get("/some/client/route")
+    assert r.status_code in (200, 404)      # 200 with dist built, 404 when it is not
+    if r.status_code == 200:
+        assert "<" in r.text                # index.html, not JSON
+
+
+def test_every_api_prefix_is_derived_from_the_router():
+    """Hand-listing prefixes would drift the first time an endpoint is added."""
+    from apps.hub.main import _API_PREFIXES
+    for expected in ("workers", "bookings", "identities", "settings", "auth", "proxies"):
+        assert expected in _API_PREFIXES
+    assert "{full_path:path}" not in _API_PREFIXES

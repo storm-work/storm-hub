@@ -2463,6 +2463,14 @@ async def ws_events(ws: WebSocket) -> None:
 # Registered LAST so every API route above wins; the SPA fallback serves index.html for client
 # routes. Only active once the dashboard is built (apps/dashboard/dist).
 _DIST = Path(__file__).resolve().parents[1] / "dashboard" / "dist"
+
+# First path segment of every route the app actually registers -- derived, not hand-listed, so a new
+# endpoint is covered automatically and this can never fall out of step with the router.
+_API_PREFIXES = {
+    r.path.split("/", 2)[1]
+    for r in app.routes
+    if getattr(r, "path", "").startswith("/") and len(r.path.split("/", 2)) > 1 and r.path != "/"
+} - {"{full_path:path}"}
 if _DIST.is_dir():
     app.mount("/assets", StaticFiles(directory=_DIST / "assets"), name="assets")
 
@@ -2478,6 +2486,18 @@ if _DIST.is_dir():
         # index.html (200) instead of a 404, defeating the point of disabling them.
         if full_path in ("docs", "redoc", "openapi.json"):
             raise HTTPException(404, "not found")
+        # An API-shaped path must 404 as JSON, never fall through to the SPA.
+        #
+        # Because this catch-all is GET-only, an API path the server does not have produced a
+        # MISLEADING pair of answers: GET returned 200 + index.html (a JSON client then fails on
+        # "Unexpected token '<'"), and any other method returned 405 Method Not Allowed. Confirmed
+        # 2026-08-21 when the dashboard's new Clear-checkpoint button hit a Hub that predated the
+        # endpoint: the operator saw "405", which reads as "wrong method" -- i.e. a bug in the
+        # request -- when the truth was simply "this server does not have that route yet".
+        #
+        # 404 tells you the route is missing. 405 sends you looking for a bug that isn't there.
+        if full_path.split("/", 1)[0] in _API_PREFIXES:
+            raise HTTPException(404, f"no such API route: /{full_path}")
         candidate = _DIST / full_path
         if candidate.is_file():
             return FileResponse(candidate)
