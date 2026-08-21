@@ -2400,11 +2400,23 @@ function ImportInline({ me, makeBody, onDone }) {
 
 function GlobalSettingsEditor({ me }) {
   const [current, setCurrent] = useState({});
+  const [catalog, setCatalog] = useState([]);
   const [key, setKey] = useState("CAPSOLVER_KEYS");
   const [val, setVal] = useState("");
   const [msg, setMsg] = useState("");
   const reload = () => api("/settings/global").then(setCurrent).catch(() => {});
   useEffect(() => { reload(); }, []);
+  // The key was a free-text box defaulting to CAPSOLVER_KEYS, so every other global setting was
+  // reachable only by knowing its exact name. CF_MAIL_DOMAIN and EMAIL_PROVIDER are the ones that
+  // bit: registration is quota-blocked on a single mail domain, changing it is the obvious next
+  // test, and the operator's reasonable read of this panel was "there is no option to change the
+  // email service". The catalog already knows every settable GLOBAL key and its note.
+  useEffect(() => {
+    api("/settings/catalog").then((c) => setCatalog(c.global || [])).catch(() => setCatalog([]));
+  }, []);
+  const groups = {};
+  for (const s of catalog) (groups[s.group || "other"] = groups[s.group || "other"] || []).push(s);
+  const chosen = catalog.find((s) => s.key === key);
   async function save() {
     setMsg("");
     try { await api("/settings/global", { method: "PUT", body: { values: { [key]: val } } }); setVal(""); reload(); setMsg("saved"); }
@@ -2415,10 +2427,24 @@ function GlobalSettingsEditor({ me }) {
       <h2>Global settings</h2>
       {msg && <div className={`banner ${msg === "saved" ? "info" : "err"}`}>{msg}</div>}
       <div className="muted" style={{ fontSize: 12, marginBottom: 8 }}>
-        Stored in the DB (not env). Set <code>CAPSOLVER_KEYS</code> here; secret values are masked on read.
+        Stored in the DB (not env). Secret values are masked on read.
+        {chosen && chosen.note ? <> · <span style={{ fontStyle: "italic" }}>{chosen.note}</span></> : null}
+        {chosen && chosen.default != null ? <> · default <code>{String(chosen.default)}</code></> : null}
       </div>
       <div className="row" style={{ marginBottom: 10 }}>
-        <div className="field"><label>Key</label><input value={key} onChange={(e) => setKey(e.target.value)} style={{ width: 240 }} /></div>
+        <div className="field"><label>Key</label>
+          {catalog.length > 0 ? (
+            <select value={key} onChange={(e) => setKey(e.target.value)} style={{ width: 260 }}>
+              {Object.keys(groups).sort().map((g) => (
+                <optgroup key={g} label={g.replace(/_/g, " ")}>
+                  {groups[g].map((s) => (<option key={s.key} value={s.key}>{s.key}</option>))}
+                </optgroup>
+              ))}
+            </select>
+          ) : (
+            <input value={key} onChange={(e) => setKey(e.target.value)} style={{ width: 260 }} />
+          )}
+        </div>
         <div className="field grow"><label>Value</label><input value={val} onChange={(e) => setVal(e.target.value)} style={{ width: "100%" }} placeholder="value" /></div>
         <div className="field" style={{ alignSelf: "end" }}><button className="btn" disabled={!me.is_operating || !key || !val} onClick={save}>Save</button></div>
       </div>

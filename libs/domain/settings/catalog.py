@@ -65,10 +65,19 @@ _GLOBAL = [
     # are legitimate stored GLOBAL config recovered from the dump -- without a catalog entry,
     # resolve() rejects them and breaks EVERY worker launch, not just registration, since it
     # validates the whole GLOBAL layer regardless of what a given launch actually needs).
-    _s("EMAIL_PROVIDER", L.GLOBAL, str, group="credentials"),
-    _s("CF_MAIL_DOMAIN", L.GLOBAL, str, group="credentials"),
-    _s("CF_WORKER_URL", L.GLOBAL, str, group="credentials"),
-    _s("CF_WORKER_SECRET", L.GLOBAL, str, group="credentials"),
+    _s("EMAIL_PROVIDER", L.GLOBAL, str, "cloudflare", group="credentials",
+       note="where registration gets verification mailboxes: 'cloudflare' (CF_MAIL_DOMAIN below)"),
+    # The domain every generated sub-account address is created under. Worth calling out because it
+    # is shared by EVERY registration: on 2026-08-21 the portal began refusing with "Dispoe de mais
+    # 0 tentativas" (0 attempts remaining) after 528 registrations, and the mail domain is the only
+    # attribute all of them have in common -- proxies rotate per registration, so a per-IP quota is
+    # ruled out. Changing this is therefore the cheapest test of whether that limit is per-domain.
+    _s("CF_MAIL_DOMAIN", L.GLOBAL, str, group="credentials",
+       note="mail domain for generated sub-account addresses -- change to test a per-domain quota"),
+    _s("CF_WORKER_URL", L.GLOBAL, str, group="credentials",
+       note="Cloudflare Worker endpoint that receives and exposes verification mail"),
+    _s("CF_WORKER_SECRET", L.GLOBAL, str, group="credentials",
+       note="shared secret for CF_WORKER_URL"),
     # Browser / stealth defaults (override-ok at template)
     _s("HEADLESS_MODE", L.GLOBAL, str, "new", _TPL, "browser"),
     _s("DRIVER", L.GLOBAL, str, "playwright", _TPL, "browser"),
