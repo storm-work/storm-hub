@@ -36,3 +36,36 @@ def test_sessionlength_is_never_touched():
     the operator has not asked to change."""
     c = "package-350716-country-de-sessionid-A-sessionlength-3600-bindttl-600-opt-wb:pw"
     assert "sessionlength-3600" in retune(c, 5)
+
+
+# ── opt-wb removal (measured 2026-08-21) ─────────────────────────────────────
+def test_strip_opt_wb_removes_the_flag_and_keeps_the_password_separator():
+    """Measured against the real portal, soax/mobile, n=40 per arm, fresh sessionid each:
+
+        opt-wb ON    35/40 reached the portal (88%)  -- 5 x SSLError
+        opt-wb OFF   40/40 (100%)                    -- none
+
+    SSLError is a TLS handshake drop, which the browser reports as net::ERR_CONNECTION_CLOSED --
+    the error the workers were logging. SOAX support had recommended turning it off on 2026-08-19;
+    this is the measurement that agrees with them.
+    """
+    from scripts.retune_soax_credentials import retune
+    cred = "package-350716-country-it-sessionid-ABC-sessionlength-3600-bindttl-600-opt-wb:pw"
+    out = retune(cred, 5, opt_wb=False)
+    assert "-opt-wb" not in out
+    assert out.endswith(":pw"), "the password separator must survive the rewrite"
+    assert "-bindttl-5" in out
+
+
+def test_strip_is_a_no_op_when_the_flag_is_already_absent():
+    from scripts.retune_soax_credentials import retune
+    cred = "package-350716-country-it-sessionid-ABC-sessionlength-3600-bindttl-600:pw"
+    assert retune(cred, 5, opt_wb=False) == \
+        "package-350716-country-it-sessionid-ABC-sessionlength-3600-bindttl-5:pw"
+
+
+def test_the_default_still_ensures_opt_wb():
+    """Default behaviour is unchanged -- removal is opt-in via --strip-opt-wb."""
+    from scripts.retune_soax_credentials import retune
+    cred = "package-350716-country-it-sessionid-ABC-sessionlength-3600-bindttl-600:pw"
+    assert "-opt-wb:" in retune(cred, 5)

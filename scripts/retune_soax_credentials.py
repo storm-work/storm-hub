@@ -31,13 +31,27 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 _BINDTTL_RE = re.compile(r"-bindttl-(\d+)")
 
 
-def retune(cred: str, bindttl: int) -> str:
-    """Pure: the rewritten credential. Only touches bindttl and a missing -opt-wb."""
+def retune(cred: str, bindttl: int, *, opt_wb: bool = True) -> str:
+    """Pure: the rewritten credential. Only touches bindttl and the -opt-wb flag.
+
+    `opt_wb=False` STRIPS the flag. Measured 2026-08-21 against the real portal, soax/mobile,
+    n=40 per arm with a fresh sessionid each:
+
+        opt-wb ON    35/40 reached the portal (88%)   -- 5 x SSLError
+        opt-wb OFF   40/40 reached the portal (100%)  -- none
+
+    SSLError is a TLS handshake drop, which is exactly what the browser reports as
+    net::ERR_CONNECTION_CLOSED -- the error the workers were logging. SOAX support had already
+    recommended turning opt-wb off (2026-08-19); this is the measurement that agrees with them.
+    """
     out = _BINDTTL_RE.sub(f"-bindttl-{bindttl}", cred)
-    if "-opt-wb" not in out:
-        # opt-wb sits immediately before the ":password" separator, matching the working format.
-        user, sep, pw = out.partition(":")
-        out = f"{user}-opt-wb{sep}{pw}" if sep else f"{out}-opt-wb"
+    if opt_wb:
+        if "-opt-wb" not in out:
+            # opt-wb sits immediately before the ":password" separator, matching the working format.
+            user, sep, pw = out.partition(":")
+            out = f"{user}-opt-wb{sep}{pw}" if sep else f"{out}-opt-wb"
+    else:
+        out = out.replace("-opt-wb", "")
     return out
 
 
@@ -45,6 +59,8 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--bindttl", type=int, default=5)
+    p.add_argument("--strip-opt-wb", action="store_true",
+                   help="REMOVE -opt-wb instead of ensuring it (see retune()'s measurement)")
     p.add_argument("--confirm", action="store_true", help="actually write (default: dry run)")
     p.add_argument("--force", action="store_true", help="proceed while workers are RUNNING")
     args = p.parse_args()
@@ -69,7 +85,7 @@ def main() -> int:
         for pr in rows:
             m = _BINDTTL_RE.search(pr.credentials_ref or "")
             before[(m.group(1) if m else "none", "-opt-wb" in (pr.credentials_ref or ""))] += 1
-            new = retune(pr.credentials_ref, args.bindttl)
+            new = retune(pr.credentials_ref, args.bindttl, opt_wb=not args.strip_opt_wb)
             if new != pr.credentials_ref:
                 changed.append((pr, new))
 
