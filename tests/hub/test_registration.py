@@ -414,3 +414,32 @@ def test_registration_geo_filter_never_excludes_an_unclassified_proxy(client):
     # that it did NOT fail on proxy selection, i.e. the NULL-geo proxy was not filtered out.
     detail = r.json().get("detail", "") if r.status_code >= 400 else ""
     assert "proxies available" not in detail, detail
+
+
+# ── the portal blocks after 2 reCAPTCHA failures (2026-08-21) ────────────────
+def test_recaptcha_rejection_is_recognised_in_both_forms():
+    """The portal's own rule, readable only once the detail stopped being cut at 80 chars:
+
+        "o sistema apenas permite falhar o processo de ReCaptcha 2 vezes ... o seu acesso a
+         plataforma de E-VISA sera bloqueado"
+
+    Two failures allowed; more and platform access is BLOCKED. MAX_PROXY_RETRIES was 5 and batches
+    run concurrently, so the retry policy was not merely failing to register -- it was working
+    toward a block, and "Dispoe de mais 0 tentativas" was the counter saying so."""
+    from apps.registrar.__main__ import is_recaptcha_rejection
+
+    assert is_recaptcha_rejection(
+        "ReCaptchaError",
+        "De forma a melhor garantir a possibilidade de agendamentos para todos os utilizadores o "
+        "sistema apenas permite falhar o processo de ReCaptcha 2 vezes.")
+    assert is_recaptcha_rejection("ReCaptchaError", "Dispõe de mais 0 tentativas ")
+
+
+def test_other_failures_are_not_treated_as_recaptcha():
+    """A proxy/network failure still deserves another proxy -- those never reached the CAPTCHA
+    check, and refusing to retry them would throw away recoverable attempts."""
+    from apps.registrar.__main__ import is_recaptcha_rejection
+
+    assert not is_recaptcha_rejection("error", "Foi encontrado um erro ao executar a operação.")
+    assert not is_recaptcha_rejection("", "")
+    assert not is_recaptcha_rejection("already_exists", "account exists")

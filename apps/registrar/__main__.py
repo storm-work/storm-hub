@@ -40,6 +40,28 @@ MAX_VERIFY_RETRIES = 3
 EMAIL_POLL_TIMEOUT = 240
 
 
+def is_recaptcha_rejection(reg_type: str, reg_desc: str) -> bool:
+    """Did the portal reject our CAPTCHA (as opposed to anything else)?
+
+    Matters because the portal punishes repetition. Its own words, visible only once the failure
+    detail stopped being truncated at 80 chars (2026-08-21):
+
+        "o sistema apenas permite falhar o processo de ReCaptcha 2 vezes. Se tentar executar este
+         processo mais vezes no periodo de tempo definido o seu acesso a plataforma de E-VISA sera
+         bloqueado"
+
+    Two failures allowed; more within the window and platform access is BLOCKED. MAX_PROXY_RETRIES
+    was 5, and batches run several sub-accounts concurrently, so the retry policy could produce
+    well over the threshold in a couple of minutes. "Dispoe de mais 0 tentativas" (0 attempts
+    remaining) is the same counter, already exhausted.
+
+    Deliberately matches on BOTH fields: the portal uses type=ReCaptchaError with the long warning
+    in the description, and also type=ReCaptchaError with the short "0 tentativas" form.
+    """
+    blob = f"{reg_type} {reg_desc}".lower()
+    return "recaptcha" in blob
+
+
 def _mk_mail(email_provider: str, email_cfg: dict):
     from libs.engine.vendor import CloudflareMail, MailTM
     if email_provider == "cloudflare":
@@ -173,6 +195,33 @@ async def _register_one(acct: dict, proxies_cycle, capsolver_keys: list[str], la
             progress(f"register attempt failed ({reg_result_detail})")
             try: s.close()
             except Exception: pass
+
+            # STOP on a reCAPTCHA rejection. Do not spend another attempt.
+            #
+            # The portal states the rule itself, and we only saw it once the detail stopped being
+            # truncated at 80 chars (2026-08-21):
+            #
+            #   "o sistema apenas permite falhar o processo de ReCaptcha 2 vezes. Se tentar
+            #    executar este processo mais vezes no periodo de tempo definido o seu acesso a
+            #    plataforma de E-VISA sera bloqueado"
+            #
+            #   -- the system allows the reCAPTCHA process to fail TWICE; try more within the
+            #      window and your access to the platform is BLOCKED.
+            #
+            # MAX_PROXY_RETRIES is 5, so one sub-account could produce five reCAPTCHA failures --
+            # 2.5x the threshold -- and a batch of six ran concurrently. This retry policy was not
+            # failing to register; it was actively working toward getting the platform access
+            # blocked, and "Dispoe de mais 0 tentativas" (0 attempts remaining) was the counter
+            # telling us so.
+            #
+            # A proxy/network failure is still worth another proxy (those `continue`s above are
+            # untouched -- they never reached the portal's CAPTCHA check). A reCAPTCHA REJECTION is
+            # the portal's verdict on the token, and repeating it is the one thing it warns about.
+            if is_recaptcha_rejection(str(reg_type), reg_desc):
+                progress("STOPPING: portal allows only 2 reCAPTCHA failures before blocking access "
+                         "-- not retrying this sub-account")
+                result("failed", detail=reg_result_detail)
+                return "failed"
 
     if not proxy_success:
         progress("FAIL exhausted proxy retries")
