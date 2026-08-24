@@ -465,3 +465,50 @@ def test_tier1_rejection_skips_tier2_entirely(db):
     except ProxyLeaseError:
         pass
     assert browser_calls["n"] == 0, "a rejected candidate must not cost a browser launch"
+
+
+# ── proven-good proxies come first (2026-08-24) ─────────────────────────────
+def test_a_proven_good_proxy_is_preferred_over_an_unprobed_one(db):
+    """Pure last_used_at NULLS FIRST is right while exploring a small pool and became harmful at
+    10x scale: 20,000 active soax rows, 18,149 never probed, 751 proven ok. Every launch drew five
+    UNKNOWN candidates at a ~10% hit rate while the proven set sat unused, and bookings sat at zero
+    running workers with "5 failed health"."""
+    good = _proxy(db, endpoint="good:1")
+    good.health = "ok"
+    good.score = 10.0
+    good.last_used_at = None
+    unprobed = _proxy(db, endpoint="unprobed:1")
+    unprobed.health = None
+    unprobed.last_used_at = None
+    db.commit()
+
+    proxy, _ = lease_proxy(db, "w1", provider="soax")
+    assert proxy.id == good.id
+
+
+def test_a_known_bad_proxy_sorts_last(db):
+    bad = _proxy(db, endpoint="bad:1")
+    bad.health = "TimeoutError: ..."
+    bad.last_used_at = None
+    unprobed = _proxy(db, endpoint="unprobed:2")
+    unprobed.health = None
+    unprobed.last_used_at = None
+    db.commit()
+
+    proxy, _ = lease_proxy(db, "w1", provider="soax")
+    assert proxy.id == unprobed.id, "an unprobed row still beats one that is known bad"
+
+
+def test_exploration_survives_when_the_proven_set_is_busy(db):
+    """Unprobed rows are the SECOND tier, not abandoned -- otherwise a pool could never grow its
+    proven set."""
+    good = _proxy(db, endpoint="good:2", max_sessions=1)
+    good.health = "ok"
+    db.commit()
+    lease_proxy(db, "w1", provider="soax")          # consumes the only proven row's capacity
+
+    unprobed = _proxy(db, endpoint="unprobed:3")
+    unprobed.health = None
+    db.commit()
+    proxy, _ = lease_proxy(db, "w2", provider="soax")
+    assert proxy.id == unprobed.id

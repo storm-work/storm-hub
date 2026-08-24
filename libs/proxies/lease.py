@@ -11,7 +11,7 @@ import random
 import re
 from datetime import datetime, timezone
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
 from libs.db import models as M
@@ -168,10 +168,29 @@ def _candidate_query(provider: str, kind: str | None, exclude_ids: set[str] | No
     # mechanism was wrong for this pool shape regardless of how well-calibrated the probe is.
     # health/score are still recorded, and still order ties below, so a consistently-bad row sinks
     # without being cut.
+    # PROVEN-GOOD FIRST, then unprobed, then known-bad -- and LRU within each tier.
+    #
+    # The tiering matters as much as the LRU. Ordering purely by last_used_at NULLS FIRST is right
+    # for a small pool being explored, and became actively harmful once the pool was regenerated at
+    # 10x: measured 2026-08-24, soax held 20,000 active rows of which 18,149 had NEVER been probed
+    # and only 751 were proven ok. NULLS FIRST meant every launch drew five UNKNOWN candidates at a
+    # ~10% hit rate while those 751 sat unused, so worker after worker failed with "no soax proxy
+    # leased after 5 probe(s): 5 failed health" and a booking sat at zero running workers.
+    #
+    # Exploration is preserved rather than abandoned: unprobed rows are still the SECOND tier, so
+    # they are reached whenever the proven set is exhausted or at capacity, and a proven row that
+    # starts failing drops out of tier 1 by its own health verdict. LRU within each tier keeps the
+    # rotation that stops selection pinning to one favourite.
+    _tier = case(
+        (M.Proxy.health == "ok", 0),
+        (M.Proxy.health.is_(None), 1),
+        else_=2,
+    )
     q = (
         select(M.Proxy)
         .where(M.Proxy.provider == provider, M.Proxy.active.is_(True))
-        .order_by(M.Proxy.last_used_at.asc().nullsfirst(),
+        .order_by(_tier.asc(),
+                  M.Proxy.last_used_at.asc().nullsfirst(),
                   M.Proxy.score.desc(), M.Proxy.created_at.asc())
     )
     if kind:
