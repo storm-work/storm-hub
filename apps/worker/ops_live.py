@@ -1783,13 +1783,54 @@ class LiveEngineOps(EngineOps):
 
             body = booking_payload(self.quest_steps, slot, residence=self.residence)
             submit_url = SUBMIT_URL + "?posto_id=" + str(self.posto_pdf)
+            # SUBMIT AS AN XHR, not a navigation -- matching data/new_booking.har, a real successful
+            # manual booking (posto 3059, 2026-08-24):
+            #
+            #   POST /VistosOnline/SubmeterVistoCriaPDF?posto_id=3059
+            #   X-Requested-With: XMLHttpRequest
+            #   Sec-Fetch-Dest: empty        Sec-Fetch-Mode: cors      Accept: */*
+            #   Referer: .../Schedule.jsp?posto_id=3059
+            #   body: lang=PT&txtHuman=&back=&f_date_c=2026%2F09%2F23&cmbPeriodo=5
+            #   -> 200, text/html, 1572 bytes
+            #
+            # EVERY ajax step in that capture has Sec-Fetch-Dest: empty / Mode: cors -- /slots and
+            # QuestNextQuestion included. We were sending the submit as a DOM form.submit(), i.e. a
+            # real page NAVIGATION (Dest: document, Mode: navigate) -- a fundamentally different
+            # request shape from the one the portal actually answers. Our questionnaire steps
+            # already use in-page fetch and work; the submit was the odd one out, and it is the one
+            # step that has never once succeeded (14 applying transitions -> 2 submits -> both
+            # abandoned on chrome-error).
+            #
+            # browser_fetch runs inside the live browser context, so it keeps the session's cookies
+            # and TLS fingerprint -- the same call ScheduleController already uses successfully.
+            html, _final_url = "", submit_url
             try:
-                _final_url, html = self.session.browser_form_post(submit_url, body, timeout=100)
+                _fx = self.session.browser_fetch(
+                    SUBMIT_URL, body, method="POST",
+                    params={"posto_id": str(self.posto_pdf)},
+                    headers={
+                        "Accept": "*/*",
+                        "X-Requested-With": "XMLHttpRequest",
+                        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                        "Referer": SCHED_JSP + "?posto_id=" + str(self.posto_pdf),
+                    },
+                    timeout=60,
+                )
+                html = str(_fx.get("body") or "")
+                self._log(f"do_apply: submit via XHR -> status={_fx.get('status')} ({len(html)}B)")
             except Exception as e:
-                self._log(f"do_apply: SubmeterVistoCriaPDF POST failed: {e}")
-                if self._breaker is not None:
-                    self._breaker.record_portal_down()
-                return "bounced"
+                self._log(f"do_apply: XHR submit failed ({str(e)[:110]}) -- trying the "
+                          f"navigation path")
+            if not html.strip():
+                # Fall back to the navigation path, then to a direct POST below. Keeping both means
+                # a portal that changes shape again does not take the booking path with it.
+                try:
+                    _final_url, html = self.session.browser_form_post(submit_url, body, timeout=100)
+                except Exception as e:
+                    self._log(f"do_apply: SubmeterVistoCriaPDF POST failed: {e}")
+                    if self._breaker is not None:
+                        self._breaker.record_portal_down()
+                    return "bounced"
 
             # storm-auto guards the submit response before classifying it, because a blank
             # chrome-error page or a DataDome interstitial is not a portal answer at all -- it

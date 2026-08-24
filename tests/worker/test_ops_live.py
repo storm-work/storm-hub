@@ -2024,3 +2024,70 @@ def test_the_browser_path_is_still_tried_first():
         def submit_form_binary(self, **k): return {"status": 200, "body": b"%PDF-1.4", "content_type": "application/pdf"}
     ops.session = _BrowserOK()
     ops.do_apply({"date": "2026-08-28", "period": 3})
+
+
+# ── the submit is an XHR, matching the real booking HAR (2026-08-24) ────────
+def test_the_submit_goes_out_as_an_xhr_with_the_har_headers():
+    """data/new_booking.har -- a REAL successful manual booking (posto 3059) -- shows the submit as
+    an AJAX call, not a navigation:
+
+        X-Requested-With: XMLHttpRequest
+        Sec-Fetch-Dest: empty   Sec-Fetch-Mode: cors   Accept: */*
+        Referer: .../Schedule.jsp?posto_id=3059
+
+    Every ajax step in that capture has Dest: empty / Mode: cors -- /slots and QuestNextQuestion
+    included. We were sending a DOM form.submit(), i.e. a real page NAVIGATION (Dest: document,
+    Mode: navigate) -- a different request shape from the one the portal answers, and the one step
+    that had never once succeeded."""
+    seen = {}
+
+    class _S:
+        def browser_fetch(self, url, data, method="POST", headers=None, timeout=30, params=None, **kw):
+            seen["url"], seen["headers"], seen["params"], seen["data"] = url, headers or {}, params, data
+            return {"status": 200, "body": "<html><form action='MostrarPdf'></form></html>"}
+        def browser_form_post(self, *a, **k):
+            raise AssertionError("navigation must not be used while the XHR succeeds")
+        def browser_nav(self, *a, **k): return "u"
+        def browser_eval(self, *a, **k): return ""
+        def submit_form_binary(self, **k):
+            return {"status": 200, "body": b"%PDF-1.4", "content_type": "application/pdf"}
+
+    ops = _make_ops(emit=lambda t, **p: None)
+    ops._log = lambda *a, **k: None
+    ops.posto_pdf = "3059"
+    ops._schedule_state_ok = lambda: True
+    ops._run_warmup_steps = lambda: True
+    ops.session = _S()
+    ops.do_apply({"date": "2026-09-23", "period": 5})
+
+    assert seen["headers"].get("X-Requested-With") == "XMLHttpRequest"
+    assert seen["headers"].get("Accept") == "*/*"
+    assert "Schedule.jsp" in seen["headers"].get("Referer", "")
+    assert seen["params"] == {"posto_id": "3059"}
+    assert seen["data"]["f_date_c"] == "2026/09/23" and str(seen["data"]["cmbPeriodo"]) == "5"
+
+
+def test_the_navigation_path_is_still_there_as_a_fallback():
+    """If the XHR returns nothing, fall through rather than losing the booking path to one portal
+    change."""
+    used = {}
+
+    class _S:
+        def browser_fetch(self, *a, **k): return {"status": 200, "body": ""}
+        def browser_form_post(self, url, data, timeout=100):
+            used["nav"] = True
+            return "https://x/VistosOnline/SubmeterVistoCriaPDF", \
+                   "<html><form action='MostrarPdf'></form></html>"
+        def browser_nav(self, *a, **k): return "u"
+        def browser_eval(self, *a, **k): return ""
+        def submit_form_binary(self, **k):
+            return {"status": 200, "body": b"%PDF-1.4", "content_type": "application/pdf"}
+
+    ops = _make_ops(emit=lambda t, **p: None)
+    ops._log = lambda *a, **k: None
+    ops.posto_pdf = "3059"
+    ops._schedule_state_ok = lambda: True
+    ops._run_warmup_steps = lambda: True
+    ops.session = _S()
+    ops.do_apply({"date": "2026-09-23", "period": 5})
+    assert used.get("nav") is True
