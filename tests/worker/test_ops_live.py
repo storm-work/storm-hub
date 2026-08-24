@@ -1861,3 +1861,69 @@ def test_nothing_escalates_before_the_booking_opens():
     ops, calls = _stuck(mono=True, slot_open=False, slot_found=False)
     ops._maybe_escalate_stuck_rewarm("await_slot_open")
     assert calls["n"] == 0
+
+
+# ── a portal refusal at login is fleet-wide news (2026-08-24) ───────────────
+class _Breaker:
+    def __init__(self): self.down = 0; self.ok = 0; self.tripped = False
+    def is_tripped(self): return self.tripped
+    def record_portal_down(self): self.down += 1
+    def record_success(self): self.ok += 1
+
+
+def test_the_portals_try_again_later_page_is_reported_to_the_breaker():
+    """265 of 266 refusals landed at login, and every worker retried independently -- 341 attempts
+    for 30 sessions. Retrying harder cannot help: the CAPTCHA solves and the token is accepted, the
+    portal simply declines to serve us."""
+    from apps.worker.ops_live import _is_portal_busy
+
+    assert _is_portal_busy("Não foi possível de momento concretizar o seu pedido")
+    assert _is_portal_busy("We were unable to complete your request at this time")
+
+
+def test_a_credential_rejection_is_not_reported_as_portal_down():
+    """Guard rail: the breaker gates the whole booking, so only the portal's own unwillingness may
+    trip it -- never a verdict about one account."""
+    from apps.worker.ops_live import _is_portal_busy
+
+    assert _is_portal_busy("login_failed_auth_redirect") is False
+    assert _is_portal_busy("Por favor, confirma o reCAPTCHA.") is False
+    assert _is_portal_busy("datadome_challenge_on_post") is False
+
+
+def test_a_tripped_breaker_stops_do_login_before_it_spends_anything():
+    ops = _make_ops(emit=lambda t, **p: None)
+    ops._log = lambda *a, **k: None
+    b = _Breaker(); b.tripped = True
+    ops._breaker = b
+    assert ops.do_login() is False
+    assert b.down == 0, "a tripped breaker must short-circuit, not re-report"
+
+
+# ── the portal's 2-failure reCAPTCHA block (2026-08-24) ─────────────────────
+def test_a_recaptcha_verdict_is_recognised():
+    """The portal states the penalty itself: two failures allowed, more and platform access is
+    BLOCKED. The registrar has respected that since 2026-08-21; the login path did not."""
+    from apps.worker.ops_live import _is_recaptcha_verdict
+
+    assert _is_recaptcha_verdict("Por favor, confirma o reCAPTCHA.")
+    assert _is_recaptcha_verdict("type=ReCaptchaError desc=...")
+    assert _is_recaptcha_verdict("Dispoe de mais 0 tentativas")
+
+
+def test_other_rejections_do_not_consume_the_captcha_budget():
+    """Only a CAPTCHA verdict may spend it -- a credential rejection or a WAF challenge says
+    nothing about the reCAPTCHA counter."""
+    from apps.worker.ops_live import _is_recaptcha_verdict
+
+    assert _is_recaptcha_verdict("login_failed_auth_redirect") is False
+    assert _is_recaptcha_verdict("datadome_challenge_on_post") is False
+    assert _is_recaptcha_verdict("Não foi possível de momento concretizar o seu pedido") is False
+    assert _is_recaptcha_verdict("") is False
+
+
+def test_the_budget_defaults_to_one_leaving_a_margin():
+    from libs.domain.settings.catalog import CATALOG
+
+    assert CATALOG["CAPTCHA_FAILURE_BUDGET"].default == 1, \
+        "the portal allows 2; spending 1 keeps a margin so a later retry cannot block the account"

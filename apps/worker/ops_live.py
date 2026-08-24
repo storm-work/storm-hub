@@ -144,6 +144,30 @@ def _classify_gettime_page(html: str) -> str:
     return "unrecognised"
 
 
+# The portal's reCAPTCHA verdict, and its own statement of the penalty:
+#
+#   "o sistema apenas permite falhar o processo de ReCaptcha 2 vezes. Se tentar executar este
+#    processo mais vezes no periodo de tempo definido o seu acesso a plataforma de E-VISA sera
+#    bloqueado"
+#
+# Two failures allowed; more within the window and PLATFORM ACCESS IS BLOCKED. The registrar has
+# respected this since 2026-08-21; the login path did not, and spent its full sticky budget walking
+# an account straight to the edge of that limit. Measured 2026-08-23: 34 of these.
+_RECAPTCHA_VERDICT_MARKERS = (
+    "por favor, confirma o recaptcha",
+    "confirma o recaptcha",
+    "recaptchaerror",
+    "apenas permite falhar o processo de recaptcha",
+    "tentativas",
+)
+
+
+def _is_recaptcha_verdict(reason: str) -> bool:
+    """True when the portal rejected our CAPTCHA specifically (not the credentials, not the WAF)."""
+    low = (reason or "").lower()
+    return any(m in low for m in _RECAPTCHA_VERDICT_MARKERS)
+
+
 def _is_portal_busy(html: str) -> bool:
     """True when the portal answered with its generic 'try again later' refusal."""
     low = (html or "").lower()
@@ -618,6 +642,8 @@ class LiveEngineOps(EngineOps):
         attempt = 0          # sticky attempts genuinely spent on this sub-account
         transient = 0        # infrastructure retries, bounded but not charged to the account
         max_transient = max(0, int(self.cfg.login.transient_retry_max))
+        captcha_fails = 0
+        captcha_budget = max(1, int(self.cfg.raw.get("CAPTCHA_FAILURE_BUDGET", 1)))
         rounds = 0
         while attempt < sticky_max:
             rounds += 1
@@ -696,6 +722,33 @@ class LiveEngineOps(EngineOps):
             attempt += 1
             self._log(f"login attempt {attempt}/{sticky_max} [{_proxy_label(self.warm_proxy)}"
                       f" acct={self.sub_account_id[:8]}]: rejected ({reason})")
+            # The portal DECLINING to serve us is fleet-wide information, not this worker's bad
+            # luck. MEASURED 2026-08-23: 265 of 266 "Não foi possível de momento concretizar o seu
+            # pedido" refusals landed at login, and each worker independently kept trying -- 341
+            # login attempts to produce 30 sessions. The CAPTCHA solves fine and the token is
+            # accepted, so nothing about retrying harder helps; the whole fleet should back off
+            # together and come back later.
+            #
+            # Fed to the SAME breaker the submit path already uses (its trip is consecutive-only, so
+            # an isolated refusal among successes cannot trip it). Deliberately NOT counted for a
+            # credential rejection or a reCAPTCHA verdict -- those say something about this account,
+            # not about the portal's willingness to serve anyone.
+            if self._breaker is not None and _is_portal_busy(reason):
+                self._breaker.record_portal_down()
+                self._log("login: that was the portal's 'try again later' page -- reported to the "
+                          "booking breaker so the whole fleet backs off, not just this worker")
+            # CAPTCHA BUDGET. The portal allows this account TWO reCAPTCHA failures before blocking
+            # platform access outright, and the sticky budget was happily spending both -- leaving
+            # the account at the edge, where any later retry in the same window blocks it for good.
+            # Stop early and let the caller rotate to another sub-account: a rotation is cheap, a
+            # blocked account is permanent.
+            if _is_recaptcha_verdict(reason):
+                captcha_fails += 1
+                if captcha_fails >= captcha_budget:
+                    self._log(f"login: {captcha_fails} reCAPTCHA rejection(s) on "
+                              f"{self.sub_account_id[:8]} -- the portal blocks an account after 2, "
+                              f"so stopping here and rotating rather than spending the rest")
+                    return False
             self._backoff(attempt)
         return False
 

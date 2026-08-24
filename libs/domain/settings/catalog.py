@@ -324,6 +324,12 @@ _TEMPLATE = [
             "permanently FAILED that way. 0 makes every failure count against the sub-account, "
             "i.e. the old (broken) behaviour."),
     _s("QUEST_STEP_RETRIES", L.TEMPLATE, int, 10, _WRK, "login_resilience"),
+    _s("CAPTCHA_FAILURE_BUDGET", L.TEMPLATE, int, 1, _WRK, "login_resilience", min_value=1.0,
+       note="reCAPTCHA rejections to spend on ONE sub-account before rotating to another. The "
+            "portal states its own rule -- 'apenas permite falhar o processo de ReCaptcha 2 vezes' "
+            "-- and blocks platform access beyond it, so the default of 1 leaves a margin. The "
+            "login path used to spend its whole sticky budget walking an account to that edge; "
+            "measured 2026-08-23, 34 accounts were taken there."),
     _s("QUEST_STEP_GAP", L.TEMPLATE, float, 1.0, _WRK, "login_resilience",
        note="seconds (+-30%% jitter) paced before each warm-up questionnaire step and before the "
             "Questionario nav. Ported from storm-auto and then NEVER READ -- the classic unwired "
