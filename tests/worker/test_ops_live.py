@@ -1056,9 +1056,12 @@ def test_a_bounce_is_still_a_bounce_when_the_url_is_not_the_pdf():
     assert LiveEngineOps._classify_submit_response("<html>questionario</html>", home) == "form_stale"
     assert LiveEngineOps._classify_submit_response("<html>getSlots</html>", home) == "no_slot"
     assert LiveEngineOps._classify_submit_response(_HOME_DASHBOARD, home) == "form_stale"
-    # ...and at a deeper URL, without the Portuguese markers, it is not the dashboard.
+    # ...and at a deeper URL, without the Portuguese markers, it is not the dashboard. It is now
+    # form_stale rather than no_slot -- REFINED 2026-08-24: a questionnaire response with no
+    # schedule markers is a submit that found no server-side anchor, not a taken slot. Either way
+    # the point this test protects holds: it is never promoted to a booking.
     assert LiveEngineOps._classify_submit_response(
-        "<html>questionario</html>", "https://x/VistosOnline/SubmeterVistoCriaPDF") == "no_slot"
+        "<html>questionario</html>", "https://x/VistosOnline/SubmeterVistoCriaPDF") == "form_stale"
 
 
 # ── verify_pdf resolution: only real %PDF bytes may promote a bounce to a booking ─────────────
@@ -1182,8 +1185,11 @@ def test_schedule_markers_veto_the_home_verdict_even_at_the_root_url():
 
 
 def test_a_deeper_url_is_not_the_home_dashboard():
+    """Uses a SCHEDULE-page bounce, not a questionnaire one, so the home-dashboard check is what is
+    actually under test. (A questionnaire bounce now routes to form_stale via its own rule, which
+    would mask what this asserts.)"""
     assert LiveEngineOps._classify_submit_response(
-        "<html>questionario</html>", _SUBMIT_URL) == "no_slot"
+        "<html>getSlots cmbPeriodo</html>", _SUBMIT_URL) == "no_slot"
 
 
 def test_bounce_reason_reports_both_halves_of_the_home_test():
@@ -1927,3 +1933,30 @@ def test_the_budget_defaults_to_one_leaving_a_margin():
 
     assert CATALOG["CAPTCHA_FAILURE_BUDGET"].default == 1, \
         "the portal allows 2; spending 1 keeps a margin so a later retry cannot block the account"
+
+
+# ── a questionnaire bounce is a lapsed anchor, not a taken slot (2026-08-24) ─
+def test_a_bounce_to_the_questionnaire_is_form_stale_not_no_slot():
+    """Measured on booking Test 2032: 60 bounced leases, 0 booked, and all 16 genuinely-available
+    slots closed -- every bounce was the portal answering SubmeterVistoCriaPDF with the
+    questionnaire (72131B, title 'questionnaire to apply for a visa', schedule_markers=none). That
+    is the response to a submit with NO server-side anchor, not evidence the slot was taken.
+    Calling it no_slot released each slot WITH a bounce penalty, parked the workers, and convinced
+    the false-slot revert that a real pool was phantom."""
+    from apps.worker.ops_live import LiveEngineOps
+
+    html = ("<html><head><title>questionnaire to apply for a visa</title></head>"
+            "<body><form action='/VistosOnline/questionario'>...</form></body></html>")
+    assert LiveEngineOps._classify_submit_response(
+        html, "https://x/VistosOnline/SubmeterVistoCriaPDF") == "form_stale"
+
+
+def test_a_bounce_to_the_schedule_page_is_still_no_slot():
+    """The guard rail: landing back on the SCHEDULE page means the anchor is intact and someone
+    simply beat us to it -- storm-auto's original reading, which still holds there."""
+    from apps.worker.ops_live import LiveEngineOps
+
+    html = ("<html><body><div id='captchaDiv'></div><script>getSlots()</script>"
+            "<select name='cmbPeriodo'></select> getPeriodosOcupados</body></html>")
+    assert LiveEngineOps._classify_submit_response(
+        html, "https://x/VistosOnline/SubmeterVistoCriaPDF") == "no_slot"

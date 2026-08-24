@@ -1955,7 +1955,30 @@ class LiveEngineOps(EngineOps):
             on_schedule_page = any(m in low for m in _SCHEDULE_MARKERS)
             looks_like_home = all(m in low for m in _HOME_MARKERS) or _is_home_url(final_url)
             home_dashboard = looks_like_home and not on_schedule_page
-            return "form_stale" if home_dashboard else "no_slot"
+            if home_dashboard:
+                return "form_stale"
+            # SPLITS storm-auto's flavour (a) in two, on our own evidence.
+            #
+            # That rule treats any bounce to the schedule/questionario form as "the slot was taken,
+            # session is FINE". That holds when we land back on the SCHEDULE page -- the anchor is
+            # intact and someone simply beat us to it. It does not hold when the portal answers a
+            # SubmeterVistoCriaPDF POST with the QUESTIONNAIRE and no schedule markers at all: that
+            # is the response to a submit with no server-side workflow anchor, documented elsewhere
+            # in this file from the 2026-08-14 trace ("title='questionnaire to apply for a visa' at
+            # 72113B, the questionnaire served back in response to a booking submit").
+            #
+            # Calling that "no_slot" is the expensive mistake: the slot is released WITH a bounce
+            # penalty, bounce_streak climbs until the worker parks, and the volume convinces the
+            # Hub's false-slot revert that a real pool is phantom. Measured 2026-08-24 on this
+            # booking: 60 bounced leases, 0 booked, and all 16 genuinely-available slots closed --
+            # every one of those bounces was this page.
+            #
+            # form_stale keeps the slot and re-warms, which is what a lapsed anchor actually needs.
+            # The downside if this is ever wrong is bounded (REWARM_MAX_ATTEMPTS, then the ladder
+            # escalates); the downside of the old reading was destroying a real slot pool.
+            if "questionario" in low and not on_schedule_page:
+                return "form_stale"
+            return "no_slot"
         # No confirmation marker and no bounce marker at all: genuinely unexpected, not a bounce.
         return "error"
 
