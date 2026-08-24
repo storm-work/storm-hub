@@ -253,7 +253,7 @@ class EventHub:
         hc = health_check if health_check is not None else check_proxy
         # Tier 1 only when tier 2 is the real browser probe: a caller injecting a fake health_check
         # is describing a fake environment and must not get a real network call underneath it.
-        _quick_screen = quick_screen if hc is check_proxy else None
+        _quick_screen = None      # DISABLED -- see lease_proxy's TIER 1 comment (it poisons the exit)
 
         db = SessionLocal()
         try:

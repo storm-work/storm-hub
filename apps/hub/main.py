@@ -2112,13 +2112,19 @@ def _pick_live_sub_account(db: Session, identity_id: str) -> M.SubAccount | None
 
 
 def _screen_tier1():
-    """The cheap raw screen -- but only when the browser tier is the REAL one.
+    """DISABLED: returns None. See libs/proxies/lease.py's TIER 1 comment.
+
+    A raw primp probe poisons the exit for the browser request that follows on the same sticky
+    session (measured 2026-08-24: browser-only 5/6, primp-then-browser 0/6). Kept as a named
+    function rather than deleted so the reasoning stays attached to the decision.
+
+    Was: the cheap raw screen -- but only when the browser tier is the REAL one.
 
     A test that stubs check_proxy is describing a fake environment; silently running a live network
     probe underneath it would make those tests reach the internet and fail on fake proxy rows. Same
     reasoning as apps/hub/events.py's gate.
     """
-    return quick_screen if check_proxy is _REAL_CHECK_PROXY else None
+    return None
 
 
 def _geos(value) -> set[str] | None:

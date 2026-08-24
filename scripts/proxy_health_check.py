@@ -119,7 +119,7 @@ def main() -> int:
         # is what makes sweeping thousands of rows practical at all. Only survivors reach the
         # browser probe. A rejection is recorded exactly as the browser tier would record it, so the
         # verdict lease_proxy reads is the same either way.
-        if not args.no_quick_screen:
+        if False:   # DISABLED -- tier 1 poisons the exit; see lease_proxy's TIER 1 comment
             from libs.proxies.health import quick_screen
             t0 = time.time()
             dead: dict[str, str] = {}

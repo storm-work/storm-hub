@@ -594,3 +594,18 @@ def test_proven_ok_still_outranks_an_established_but_unverified_row(db):
 
     proxy, _ = lease_proxy(db, "w1", provider="soax")
     assert proxy.id == proven.id, "a proven verdict outranks mere LRU recency"
+
+
+def test_tier1_is_disabled_because_it_poisons_the_exit():
+    """A raw primp probe to the portal flags the IP, and the browser request that follows on the
+    same sticky session gets ERR_CONNECTION_CLOSED. Measured 2026-08-24, same rows, sequential:
+
+        browser only                 5/6 ok  (83%)
+        quick_screen THEN browser    0/6 ok  ( 0%)
+
+    storm-auto can screen this way because primp is its PRIMARY transport, so the fingerprint stays
+    consistent. We probe with primp and then switch to a browser on the same exit, which is the
+    combination that gets flagged. This test exists so re-enabling it is a deliberate act."""
+    import apps.hub.main as hub_main
+
+    assert hub_main._screen_tier1() is None

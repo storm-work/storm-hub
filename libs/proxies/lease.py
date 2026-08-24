@@ -322,11 +322,23 @@ def lease_proxy(db: Session, worker_id: str, provider: str, *, kind: str | None 
         probes += 1
         tried_ids.append(proxy.id)
         url = conn_url(proxy, geo=geo)
-        # TIER 1 -- cheap raw reachability, no browser. storm-auto's pattern: screen the obvious
-        # dead exits for ~4s each instead of paying ~20-25s of Chromium to discover a socket will
-        # not open. ~76% of our transient login failures are connectivity-level, so this is where
-        # most of the probe budget was being burned. A raw check can only ever REJECT here; anything
-        # that answers falls through to the authoritative browser probe below.
+        # TIER 1 -- DISABLED BY DEFAULT, 2026-08-24. Read this before re-enabling it.
+        #
+        # The reasoning for it was sound and the measurement was not: a raw primp probe to the portal
+        # POISONS the exit for the browser request that follows on the same sticky session. Measured
+        # the same day, same rows, sequential:
+        #     browser only                 5/6 ok  (83%)
+        #     quick_screen THEN browser    0/6 ok  ( 0%)
+        # DataDome evidently flags the IP on the non-browser TLS handshake, and the subsequent
+        # Chromium nav gets ERR_CONNECTION_CLOSED. So every launch was destroying its own candidates
+        # before probing them -- a booking sat at zero running workers for over an hour.
+        #
+        # storm-auto can screen this way because primp is its PRIMARY transport, so the fingerprint
+        # stays consistent across the session. We use primp only as a probe and then switch to a
+        # browser on the same exit, which is exactly the combination that gets flagged.
+        #
+        # It also invalidates the "fresh sessionids are 0.5% healthy" figure from earlier that day:
+        # that sweep ran tier 1 over all 600 rows first, so it poisoned everything it measured.
         if _quick_screen is not None:
             alive, why = _quick_screen(url)
             if not alive:
