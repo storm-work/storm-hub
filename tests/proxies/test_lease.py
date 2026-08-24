@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import create_engine, select
@@ -224,7 +224,14 @@ def test_leases_walk_the_whole_pool_before_repeating_any_proxy(db):
     pool sat idle. LRU ordering IS the cursor -- each lease resumes where the last one left off."""
     from libs.proxies.lease import lease_proxy, release_proxy
 
+    # All ESTABLISHED and equally idle, so the LRU cursor is what is under test. (These tests lease
+    # with no health_check, so nothing writes a verdict; in production every lease probes and lands
+    # in the proven or known-bad tier, and the "established, verdict wiped" tier exists only for the
+    # post-reset recovery case.)
     made = [_proxy(db, endpoint=f"p{i}:80", max_sessions=1) for i in range(5)]
+    for i, mp in enumerate(made):
+        mp.last_used_at = datetime(2026, 8, 1, tzinfo=timezone.utc) + timedelta(minutes=i)
+    db.commit()
     seen = []
     for i in range(5):
         p, _ = lease_proxy(db, f"w{i}", "soax")
@@ -240,8 +247,13 @@ def test_the_cursor_survives_release_so_the_next_lease_resumes_not_restarts(db):
     'begins from the first point every time' behaviour being fixed."""
     from libs.proxies.lease import lease_proxy, release_proxy
 
+    # All three ESTABLISHED (same tier), so this measures the cursor rather than the tiering --
+    # which is what the test is actually about. Leaving them never-used would promote whichever one
+    # is leased into a higher tier and re-select it, testing tiering by accident.
     for i in range(3):
-        _proxy(db, endpoint=f"q{i}:80", max_sessions=1)
+        p = _proxy(db, endpoint=f"q{i}:80", max_sessions=1)
+        p.last_used_at = datetime(2026, 8, 1, tzinfo=timezone.utc) + timedelta(minutes=i)
+    db.commit()
 
     first, _ = lease_proxy(db, "w1", "soax")
     release_proxy(db, "w1")
@@ -271,9 +283,20 @@ def test_a_failed_probe_rotates_that_proxy_to_the_back(db):
         f"probed the same dead proxies twice: {tried_first} then {tried_second}")
 
 
-def test_a_never_used_proxy_outranks_one_with_a_better_score(db):
-    """NULLS FIRST: a fresh proxy is preferred over a proven one until the pool has been walked
-    once, so a newly imported batch actually gets used instead of being stuck behind favourites."""
+def test_an_established_proxy_now_outranks_a_never_used_one(db):
+    """REVERSES a previously deliberate invariant, on measurement.
+
+    This test used to assert the opposite -- "NULLS FIRST: a fresh proxy is preferred over a proven
+    one until the pool has been walked once, so a newly imported batch actually gets used instead of
+    being stuck behind favourites". That premise was that a fresh row is an untried but PLAUSIBLE
+    proxy. For rotating providers it is not: a row is a sticky SESSION, and one the provider has
+    never established is measurably near-useless (2026-08-24: 600 never-used sessionids -> 0.5%
+    healthy; 12 already-used -> 92%).
+
+    So walking the fresh pool end-to-end first is not exploration, it is failing ~199 times in 200 --
+    which is precisely what left a booking at zero running workers. Exploration is preserved rather
+    than dropped: never-used rows are the tier BELOW established ones, reached whenever the
+    established set is exhausted or at capacity."""
     from libs.proxies.lease import lease_proxy
 
     veteran = _proxy(db, endpoint="veteran:80", max_sessions=5)
@@ -283,7 +306,23 @@ def test_a_never_used_proxy_outranks_one_with_a_better_score(db):
     db.commit()
 
     got, _ = lease_proxy(db, "w1", "soax")
-    assert got.endpoint == fresh.endpoint
+    assert got.endpoint == veteran.endpoint
+
+
+def test_a_never_used_proxy_is_still_reached_when_established_ones_are_full(db):
+    """The other half of the reversal: exploration must survive, or the established set can never
+    grow."""
+    from libs.proxies.lease import lease_proxy
+
+    veteran = _proxy(db, endpoint="veteran2:80", max_sessions=1)
+    veteran.last_used_at = datetime(2026, 8, 1, tzinfo=timezone.utc)
+    fresh = _proxy(db, endpoint="fresh2:80", max_sessions=1)
+    db.commit()
+
+    first, _ = lease_proxy(db, "w1", "soax")          # takes the veteran's only slot
+    second, _ = lease_proxy(db, "w2", "soax")
+    assert first.endpoint == veteran.endpoint
+    assert second.endpoint == fresh.endpoint
 
 
 # ── geo filtering (measured 2026-08-18: DE 23.7% / IT 23.4% ... CZ 2.9% login success) ────────
@@ -292,10 +331,14 @@ def test_geo_filter_restricts_the_pool_to_the_named_countries(db):
     CZ took the MOST attempts at the WORST rate. This is the selector that fixes that."""
     from libs.proxies.lease import lease_proxy, release_proxy
 
+    # Same tier for all, so geo is the only selector under test.
+    n = 0
     for geo in ("CZ", "DE", "IT", "LU"):
         for i in range(2):
             p = _proxy(db, endpoint=f"{geo}{i}:80", max_sessions=1)
             p.geo = geo
+            p.last_used_at = datetime(2026, 8, 1, tzinfo=timezone.utc) + timedelta(minutes=n)
+            n += 1
     db.commit()
 
     got = []
@@ -370,9 +413,12 @@ def test_score_still_orders_ties_without_excluding_anyone(db):
     bad row sinks -- it just never gets cut."""
     from libs.proxies.lease import lease_proxy, release_proxy
 
+    # Both ESTABLISHED and equally idle, so score is the only thing separating them.
     good = _proxy(db, endpoint="good:80", max_sessions=1); good.score = 5.0
+    good.last_used_at = datetime(2026, 8, 1, tzinfo=timezone.utc)
     bad = _proxy(db, endpoint="bad:80", max_sessions=1)
     bad.score, bad.is_healthy = -5.0, False
+    bad.last_used_at = datetime(2026, 8, 1, tzinfo=timezone.utc)
     db.commit()
 
     first, _ = lease_proxy(db, "w1", "soax"); release_proxy(db, "w1")
@@ -512,3 +558,39 @@ def test_exploration_survives_when_the_proven_set_is_busy(db):
     db.commit()
     proxy, _ = lease_proxy(db, "w2", provider="soax")
     assert proxy.id == unprobed.id
+
+
+# ── selection must survive a health wipe (2026-08-24) ───────────────────────
+def test_an_established_session_beats_a_never_used_one_even_with_no_verdict(db):
+    """POST /proxies/reset-health clears every verdict, and on 2026-08-24 one click emptied tier 1
+    across all 21,600 rows. Everything then fell into a single tier ordered last_used_at NULLS
+    FIRST, which puts NEVER-USED sessions FIRST -- the exact opposite of the measurement (a
+    never-used sessionid is ~0.5% healthy, an already-used one ~92%). A cleared verdict loses our
+    RECORD of a session, not the session itself."""
+    from datetime import datetime, timezone
+
+    established = _proxy(db, endpoint="established:1")
+    established.health = None                      # verdict wiped
+    established.last_used_at = datetime(2026, 8, 20, tzinfo=timezone.utc)
+    fresh = _proxy(db, endpoint="fresh:1")
+    fresh.health = None
+    fresh.last_used_at = None                      # never established
+    db.commit()
+
+    proxy, _ = lease_proxy(db, "w1", provider="soax")
+    assert proxy.id == established.id
+
+
+def test_proven_ok_still_outranks_an_established_but_unverified_row(db):
+    from datetime import datetime, timezone
+
+    proven = _proxy(db, endpoint="proven:1")
+    proven.health = "ok"
+    proven.last_used_at = datetime(2026, 8, 24, tzinfo=timezone.utc)   # used MORE recently
+    established = _proxy(db, endpoint="established:2")
+    established.health = None
+    established.last_used_at = datetime(2026, 8, 1, tzinfo=timezone.utc)
+    db.commit()
+
+    proxy, _ = lease_proxy(db, "w1", provider="soax")
+    assert proxy.id == proven.id, "a proven verdict outranks mere LRU recency"

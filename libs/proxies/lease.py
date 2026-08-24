@@ -11,7 +11,7 @@ import random
 import re
 from datetime import datetime, timezone
 
-from sqlalchemy import case, func, select
+from sqlalchemy import and_, case, func, select
 from sqlalchemy.orm import Session
 
 from libs.db import models as M
@@ -181,10 +181,25 @@ def _candidate_query(provider: str, kind: str | None, exclude_ids: set[str] | No
     # they are reached whenever the proven set is exhausted or at capacity, and a proven row that
     # starts failing drops out of tier 1 by its own health verdict. LRU within each tier keeps the
     # rotation that stops selection pinning to one favourite.
+    # Tier 1 keyed on the health verdict ALONE was not resilient: POST /proxies/reset-health clears
+    # every verdict, and on 2026-08-24 one click emptied tier 1 across all 21,600 rows. Everything
+    # then fell into a single tier ordered last_used_at NULLS FIRST -- which puts NEVER-USED sessions
+    # FIRST, the exact opposite of what the measurement says to do.
+    #
+    # So tier on whether the SESSION WAS EVER ESTABLISHED as well, because that survives a verdict
+    # wipe and is what actually predicts success (measured 2026-08-24):
+    #     never-used sessionid   600 sampled ->  0.5% healthy
+    #     already-used sessionid  12 sampled -> 92%   healthy
+    # A cleared verdict loses our RECORD of a session; it does not lose the session itself -- the
+    # provider still has it, which is why an established row with no verdict still beats a fresh one.
     _tier = case(
-        (M.Proxy.health == "ok", 0),
-        (M.Proxy.health.is_(None), 1),
-        else_=2,
+        (M.Proxy.health == "ok", 0),                                        # proven good
+        (and_(M.Proxy.health.is_(None), M.Proxy.last_used_at.isnot(None)), 1),  # established, verdict unknown
+        # Both conditions, not just last_used_at: a row carrying a FAILURE verdict must fall to the
+        # bottom tier whether or not it was ever stamped, and checking only last_used_at let a
+        # known-bad row share a tier with an untried one.
+        (and_(M.Proxy.health.is_(None), M.Proxy.last_used_at.is_(None)), 2),   # never established (~0.5%)
+        else_=3,                                                            # known bad
     )
     q = (
         select(M.Proxy)

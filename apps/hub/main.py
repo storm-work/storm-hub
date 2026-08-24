@@ -1319,7 +1319,7 @@ def toggle_proxy_active(proxy_id: str, db: Session = Depends(get_db),
 
 
 @app.post("/proxies/reset-health")
-def reset_proxy_health(confirm: bool = False, force: bool = False,
+def reset_proxy_health(confirm: bool = False, force: bool = False, include_ok: bool = False,
                        db: Session = Depends(get_db),
                        _op: Principal = Depends(require_operator)) -> dict:
     """Clear every proxy's health verdict back to unprobed (dashboard Proxies tab "Reset pool").
@@ -1340,6 +1340,9 @@ def reset_proxy_health(confirm: bool = False, force: bool = False,
     would use them, and condemned 639 of 2000. Fixing the probe does not un-condemn them; only this
     does.
 
+    Clears FAILURE verdicts only by default; pass include_ok=true to wipe the proven-ok rows too
+    (rarely what you want -- see the comment in the body).
+
     Resets to is_healthy=True / health=None / score=0.0 -- "unprobed", not "known good": the next
     lease re-probes, now with the same browser configuration a worker uses.
 
@@ -1350,17 +1353,34 @@ def reset_proxy_health(confirm: bool = False, force: bool = False,
     if running and not force:
         raise HTTPException(409, f"{len(running)} worker(s) are RUNNING and would immediately "
                                  f"re-dirty this state -- stop the booking first, or pass force")
+    # PRESERVE the proven-ok rows unless explicitly told otherwise. A health='ok' verdict is not a
+    # stale opinion to be cleared -- since 2026-08-24 we know it is the record of WHICH sticky
+    # sessions the provider actually established, and that is what predicts success:
+    #     never-used sessionid  -> ~0.5% healthy
+    #     already-used one      -> ~92%
+    # Confirmed the hard way that same day: one "Reset pool" click wiped 752 proven soax rows plus
+    # 375 retired ones, and four minutes later a booking could not launch a single worker -- every
+    # candidate drawn from the 19,948 unproven rows. The set had taken days of live traffic to build
+    # and a 600-row sweep recovered only 3, so it is expensive to rebuild and cheap to keep.
+    #
+    # The endpoint's original purpose is untouched: clearing FALSE NEGATIVES (good proxies wrongly
+    # condemned) means clearing the failure verdicts, which is exactly what the default now does.
+    _scope = [M.Proxy.health.isnot(None)]
+    if not include_ok:
+        _scope.append(M.Proxy.health != "ok")
     total = db.scalar(select(func.count()).select_from(M.Proxy)) or 0
-    probed = db.scalar(select(func.count()).select_from(M.Proxy)
-                       .where(M.Proxy.health.isnot(None))) or 0
+    probed = db.scalar(select(func.count()).select_from(M.Proxy).where(*_scope)) or 0
+    preserved = 0 if include_ok else (db.scalar(
+        select(func.count()).select_from(M.Proxy).where(M.Proxy.health == "ok")) or 0)
     leasable_before = db.scalar(select(func.count()).select_from(M.Proxy).where(
         M.Proxy.active.is_(True), M.Proxy.is_healthy.is_(True))) or 0   # reported, not the gate
     if confirm:
-        for pr in db.scalars(select(M.Proxy).where(M.Proxy.health.isnot(None))).all():
+        for pr in db.scalars(select(M.Proxy).where(*_scope)).all():
             pr.is_healthy, pr.health, pr.score = True, None, 0.0
         db.commit()
-        logger.warning("proxy pool health reset by operator: %d probed row(s) cleared", probed)
-    return {"confirmed": confirm, "total": total, "probed": probed,
+        logger.warning("proxy pool health reset by operator: %d row(s) cleared, %d proven-ok "
+                       "row(s) PRESERVED (include_ok=%s)", probed, preserved, include_ok)
+    return {"confirmed": confirm, "total": total, "probed": probed, "preserved_ok": preserved,
             "leasable_before": leasable_before,
             "leasable_after": total if confirm else leasable_before,
             "running_workers": len(running)}

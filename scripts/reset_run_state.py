@@ -37,6 +37,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--include-ok", action="store_true",
+
+                   help="also clear proven-ok verdicts (default: keep them -- they record which "
+
+                        "sticky sessions the provider actually established, and are expensive to "
+
+                        "rebuild: a 600-row sweep recovered only 3)")
+
     p.add_argument("--proxy-health", action="store_true", help="reset all proxy health to unprobed")
     p.add_argument("--slot-leases", metavar="BOOKING",
                    help="release stranded slot leases for this booking NAME (or 'all')")
@@ -70,7 +78,15 @@ def main() -> int:
             total = db.scalar(select(func.count()).select_from(M.Proxy)) or 0
             print(f"proxy-health : {n} probed row(s) -> unprobed; leasable {leasable} -> {total}")
             if args.confirm:
-                for pr in db.scalars(select(M.Proxy).where(M.Proxy.health.isnot(None))).all():
+                # PRESERVE proven-ok rows unless --include-ok. A health='ok' verdict records which
+                # sticky sessions the provider actually established (measured 2026-08-24: an
+                # already-used sessionid is ~92% healthy, a never-used one ~0.5%), and one blanket
+                # reset that day took a whole fleet offline. Clearing FAILURE verdicts -- the
+                # false-negative case this flag exists for -- is unaffected.
+                _scope = [M.Proxy.health.isnot(None)]
+                if not args.include_ok:
+                    _scope.append(M.Proxy.health != "ok")
+                for pr in db.scalars(select(M.Proxy).where(*_scope)).all():
                     pr.is_healthy, pr.health, pr.score = True, None, 0.0
                 wrote = True
 
