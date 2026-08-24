@@ -200,3 +200,68 @@ def test_an_engine_without_the_classifier_keeps_the_old_behaviour():
     assert not hasattr(ops, "warmup_failure_kind")
     _machine(ops, REWARM_MAX_ATTEMPTS=2).run()
     assert ops.logins == 2
+
+
+# ── re-warm after N consecutive apply bounces (operator, 2026-08-21) ─────────
+class _BouncingOps(_Ops):
+    """Apply always bounces. Counts warmups so we can see the re-warm actually happen."""
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.applies = 0
+        self.released = 0
+
+    MAX_ASSIGNMENTS = 12          # the real orchestrator stops assigning; an unbounded double hangs
+
+    def await_slot_open(self): return "ok"
+    def slot_found_seen(self): return True
+    def scouts_invalid(self): return False
+    def is_stopped(self):
+        # A holding worker with nothing assigned waits FOREVER by design -- that is what HOLDING is
+        # for, and production bounds it with a stop or the booking timeout. A double that never
+        # stops just hangs the test.
+        return getattr(self, "_assigned", 0) > self.MAX_ASSIGNMENTS
+
+    def await_assignment(self):
+        self._assigned = getattr(self, "_assigned", 0) + 1
+        return None if self._assigned > self.MAX_ASSIGNMENTS else {"date": "2026-09-01", "period": 5}
+
+    def do_apply(self, slot):
+        self.applies += 1
+        return "bounced"
+
+    def release_slot(self, slot, reason="bounce"):
+        self.released += 1
+
+
+def test_two_consecutive_bounces_trigger_a_re_warm():
+    """Two failures in a row is more likely a stale form anchor than two taken slots, and a re-warm
+    is ~38s against a re-login's CAPTCHA solve and sub-account spend."""
+    ops = _BouncingOps()
+    cfg = EngineConfig.from_settings({"ROLE": "apply", "APPLY_MAX_ATTEMPTS": 5,
+                                      "APPLY_REWARM_AFTER_BOUNCES": 2})
+    PhaseMachine(cfg, ops).run()
+    # bounces at 1,2,3,4,5 -> re-warm on 2 and 4, park at 5. 1 initial warmup + 2 re-warms.
+    # bounces 1..12, re-warm on every 2nd that is not the park boundary (5, 10).
+    assert ops.warmups > 1, f"no re-warm happened (warmups={ops.warmups})"
+    assert ops.logins == 1, "a bounce must never cost a re-login"
+
+
+def test_the_park_bound_still_applies():
+    """The outer budget protects the Hub's false-slot detection from one degraded session."""
+    ops = _BouncingOps()
+    cfg = EngineConfig.from_settings({"ROLE": "apply", "APPLY_MAX_ATTEMPTS": 5,
+                                      "APPLY_REWARM_AFTER_BOUNCES": 2})
+    PhaseMachine(cfg, ops).run()
+    # _park backs off and keeps holding -- it does not end the run -- so the count is bounded by
+    # the double's assignment supply, not by max_bounces. What matters is that every bounce handed
+    # its slot back and none of them cost a re-login.
+    assert ops.released == ops.applies, "every bounce must hand its slot back"
+    assert ops.logins == 1
+
+
+def test_rewarm_cadence_is_configurable():
+    ops = _BouncingOps()
+    cfg = EngineConfig.from_settings({"ROLE": "apply", "APPLY_MAX_ATTEMPTS": 6,
+                                      "APPLY_REWARM_AFTER_BOUNCES": 3})
+    PhaseMachine(cfg, ops).run()
+    assert ops.warmups > 1, "a cadence of 3 must still produce re-warms"

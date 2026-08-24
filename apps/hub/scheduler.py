@@ -25,10 +25,10 @@ import logging
 from sqlalchemy import and_, func, or_, select, update
 
 from libs.db import models as M
-from libs.bus.names import notified_key
+from libs.bus.names import manual_open_key, notified_key
 from libs.domain.enums import (
-    BookingStatus, SlotLeaseOutcome, SlotStatus, WorkerRole, WorkerStatus, WorkerSubstate,
-)
+    NOT_BOOKABLE_PREFIX, BookingStatus, SlotLeaseOutcome, SlotStatus, WorkerRole, WorkerStatus,
+    WorkerSubstate)
 from libs.engine import orchestration, pool_manager
 
 logger = logging.getLogger(__name__)
@@ -73,6 +73,23 @@ _LAUNCH_BLOCKED_BOOKING_STATUSES = frozenset({
 # so _hold_respawn now picks these up with the same backoff/cap/kill-before-relaunch it already
 # applies to FAILED and HELD.
 LAUNCH_FAILED_PREFIX = "launch failed:"
+
+# Machine-readable marker on substate_detail, same convention as LAUNCH_FAILED_PREFIX above, for a
+# worker that is HOLDING but NOT BOOKABLE: its keepalive found the schedule anchor gone and the
+# in-place re-warm failed to rebuild it.
+#
+# CONFIRMED LIVE 2026-08-21: 147 "form-state lapsed" against only 42 "re-warm restored" -- 110
+# failures, every one of which left the worker reporting a bare `holding`, indistinguishable from a
+# healthy warm hold. ops_live's keepalive deliberately does not escalate to a re-login before
+# slot-found (the LOOSE HOLD anti-attrition rule, which is correct), but it recorded the failure
+# ONLY as a log line: no substate, no detail, no counter. So the Hub counted these workers as ready
+# capacity, handed them slot leases the moment slot-open fired, and they bounced.
+#
+# The worker stays in HOLDING on purpose -- it is still authenticated, still keepalive-ing, and still
+# recoverable in place, so neither FAILED (respawn: new proxy + new login) nor a transition-table
+# change is warranted. What changes is that _assign_slots stops treating it as leasable until a
+# re-warm actually succeeds and clears the marker.
+# (the literal itself lives in libs/domain/enums.py -- see the import above)
 
 
 def plan_booking_actions(status: str, warmup_start_at, slot_open_at, now: datetime) -> list[str]:
@@ -331,6 +348,7 @@ class Scheduler:
         max_attempts = int(self._effective_booking_setting(db, bk, "MAX_RESPAWN_ATTEMPTS", 5))
         base = float((bk.settings_json or {}).get("RESPAWN_BACKOFF_BASE", 2.0))
         cap = float((bk.settings_json or {}).get("RESPAWN_BACKOFF_CAP", 120.0))
+        due: list[M.Worker] = []
         for w in failed:
             key = f"respawn:{w.id}"
             attempt = int(self._redis.hget(key, "attempt") or 0)
@@ -349,9 +367,28 @@ class Scheduler:
             self._redis.hset(key, mapping={"attempt": attempt + 1, "next_eligible": time.time() + backoff})
             self._redis.expire(key, 86400)
             if self._on_relaunch is not None:
-                try:
-                    self._on_relaunch(db, w)
-                except Exception:
+                due.append(w)
+
+        # Dispatch OFF the tick. _do_launch_worker leases a proxy, and lease_proxy's health_check is
+        # libs/proxies/health.check_proxy -- a throwaway headless Chromium per candidate, up to
+        # max_probes=5 at ~20s each. Its own docstring says callers on a shared thread (it names the
+        # Scheduler tick) "must dispatch this to a background thread/pool rather than call it inline,
+        # or every other booking's event/tick handling stalls behind it", and this call site was
+        # doing exactly that. Confirmed live 2026-08-21: three real bookings sat RUNNING with
+        # slot_open_fired_at set while the tick was stuck in health probes, so plan_booking_actions
+        # missed the scheduled slot-open and _latch_signals -- which runs immediately BEFORE this in
+        # the same per-booking block -- never delivered the signal to a single scout. Discovery
+        # never started, and the Hub accumulated 28 defunct browser children.
+        #
+        # Batched into ONE fleet dispatch rather than one per worker: _begin_fleet_launch is keyed
+        # per BOOKING and returns False while a launch is already in flight, so dispatching
+        # individually would let the first worker's launch lock out the other eight -- each of whom
+        # has already had its attempt counter incremented above, burning MAX_RESPAWN_ATTEMPTS on
+        # launches that never happened.
+        if due and self._on_relaunch is not None:
+            try:
+                self._on_relaunch(db, due)
+            except Exception:
                     # A relaunch that can't get a proxy is ORDINARY -- the pool is finite and a
                     # booking routinely wants more workers than there are healthy proxies. It must
                     # not be fatal to the tick. Confirmed live 2026-08-15: lease_proxy raised
@@ -360,8 +397,8 @@ class Scheduler:
                     # propagated out of _hold_respawn -> _tick_once -> the catch-all -- killing slot
                     # assignment, signal latching and every watchdog, for EVERY booking, that tick.
                     # The worker's own row is already left FAILED by _do_launch_worker.
-                    logger.warning("relaunch of worker %s failed; continuing this tick",
-                                   w.id, exc_info=True)
+                logger.warning("relaunch dispatch failed for %d worker(s); continuing this tick",
+                               len(due), exc_info=True)
 
     # ── D3: dead-process + stall watchdogs ───────────────────────────────────
     def _reap_dead_workers(self, db, now: datetime) -> None:
@@ -636,6 +673,23 @@ class Scheduler:
         if db.scalar(select(M.Slot.id).where(M.Slot.booking_id == bk.id).limit(1)):
             return False
 
+        # NEVER silently undo an OPERATOR's explicit fire. This guard exists for a SCHEDULED open
+        # that turned out to be wrong; applying it to a manual fire overrules a deliberate human
+        # decision, and it did so without logging a single line.
+        #
+        # CONFIRMED 2026-08-23: the operator fired slot-open at 22:38:45; it was cleared at 22:58:45;
+        # from the dashboard that was indistinguishable from the fire never having worked. It is also
+        # self-perpetuating whenever discovery is broken -- "no slots in 20 minutes" is always true
+        # if nothing can successfully scan -- so every manual fire gets undone on a 20-minute cycle.
+        #
+        # The deeper logic error, worth fixing separately: this infers "the open was FALSE" from
+        # "we found nothing", but finding nothing equally means WE NEVER SUCCESSFULLY LOOKED.
+        if self._redis is not None and self._redis.get(manual_open_key(bk.id)):
+            logger.info("booking %s: slot-open was fired MANUALLY -- not reverting it (%.0fs with "
+                        "no slots found)", bk.id,
+                        (now - _aware(bk.slot_open_fired_at)).total_seconds())
+            return False
+
         running = db.scalars(select(M.Worker).where(
             M.Worker.booking_id == bk.id, M.Worker.status == WorkerStatus.RUNNING)).all()
         if self._bus is not None:
@@ -648,6 +702,12 @@ class Scheduler:
             for signal_name in ("slot_open", "slot_found"):
                 self._redis.delete(notified_key(bk.id, signal_name))
         self.reset_scout_pool(bk.id)
+        # LOUD. This used to happen in complete silence, so an operator watching the dashboard saw
+        # their fire simply cease to exist with nothing anywhere to explain it.
+        logger.warning("booking %s: REVERTING slot-open -- %.0fs elapsed with zero slots found "
+                       "(SLOT_OPEN_INACTIVATE_AFTER=%.0fs). Scouts drop back to holding and the "
+                       "signal latch is cleared; re-fire to re-open.",
+                       bk.id, (now - _aware(bk.slot_open_fired_at)).total_seconds(), after)
         bk.slot_open_fired_at = None
         from libs.domain.state_machines import IllegalTransition, booking_transition
         try:
@@ -958,7 +1018,11 @@ class Scheduler:
         holding = db.scalars(select(M.Worker).where(
             M.Worker.booking_id == bk.id, M.Worker.role == WorkerRole.APPLY,
             M.Worker.status == WorkerStatus.RUNNING,
-            M.Worker.substate == WorkerSubstate.HOLDING)).all()
+            M.Worker.substate == WorkerSubstate.HOLDING,
+            # A worker whose re-warm failed is holding but cannot book -- handing it a lease just
+            # burns the slot's capacity on a guaranteed bounce. See NOT_BOOKABLE_PREFIX.
+            or_(M.Worker.substate_detail.is_(None),
+                ~M.Worker.substate_detail.like(f"{NOT_BOOKABLE_PREFIX}%")))).all()
         if self._bus is not None:
             holding = [w for w in holding if not self._bus.has_pending_commands(w.id)]
 

@@ -135,3 +135,25 @@ def test_snapshot_reports_medians_and_streaks():
     assert snap["degraded"] is True
     assert snap["slow_streak"] == 2
     assert "warmup" in snap["phases"]
+
+
+# ── in-page forms of "the request never landed" (2026-08-22) ─────────────────
+@pytest.mark.parametrize("msg", [
+    "browser_eval failed: Page.evaluate: TypeError: Failed to fetch",
+    "home-lang POST failed: browser_eval failed: Page.evaluate: TypeError: Failed to fetch",
+    "do_apply: submit response is a Chrome network-error page (187732B) -- the request never "
+    "reached the portal",
+])
+def test_an_in_page_fetch_failure_is_unreachable_not_unknown(msg):
+    """Everything in the original unreachable set was a Playwright NAVIGATION error, but much of the
+    warm-up runs as fetch() inside the page, where a dead tunnel surfaces as a bare "Failed to
+    fetch" with no net::ERR_* code. Both of these classified "unknown" until 2026-08-22, so the
+    ladder treated a dead proxy as a session problem: worker SOFIA FILOMENA COSTA spent two full
+    re-warms (34s + 41s), a re-login and a checkpoint restore on a tunnel already proven dead."""
+    assert classify_failure(msg) == "unreachable"
+
+
+def test_the_portals_own_rejection_is_still_not_unreachable():
+    """Guard rail: the new markers must not swallow a genuine portal verdict."""
+    assert classify_failure("status=200 login_failed_auth_redirect") == "portal"
+    assert classify_failure("do_warmup: csrf_missing after Formulario POST") == "portal"

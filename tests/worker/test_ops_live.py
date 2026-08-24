@@ -1508,3 +1508,356 @@ def test_an_unwarmed_worker_still_probes_home():
     ops = _keepalive_ops(_SCHED_OK, warmed=False)
     ops._do_keepalive("test")
     assert ops.session.navs and "Schedule.jsp" not in ops.session.navs[0]
+
+
+# ── escalating a re-warm that keeps failing (2026-08-22) ─────────────────────
+# CONFIRMED LIVE on Test 2032: a worker held a HEALTHY auth session (keepalive nav returned a full
+# 28,505-byte page every cycle) while every questionnaire POST came back 403 -- the exit IP was
+# WAF-flagged, not the session. Neither ladder acted: the dead-session path never fired because
+# browser_nav succeeded, and the re-warm path marked NOT BOOKABLE and returned. It looped to streak
+# 7 on the same blocked proxy. Re-warming cannot clear an IP-level block; rebuilding on a fresh
+# proxy can.
+class _Restores:
+    """Records whether the escalation reached the restore chain."""
+    def __init__(self):
+        self.calls = 0
+
+    def __call__(self, context=""):
+        self.calls += 1
+        return True
+
+
+def _stuck_ops(streak, *, slot_found, escalate_after=3):
+    ops = _make_ops(cfg=_cfg(REWARM_ESCALATE_AFTER=escalate_after))
+    ops._rewarm_fail_streak = streak
+    ops.posto_pdf = "5084"
+    ops._slot_found_seen = lambda: slot_found
+    ops._attempt_keepalive_restore = _Restores()
+    ops._mark_hold_bookable = lambda ok, why="": None
+    ops._log = lambda *a, **k: None
+    return ops
+
+
+def test_below_the_threshold_it_keeps_re_warming_in_place():
+    ops = _stuck_ops(2, slot_found=True)
+    ops._maybe_escalate_stuck_rewarm("await_assignment")
+    assert ops._attempt_keepalive_restore.calls == 0
+
+
+def test_at_the_threshold_it_rebuilds_the_session():
+    ops = _stuck_ops(3, slot_found=True)
+    ops._maybe_escalate_stuck_rewarm("await_assignment")
+    assert ops._attempt_keepalive_restore.calls == 1
+
+
+def test_it_never_escalates_before_slot_found():
+    """The LOOSE HOLD rule: a re-login costs a CAPTCHA solve and sub-account budget, and before
+    slot_found there is nothing to book that would justify spending them."""
+    ops = _stuck_ops(9, slot_found=False)
+    ops._maybe_escalate_stuck_rewarm("await_slot_open")
+    assert ops._attempt_keepalive_restore.calls == 0
+    assert ops._rewarm_fail_streak == 9, "streak must survive so it escalates once slot_found fires"
+
+
+def test_escalating_clears_the_streak_so_it_does_not_fire_every_tick():
+    ops = _stuck_ops(7, slot_found=True)
+    ops._maybe_escalate_stuck_rewarm("await_assignment")
+    assert ops._rewarm_fail_streak == 0
+
+
+def test_escalation_forces_the_anchor_to_be_rebuilt():
+    """posto_pdf still holds the value from the warm-up that has since lapsed. It must be cleared,
+    or _attempt_keepalive_restore stops at re-authenticating and leaves the dead anchor in place."""
+    seen = {}
+    ops = _stuck_ops(3, slot_found=True)
+
+    def _restore(context=""):
+        seen["posto_pdf_at_restore"] = ops.posto_pdf
+        return True
+    ops._attempt_keepalive_restore = _restore
+    ops._maybe_escalate_stuck_rewarm("await_assignment")
+    assert seen["posto_pdf_at_restore"] is None
+
+
+def test_the_threshold_is_operator_configurable():
+    ops = _stuck_ops(4, slot_found=True, escalate_after=9)
+    ops._maybe_escalate_stuck_rewarm("await_assignment")
+    assert ops._attempt_keepalive_restore.calls == 0, "REWARM_ESCALATE_AFTER must be read, not hardcoded"
+
+
+# ── a challenged ScheduleController must not report a warm session (2026-08-22) ──
+def test_challenge_body_is_recognised():
+    """44699 bytes of DataDome shell -- the exact body that was accepted as a successful
+    ScheduleController on worker SOFIA FILOMENA COSTA, moments before her submit died."""
+    from apps.worker.ops_live import _is_challenge_body
+
+    challenge = ('<!DOCTYPE html>\n<html>\n<head>\n<meta charset="UTF-8">\n'
+                 '<meta name="robots" content="noindex,nofollow">\n<style>\n'
+                 '  body{margin:0;background:#fff}\n</style>\n</head>\n<body>\n'
+                 '<script src="/ch/bd.js"></script>\n')
+    assert _is_challenge_body(challenge) is True
+
+
+def test_a_real_schedule_page_is_not_a_challenge():
+    """Guard rail: the real page must never be mistaken for an interstitial, or every warm-up
+    fails."""
+    from apps.worker.ops_live import _is_challenge_body
+
+    real = ("<html><body><div id='captchaDiv'></div><script>getSlots();</script>"
+            "<form action='SubmeterVistoCriaPDF'><input name='f_date_c'>"
+            "<select name='cmbPeriodo'></select></form></body></html>")
+    assert _is_challenge_body(real) is False
+    assert _is_challenge_body("") is False
+    assert _is_challenge_body(None) is False
+
+
+# ── lazy re-warm: don't rebuild an anchor that is still good (2026-08-22) ────
+class _SchedPageSession:
+    """Serves a given Schedule.jsp body for the state probe."""
+    def __init__(self, html, final_url="https://x/VistosOnline/Schedule.jsp"):
+        self._html, self._url = html, final_url
+        self.navs = 0
+
+    def browser_nav(self, url, **kw):
+        self.navs += 1
+        return self._url
+
+    def browser_eval(self, js):
+        return self._html
+
+
+_REAL_SCHED = ("<html><div id='captchaDiv'></div><script>getSlots()</script>"
+               "<form action='SubmeterVistoCriaPDF'><input name='f_date_c'>"
+               "<select name='cmbPeriodo'></select></form></html>")
+
+
+def test_a_live_anchor_skips_the_rewarm_entirely():
+    """storm-auto does ONE Schedule.jsp GET and only re-warms if the markers are gone. We rebuilt
+    the whole questionnaire chain before EVERY submit -- 5 of this run's 8 apply rounds died inside
+    that rebuild, not at the submit."""
+    ops = _make_ops(emit=lambda t, **p: None)
+    ops.session = _SchedPageSession(_REAL_SCHED)
+    ops.posto_pdf = "2032"
+    assert ops._schedule_state_ok() is True
+    assert ops.session.navs == 1, "one GET, no rebuild"
+
+
+def test_a_challenged_schedule_page_is_not_ok():
+    ops = _make_ops(emit=lambda t, **p: None)
+    ops.session = _SchedPageSession(
+        '<html><head><meta name="robots" content="noindex,nofollow">'
+        '<script src="/ch/bd.js"></script></head></html>')
+    assert ops._schedule_state_ok() is False
+
+
+def test_an_auth_redirect_is_not_ok():
+    ops = _make_ops(emit=lambda t, **p: None)
+    ops.session = _SchedPageSession("<html>login</html>",
+                                    final_url="https://x/VistosOnline/Authentication.jsp")
+    assert ops._schedule_state_ok() is False
+
+
+def test_a_partial_render_is_refresh_retried_before_giving_up(monkeypatch):
+    """A 200 with the form not yet AJAX-populated is a reload, not a reason to redo 7 quest steps."""
+    monkeypatch.setattr("apps.worker.ops_live.time.sleep", lambda *_: None)
+    ops = _make_ops(emit=lambda t, **p: None)
+    ops.session = _SchedPageSession("<html>no markers yet</html>")
+    assert ops._schedule_state_ok() is False
+    assert ops.session.navs == 1 + ops.cfg.login.partial_render_retries
+
+
+# ── the portal's "try again later" page is not the slot's fault (2026-08-23) ──
+def test_portal_busy_page_is_recognised_in_both_languages():
+    from apps.worker.ops_live import _is_portal_busy
+
+    assert _is_portal_busy(
+        "<html>Não foi possível de momento concretizar o seu pedido, por favor tente mais tarde</html>")
+    assert _is_portal_busy(
+        "<html>We were unable to complete your request at this time. Please try again later.</html>")
+    assert _is_portal_busy("<html>getSlots cmbPeriodo</html>") is False
+    assert _is_portal_busy("") is False
+
+
+def test_a_busy_portal_does_not_bounce_the_slot():
+    """"error" falls through to the BOUNCE path, so the portal declining to serve us was being
+    recorded as evidence the slot was phantom -- feeding the false-slot revert that would retire a
+    pool of genuinely available slots."""
+    ops = _ops_with_submit(
+        "<!DOCTYPE html><html lang='en'><body>We were unable to complete your request at this "
+        "time. Please try again later.</body></html>",
+        url="https://pedidodevistos.mne.gov.pt/VistosOnline/SubmeterVistoCriaPDF?posto_id=2032")
+    ops._schedule_state_ok = lambda: True
+    assert ops.do_apply({"date": "2026-08-28", "period": 3}) == "portal_unreachable"
+
+
+# ── the portal saying "you already have an appointment" (2026-08-23) ─────────
+def test_already_booked_markers_match_the_portals_wording():
+    from apps.worker.ops_live import _ALREADY_BOOKED_MARKERS
+
+    real = ("&times; | This applicant already has an application registered with a future "
+            "schedule. You do not need to request a new application").lower()
+    assert any(m in real for m in _ALREADY_BOOKED_MARKERS)
+
+
+def test_an_ordinary_validation_error_is_not_treated_as_already_booked():
+    """Guard rail: retiring an identity is irreversible-ish (BOOKED only goes on to ARCHIVED), so a
+    generic rejection must never trigger it."""
+    from apps.worker.ops_live import _ALREADY_BOOKED_MARKERS
+
+    other = "&times; | The selected date is no longer available. Please choose another.".lower()
+    assert not any(m in other for m in _ALREADY_BOOKED_MARKERS)
+
+
+# ── mail.tm rate limiting was the top registration failure (2026-08-23) ─────
+def test_mailtm_takes_a_proxy_so_creation_is_not_all_from_one_ip():
+    """87 of ~170 registration outcomes were "mail.tm create failed (429)" -- more than every
+    portal-side cause combined -- because a module-level unproxied Session sent every mailbox
+    creation from the server's single address."""
+    from libs.engine.vendor.email_pool import MailTM
+
+    m = MailTM(proxy="http://u:p@proxy.example:8080")
+    assert m._sess.proxies["https"] == "http://u:p@proxy.example:8080"
+    assert MailTM()._sess.proxies == {}, "no proxy configured must stay direct"
+
+
+def test_mailtm_sessions_are_per_instance():
+    """A shared module-level Session also meant concurrent registrations shared cookies/keep-alive
+    against a per-IP rate limiter."""
+    from libs.engine.vendor.email_pool import MailTM
+
+    assert MailTM()._sess is not MailTM()._sess
+
+
+def test_mailtm_backs_off_on_429_instead_of_failing_immediately():
+    from libs.engine.vendor.email_pool import MailTM
+
+    m = MailTM(retries=3, backoff=0.0)
+    calls = {"n": 0}
+
+    class _R:
+        status_code = 429
+        text = "rate limited"
+
+    def _post(url, json=None, timeout=None):
+        calls["n"] += 1
+        return _R()
+
+    m._sess.post = _post
+    r = m._post("/accounts", {})
+    assert calls["n"] == 3, "a 429 is a WAIT, not an immediate failure"
+    assert r.status_code == 429
+
+
+# ── a refusing portal must not drive a rebuild (2026-08-23) ──────────────────
+_BUSY_PAGE = ("<!DOCTYPE html><html lang='en'><body>We were unable to complete your request at "
+              "this time. Please try again later.</body></html>")
+
+
+def test_the_state_probe_flags_a_refusing_portal_rather_than_a_stale_form():
+    """CONFIRMED live on Test 2032 (AMILCAR LOPES): the submit was refused with the 'try again
+    later' page, then Schedule.jsp returned the SAME page four times. That read as "200 but no
+    scheduling markers", escalated into a full questionnaire re-warm whose every step was also
+    refused, and ended in a full re-login -- a CAPTCHA solve spent rebuilding into a wall."""
+    ops = _make_ops(emit=lambda t, **p: None)
+    ops.session = _SchedPageSession(_BUSY_PAGE)
+    ops.posto_pdf = "2032"
+    assert ops._schedule_state_ok() is False
+    assert ops._portal_busy_seen is True
+    assert ops.session.navs == 1, "no point refresh-retrying a refusal"
+
+
+def test_apply_backs_off_instead_of_rebuilding_when_the_portal_refuses():
+    ops = _make_ops(emit=lambda t, **p: None)
+    ops.session = _SchedPageSession(_BUSY_PAGE)
+    ops.posto_pdf = "2032"
+    rewarms = {"n": 0}
+    ops._run_warmup_steps = lambda: rewarms.__setitem__("n", rewarms["n"] + 1) or True
+
+    assert ops.do_apply({"date": "2026-08-28", "period": 3}) == "portal_unreachable"
+    assert rewarms["n"] == 0, "must not rebuild into a portal that is refusing everything"
+
+
+def test_a_genuinely_stale_form_still_triggers_the_rewarm():
+    """Guard rail: the back-off must not swallow the real stale-anchor case it sits in front of."""
+    ops = _make_ops(emit=lambda t, **p: None)
+    ops.session = _SchedPageSession("<html>some other page with no markers</html>")
+    ops.posto_pdf = "2032"
+    ops._run_warmup_steps = lambda: False        # rebuild attempted, and fails
+
+    assert ops.do_apply({"date": "2026-08-28", "period": 3}) == "session"
+    assert ops._portal_busy_seen is False
+
+
+# ── the silent gettime rejection (2026-08-23) ───────────────────────────────
+def test_gettime_page_classifier_names_the_page():
+    from apps.worker.ops_live import _classify_gettime_page
+
+    assert _classify_gettime_page('<script src="/ch/bd.js"></script>') == "waf_challenge"
+    assert _classify_gettime_page("We were unable to complete your request at this time") \
+        == "portal_try_again_later"
+    assert _classify_gettime_page("<form action='/VistosOnline/login'>") == "auth_redirect"
+    assert _classify_gettime_page("<html>something new</html>") == "unrecognised"
+
+
+def test_a_rejected_gettime_says_why_instead_of_returning_silently():
+    """CONFIRMED live: a worker flipped discovering -> holding 15 times in 7 minutes emitting
+    NOTHING, because this path was a bare `return`. The dashboard showed a busy discoverer that had
+    scanned zero dates every time."""
+    logged = []
+    ops = _make_ops(emit=lambda t, **p: None)
+    ops._log = logged.append
+
+    # A REAL blocked gettime is a full HTML page: classify_gettime_body flags anything over 5000
+    # bytes (or carrying the WAF markers) as BLOCKED. The live ones were 28-44KB.
+    waf = ('<html><head><script src="/ch/bd.js"></script></head><body>'
+           + "x" * 6000 + "</body></html>")
+
+    class _Waf:
+        def browser_nav(self, *a, **k): return "u"
+        def browser_eval(self, *a, **k): return waf
+    ops.session = _Waf()
+
+    out = ops.do_discover(["2026-09-01", "2026-09-02"])
+    assert [o["outcome"] for o in out] == ["failed", "failed"]
+    assert any("scanned NOTHING" in m and "waf_challenge" in m for m in logged), logged
+
+
+# ── the escalation deadlock under MONO_BOOKING (2026-08-23) ─────────────────
+def _stuck(mono, slot_open, slot_found, streak=5):
+    # MONO_BOOKING is a BOOKING-layer setting; _cfg() puts everything in TEMPLATE.
+    cfg = EngineConfig.from_settings(resolve({
+        L.BOOKING: {"MONO_BOOKING": mono},
+        L.TEMPLATE: {"ROLE": "apply", "REWARM_ESCALATE_AFTER": 3},
+    }))
+    ops = _make_ops(cfg=cfg)
+    ops._rewarm_fail_streak = streak
+    ops.posto_pdf = "2032"
+    ops._slot_open_seen = lambda: slot_open
+    ops._slot_found_seen = lambda: slot_found
+    ops._mark_hold_bookable = lambda ok, why="": None
+    ops._log = lambda *a, **k: None
+    calls = {"n": 0}
+    ops._attempt_keepalive_restore = lambda context="": calls.__setitem__("n", calls["n"] + 1) or True
+    return ops, calls
+
+
+def test_mono_escalates_once_slot_open_has_fired():
+    """The deadlock: under MONO the apply worker IS the discoverer, so gating on slot_found is
+    circular -- lapsed form-state means it cannot discover, so nothing is ever found, so escalation
+    is refused forever. Four workers sat at 're-warm failed x7' for over an hour."""
+    ops, calls = _stuck(mono=True, slot_open=True, slot_found=False)
+    ops._maybe_escalate_stuck_rewarm("await_assignment")
+    assert calls["n"] == 1
+
+
+def test_split_mode_still_waits_for_slot_found():
+    """The LOOSE HOLD rule is correct where an idle applier really is waiting on scouts."""
+    ops, calls = _stuck(mono=False, slot_open=True, slot_found=False)
+    ops._maybe_escalate_stuck_rewarm("await_assignment")
+    assert calls["n"] == 0
+
+
+def test_nothing_escalates_before_the_booking_opens():
+    ops, calls = _stuck(mono=True, slot_open=False, slot_found=False)
+    ops._maybe_escalate_stuck_rewarm("await_slot_open")
+    assert calls["n"] == 0

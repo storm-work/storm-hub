@@ -548,3 +548,55 @@ def test_start_releases_leases_on_the_slots_it_closes(client):
             M.SlotLease.released_at.is_(None))).all()
     finally:
         db.close()
+
+
+def test_worker_logs_are_scoped_to_the_current_run(client):
+    """A Worker ROW outlives the run that created it -- every /start relaunches the same row -- and
+    the event stream is keyed only by worker_id. So the log replayed yesterday's attempts
+    interleaved with today's, with nothing to tell them apart, which is exactly the view an operator
+    reads to understand what THIS run did. Booking.started_at is rewritten on every /start, so it is
+    the run boundary."""
+    import time
+
+    import apps.hub.main as hub_main
+    from libs.db import models as M
+
+    h = _operate_headers(client)
+    bid, wid = _bk_with_worker(client, h)
+
+    hub_main._bus.emit_event(wid, "log_line", text="from the PREVIOUS run")
+    time.sleep(0.02)
+
+    # Start the run: this stamps started_at, which becomes the boundary.
+    db = hub_main.SessionLocal()
+    try:
+        from datetime import datetime, timezone
+        db.get(M.Booking, bid).started_at = datetime.now(timezone.utc)
+        db.commit()
+    finally:
+        db.close()
+    time.sleep(0.02)
+    hub_main._bus.emit_event(wid, "log_line", text="from THIS run")
+
+    r = client.get(f"/workers/{wid}/logs", headers=h).json()
+    assert [l["text"] for l in r["lines"]] == ["from THIS run"]
+    assert r["hidden_from_earlier_runs"] == 1
+
+    # ...and the operator can still get everything back deliberately.
+    r_all = client.get(f"/workers/{wid}/logs?all_runs=true", headers=h).json()
+    assert [l["text"] for l in r_all["lines"]] == ["from the PREVIOUS run", "from THIS run"]
+    assert r_all["hidden_from_earlier_runs"] == 0
+
+
+def test_a_booking_that_never_started_shows_everything(client):
+    """No started_at means no run boundary to apply -- hiding everything would be worse than
+    showing a little extra."""
+    import apps.hub.main as hub_main
+
+    h = _operate_headers(client)
+    bid, wid = _bk_with_worker(client, h)
+    hub_main._bus.emit_event(wid, "log_line", text="before any run")
+
+    r = client.get(f"/workers/{wid}/logs", headers=h).json()
+    assert [l["text"] for l in r["lines"]] == ["before any run"]
+    assert r["run_started_at"] is None

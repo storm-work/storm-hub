@@ -11,8 +11,10 @@ Lives in libs/ (not apps/worker/) because BOTH processes need it:
 That second one was the miss (2026-08-14). check_proxy runs inside the HUB, so it was screening
 proxies with NAV_TIMEOUT_SCALE=1.0 and the entire anti-detect surface off -- strictly harsher
 conditions than the workers that would actually use those proxies. Every false negative it produced
-set is_healthy=False, and lease_proxy's _candidate_query filters on is_healthy, so a good proxy was
-permanently removed from the pool by a probe that never had the settings the operator configured.
+set is_healthy=False, and at the time lease_proxy's _candidate_query filtered on is_healthy, so a
+good proxy was permanently removed from the pool by a probe that never had the settings the operator
+configured. (That filter is gone as of the same fix -- see lease_proxy's NOTE -- so this class of
+false negative now costs ordering rather than eligibility. The env-export bug itself was still real.)
 """
 from __future__ import annotations
 

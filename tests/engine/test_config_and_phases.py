@@ -442,3 +442,58 @@ def test_a_successful_first_round_never_rewarms():
     PhaseMachine(_cfg(booking={"SCOUT_REBUILD_AFTER_FAILED_ROUNDS": 3}, ROLE="scout"), ops).run()
     assert ops.warmups == 1, "an 'empty' answer is news about the calendar, not a broken session"
     assert ops.logins == 1
+
+
+# ── MONO_BOOKING: the worker discovers its own slots and books them ──────────
+def test_mono_booking_self_discovers_without_waiting_for_a_scout():
+    """storm-auto's architecture: no separate scout fleet, every warmed worker scans and books. The
+    split model's idle hold is what lets the booking anchor lapse (147 lapses vs 42 restores,
+    2026-08-21) -- a worker running its own discovery rounds keeps it alive the way scouts do."""
+    fut = _future_weekday()
+    ops = SimEngineOps(
+        assignment=None, scouts_invalid=False,          # scouts are ALIVE -- the fallback must not fire
+        discover_outcomes={fut: {"outcome": "found", "periods": [4]}},
+    )
+    cfg = EngineConfig.from_settings(resolve({
+        L.BOOKING: {"CAL_START_DATE": fut, "CAL_END_DATE": fut, "CAL_NUM_DAYS": 1,
+                    "MONO_BOOKING": True},
+        L.TEMPLATE: {"ROLE": "apply"},
+    }))
+    res = PhaseMachine(cfg, ops).run()
+    assert res.outcome == "booked"
+    assert WorkerSubstate.DISCOVERING in res.visited
+
+
+def test_without_mono_a_worker_with_live_scouts_never_self_discovers():
+    """The guard rail on the above: with scouts alive and MONO off, the worker must keep holding and
+    leave discovery to the scouts -- otherwise every applier duplicates the whole scan."""
+    fut = _future_weekday()
+    ops = SimEngineOps(
+        assignment=None, scouts_invalid=False, stop_after_polls=3,
+        discover_outcomes={fut: {"outcome": "found", "periods": [4]}},
+    )
+    cfg = EngineConfig.from_settings(resolve({
+        L.BOOKING: {"CAL_START_DATE": fut, "CAL_END_DATE": fut, "CAL_NUM_DAYS": 1},
+        L.TEMPLATE: {"ROLE": "apply"},
+    }))
+    res = PhaseMachine(cfg, ops).run()
+    assert res.outcome == "stopped"
+    assert WorkerSubstate.DISCOVERING not in res.visited
+    assert ops.applied == 0
+
+
+def test_mono_shares_what_it_finds_with_the_pool():
+    """The old fallback kept its find PRIVATE: the Hub never learned the slot existed, slot_found
+    never fired, and every other applier re-scanned the same window for the same thing."""
+    fut = _future_weekday()
+    ops = SimEngineOps(
+        assignment=None, scouts_invalid=False,
+        discover_outcomes={fut: {"outcome": "found", "periods": [4]}},
+    )
+    cfg = EngineConfig.from_settings(resolve({
+        L.BOOKING: {"CAL_START_DATE": fut, "CAL_END_DATE": fut, "CAL_NUM_DAYS": 1,
+                    "MONO_BOOKING": True},
+        L.TEMPLATE: {"ROLE": "apply"},
+    }))
+    PhaseMachine(cfg, ops).run()
+    assert ops.pushed, "a mono worker must push its finds so slot_found fires and others benefit"

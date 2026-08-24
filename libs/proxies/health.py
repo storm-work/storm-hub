@@ -29,6 +29,56 @@ SCORE_MAX = 100.0
 SCORE_MIN = 0.0
 
 
+# Connection-level failures: the exit could not carry a request AT ALL. A browser cannot fix any of
+# these, which is what makes a cheap raw probe a valid NEGATIVE filter even though DataDome makes it
+# useless as a positive one.
+_DEAD_MARKERS = (
+    "connect", "timed out", "timeout", "connection", "tunnel", "proxy", "socks",
+    "unreachable", "reset", "refused", "eof", "handshake", "ssl",
+)
+
+
+def quick_screen(conn_url: str, timeout: float = 6.0) -> tuple[bool, str]:
+    """Cheap raw reachability check -- NO browser. `(alive, reason)`.
+
+    This is the tier storm-auto has and storm-hub did not, and its absence is expensive. Our own
+    docstring below says a raw check "can't" verify a proxy, which is half right and cost us the
+    other half:
+
+      * a raw check CANNOT prove an exit is GOOD -- DataDome 403s raw fetches regardless. True.
+      * a raw check CAN prove an exit is DEAD -- if TCP/TLS will not establish through the proxy,
+        no browser is going to change that.
+
+    So this is a one-way filter: a connection-level failure is decisive and rejects the candidate;
+    ANY HTTP response (200, 403, anything) means the exit is alive and the caller must fall through
+    to the authoritative browser check.
+
+    MEASURED 2026-08-23: of 228 transient login failures, ~173 were connectivity-level (timeouts,
+    session-init timeouts, connection closed, tunnel failed) -- ~76% of them never needed a browser
+    at all. At ~20-25s per Chromium probe against ~4s here, screening in this order is most of the
+    "40% of login work is retrying dead infrastructure" figure, and it removes the fleet-launch
+    browser storm that made those probes fail each other in the first place.
+    """
+    try:
+        import primp
+    except ImportError:
+        return True, "primp unavailable -- falling through to the browser check"
+    try:
+        c = primp.Client(proxy=conn_url, verify=False, follow_redirects=True, timeout=timeout)
+        r = c.get(HOME_URL)
+        # Any status at all means the tunnel carried a request end to end.
+        return True, f"reachable (status={r.status_code})"
+    except Exception as e:
+        detail = f"{e.__class__.__name__}: {e}"
+        low = detail.lower()
+        if any(m in low for m in _DEAD_MARKERS):
+            return False, f"dead exit -- {detail[:150]}"
+        # Something we do not recognise: do NOT reject on it. Failing open costs one browser probe;
+        # failing closed on an unfamiliar error would quietly shrink the pool the way the 639-row
+        # false-condemnation incident did.
+        return True, f"unrecognised raw error, deferring to browser -- {detail[:120]}"
+
+
 def check_proxy(conn_url: str, timeout: float = 20.0) -> tuple[bool, str]:
     """One throwaway headless browser, one nav to the real portal home page. Never raises -- a probe
     failure IS the result, not an error the caller has to handle. Blocking/synchronous and can take

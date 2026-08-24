@@ -378,6 +378,8 @@ class PhaseMachine:
         # single degraded session must not be able to manufacture the bounce volume that convinces
         # the Hub its genuinely-real slots are false.
         max_bounces = max(1, int(self.cfg.raw.get("APPLY_MAX_ATTEMPTS", 5)))
+        rewarm_after_bounces = max(1, int(self.cfg.raw.get("APPLY_REWARM_AFTER_BOUNCES", 2)))
+        mono = bool(self.cfg.raw.get("MONO_BOOKING", False))
         # Consecutive `session` outcomes. The bounce cap above deliberately does NOT cover these --
         # treating a session failure as a bounce is what let one dead proxy manufacture 5082
         # "bounced" leases and park every applier (2026-08-15). But uncapping it entirely left the
@@ -405,8 +407,25 @@ class PhaseMachine:
             if slot is None and self.ops.is_stopped():
                 return PhaseResult("stopped", self._sub, "stopped while awaiting assignment",
                                    self.visited)
-            if slot is None and self.ops.scouts_invalid():
-                # FALLBACK: no valid scouts -> apply self-discovers over its own configured window
+            if slot is None and (mono or self.ops.scouts_invalid()):
+                # MONO_BOOKING: the worker discovers its OWN slots and books them, instead of idling
+                # until a scout hands it one. This is storm-auto's confirmed architecture -- there is
+                # no separate scout fleet there, every warmed worker scans a slice of the date window
+                # each round and books what it finds.
+                #
+                # It is also the fix for the hold problem, which is why it is worth having as more
+                # than a fallback. The split model leaves an applier doing NOTHING but a 600s
+                # keepalive nav between slot-open and slot-found, and a bare nav VERIFIES the
+                # server-side booking anchor without RENEWING it -- so the anchor lapses, the worker
+                # reports a healthy-looking `holding`, and it cannot book when a slot finally
+                # arrives. Measured 2026-08-21: 147 "form-state lapsed" against 42 re-warms that
+                # restored it. Note which workers do NOT suffer this: scouts, whose continuous
+                # getPeriodosOcupados traffic is exactly what keeps their anchor alive. storm-auto
+                # never needed a keepalive at all ("keepalive" appears once in its whole apply loop,
+                # in a docstring) because no worker is ever idle.
+                #
+                # Same code path as the scouts_invalid fallback that was already here; MONO_BOOKING
+                # just stops it being conditional on the scouts having died first.
                 self._to(WorkerSubstate.DISCOVERING)
                 d = self.cfg.discovery
                 dates = pool_manager.default_date_window(
@@ -414,6 +433,13 @@ class PhaseMachine:
                     today=date.today(),
                 )
                 found = _flatten_found(self.ops.do_discover(dates))
+                if found:
+                    # SHARE the find. The fallback kept it private, so the Hub never learned the
+                    # slot existed, slot_found never fired, and no other worker could use it --
+                    # every applier re-scanned the same window to find the same thing. storm-auto
+                    # merges finds into the shared pool and fires slot-found on the FIRST free date
+                    # rather than at the end of the scan.
+                    self.ops.push_slots(found)
                 slot = found[0] if found else None
             if slot is None:
                 # Nothing to apply right now. That is what HOLDING is for -- it is not a failure and
@@ -506,4 +532,15 @@ class PhaseMachine:
             if bounce_streak >= max_bounces:
                 bounce_streak = 0
                 self._park(f"{max_bounces} consecutive bounces")
+            elif bounce_streak % rewarm_after_bounces == 0:
+                # Two bounces in a row is much more likely a stale server-side form anchor than two
+                # genuinely taken slots -- and re-warming is ~38s, against a re-login's CAPTCHA solve
+                # and a slice of the sub-account budget the portal is already penalising us on.
+                # Previously this just retried until it hit max_bounces and parked, so a worker whose
+                # anchor had lapsed spent its whole budget bouncing good slots off the pool.
+                self._to(WorkerSubstate.WARMING_UP,
+                         detail=f"{bounce_streak} consecutive bounces: re-warming before the next try")
+                if self.ops.do_warmup():
+                    self._to(WorkerSubstate.WARMED)
+                self._to(WorkerSubstate.HOLDING)
             self.ops.poll_gap()

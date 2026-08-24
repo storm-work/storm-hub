@@ -39,6 +39,22 @@ _UNREACHABLE_MARKERS = (
     # Solver/proxy-provider phrasings for the same thing (CapSolver returns
     # ERROR_PROXY_CONNECT_REFUSED, which matches none of the net::ERR_* forms above).
     "connect_refused", "connection refused", "connection reset", "proxy_connect",
+    # IN-PAGE forms. Everything above is what Playwright reports when a NAVIGATION fails, but a
+    # large part of the warm-up runs as fetch() inside the page, and a dead tunnel surfaces there as
+    # a bare "TypeError: Failed to fetch" with no net::ERR_* code attached. Likewise do_apply reads
+    # the submit response and recognises Chrome's own network-error interstitial, saying in its own
+    # words that "the request never reached the portal".
+    #
+    # Both were classified "unknown" until 2026-08-22, so the recovery ladder treated a DEAD PROXY
+    # as a session/portal problem. Traced live on worker SOFIA FILOMENA COSTA (Test 2032): the
+    # submit hit a network-error page, then two full re-warms (34s + 41s) and a re-login and a
+    # checkpoint restore all failed with "Failed to fetch" -- every one of them spent on a tunnel
+    # that was already provably dead, instead of rotating the exit.
+    #
+    # The knowledge existed; it was in a CODE COMMENT in _run_warmup_steps ("a transient network
+    # failure inside the page (dead proxy, dropped tunnel)") rather than in the classifier that
+    # actually decides what to do about it.
+    "failed to fetch", "network-error page", "networkerror", "err_internet_disconnected",
 )
 
 # Markers that mean "it reached the portal and the portal is being slow". Deliberately checked AFTER

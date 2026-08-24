@@ -29,7 +29,9 @@ from libs.db import models as M
 from libs.domain.enums import (
     BOOKING_ACTIVE_STATUSES,
     BookingStatus,
+    BookingType,
     IdentityStatus,
+    IdentityType,
     SessionPurpose,
     SessionStatus,
     SlotLeaseOutcome,
@@ -51,18 +53,21 @@ from .auth import (
     hash_password,
     make_token,
     open_session,
+    principal_from_token,
     require_operator,
+    require_viewer,
     try_decode,
     verify_password,
 )
 from libs.bus import Bus, connect
 from libs.engine import vendor_env
 from libs.bus.names import EVENT_STREAM, notified_key, respawn_key
-from libs.domain.enums import WorkerStatus, WorkerSubstate
+from libs.domain.enums import WorkerRole, WorkerStatus, WorkerSubstate
 from libs.domain.settings import resolve
 
 from libs.domain.enums import RegistrationMode, RegistrationStatus, SubAccountStatus
-from libs.proxies.health import check_proxy
+from libs.proxies.health import check_proxy, quick_screen
+from libs.proxies.health import check_proxy as _REAL_CHECK_PROXY
 from libs.proxies.lease import ProxyLeaseError, lease_proxy, release_proxy, conn_url
 
 from .config import settings
@@ -372,14 +377,26 @@ def _set_worker_status(w: M.Worker, status: WorkerStatus, *, detail: str | None 
     w.substate_detail = detail
 
 
-def _sched_on_relaunch(db: Session, worker: M.Worker) -> None:
-    """Hold-phase respawn (D2) — relaunch a single FAILED worker via the same launch path a fresh
-    start uses. The scheduler's _hold_respawn already stopped the old process first (F15) and gates
-    this call with per-worker backoff + a hard attempt cap (F6) before ever calling it."""
-    _reset_worker_bus_state(worker.booking_id, worker.id)
-    _set_worker_status(worker, WorkerStatus.READY)
+def _sched_on_relaunch(db: Session, workers: list[M.Worker]) -> None:
+    """Hold-phase respawn (D2) — relaunch FAILED workers via the same launch path a fresh start
+    uses. The scheduler's _hold_respawn already stopped the old processes first (F15) and gates this
+    call with per-worker backoff + a hard attempt cap (F6) before ever calling it.
+
+    Takes a LIST and dispatches to a BACKGROUND thread. It used to take one worker and call
+    _do_launch_worker inline on the scheduler tick -- which leases a proxy, which runs check_proxy,
+    which launches a real headless Chromium per candidate. check_proxy's docstring names the
+    Scheduler tick as a caller that must not do this inline; doing it anyway stalled the whole tick
+    and, on 2026-08-21, stopped slot-open from ever reaching the scouts of three live bookings."""
+    workers = list(workers)
+    if not workers:
+        return
+    booking_id = workers[0].booking_id
+    for worker in workers:
+        _reset_worker_bus_state(worker.booking_id, worker.id)
+        _set_worker_status(worker, WorkerStatus.READY)
     db.commit()
-    _do_launch_worker(db, worker)
+    # Same background path a fresh fleet start uses, including its per-booking in-flight guard.
+    _begin_fleet_launch(booking_id, [w.id for w in workers])
 
 
 scheduler = Scheduler(
@@ -540,7 +557,8 @@ def health(db: Session = Depends(get_db)) -> dict:
 
 
 @app.get("/ops/status")
-def ops_status(db: Session = Depends(get_db)) -> dict:
+def ops_status(db: Session = Depends(get_db),
+               _v: Principal = Depends(require_viewer)) -> dict:
     """Minimum-viable operational observability (Phase F3) -- exists specifically because of the
     confirmed incident's root cause: a runaway hold loop drove Redis writes into the hundreds/sec
     for over an hour with nothing surfacing it until the operator noticed live, by hand. This
@@ -697,7 +715,7 @@ def get_artifact_file(artifact_id: str, db: Session = Depends(get_db),
 
 
 @app.get("/settings/catalog")
-def settings_catalog() -> dict:
+def settings_catalog(_v: Principal = Depends(require_viewer)) -> dict:
     """The settings taxonomy (§6), grouped by home layer — powers the dashboard settings editors.
 
     The "booking" list is the one exception to "home layer only": it also includes settings whose
@@ -974,7 +992,8 @@ def create_identity(
 
 
 @app.get("/identities", response_model=list[IdentityOut])
-def list_identities(db: Session = Depends(get_db)) -> list[IdentityOut]:
+def list_identities(db: Session = Depends(get_db),
+                    _v: Principal = Depends(require_viewer)) -> list[IdentityOut]:
     """Every identity, each annotated with the ACTIVE booking currently holding it (if any).
 
     C2 exclusivity is enforced by attach_identity (409 "already allocated to another active
@@ -1247,7 +1266,8 @@ def gen_test_identities(body: GenTestIdentities, db: Session = Depends(get_db),
 
 # ── Proxy pool (DB-backed) ────────────────────────────────────────────────────
 @app.get("/proxies", response_model=list[ProxyOut])
-def list_proxies(db: Session = Depends(get_db)) -> list[M.Proxy]:
+def list_proxies(db: Session = Depends(get_db),
+                 _v: Principal = Depends(require_viewer)) -> list[M.Proxy]:
     return list(db.scalars(select(M.Proxy).order_by(M.Proxy.created_at.desc())).all())
 
 
@@ -1308,9 +1328,14 @@ def reset_proxy_health(confirm: bool = False, force: bool = False,
     `scripts/reset_run_state.py --proxy-health` -- exposed here because the situation it exists for
     recurs and shelling into the box for it is friction the operator shouldn't need.
 
-    WHY it is ever needed: lease_proxy filters on is_healthy, and health.apply_result sets
-    is_healthy=False on ANY probe failure, so every false negative removes a good proxy from the
-    pool PERMANENTLY. Confirmed live 2026-08-15: the Hub's own probe ran with anti-detection off
+    WHY it is ever needed: health.apply_result sets is_healthy=False on ANY probe failure, and the
+    verdict then follows the row around -- it sinks the row in score ordering and it is what the
+    dashboard and this endpoint's own counts report as "unhealthy".
+
+    NOTE (corrected 2026-08-21): lease_proxy does NOT filter on is_healthy and has not since the
+    639-row false-condemnation incident -- see its NOTE. So this reset no longer un-blocks BOOKING
+    leases (nothing was blocking them); what it does is clear stale verdicts and scores so ordering
+    and reporting start from a clean slate. Confirmed live 2026-08-15: the Hub's own probe ran with anti-detection off
     (it exported an empty vendor env), screening proxies far more harshly than the workers that
     would use them, and condemned 639 of 2000. Fixing the probe does not un-condemn them; only this
     does.
@@ -1329,7 +1354,7 @@ def reset_proxy_health(confirm: bool = False, force: bool = False,
     probed = db.scalar(select(func.count()).select_from(M.Proxy)
                        .where(M.Proxy.health.isnot(None))) or 0
     leasable_before = db.scalar(select(func.count()).select_from(M.Proxy).where(
-        M.Proxy.active.is_(True), M.Proxy.is_healthy.is_(True))) or 0
+        M.Proxy.active.is_(True), M.Proxy.is_healthy.is_(True))) or 0   # reported, not the gate
     if confirm:
         for pr in db.scalars(select(M.Proxy).where(M.Proxy.health.isnot(None))).all():
             pr.is_healthy, pr.health, pr.score = True, None, 0.0
@@ -1434,8 +1459,13 @@ def run_registration(body: RegistrationRunRequest, db: Session = Depends(get_db)
     # FK to workers.id, which a registration run has none of, and registration cycles through many
     # proxies briefly rather than holding one for a long booking-style hold phase, so the capacity
     # bookkeeping ProxyLease exists for doesn't fit here. apps/registrar round-robins this list.
-    q = select(M.Proxy).where(M.Proxy.provider == body.provider, M.Proxy.active.is_(True),
-                              M.Proxy.is_healthy.is_(True))
+    # is_healthy is deliberately NOT a filter here, matching lease_proxy (see its NOTE): these pools
+    # are ROTATING, so a row is a session template and not an IP, and a probe failure means "that
+    # exit was bad a moment ago" rather than "this row is bad". This was the last place in the
+    # codebase that still excluded on it -- the booking path stopped doing so when the 639-row
+    # false-condemnation incident was fixed, but registration kept the old filter and so kept
+    # shrinking its own pool permanently, one transient failure at a time.
+    q = select(M.Proxy).where(M.Proxy.provider == body.provider, M.Proxy.active.is_(True))
     if body.kind:
         q = q.where(M.Proxy.kind == body.kind)
     geos = _geos(body.geos)
@@ -1528,7 +1558,8 @@ def write_global_settings(body: GlobalSettingsPut, db: Session = Depends(get_db)
 
 # ── Worker templates ──────────────────────────────────────────────────────────
 @app.get("/templates", response_model=list[TemplateOut])
-def list_templates(db: Session = Depends(get_db)) -> list[M.WorkerTemplate]:
+def list_templates(db: Session = Depends(get_db),
+                   _v: Principal = Depends(require_viewer)) -> list[M.WorkerTemplate]:
     return list(db.scalars(select(M.WorkerTemplate).order_by(M.WorkerTemplate.created_at.asc())).all())
 
 
@@ -1637,6 +1668,106 @@ def update_booking(booking_id: str, body: BookingUpdate, db: Session = Depends(g
             bk.settings_json = validate_layer(L.BOOKING, body.settings)
         except Exception as e:
             raise HTTPException(400, f"invalid booking settings: {e}")
+
+    # Switching the booking between REAL and TEST. Creation-only until 2026-08-22, so a booking
+    # started under the wrong type had to be rebuilt from scratch.
+    #
+    # This is not a label -- libs/domain/rules.py's resolve_worker_role gives the two types
+    # genuinely different rules, so a switch has to bring the existing fleet with it:
+    #
+    #   TEST : only TEST identities may attach, and the operator assigns each role explicitly.
+    #   REAL : any identity attaches, and the role is DERIVED (test -> scout, real -> apply).
+    #
+    # test -> real  : legal for any fleet, but every attached worker's role must be RE-DERIVED, or
+    #                 the booking ends up with roles that its own rule would never have produced
+    #                 (e.g. a test identity sitting at "apply" because someone assigned it that way
+    #                 under the test rules).
+    # real -> test  : refused outright if any REAL identity is attached -- a TEST booking may not
+    #                 contain them, and silently detaching someone's fleet is not this endpoint's
+    #                 call to make. Existing roles are kept: under TEST they are operator-assigned,
+    #                 and what is already there IS the operator's assignment.
+    #
+    # Both directions refuse while workers are RUNNING, for the same reason the posto change does:
+    # a live worker's role is already frozen into its launch payload and its phase machine.
+    if body.type is not None and body.type != bk.type:
+        running = db.scalar(select(func.count()).select_from(M.Worker).where(
+            M.Worker.booking_id == bk.id, M.Worker.status == WorkerStatus.RUNNING)) or 0
+        if running:
+            raise HTTPException(
+                409, f"cannot change booking type while {running} worker(s) are RUNNING: their "
+                     f"roles are already frozen. Stop the booking first.")
+        workers = db.scalars(select(M.Worker).where(M.Worker.booking_id == bk.id)).all()
+        idents = {i.id: i for i in db.scalars(select(M.Identity).where(
+            M.Identity.id.in_([w.identity_id for w in workers] or [""]))).all()}
+
+        if body.type == BookingType.TEST:
+            offenders = [idents[w.identity_id].full_name for w in workers
+                         if w.identity_id in idents
+                         and idents[w.identity_id].type != IdentityType.TEST]
+            if offenders:
+                raise HTTPException(
+                    409, f"a TEST booking may only contain TEST identities; detach these first "
+                         f"({len(offenders)}): {', '.join(offenders[:5])}"
+                         + (" ..." if len(offenders) > 5 else ""))
+            rederived = 0
+        else:
+            rederived = 0
+            for w in workers:
+                ident = idents.get(w.identity_id)
+                if ident is None:
+                    continue
+                want = (WorkerRole.SCOUT if ident.type == IdentityType.TEST else WorkerRole.APPLY)
+                if w.role != want:
+                    w.role = want
+                    rederived += 1
+        logger.info("booking %s type %s -> %s (%d worker role(s) re-derived)",
+                    bk.id, bk.type, body.type, rederived)
+        bk.type = body.type
+
+    # Re-targeting the posto. It was creation-only until 2026-08-22, so the only way to move a
+    # booking to a different consulate was to build a new one and re-attach every identity.
+    #
+    # Two things make it unsafe to treat as an ordinary field edit, and both are handled here rather
+    # than left to the operator to remember:
+    #
+    #  1. RUNNING WORKERS HOLD THE OLD POSTO FROZEN. _do_launch_worker reads bk.posto_id at LAUNCH
+    #     and bakes it into the worker's payload (and its warmed Schedule.jsp anchor, and its
+    #     checkpoint's posto_pdf). Changing the column under a live worker does not re-target it --
+    #     it desyncs it: the booking would claim one posto while its workers keep working another,
+    #     invisibly. So this refuses while any worker is RUNNING; stop the booking first.
+    #
+    #  2. SLOTS ARE POSTO-SCOPED. M.Slot carries its own posto_id (stamped from the booking when
+    #     events.py persists a discovery), so slots found at the old posto are not bookable at the
+    #     new one -- an apply worker handed one would bounce on every attempt. They are retired the
+    #     same way DELETE /bookings/{id}/slots retires them: CLOSED rather than deleted, leases
+    #     released, so history and any BookedAppointment FK survive.
+    if body.posto_id is not None and body.posto_id != bk.posto_id:
+        running = db.scalar(select(func.count()).select_from(M.Worker).where(
+            M.Worker.booking_id == bk.id, M.Worker.status == WorkerStatus.RUNNING)) or 0
+        if running:
+            raise HTTPException(
+                409, f"cannot change posto while {running} worker(s) are RUNNING: they warmed "
+                     f"against posto {bk.posto_id} and would keep booking it. Stop the booking first.")
+        stale = db.scalars(select(M.Slot).where(
+            M.Slot.booking_id == bk.id,
+            M.Slot.status.notin_([SlotStatus.TAKEN, SlotStatus.CLOSED]))).all()
+        for slot in stale:
+            for lease in db.scalars(select(M.SlotLease).where(
+                    M.SlotLease.slot_id == slot.id, M.SlotLease.released_at.is_(None))).all():
+                lease.released_at = _now()
+                lease.outcome = SlotLeaseOutcome.EXPIRED
+            slot.status = SlotStatus.CLOSED
+        # The found-phase belonged to the old posto; drop the latch so discovery re-runs for the new
+        # one instead of the next tick re-firing slot_found off a pool that no longer applies.
+        bk.slot_found_fired_at = None
+        try:
+            _bus.r.delete(notified_key(bk.id, "slot_found"))
+        except Exception:
+            pass
+        logger.info("booking %s re-targeted: posto %s -> %s (%d slot(s) retired)",
+                    bk.id, bk.posto_id, body.posto_id, len(stale))
+        bk.posto_id = body.posto_id
+
     for field in ("name", "nationality", "residence", "warmup_start_at", "slot_open_at"):
         val = getattr(body, field)
         if val is not None:
@@ -1647,16 +1778,59 @@ def update_booking(booking_id: str, body: BookingUpdate, db: Session = Depends(g
 
 
 @app.get("/bookings", response_model=list[BookingOut])
-def list_bookings(db: Session = Depends(get_db)) -> list[M.Booking]:
+def list_bookings(db: Session = Depends(get_db),
+                  _v: Principal = Depends(require_viewer)) -> list[M.Booking]:
     return list(db.scalars(select(M.Booking).order_by(M.Booking.created_at.desc())).all())
 
 
 @app.get("/bookings/{booking_id}", response_model=BookingOut)
-def get_booking(booking_id: str, db: Session = Depends(get_db)) -> M.Booking:
+def get_booking(booking_id: str, db: Session = Depends(get_db),
+                _v: Principal = Depends(require_viewer)) -> M.Booking:
     bk = db.get(M.Booking, booking_id)
     if not bk:
         raise HTTPException(404, "booking not found")
     return bk
+
+
+@app.post("/bookings/{booking_id}/duplicate", response_model=BookingOut, status_code=201)
+def duplicate_booking(booking_id: str, db: Session = Depends(get_db),
+                      _op: Principal = Depends(require_operator)) -> M.Booking:
+    """Copy a booking's CONFIGURATION into a fresh DRAFT. Attached identities are NOT carried over.
+
+    Setting up a run means getting posto, nationality, residence, the calendar window and a dozen
+    settings right; re-typing all of that to run the same configuration against a new set of
+    identities is where transcription mistakes come from. This copies exactly that, and nothing else.
+
+    Deliberately NOT copied:
+      - workers / identity attachments. An identity may hold only ONE unreleased allocation
+        (uq_identity_active_allocation), so copying them would either fail on that index or silently
+        steal identities from the source booking. The operator attaches fresh ones.
+      - run state: started_at, slot_open_fired_at, slot_found_fired_at, and the schedule times. A
+        duplicate is a NEW run -- carrying a fired-signal timestamp is exactly the bug that made
+        restarted bookings skip their whole discovery phase.
+      - slots and appointments, which are observations and records belonging to the original run.
+    """
+    src = db.get(M.Booking, booking_id)
+    if not src:
+        raise HTTPException(404, "booking not found")
+    base = f"{src.name} (copy)"
+    name, n = base, 2
+    while db.scalar(select(M.Booking.id).where(M.Booking.name == name)):
+        name, n = f"{base} {n}", n + 1
+    dup = M.Booking(
+        name=name,
+        type=src.type,
+        posto_id=src.posto_id,
+        nationality=src.nationality,
+        residence=src.residence,
+        status=BookingStatus.DRAFT,
+        settings_json=dict(src.settings_json or {}),
+    )
+    db.add(dup)
+    db.commit()
+    db.refresh(dup)
+    logger.info("booking %s duplicated from %s as %r", dup.id, booking_id, name)
+    return dup
 
 
 @app.delete("/bookings/{booking_id}", status_code=204)
@@ -1811,7 +1985,8 @@ def attach_identity(
 
 
 @app.get("/bookings/{booking_id}/workers", response_model=list[WorkerOut])
-def list_workers(booking_id: str, db: Session = Depends(get_db)) -> list[M.Worker]:
+def list_workers(booking_id: str, db: Session = Depends(get_db),
+                 _v: Principal = Depends(require_viewer)) -> list[M.Worker]:
     return list(db.scalars(select(M.Worker).where(M.Worker.booking_id == booking_id)).all())
 
 
@@ -1916,6 +2091,16 @@ def _pick_live_sub_account(db: Session, identity_id: str) -> M.SubAccount | None
     return candidates[0] if candidates else None
 
 
+def _screen_tier1():
+    """The cheap raw screen -- but only when the browser tier is the REAL one.
+
+    A test that stubs check_proxy is describing a fake environment; silently running a live network
+    probe underneath it would make those tests reach the internet and fail on fake proxy rows. Same
+    reasoning as apps/hub/events.py's gate.
+    """
+    return quick_screen if check_proxy is _REAL_CHECK_PROXY else None
+
+
 def _geos(value) -> set[str] | None:
     """Parse a PROXY_GEOS setting ("DE,IT") into a set. Blank/absent -> None = no restriction."""
     parts = {g.strip().upper() for g in str(value or "").replace(";", ",").split(",") if g.strip()}
@@ -1986,7 +2171,7 @@ def _do_launch_worker(db: Session, w: M.Worker) -> None:
         try:
             proxy, warm_proxy = lease_proxy(
                 db, w.id, provider=str(eff.get("PROXY_PROVIDER", "soax")),
-                kind=eff.get("PROXY_KIND") or None, health_check=check_proxy,
+                kind=eff.get("PROXY_KIND") or None, health_check=check_proxy, quick_screen=_screen_tier1(),
                 geos=_geos(eff.get("PROXY_GEOS")),
             )
         except ProxyLeaseError as e:
@@ -2000,7 +2185,7 @@ def _do_launch_worker(db: Session, w: M.Worker) -> None:
             try:
                 _hold_proxy_row, hold_proxy = lease_proxy(
                     db, w.id, provider=str(eff.get("HOLD_PROXY_PROVIDER", "soax")),
-                    kind=eff.get("HOLD_PROXY_KIND") or None, health_check=check_proxy,
+                    kind=eff.get("HOLD_PROXY_KIND") or None, health_check=check_proxy, quick_screen=_screen_tier1(),
                     geos=_geos(eff.get("HOLD_PROXY_GEOS")),
                 )
             except ProxyLeaseError as e:
@@ -2147,6 +2332,10 @@ def start_booking(booking_id: str, db: Session = Depends(get_db),
     bk.started_at = _now()
     bk.slot_open_fired_at = None
     bk.slot_found_fired_at = None
+    try:
+        _bus.r.delete(manual_open_key(bk.id))   # a fresh run un-marks the previous manual fire
+    except Exception:
+        pass
     # Retire the previous run's discovered slots. They are per-run observations of a portal that
     # has moved on, and leaving them AVAILABLE makes the scheduler fire slot_found on the very
     # next tick -- confirmed live 2026-08-14: booking Test2 restarted at 08:44:22 and had
@@ -2222,6 +2411,12 @@ def fire_slot_open(booking_id: str, db: Session = Depends(get_db),
         raise HTTPException(409, f"cannot fire slot-open from status {bk.status}")
     bk.slot_open_fired_at = _now()
     db.commit()
+    # Mark it OPERATOR-fired so the scheduler's false-slot-open guard leaves it alone. It used to
+    # revert manual fires after SLOT_OPEN_INACTIVATE_AFTER with no log anywhere.
+    try:
+        _bus.r.set(manual_open_key(bk.id), "1", ex=86400)
+    except Exception:
+        pass
     _sched_on_slot_open(db, bk)
     return {"fired": True, "booking_status": str(bk.status)}
 
@@ -2271,6 +2466,10 @@ def schedule_booking(booking_id: str, db: Session = Depends(get_db),
     bk.started_at = None
     bk.slot_open_fired_at = None
     bk.slot_found_fired_at = None
+    try:
+        _bus.r.delete(manual_open_key(bk.id))   # a fresh run un-marks the previous manual fire
+    except Exception:
+        pass
     for signal_name in ("slot_open", "slot_found"):
         try:
             _bus.r.delete(notified_key(booking_id, signal_name))
@@ -2311,7 +2510,8 @@ def stop_booking(booking_id: str, db: Session = Depends(get_db),
 
 
 @app.get("/bookings/{booking_id}/summary")
-def booking_summary(booking_id: str, db: Session = Depends(get_db)) -> dict:
+def booking_summary(booking_id: str, db: Session = Depends(get_db),
+                    _v: Principal = Depends(require_viewer)) -> dict:
     """Run overview: booking status + worker counts by status/role/substate."""
     bk = db.get(M.Booking, booking_id)
     if not bk:
@@ -2334,7 +2534,9 @@ def booking_summary(booking_id: str, db: Session = Depends(get_db)) -> dict:
 
 
 @app.get("/workers/{worker_id}/logs")
-def worker_logs(worker_id: str, limit: int = 200, db: Session = Depends(get_db)) -> dict:
+def worker_logs(worker_id: str, limit: int = 200, all_runs: bool = False,
+                db: Session = Depends(get_db),
+                _v: Principal = Depends(require_viewer)) -> dict:
     """A worker's recent log lines, replayed from the shared `evt` Redis stream.
 
     Confirmed 2026-08-14: worker logs were WEBSOCKET-ONLY. The dashboard's per-worker log view
@@ -2347,14 +2549,34 @@ def worker_logs(worker_id: str, limit: int = 200, db: Session = Depends(get_db))
 
     Bounded by EVENT_STREAM_MAXLEN (the stream is capped, see libs/bus/bus.py), so this is
     best-effort recent history, not an archive: a busy fleet ages older lines out. WorkerRun.log_path
-    exists in the schema for durable per-run logs but nothing writes it yet."""
-    if not db.get(M.Worker, worker_id):
+    exists in the schema for durable per-run logs but nothing writes it yet.
+
+    SCOPED TO THE CURRENT RUN by default (`all_runs=false`). A Worker ROW outlives the run that
+    created it -- the same row is relaunched by every subsequent /start -- and the event stream is
+    keyed only by worker_id, so this replayed yesterday's attempts interleaved with today's with
+    nothing to tell them apart. Reading a log to understand what a run did meant mentally splicing
+    several runs together.
+
+    `Booking.started_at` is rewritten on every /start, so it is exactly the current run's boundary
+    and needs no new schema. A booking that has never started (started_at IS NULL) has no boundary
+    to apply, so everything is returned."""
+    w = db.get(M.Worker, worker_id)
+    if not w:
         raise HTTPException(404, "worker not found")
+    run_started = None
+    if not all_runs:
+        bk = db.get(M.Booking, w.booking_id)
+        run_started = _aware(bk.started_at).timestamp() if (bk and bk.started_at) else None
     out: list[dict] = []
+    hidden = 0
     try:
         for _eid, fields in _bus.r.xrevrange(EVENT_STREAM, count=5000):
             payload = json.loads(fields.get("data", "{}") or "{}")
             if payload.get("worker_id") != worker_id:
+                continue
+            if run_started is not None and float(fields.get("ts") or 0) < run_started:
+                # Older than this run's start: a previous run of the same worker row.
+                hidden += 1
                 continue
             etype = fields.get("type")
             if etype == "log_line" and payload.get("text"):
@@ -2367,7 +2589,8 @@ def worker_logs(worker_id: str, limit: int = 200, db: Session = Depends(get_db))
     except Exception as e:
         raise HTTPException(503, f"could not read event stream: {e}")
     out.reverse()   # xrevrange walks newest-first; the log view wants oldest-first
-    return {"worker_id": worker_id, "lines": out, "truncated": len(out) >= limit}
+    return {"worker_id": worker_id, "lines": out, "truncated": len(out) >= limit,
+            "run_started_at": run_started, "hidden_from_earlier_runs": hidden}
 
 
 @app.post("/workers/{worker_id}/stop", response_model=WorkerOut)
@@ -2444,7 +2667,27 @@ def restart_worker(worker_id: str, db: Session = Depends(get_db),
 
 @app.websocket("/ws/events")
 async def ws_events(ws: WebSocket) -> None:
-    """Live worker status/log stream for the dashboard (fanned from the evt Redis stream)."""
+    """Live worker status/log stream for the dashboard (fanned from the evt Redis stream).
+
+    Authenticated like every other read. This socket accepted anonymously until 2026-08-21, which
+    made it the widest hole of the set: not one snapshot but a continuous feed of worker status
+    transitions and log lines to anyone who could open a socket. A browser's WebSocket constructor
+    cannot set an Authorization header, so the token comes in as a query parameter and is validated
+    BEFORE accept() -- an unauthenticated caller is closed with 1008 (policy violation) and never
+    reaches the subscribe.
+    """
+    token = ws.query_params.get("token")
+    if not token:
+        await ws.close(code=1008)
+        return
+    db = SessionLocal()
+    try:
+        principal_from_token(token, db)
+    except Exception:
+        await ws.close(code=1008)
+        return
+    finally:
+        db.close()
     await ws.accept()
     q = event_hub.subscribe()
     try:

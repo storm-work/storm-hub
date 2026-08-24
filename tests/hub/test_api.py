@@ -57,13 +57,14 @@ def test_health_and_catalog(client):
 
 
 def test_ops_status_reports_redis_disk_and_workers(client):
-    r = client.get("/ops/status")
+    h = _operate_headers(client)          # reads require a token since require_viewer landed
+    r = client.get("/ops/status", headers=h)
     assert r.status_code == 200
     body = r.json()
     assert "redis" in body and "disk" in body and "workers" in body
     assert "free_pct" in body["disk"]
     assert "running" in body["workers"]
-    cat = client.get("/settings/catalog").json()
+    cat = client.get("/settings/catalog", headers=h).json()
     assert cat["_meta"]["total"] > 90
     assert {"global", "booking", "template"} <= set(cat)
 
@@ -208,7 +209,7 @@ def test_templates_crud_and_seed(client):
     # wrong-layer setting rejected
     bad = client.post("/templates", json={"name": "x", "role": "apply", "settings": {"SCOUT_POOL": True}}, headers=h)
     assert bad.status_code == 400
-    assert any(t["name"] == "Scout A" for t in client.get("/templates").json())
+    assert any(t["name"] == "Scout A" for t in client.get("/templates", headers=h).json())
 
 
 def test_arm_with_template_and_start_booking(client):

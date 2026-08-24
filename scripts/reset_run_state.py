@@ -13,7 +13,8 @@ fixed:
                    Every health verdict in the DB before 2026-08-14 was produced by a prober running
                    with the vendor's own env defaults (NAV_TIMEOUT_SCALE=1.0, anti-detect off)
                    because the Hub never applied its settings -- strictly harsher conditions than the
-                   workers that would use those proxies. lease_proxy filters on is_healthy, so each
+                   workers that would use those proxies. (lease_proxy no longer filters on is_healthy -- see its
+                   NOTE -- so this clears stale verdicts/scores rather than un-blocking leases.) Each
                    false negative permanently removed a good proxy from the pool.
 
   --slot-leases    Release unreleased SlotLeases and reopen the slots they were holding.

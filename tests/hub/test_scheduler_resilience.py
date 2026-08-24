@@ -177,7 +177,7 @@ def test_hold_respawn_relaunches_failed_worker_and_stops_old_process_first():
     r = fakeredis.FakeStrictRedis(decode_responses=True)
     sup = _FakeSupervisor()
     relaunched = []
-    sched = _scheduler(redis_client=r, supervisor=sup, on_relaunch=lambda db, w: relaunched.append(w.id))
+    sched = _scheduler(redis_client=r, supervisor=sup, on_relaunch=lambda db, ws: relaunched.extend(x.id for x in ws))
 
     engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     metadata.create_all(engine)
@@ -197,7 +197,7 @@ def test_hold_respawn_relaunches_failed_worker_and_stops_old_process_first():
 def test_hold_respawn_respects_backoff_and_stops_after_max_attempts():
     r = fakeredis.FakeStrictRedis(decode_responses=True)
     relaunched = []
-    sched = _scheduler(redis_client=r, on_relaunch=lambda db, w: relaunched.append(w.id))
+    sched = _scheduler(redis_client=r, on_relaunch=lambda db, ws: relaunched.extend(x.id for x in ws))
 
     engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     metadata.create_all(engine)
@@ -230,7 +230,7 @@ def test_hold_respawn_skips_stopped_booking():
     excluded COMPLETED/ABORTED/DRAFT bookings -- relaunched it right back within one tick."""
     r = fakeredis.FakeStrictRedis(decode_responses=True)
     relaunched = []
-    sched = _scheduler(redis_client=r, on_relaunch=lambda db, w: relaunched.append(w.id))
+    sched = _scheduler(redis_client=r, on_relaunch=lambda db, ws: relaunched.extend(x.id for x in ws))
     engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     metadata.create_all(engine)
     Session = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
@@ -247,7 +247,7 @@ def test_hold_respawn_skips_stopped_booking():
 def test_hold_respawn_disabled_by_flag():
     r = fakeredis.FakeStrictRedis(decode_responses=True)
     relaunched = []
-    sched = _scheduler(redis_client=r, on_relaunch=lambda db, w: relaunched.append(w.id))
+    sched = _scheduler(redis_client=r, on_relaunch=lambda db, ws: relaunched.extend(x.id for x in ws))
     engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     metadata.create_all(engine)
     Session = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
@@ -818,7 +818,7 @@ def test_hold_respawn_also_retries_held_workers():
     to land here only via the `held`->FAILED mis-mapping; now it must be named explicitly."""
     r = fakeredis.FakeStrictRedis(decode_responses=True)
     relaunched = []
-    sched = _scheduler(redis_client=r, on_relaunch=lambda db, w: relaunched.append(w.id))
+    sched = _scheduler(redis_client=r, on_relaunch=lambda db, ws: relaunched.extend(x.id for x in ws))
 
     engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     metadata.create_all(engine)
@@ -1427,26 +1427,46 @@ def test_a_relaunch_failure_does_not_abort_the_whole_tick(db):
     sched._hold_respawn(db, bk, NOW)      # must return normally, not raise
 
 
-def test_a_relaunch_failure_still_lets_the_other_workers_relaunch(db):
-    """One unlucky worker must not deny the rest their retry."""
-    r = fakeredis.FakeStrictRedis(decode_responses=True)
-    done = []
+def test_every_due_worker_is_dispatched_in_one_batch(db):
+    """One unlucky worker must not deny the rest their retry -- now enforced one layer down.
 
-    def _flaky(db_, w):
-        if not done:
-            done.append(("failed", w.id))
-            raise RuntimeError("no healthy proxy")
-        done.append(("ok", w.id))
+    _hold_respawn used to call on_relaunch once PER worker, inline on the tick, so this test made a
+    callback raise for the first worker and checked the other two still got their turn. Since
+    2026-08-21 the whole due set is handed over in ONE dispatch that runs on a background thread
+    (_begin_fleet_launch -> _launch_worker_fleet), because the inline version ran a real headless
+    Chromium proxy probe per candidate and stalled every booking's tick behind it.
+
+    Per-worker isolation did not disappear, it moved: _launch_worker_fleet gives each worker its own
+    thread and DB session precisely so one worker's failure cannot abort the others. What
+    _hold_respawn still owes is that every eligible worker reaches that dispatch -- which is what
+    this now asserts."""
+    r = fakeredis.FakeStrictRedis(decode_responses=True)
+    batches = []
 
     sched = _scheduler(redis_client=r, supervisor=_FakeSupervisor(), bus=_FakeBus(),
-                       on_relaunch=_flaky)
+                       on_relaunch=lambda db_, ws: batches.append([w.id for w in ws]))
     bk = _make_booking(db)
-    for _ in range(3):
-        _make_worker(db, bk, _make_identity(db), status=WorkerStatus.FAILED)
+    made = [_make_worker(db, bk, _make_identity(db), status=WorkerStatus.FAILED) for _ in range(3)]
 
     sched._hold_respawn(db, bk, NOW)
 
-    assert len(done) == 3 and [d[0] for d in done] == ["failed", "ok", "ok"]
+    assert len(batches) == 1, "one dispatch for the whole due set, not one per worker"
+    assert sorted(batches[0]) == sorted(w.id for w in made)
+
+
+def test_a_dispatch_failure_does_not_abort_the_tick(db):
+    """The dispatch itself raising must not kill the tick for every other booking."""
+    r = fakeredis.FakeStrictRedis(decode_responses=True)
+
+    def _boom(db_, ws):
+        raise RuntimeError("thread pool exhausted")
+
+    sched = _scheduler(redis_client=r, supervisor=_FakeSupervisor(), bus=_FakeBus(),
+                       on_relaunch=_boom)
+    bk = _make_booking(db)
+    _make_worker(db, bk, _make_identity(db), status=WorkerStatus.FAILED)
+
+    sched._hold_respawn(db, bk, NOW)   # must not raise
 
 
 # ── a SCHEDULED start must launch, not just transition (confirmed live 2026-08-19) ────────────
@@ -1513,7 +1533,7 @@ def test_hold_respawn_retries_a_worker_whose_LAUNCH_failed():
 
     r = fakeredis.FakeStrictRedis(decode_responses=True)
     relaunched = []
-    sched = _scheduler(redis_client=r, on_relaunch=lambda db, w: relaunched.append(w.id))
+    sched = _scheduler(redis_client=r, on_relaunch=lambda db, ws: relaunched.extend(x.id for x in ws))
 
     db = _launch_failed_db()
     bk = _make_booking(db)
@@ -1531,7 +1551,7 @@ def test_hold_respawn_leaves_a_plain_READY_worker_alone():
     but deliberately has not started -- auto-launching those would start a booking nobody ran."""
     r = fakeredis.FakeStrictRedis(decode_responses=True)
     relaunched = []
-    sched = _scheduler(redis_client=r, on_relaunch=lambda db, w: relaunched.append(w.id))
+    sched = _scheduler(redis_client=r, on_relaunch=lambda db, ws: relaunched.extend(x.id for x in ws))
 
     db = _launch_failed_db()
     bk = _make_booking(db)
@@ -1548,7 +1568,7 @@ def test_launch_failure_retry_still_honours_the_respawn_cap():
 
     r = fakeredis.FakeStrictRedis(decode_responses=True)
     relaunched = []
-    sched = _scheduler(redis_client=r, on_relaunch=lambda db, w: relaunched.append(w.id))
+    sched = _scheduler(redis_client=r, on_relaunch=lambda db, ws: relaunched.extend(x.id for x in ws))
 
     db = _launch_failed_db()
     bk = _make_booking(db)
@@ -1726,3 +1746,89 @@ def test_prewarm_can_be_disabled_with_zero():
 
     _prewarm_sched(r, bus)._maybe_prewarm(db, bk, NOW)
     assert sent == []
+
+
+# ── a holding worker that cannot book must not be handed a slot ──────────────
+def test_assign_skips_a_holding_worker_marked_not_bookable(db):
+    """CONFIRMED LIVE 2026-08-21. A keepalive that finds the schedule anchor gone re-warms in place;
+    110 of those re-warms failed against 42 that succeeded. The failure was recorded ONLY as a log
+    line, so the worker kept reporting a bare `holding` -- the Hub counted it as ready capacity, and
+    it bounced the first slot it was handed. It now carries NOT_BOOKABLE_PREFIX on substate_detail
+    and is skipped here until a re-warm succeeds and clears it."""
+    from libs.domain.enums import NOT_BOOKABLE_PREFIX
+
+    r = fakeredis.FakeStrictRedis(decode_responses=True)
+    bus = _FakeBus()
+    sched = _scheduler(redis_client=r, bus=bus)
+    bk = _make_booking(db)
+    bk.status = BookingStatus.RUNNING
+    good = _make_worker(db, bk, _make_identity(db), status=WorkerStatus.RUNNING,
+                        role=WorkerRole.APPLY, substate=WorkerSubstate.HOLDING)
+    bad = _make_worker(db, bk, _make_identity(db), status=WorkerStatus.RUNNING,
+                       role=WorkerRole.APPLY, substate=WorkerSubstate.HOLDING)
+    bad.substate_detail = f"{NOT_BOOKABLE_PREFIX} form-state lapsed, re-warm failed x3"
+    db.add(M.Slot(booking_id=bk.id, posto_id="5084", date="2026-08-18", period=4,
+                  status=SlotStatus.AVAILABLE))
+    db.commit()
+
+    sched._assign_slots(db, bk)
+
+    leased = {l.worker_id for l in db.scalars(select(M.SlotLease)).all()}
+    assert good.id in leased, "a healthy holding worker must still be assignable"
+    assert bad.id not in leased, "a not-bookable worker must never be handed a slot"
+
+
+def test_a_healthy_holding_worker_with_a_detail_is_still_assignable(db):
+    """The filter keys on the PREFIX, not on 'has any detail' -- an ordinary detail must not
+    accidentally bench a perfectly good worker."""
+    r = fakeredis.FakeStrictRedis(decode_responses=True)
+    sched = _scheduler(redis_client=r, bus=_FakeBus())
+    bk = _make_booking(db)
+    bk.status = BookingStatus.RUNNING
+    w = _make_worker(db, bk, _make_identity(db), status=WorkerStatus.RUNNING,
+                     role=WorkerRole.APPLY, substate=WorkerSubstate.HOLDING)
+    w.substate_detail = "re-warm restored the schedule form"
+    db.add(M.Slot(booking_id=bk.id, posto_id="5084", date="2026-08-18", period=4,
+                  status=SlotStatus.AVAILABLE))
+    db.commit()
+
+    sched._assign_slots(db, bk)
+
+    assert {l.worker_id for l in db.scalars(select(M.SlotLease)).all()} == {w.id}
+
+
+# ── a manual slot-open must not be silently reverted (2026-08-23) ───────────
+def test_a_manually_fired_slot_open_is_not_reverted(db):
+    """CONFIRMED live: the operator fired slot-open at 22:38:45; the false-slot-open guard cleared
+    it at 22:58:45 and logged NOTHING, so it was indistinguishable from the fire never having
+    worked. It is self-perpetuating whenever discovery is broken -- "no slots in 20 minutes" is
+    always true if nothing can successfully scan."""
+    from datetime import timedelta
+
+    from libs.bus.names import manual_open_key
+
+    r = fakeredis.FakeStrictRedis(decode_responses=True)
+    sched = _scheduler(redis_client=r, bus=_FakeBus())
+    bk = _make_booking(db)
+    bk.status = BookingStatus.RUNNING
+    bk.slot_open_fired_at = NOW - timedelta(seconds=5000)     # far past the 1200s window
+    db.commit()
+
+    r.set(manual_open_key(bk.id), "1")
+    assert sched._maybe_inactivate_slot_open(db, bk, NOW) is False
+    assert bk.slot_open_fired_at is not None, "an operator's explicit fire must survive"
+
+
+def test_a_scheduled_slot_open_is_still_reverted(db):
+    """The guard still does its job for a SCHEDULED open that turned out to be wrong."""
+    from datetime import timedelta
+
+    r = fakeredis.FakeStrictRedis(decode_responses=True)
+    sched = _scheduler(redis_client=r, bus=_FakeBus())
+    bk = _make_booking(db)
+    bk.status = BookingStatus.RUNNING
+    bk.slot_open_fired_at = NOW - timedelta(seconds=5000)
+    db.commit()
+
+    assert sched._maybe_inactivate_slot_open(db, bk, NOW) is True
+    assert bk.slot_open_fired_at is None

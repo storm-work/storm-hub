@@ -379,3 +379,89 @@ def test_score_still_orders_ties_without_excluding_anyone(db):
     second, _ = lease_proxy(db, "w2", "soax")
     assert first.endpoint == "good:80"      # better score wins the tie...
     assert second.endpoint == "bad:80"      # ...but the other is still reachable
+
+
+# ── lease-time geo injection (2026-08-23) ───────────────────────────────────
+def test_geo_is_injected_per_provider_format():
+    """The pools carry NO country since the 2026-08-22 regeneration, so the country has to be added
+    at lease time. Formats differ, so this cannot be generic."""
+    from libs.proxies.lease import _inject_geo
+
+    soax = "package-335959-sessionid-AbC-sessionlength-3600-bindttl-600-idlettl-900-opt-wb:PW"
+    assert _inject_geo(soax, "soax", "de").startswith("package-335959-country-de-sessionid-")
+    assert _inject_geo("sodade2026-17:PW", "webshare", "de") == "sodade2026-DE-17:PW"
+
+
+def test_a_credential_that_already_has_a_country_is_left_alone():
+    from libs.proxies.lease import _inject_geo
+
+    already = "package-335959-country-pt-sessionid-AbC:PW"
+    assert _inject_geo(already, "soax", "de") == already
+
+
+def test_no_geo_leaves_the_credential_byte_identical():
+    """Every non-geo caller must get exactly what is stored."""
+    from libs.proxies.lease import _inject_geo
+
+    cred = "package-335959-sessionid-AbC:PW"
+    assert _inject_geo(cred, "soax", "") == cred
+    assert _inject_geo(cred, "soax", None) == cred
+
+
+def test_an_unknown_provider_is_not_mangled():
+    from libs.proxies.lease import _inject_geo
+
+    assert _inject_geo("whatever:PW", "someotherprovider", "de") == "whatever:PW"
+
+
+# ── two-tier screening (2026-08-24) ─────────────────────────────────────────
+def test_a_dead_exit_is_rejected_without_launching_a_browser():
+    """storm-auto screens cheaply first; we paid ~20-25s of Chromium to discover a socket would not
+    open. ~76% of our transient login failures were connectivity-level, so that is where the probe
+    budget was going."""
+    from libs.proxies.health import quick_screen
+
+    alive, why = quick_screen("http://u:p@127.0.0.1:9", timeout=3)
+    assert alive is False
+    assert "dead exit" in why
+
+
+def test_an_unrecognised_raw_error_fails_OPEN():
+    """Failing closed on an unfamiliar error would quietly shrink the pool -- exactly how the
+    639-row false-condemnation incident happened. One wasted browser probe is the cheaper mistake."""
+    import libs.proxies.health as H
+
+    class _Boom:
+        def __init__(self, **kw): pass
+        def get(self, url): raise RuntimeError("something nobody has seen before")
+
+    import sys, types
+    real = sys.modules.get("primp")
+    sys.modules["primp"] = types.SimpleNamespace(Client=_Boom)
+    try:
+        alive, why = H.quick_screen("http://u:p@x:1")
+        assert alive is True and "deferring to browser" in why
+    finally:
+        if real is not None:
+            sys.modules["primp"] = real
+        else:
+            sys.modules.pop("primp", None)
+
+
+def test_tier1_rejection_skips_tier2_entirely(db):
+    """The point of the cheap tier: a candidate it rejects must never reach the browser."""
+    browser_calls = {"n": 0}
+
+    def _never(url):
+        browser_calls["n"] += 1
+        return True, "ok"
+
+    for i in range(3):
+        _proxy(db, endpoint=f"proxy.soax.com:500{i}")
+    db.commit()
+    try:
+        lease_proxy(db, "w1", provider="soax", health_check=_never,
+                    quick_screen=lambda url: (False, "dead exit -- test"))
+    except ProxyLeaseError:
+        pass
+    assert browser_calls["n"] == 0, "a rejected candidate must not cost a browser launch"

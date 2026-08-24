@@ -46,14 +46,48 @@ def _random_str(n: int) -> str:
 
 
 class MailTM:
-    def __init__(self, timeout: int = 10):
+    """mail.tm client.
+
+    `proxy` matters more than it looks. This class used a single MODULE-LEVEL requests.Session with
+    no proxy, so every mailbox creation in a registration run left the server's one IP -- and mail.tm
+    rate-limits per IP. Measured 2026-08-23: of ~170 registration outcomes, **87 were
+    "mail.tm create failed (429)"**, more than every portal-side cause put together. Registration
+    looked like it was failing against the portal when it was mostly never getting an inbox.
+
+    Each registration already has a proxy for its portal work; passing it here spreads mailbox
+    creation over the same pool instead of funnelling it through one address.
+    """
+
+    def __init__(self, timeout: int = 10, proxy: str | None = None,
+                 retries: int = 4, backoff: float = 2.0):
         self._timeout = timeout
         self._domain  = None
+        self._retries = max(1, retries)
+        self._backoff = max(0.0, backoff)
+        # Per-instance, so two concurrent registrations never share cookies/keep-alive -- and so a
+        # proxy can be set at all.
+        self._sess = requests.Session()
+        self._sess.headers.update({"Content-Type": "application/json"})
+        if proxy:
+            self._sess.proxies.update({"http": proxy, "https": proxy})
+
+    def _post(self, path: str, payload: dict):
+        """POST with back-off on 429. A rate limit is a WAIT, not a failure -- the previous code
+        raised on the first 429 and threw the whole registration away."""
+        last = None
+        for attempt in range(self._retries):
+            r = self._sess.post(f"{_BASE}{path}", json=payload, timeout=self._timeout)
+            if r.status_code != 429:
+                return r
+            last = r
+            if attempt < self._retries - 1:
+                time.sleep(self._backoff * (2 ** attempt) * random.uniform(0.7, 1.3))
+        return last
 
     def domain(self) -> str:
         if self._domain:
             return self._domain
-        r = _SESS.get(f"{_BASE}/domains", timeout=self._timeout)
+        r = self._sess.get(f"{_BASE}/domains", timeout=self._timeout)
         r.raise_for_status()
         members = r.json().get("hydra:member", [])
         if not members:
@@ -73,25 +107,25 @@ class MailTM:
         if not password:
             password = _random_str(16)
 
-        r = _SESS.post(f"{_BASE}/accounts",
-                       json={"address": address, "password": password},
-                       timeout=self._timeout)
-        if r.status_code not in (200, 201):
-            raise RuntimeError(f"mail.tm create failed ({r.status_code}): {r.text[:200]}")
+        r = self._post("/accounts", {"address": address, "password": password})
+        if r is None or r.status_code not in (200, 201):
+            raise RuntimeError(
+                f"mail.tm create failed ({r.status_code if r is not None else '?'}): "
+                f"{r.text[:200] if r is not None else 'no response'}"
+                + (f" [after {self._retries} attempts with back-off]"
+                   if r is not None and r.status_code == 429 else ""))
         print(f"[email] created: {address}")
         return address, password
 
     def token(self, address: str, password: str) -> str:
         """Get a JWT to access this mailbox."""
-        r = _SESS.post(f"{_BASE}/token",
-                       json={"address": address, "password": password},
-                       timeout=self._timeout)
+        r = self._post("/token", {"address": address, "password": password})
         r.raise_for_status()
         return r.json()["token"]
 
     def messages(self, jwt: str) -> list[dict]:
         """Return list of message summaries."""
-        r = _SESS.get(f"{_BASE}/messages",
+        r = self._sess.get(f"{_BASE}/messages",
                       headers={"Authorization": f"Bearer {jwt}"},
                       timeout=self._timeout)
         r.raise_for_status()
@@ -99,7 +133,7 @@ class MailTM:
 
     def message_body(self, jwt: str, msg_id: str) -> str:
         """Return full text/html body of a message."""
-        r = _SESS.get(f"{_BASE}/messages/{msg_id}",
+        r = self._sess.get(f"{_BASE}/messages/{msg_id}",
                       headers={"Authorization": f"Bearer {jwt}"},
                       timeout=self._timeout)
         r.raise_for_status()

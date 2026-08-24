@@ -12,7 +12,10 @@ function useEvents(enabled) {
   useEffect(() => {
     if (!enabled) return;
     const proto = location.protocol === "https:" ? "wss" : "ws";
-    const ws = new WebSocket(`${proto}://${location.host}/ws/events`);
+    // The WebSocket constructor cannot set an Authorization header, so /ws/events takes the token as
+    // a query parameter and validates it before accepting the socket.
+    const ws = new WebSocket(
+      `${proto}://${location.host}/ws/events?token=${encodeURIComponent(auth.token || "")}`);
     ref.current = ws;
     ws.onmessage = (ev) => {
       const m = JSON.parse(ev.data);
@@ -314,7 +317,8 @@ function Bookings({ me, events, setLeftPanel, setRightPanel }) {
       {booking ? (
         <>
           <BookingOverview me={me} booking={booking} events={events} workers={workers}
-            onBookingChanged={reload} onDeleted={() => { setSelectedId(null); reload(); }} />
+            onBookingChanged={reload} onDeleted={() => { setSelectedId(null); reload(); }}
+            onSelectBooking={(id) => { setSelectedId(id); reload(); }} />
           <BookingOpsTabs me={me} booking={booking} events={events} workers={workers}
             setRightPanel={setRightPanel} onBookingChanged={reload} />
         </>
@@ -535,19 +539,21 @@ function BookingRunSummary({ workers, events }) {
   );
 }
 
-function BookingOverview({ me, booking, events, workers, onBookingChanged, onDeleted }) {
+function BookingOverview({ me, booking, events, workers, onBookingChanged, onDeleted, onSelectBooking }) {
   const op = me.is_operating;
   const [msg, setMsg] = useState("");
   const [editing, setEditing] = useState(false);
   const [edit, setEdit] = useState(() => ({
-    name: booking.name, nationality: booking.nationality || "", residence: booking.residence || "",
+    name: booking.name, type: booking.type, posto_id: booking.posto_id || "",
+    nationality: booking.nationality || "", residence: booking.residence || "",
     warmup_start_at: isoToDatetimeLocal(booking.warmup_start_at), slot_open_at: isoToDatetimeLocal(booking.slot_open_at),
   }));
 
   useEffect(() => {
     setEditing(false);
     setEdit({
-      name: booking.name, nationality: booking.nationality || "", residence: booking.residence || "",
+      name: booking.name, type: booking.type, posto_id: booking.posto_id || "",
+      nationality: booking.nationality || "", residence: booking.residence || "",
       warmup_start_at: isoToDatetimeLocal(booking.warmup_start_at), slot_open_at: isoToDatetimeLocal(booking.slot_open_at),
     });
   }, [booking.id]);
@@ -573,6 +579,17 @@ function BookingOverview({ me, booking, events, workers, onBookingChanged, onDel
   const schedule = () => act(() => api(`/bookings/${booking.id}/schedule`, { method: "POST" }));
   const fireSlotOpen = () => act(() => api(`/bookings/${booking.id}/fire-slot-open`, { method: "POST" }));
   const fireSlotFound = () => act(() => api(`/bookings/${booking.id}/fire-slot-found`, { method: "POST" }));
+  async function duplicateBooking() {
+    setMsg("");
+    try {
+      const b = await api(`/bookings/${booking.id}/duplicate`, { method: "POST" });
+      // Land ON the copy. It is a DRAFT with no identities, so the next step is always attaching
+      // them -- and leaving the operator on the source booking invites editing the wrong one.
+      // onBookingChanged is `reload` and takes no argument, so selecting needs its own callback.
+      if (onSelectBooking) onSelectBooking(b.id); else onBookingChanged();
+    } catch (e) { setMsg(e.message); }
+  }
+
   async function deleteBooking() {
     if (!window.confirm(
       `Delete "${booking.name}" permanently? This stops and removes every worker, slot, and ` +
@@ -587,7 +604,8 @@ function BookingOverview({ me, booking, events, workers, onBookingChanged, onDel
     await api(`/bookings/${booking.id}`, {
       method: "PUT",
       body: {
-        name: edit.name, nationality: edit.nationality, residence: edit.residence,
+        name: edit.name, type: edit.type, posto_id: edit.posto_id, nationality: edit.nationality,
+        residence: edit.residence,
         warmup_start_at: edit.warmup_start_at ? new Date(edit.warmup_start_at).toISOString() : null,
         slot_open_at: edit.slot_open_at ? new Date(edit.slot_open_at).toISOString() : null,
       },
@@ -618,6 +636,22 @@ function BookingOverview({ me, booking, events, workers, onBookingChanged, onDel
           <div className="row" style={{ flexWrap: "wrap", gap: 8, alignItems: "flex-end" }}>
             <div className="field" style={{ margin: 0 }}><label>Name</label>
               <input value={edit.name} onChange={(e) => setEdit({ ...edit, name: e.target.value })} /></div>
+            <div className="field" style={{ margin: 0 }}><label>Type</label>
+              <select value={edit.type} onChange={(e) => setEdit({ ...edit, type: e.target.value })}
+                      style={{ width: 108 }}>
+                <option value="real">real</option>
+                <option value="test">test</option>
+              </select></div>
+            {edit.type !== booking.type && (
+              <div className="muted" style={{ fontSize: 12, flexBasis: "100%" }}>
+                {edit.type === "test"
+                  ? "→ test: only TEST identities may stay attached (real ones must be detached first), and you assign each role yourself."
+                  : "→ real: every attached worker's role is re-derived — test identity becomes a scout, real identity becomes an applier."}
+              </div>
+            )}
+            <div className="field" style={{ margin: 0 }}><label>Posto</label>
+              <input value={edit.posto_id} onChange={(e) => setEdit({ ...edit, posto_id: e.target.value })}
+                     style={{ width: 90 }} title="Changing this retires slots found at the old posto, and is refused while workers are RUNNING" /></div>
             <div className="field" style={{ margin: 0 }}><label>Nationality</label>
               <input value={edit.nationality} onChange={(e) => setEdit({ ...edit, nationality: e.target.value })} style={{ width: 90 }} /></div>
             <div className="field" style={{ margin: 0 }}><label>Residence</label>
@@ -653,6 +687,8 @@ function BookingOverview({ me, booking, events, workers, onBookingChanged, onDel
         <button className="btn ghost" disabled={!op || !canFireSlotFound || !!busy} onClick={fireSlotFound}
           title={booking.slot_found_fired_at ? "already fired" : !booking.slot_open_fired_at ? "fire slot-open first" : "manually fire slot-found now"}>🔔 Fire slot-found</button>
         <button className="btn ghost" disabled={!op || !canStop || !!busy} onClick={stopAll} title={!canStop ? `booking is ${booking.status}` : "stop all running workers"}>■ Stop</button>
+        <button className="btn ghost" disabled={!op || !!busy} onClick={duplicateBooking}
+          title="create a DRAFT copy of this booking's configuration — identities are not carried over">⧉ Duplicate</button>
         <button className="btn ghost" disabled={!op} onClick={deleteBooking} title="permanently delete this booking and everything on it">🗑 Delete</button>
       </div>
       <div className="row muted" style={{ fontSize: 13, marginBottom: 6, gap: 14, flexWrap: "wrap" }}>
@@ -1276,13 +1312,22 @@ function BookingWorkers({ me, booking, events, workers, setRightPanel }) {
 function WorkerLog({ workerId, liveLogs }) {
   const [history, setHistory] = useState(null);   // null = still loading
   const [err, setErr] = useState("");
+  // Scoped to the CURRENT booking run by default. A worker ROW is reused by every /start, and the
+  // event stream is keyed only by worker_id, so this used to interleave every past run's lines with
+  // no way to tell them apart.
+  const [allRuns, setAllRuns] = useState(false);
+  const [hidden, setHidden] = useState(0);
   useEffect(() => {
     let alive = true;
-    api(`/workers/${workerId}/logs`)
-      .then((r) => { if (alive) setHistory((r.lines || []).map((l) => l.text)); })
+    api(`/workers/${workerId}/logs${allRuns ? "?all_runs=true" : ""}`)
+      .then((r) => {
+        if (!alive) return;
+        setHistory((r.lines || []).map((l) => l.text));
+        setHidden(r.hidden_from_earlier_runs || 0);
+      })
       .catch((e) => { if (alive) { setHistory([]); setErr(e.message); } });
     return () => { alive = false; };
-  }, [workerId]);
+  }, [workerId, allRuns]);
 
   // The tail of `history` and the head of `liveLogs` overlap for a worker that was already emitting
   // when the tab connected -- drop live lines already present at the end of history.
@@ -1300,7 +1345,21 @@ function WorkerLog({ workerId, liveLogs }) {
       {err && <div className="err">could not load history: {err}</div>}
       {history === null ? <span className="muted">loading log…</span>
         : lines.length ? lines.map((l, i) => <div key={i}>{l}</div>)
-        : <span className="muted">no log lines for this worker yet</span>}
+        : <span className="muted">
+            {allRuns ? "no log lines for this worker yet"
+                     : "no log lines yet in this run"}
+          </span>}
+      {(hidden > 0 || allRuns) && (
+        <div className="muted" style={{ marginTop: 6, paddingTop: 6,
+                                        borderTop: "1px solid var(--border)", fontFamily: "inherit" }}>
+          {allRuns
+            ? <>showing <b>every run</b> of this worker · </>
+            : <>{hidden} line{hidden === 1 ? "" : "s"} from earlier runs hidden · </>}
+          <a href="#" onClick={(e) => { e.preventDefault(); setAllRuns(!allRuns); }}>
+            {allRuns ? "show only this run" : "show all runs"}
+          </a>
+        </div>
+      )}
     </div>
   );
 }
@@ -1310,6 +1369,7 @@ function AttachPanel({ me, booking, identities, templates, attached, onAttached 
   const [q, setQ] = useState("");
   const [sel, setSel] = useState({});
   const [role, setRole] = useState("scout");
+  const [showRole, setShowRole] = useState("all");
   const [tplId, setTplId] = useState("");
   const [msg, setMsg] = useState("");
   const op = me.is_operating;
@@ -1319,11 +1379,33 @@ function AttachPanel({ me, booking, identities, templates, attached, onAttached 
   // operator only found out by picking one), AND has a usable sub-account (status "active" means
   // >=1 sub-account exists per IdentityStatus's own definition) -- conversation_extract #269:
   // not-ready identities (zero verified sub-accounts) were showing up here before.
-  const matchesSearch = (i) => !q || i.full_name.toLowerCase().includes(q.toLowerCase());
+  // Which role each identity will actually get. On a REAL booking the Role select is not shown and
+  // `assigned_role` is IGNORED by the server -- resolve_worker_role derives it from identity type
+  // (test -> scout, real -> apply). That rule was invisible here: the operator picked identities
+  // with no way to know whether they were about to create scouts or appliers, and on a real booking
+  // the only lever is the identity's own type. Mirrors libs/domain/rules.py:resolve_worker_role.
+  const roleFor = (i) => (booking.type === "test" ? role : (i.type === "test" ? "scout" : "apply"));
+  // Search matches passport OR name. The table shows the passport (operator, 2026-08-21) because
+  // that is the identifier that appears on the portal side and in a booked appointment, and names
+  // repeat across identities ("RICARDO FERREIRA" / "RICARDO MATOS" / "RICARDO RONALDO CORREIA...");
+  // the passport is the one field guaranteed to identify a row. Name stays searchable so an operator
+  // who only remembers the name is not stuck.
+  const matchesSearch = (i) => {
+    if (!q) return true;
+    const needle = q.toLowerCase();
+    return (i.passport_no || "").toLowerCase().includes(needle)
+        || (i.full_name || "").toLowerCase().includes(needle);
+  };
   const forThisBooking = identities.filter(
     (i) => (booking.type === "real" || i.type === "test") && matchesSearch(i));
+  // Role filter. On a REAL booking role is DERIVED (test -> scout, real -> apply), so this narrows
+  // the list to the identities that will actually become the role you are staffing -- picking scouts
+  // for a real booking previously meant eyeballing the Type column across the whole list. On a TEST
+  // booking `role` is an ASSIGNMENT applied to everything selected, not a filter, so it is not
+  // applied here.
   const eligible = forThisBooking.filter(
-    (i) => !attached.has(i.id) && !i.allocated_booking_id && i.status === "active");
+    (i) => !attached.has(i.id) && !i.allocated_booking_id && i.status === "active"
+           && (booking.type === "test" || showRole === "all" || roleFor(i) === showRole));
 
   // An identity attached ANYWHERE is not mentioned at all (operator, 2026-08-21). It was already
   // excluded from the selectable list -- `attached` covers this booking, `allocated_booking_id`
@@ -1357,7 +1439,22 @@ function AttachPanel({ me, booking, identities, templates, attached, onAttached 
 
   return (
     <>
-      <div className="field"><SearchBox q={q} setQ={setQ} placeholder="filter identities by name…" /></div>
+      <div className="field"><SearchBox q={q} setQ={setQ} placeholder="filter by passport or name…" /></div>
+      {booking.type === "real" && (
+        <div className="muted" style={{ fontSize: 12, marginBottom: 8 }}>
+          Role is derived from identity type on a real booking — test identities become scouts,
+          real identities become appliers. The Role column below shows what each one will get.
+        </div>
+      )}
+      {booking.type === "real" && (
+        <div className="field"><label>Show</label>
+          <select value={showRole} onChange={(e) => { setShowRole(e.target.value); setSel({}); }}
+                  style={{ width: "100%" }}>
+            <option value="all">all eligible</option>
+            <option value="scout">scouts only (test identities)</option>
+            <option value="apply">appliers only (real identities)</option>
+          </select></div>
+      )}
       {booking.type === "test" && (
         <div className="field"><label>Role</label>
           <select value={role} onChange={(e) => setRole(e.target.value)} style={{ width: "100%" }}>
@@ -1378,16 +1475,27 @@ function AttachPanel({ me, booking, identities, templates, attached, onAttached 
         <thead><tr>
           <th style={{ width: 28 }}><input type="checkbox" checked={eligible.length > 0 && eligible.every((i) => sel[i.id])}
             onChange={(e) => { const s = {}; if (e.target.checked) eligible.forEach((i) => (s[i.id] = true)); setSel(s); }} /></th>
-          <th>Name</th><th style={{ width: "22%" }}>Type</th>
+          {/* px, not %: this table lives in a narrow side panel where 16% is ~40px -- less than
+              the word "apply" -- so the pills had nothing to sit in. Passport takes what is left. */}
+          <th>Passport</th><th style={{ width: 74 }}>Type</th><th style={{ width: 74 }}>Role</th>
         </tr></thead>
         <tbody>{eligible.map((i) => (
           <tr key={i.id}>
             <td><input type="checkbox" checked={!!sel[i.id]} onChange={(e) => setSel({ ...sel, [i.id]: e.target.checked })} /></td>
-            <td>{i.full_name}</td><td><span className="pill">{i.type}</span></td>
+            <td title={i.full_name}>{i.passport_no || <span className="muted">— none —</span>}</td>
+            <td><span className="pill">{i.type}</span></td>
+            <td><span className="pill">{roleFor(i)}</span></td>
           </tr>
         ))}</tbody>
       </table>
-      {eligible.length === 0 && <div className="muted" style={{ padding: 8 }}>No eligible not-yet-attached identities with a usable sub-account.</div>}
+      {eligible.length === 0 && (
+        <div className="muted" style={{ padding: 8 }}>
+          {booking.type === "real" && showRole === "scout"
+            ? "No test identities available. A real booking's scouts come from TEST identities, so "
+              + "generate more or free some before staffing scouts."
+            : "No eligible not-yet-attached identities with a usable sub-account."}
+        </div>
+      )}
       {hiddenNotReady > 0 && (
         <div className="muted" style={{ fontSize: 12, padding: "8px 4px", borderTop: "1px solid var(--border)", marginTop: 8 }}>
           Not shown: {hiddenNotReady} without a usable sub-account.
@@ -1867,6 +1975,9 @@ function IdentityDetailPanel({ i, op, subs, onChanged, onClose }) {
   const [comment, setComment] = useState(i.comment || "");
   const [posto, setPosto] = useState(i.target_posto || "");
   const [msg, setMsg] = useState("");
+  // Re-sync when a DIFFERENT identity is selected -- without this the panel kept showing (and would
+  // have saved) the previously-selected identity's comment/posto.
+  useEffect(() => { setComment(i.comment || ""); setPosto(i.target_posto || ""); setMsg(""); }, [i.id]);
 
   async function save() {
     setMsg("");

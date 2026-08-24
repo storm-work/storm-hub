@@ -149,17 +149,26 @@ def test_audit_survives_a_long_resolved_path(client):
 
 def test_get_requests_are_not_audited(client):
     c, TestSession = client
-    c.post("/auth/bootstrap", json={"username": "admin", "password": "pw"})  # 1 audit row (POST)
-    c.get("/identities")  # GET -- must add none
-
     from libs.db import models as M
     from sqlalchemy import select, func
-    db = TestSession()
-    try:
-        n = db.scalar(select(func.count()).select_from(M.AuditRow))
-    finally:
-        db.close()
-    assert n == 1
+
+    def audit_rows() -> int:
+        db = TestSession()
+        try:
+            return db.scalar(select(func.count()).select_from(M.AuditRow))
+        finally:
+            db.close()
+
+    c.post("/auth/bootstrap", json={"username": "admin", "password": "pw"})
+    # The GET must be AUTHENTICATED to be meaningful: since require_viewer landed, an anonymous read
+    # 401s in the dependency and never reaches the handler, which would prove nothing about whether
+    # successful reads are audited. Login is itself an audited POST, so measure the delta across the
+    # GET alone rather than asserting a total.
+    tok = c.post("/auth/login", json={"username": "admin", "password": "pw",
+                                      "purpose": "view"}).json()["token"]
+    before = audit_rows()
+    c.get("/identities", headers={"Authorization": f"Bearer {tok}"})  # GET -- must add none
+    assert audit_rows() == before
 
 
 def test_docs_are_disabled_by_default(client):
@@ -293,3 +302,84 @@ def test_a_live_operator_is_never_bumped(client):
         assert len(actives) == 1      # the invariant holds
     finally:
         db.close()
+
+
+# ── every route is guarded unless it is deliberately public ──────────────────
+# The VIEWER role and the login form's "View (read-only)" purpose both shipped without any guard
+# backing them, so ten read routes answered anonymous callers -- GET /identities served full_name,
+# birthdate and passport_no of every applicant. That was not a regression; the guard was simply
+# never written. This test exists so the next route added cannot repeat it silently.
+_PUBLIC_BY_DESIGN = {
+    ("GET", "/health"),                  # liveness probe, no data
+    ("GET", "/"),                        # the SPA shell
+    ("GET", "/{full_path:path}"),        # SPA catch-all -- must serve the login page anonymously
+    ("POST", "/auth/bootstrap"),         # self-closes once a user exists (409 thereafter)
+    ("POST", "/auth/login"),             # the entry point itself
+}
+
+
+def test_no_route_is_unauthenticated_unless_explicitly_public():
+    import ast
+    import io
+
+    src = io.open("apps/hub/main.py", encoding="utf-8").read()
+    guards = ("require_operator", "require_admin", "require_viewer", "active_operator", "Principal")
+
+    def is_guarded(node) -> bool:
+        if any(g in ast.unparse(node.args) for g in guards):
+            return True
+        # websockets validate the token by hand, before accept()
+        return "principal_from_token" in ast.unparse(node)
+
+    unguarded = set()
+    for node in ast.walk(ast.parse(src)):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for dec in node.decorator_list:
+            if not (isinstance(dec, ast.Call) and isinstance(dec.func, ast.Attribute)):
+                continue
+            if not (isinstance(dec.func.value, ast.Name) and dec.func.value.id == "app"):
+                continue
+            verb = dec.func.attr.upper()
+            if verb not in ("GET", "POST", "PUT", "DELETE", "PATCH", "WEBSOCKET"):
+                continue
+            if not (dec.args and isinstance(dec.args[0], ast.Constant)):
+                continue
+            path = dec.args[0].value
+            if not is_guarded(node):
+                unguarded.add((verb, path))
+
+    leaked = unguarded - _PUBLIC_BY_DESIGN
+    assert not leaked, (
+        f"these routes take no auth dependency: {sorted(leaked)}. Add Depends(require_viewer) for "
+        f"reads or Depends(require_operator) for mutations -- or, if the route is genuinely meant to "
+        f"be public, add it to _PUBLIC_BY_DESIGN with the reason."
+    )
+
+
+def test_reads_reject_an_anonymous_caller(client):
+    """The concrete symptom: passport numbers to anyone who could reach the port."""
+    c, _ = client
+    c.post("/auth/bootstrap", json={"username": "admin", "password": "pw"})
+    for path in ("/identities", "/bookings", "/proxies", "/templates", "/ops/status",
+                 "/settings/catalog"):
+        assert c.get(path).status_code == 401, f"{path} answered an anonymous caller"
+
+
+def test_events_websocket_rejects_an_anonymous_client(client):
+    """The widest hole of the set: a continuous feed of worker status and log lines, not one
+    snapshot. It accepted anonymously until require_viewer landed."""
+    from starlette.websockets import WebSocketDisconnect
+
+    c, _ = client
+    c.post("/auth/bootstrap", json={"username": "admin", "password": "pw"})
+
+    with pytest.raises(WebSocketDisconnect) as e:
+        with c.websocket_connect("/ws/events") as ws:
+            ws.receive_json()
+    assert e.value.code == 1008
+
+    with pytest.raises(WebSocketDisconnect) as e:
+        with c.websocket_connect("/ws/events?token=garbage") as ws:
+            ws.receive_json()
+    assert e.value.code == 1008

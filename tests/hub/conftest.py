@@ -24,6 +24,31 @@ def _no_real_worker_subprocesses(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _default_engine_mode_sim(monkeypatch):
+    """Keep ENGINE_MODE=sim as the DEFAULT for hub tests, and make live an explicit opt-in.
+
+    The catalog default flipped sim -> live on 2026-08-21 (operator's call: a live booking should
+    never quietly run in sim because nobody set the mode). But a live launch needs prerequisites a
+    unit test has no reason to provide -- a usable sub-account, a leasable proxy -- and raises 409
+    when they are missing. That 409 is indistinguishable, to a test asserting `!= 409`, from the one
+    the test actually cares about: test_host_session_cap_of_zero_means_unlimited started failing on
+    "no usable sub-account" while claiming the cap was wrong.
+
+    So the flip is honoured in production and pinned here. Tests that mean to exercise the live path
+    set ENGINE_MODE="live" in their own booking settings (see tests/hub/test_live_launch.py), which
+    overrides this because BOOKING beats GLOBAL in the resolver.
+    """
+    import dataclasses
+
+    from libs.domain.settings.catalog import CATALOG
+
+    spec = CATALOG.get("ENGINE_MODE")
+    if spec is not None and spec.default == "live":
+        # Setting is a frozen dataclass, so swap the entry rather than mutate it.
+        monkeypatch.setitem(CATALOG, "ENGINE_MODE", dataclasses.replace(spec, default="sim"))
+
+
+@pytest.fixture(autouse=True)
 def _launch_fleet_synchronously(monkeypatch):
     """Run the fleet launch INLINE for hub tests instead of on a background thread.
 

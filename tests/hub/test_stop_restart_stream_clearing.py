@@ -255,7 +255,9 @@ def test_sched_on_relaunch_clears_signal_notified_membership(client):
     db = hub_main.SessionLocal()
     try:
         w = db.get(M.Worker, wid)
-        hub_main._sched_on_relaunch(db, w)
+        # Takes a LIST since 2026-08-21: the respawn dispatch is batched and backgrounded so a
+        # proxy health probe can't stall the scheduler tick.
+        hub_main._sched_on_relaunch(db, [w])
     finally:
         db.close()
 

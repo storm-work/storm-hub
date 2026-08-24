@@ -134,6 +134,8 @@ class BookingCreate(BaseModel):
 
 class BookingUpdate(BaseModel):
     name: str | None = None
+    type: BookingType | None = None
+    posto_id: str | None = None
     nationality: str | None = None
     residence: str | None = None
     warmup_start_at: datetime | None = None

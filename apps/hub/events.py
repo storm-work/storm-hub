@@ -245,12 +245,15 @@ class EventHub:
         from libs.db import models as M
         from libs.domain.enums import SettingsLayer as L
         from libs.domain.settings import resolve
-        from libs.proxies.health import check_proxy
+        from libs.proxies.health import check_proxy, quick_screen
         from libs.proxies.lease import ProxyLeaseError, lease_proxy
 
         from .settings_store import get_global
 
         hc = health_check if health_check is not None else check_proxy
+        # Tier 1 only when tier 2 is the real browser probe: a caller injecting a fake health_check
+        # is describing a fake environment and must not get a real network call underneath it.
+        _quick_screen = quick_screen if hc is check_proxy else None
 
         db = SessionLocal()
         try:
@@ -290,11 +293,11 @@ class EventHub:
 
             try:
                 proxy, url = lease_proxy(db, worker_id, provider=provider, kind=kind,
-                                         exclude_ids=old_proxy_ids, health_check=hc, geos=geos)
+                                         exclude_ids=old_proxy_ids, health_check=hc, quick_screen=_quick_screen, geos=geos)
             except ProxyLeaseError:
                 try:
                     proxy, url = lease_proxy(db, worker_id, provider=provider, kind=kind,
-                                             health_check=hc, geos=geos)
+                                             health_check=hc, quick_screen=_quick_screen, geos=geos)
                 except ProxyLeaseError as e:
                     bus.send_command(worker_id, "proxy_unavailable", reason=str(e))
                     return
@@ -466,6 +469,42 @@ class EventHub:
             logger.exception("identity bookkeeping failed for worker %s (booking still recorded)",
                              w.id)
 
+    def _mark_already_booked(self, worker_id: str, detail: str) -> None:
+        """The portal told a worker its applicant already holds a future appointment.
+
+        Retires the identity so it stops being attached to new bookings. Deliberately does NOT
+        create a BookedAppointment: we have no idea when that appointment is, and a fabricated
+        booking record is far worse than a missing one (see the success-detection rule -- only %PDF
+        bytes prove a booking WE made). The IdentityEvent carries the portal's own wording, so the
+        reason survives in history rather than living only in a worker log that rolls away.
+        """
+        from libs.domain.enums import IdentityEvent, IdentityStatus
+        from libs.domain.state_machines import IllegalTransition, identity_transition
+        db = SessionLocal()      # module-level, matching every other handler in this file
+        try:
+            w = db.get(M.Worker, worker_id)
+            if w is None:
+                return
+            ident = db.get(M.Identity, w.identity_id)
+            if ident is None:
+                return
+            db.add(M.IdentityEvent(
+                identity_id=ident.id, sub_account_id=w.sub_account_id, booking_id=w.booking_id,
+                event=IdentityEvent.BOOKED, step="already_booked_at_portal",
+                detail=detail[:500], ts=datetime.now(timezone.utc),
+            ))
+            try:
+                ident.status = identity_transition(ident.status, IdentityStatus.BOOKED)
+                logger.warning("identity %s (%s) retired: the portal reports an existing future "
+                               "appointment", ident.id, ident.full_name)
+            except IllegalTransition:
+                pass    # already booked/retired/archived -- leave the stronger state alone
+            db.commit()
+        except Exception:
+            logger.exception("mark_already_booked failed for worker %s", worker_id)
+        finally:
+            db.close()
+
     def _persist_booked_pdf(self, worker_id: str, pdf_path: str | None, slot: dict | None) -> None:
         """A live apply confirmed a booking and saved its PDF to disk (Phase: dashboard "open pdf"
         feature) -- create the Artifact + BookedAppointment rows the schema already had (models.py's
@@ -630,6 +669,9 @@ class EventHub:
                         _step("persist_slots", self._persist_slots, wid, m.payload.get("slots", []))
                     if m.type == "booked":
                         _step("persist_booking", self._persist_booking, wid, m.payload.get("slot"))
+                    if m.type == "already_booked":
+                        _step("mark_already_booked", self._mark_already_booked,
+                              wid, m.payload.get("detail", ""))
                     if m.type == "booked_pdf" and m.payload.get("pdf_path"):
                         _step("persist_booked_pdf", self._persist_booked_pdf,
                               wid, m.payload["pdf_path"], m.payload.get("slot"))

@@ -38,3 +38,10 @@ def notified_key(booking_id: str, signal_name: str) -> str:
     across a worker's own restart, silently starving the new process of a signal its predecessor
     already received)."""
     return f"notified:{booking_id}:{signal_name}"
+
+
+def manual_open_key(booking_id: str) -> str:
+    """Marks a slot-open the OPERATOR fired by hand, so the scheduler's false-slot-open guard does
+    not silently undo a deliberate decision. Set by POST /bookings/{id}/fire-slot-open; cleared
+    wherever the slot-open latch itself is reset (a fresh /start)."""
+    return f"manual_open:{booking_id}"

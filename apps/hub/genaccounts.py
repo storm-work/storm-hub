@@ -39,10 +39,38 @@ def _alpha(s: str) -> str:
     return re.sub(r"[^a-z]", "", "".join(c for c in nfkd if not unicodedata.combining(c)).lower())
 
 
+# Username shape: FIRST[:n] + LAST[:n] + digits. Widened from 3-3-4 to 4-4-6 on 2026-08-23.
+#
+# WHY. The old rule gave 53 x 29 = 1,537 distinct name prefixes over a 9,000-wide digit space, and
+# `existing` can only ever contain usernames in THIS database. storm-auto -- the predecessor that
+# made 100+ of the portal's appointments -- used the byte-identical rule (its own _make_username is
+# first[:3] + last[:3] + randint(1000,9999)) drawing on the same name pools, and its Account table
+# is now EMPTY because the data was migrated out during the rebuild. So those usernames exist on the
+# PORTAL and nowhere we can enumerate.
+#
+# Re-issuing one is not a harmless duplicate: the portal already holds that account's appointment,
+# so the warm-up is rejected with "This applicant already has an application registered with a
+# future schedule" and the identity is unusable. Three identities were retired for exactly this on
+# 2026-08-23, and it is indistinguishable from our own booking having failed.
+#
+# We cannot enumerate what the portal knows, so the only defence is to make accidental reuse
+# negligible. Per 20 accounts issued under one name prefix:
+#     3-3-4     9,000 wide   ->  2.089% chance of reusing a historical username
+#     4-4-6   900,000 wide   ->  0.021%                          (100x better)
+# 4 characters rather than 3 also lifts the prefix count (1,537 -> 1,650), and 14 characters is
+# still an ordinary-looking username.
+_USERNAME_NAME_CHARS = 4
+_USERNAME_DIGITS = 6
+
+
 def make_username(first: str, last: str, existing: set[str]) -> str:
-    base = _alpha(first)[:3].ljust(3, "x") + _alpha(last)[:3].ljust(3, "x")
+    """A username not present in `existing` -- which every caller populates from the WHOLE
+    sub_accounts table, not just the identity being generated for."""
+    n = _USERNAME_NAME_CHARS
+    base = _alpha(first)[:n].ljust(n, "x") + _alpha(last)[:n].ljust(n, "x")
+    lo, hi = 10 ** (_USERNAME_DIGITS - 1), 10 ** _USERNAME_DIGITS - 1
     for _ in range(300):
-        cand = base + str(random.randint(1000, 9999))
+        cand = base + str(random.randint(lo, hi))
         if cand not in existing:
             existing.add(cand)
             return cand

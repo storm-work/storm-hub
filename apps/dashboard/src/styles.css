@@ -143,7 +143,12 @@ button.btn:disabled { opacity: 0.5; cursor: not-allowed; }
 table { width: 100%; table-layout: fixed; border-collapse: collapse; font-size: 14px; }
 th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); overflow-wrap: break-word; word-break: break-word; }
 th { color: var(--muted); font-weight: 500; font-size: 12px; text-transform: uppercase; letter-spacing: 0.4px; }
-.pill { font-size: 12px; padding: 2px 8px; border-radius: 999px; background: var(--panel2); border: 1px solid var(--border); }
+/* white-space: nowrap is load-bearing, not cosmetic. A pill is a single label; in a narrow column
+   (the attach panel's Type/Role at 16% inside a side panel) the text broke mid-word and rendered as
+   "re al" / "ap ply" stacked vertically, which reads as corrupted data rather than a tight column.
+   inline-block keeps the padding/radius from collapsing once it can no longer wrap. */
+.pill { display: inline-block; white-space: nowrap; font-size: 12px; padding: 2px 8px;
+        border-radius: 999px; background: var(--panel2); border: 1px solid var(--border); }
 
 /* Compact button variant for dense action cells (e.g. per-row worker actions) that need several
    buttons to fit on one line instead of wrapping into a second row. */

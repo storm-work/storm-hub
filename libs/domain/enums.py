@@ -105,6 +105,14 @@ class WorkerSubstate(StrEnum):
     FAILED = "failed"            # detail carries the failing step
 
 
+# Machine-readable marker written into Worker.substate_detail by a worker, read back by the Hub's
+# _assign_slots. It lives HERE rather than in either side because both processes must agree on the
+# literal: the worker (apps/worker/ops_live.py) writes it and the Hub (apps/hub/scheduler.py) filters
+# on it, and a drifted copy would silently stop excluding anything -- failing open, in the direction
+# that hands unbookable workers real slot leases.
+NOT_BOOKABLE_PREFIX = "not bookable:"
+
+
 # ── Slots (C5) ────────────────────────────────────────────────────────────────
 class SlotStatus(StrEnum):
     AVAILABLE = "available"

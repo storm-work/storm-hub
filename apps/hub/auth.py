@@ -90,18 +90,29 @@ class Principal:
 _bearer = HTTPBearer(auto_error=False, description="Paste the token from /auth/login")
 
 
+def principal_from_token(token: str, db: Session) -> Principal:
+    """Resolve a raw token WITHOUT FastAPI's dependency machinery.
+
+    Exists for the websocket at /ws/events: a browser's WebSocket constructor cannot set an
+    Authorization header, so the token arrives as a query parameter and has to be validated by hand
+    before the socket is accepted. Same checks as current_principal, which now delegates here so the
+    two paths cannot drift apart.
+    """
+    data = _decode(token)
+    user = db.get(M.User, data.get("sub"))
+    session = db.get(M.UserSession, data.get("sid"))
+    if not user or not session or session.status == SessionStatus.ENDED:
+        raise HTTPException(401, "session ended or not found")
+    return Principal(user, session)
+
+
 def current_principal(
     creds: HTTPAuthorizationCredentials | None = Depends(_bearer),
     db: Session = Depends(get_db),
 ) -> Principal:
     if creds is None or creds.scheme.lower() != "bearer":
         raise HTTPException(401, "missing bearer token")
-    data = _decode(creds.credentials)
-    user = db.get(M.User, data.get("sub"))
-    session = db.get(M.UserSession, data.get("sid"))
-    if not user or not session or session.status == SessionStatus.ENDED:
-        raise HTTPException(401, "session ended or not found")
-    return Principal(user, session)
+    return principal_from_token(creds.credentials, db)
 
 
 def require_operator(principal: Principal = Depends(current_principal)) -> Principal:
@@ -110,6 +121,22 @@ def require_operator(principal: Principal = Depends(current_principal)) -> Princ
         raise HTTPException(
             423, "operate seat required (log in with purpose=operate; the seat may be held by another user)"
         )
+    return principal
+
+
+def require_viewer(principal: Principal = Depends(current_principal)) -> Principal:
+    """Guard for READ endpoints — any authenticated principal, operate seat or not.
+
+    This is the half of the permission model that was specified and then never written. The VIEWER
+    role has existed in libs/domain/enums.py and the login form has offered "View (read-only)" as a
+    purpose from the start, but no guard ever backed either of them, so every read route was left
+    with a bare `Depends(get_db)` and answered anonymous callers. GET /identities served full_name,
+    birthdate and passport_no of every applicant to anyone who could reach the port.
+
+    Deliberately does NOT require the operate seat: reading is not an operation on the fleet, and
+    contending for the single seat to look at a list would make the viewer role useless — which is
+    the same reasoning require_admin already applies.
+    """
     return principal
 
 

@@ -62,13 +62,17 @@ def is_recaptcha_rejection(reg_type: str, reg_desc: str) -> bool:
     return "recaptcha" in blob
 
 
-def _mk_mail(email_provider: str, email_cfg: dict):
+def _mk_mail(email_provider: str, email_cfg: dict, proxy: str | None = None):
+    """`proxy` is for mail.tm only: it rate-limits per IP, and every mailbox in a run was being
+    created from the server's single address. 87 of ~170 registration outcomes on 2026-08-23 were
+    "mail.tm create failed (429)" -- more than every portal-side cause combined. Cloudflare Email
+    Routing is our own infrastructure and needs no proxy."""
     from libs.engine.vendor import CloudflareMail, MailTM
     if email_provider == "cloudflare":
         return CloudflareMail(domain=email_cfg.get("cf_mail_domain"),
                               worker_url=email_cfg.get("cf_worker_url"),
                               secret=email_cfg.get("cf_worker_secret"))
-    return MailTM()
+    return MailTM(proxy=proxy)
 
 
 async def _register_one(acct: dict, proxies_cycle, capsolver_keys: list[str], lang: str,
@@ -92,7 +96,11 @@ async def _register_one(acct: dict, proxies_cycle, capsolver_keys: list[str], la
 
     progress("starting")
     progress("creating email inbox")
-    mail = _mk_mail(email_provider, email_cfg)
+    # Take a proxy from the same rotation the portal work uses, so mailbox creation is spread over
+    # the pool rather than hammering mail.tm from one IP. peek-then-reuse: the loop below calls
+    # next() again for its own attempt, and cycling one extra entry costs nothing.
+    _mail_proxy = (next(proxies_cycle) or {}).get("url")
+    mail = _mk_mail(email_provider, email_cfg, proxy=_mail_proxy)
     try:
         if email_provider == "cloudflare":
             email_addr, email_key = await loop.run_in_executor(executor, mail.create)

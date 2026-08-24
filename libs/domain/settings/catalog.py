@@ -127,6 +127,13 @@ _GLOBAL = [
 # ─────────────────────────────────────────────────────────────────────────────
 _BOOKING = [
     # Test-only / run mode
+    _s("MONO_BOOKING", L.BOOKING, bool, False, group="mode",
+       note="apply workers discover their OWN slots and book them, instead of holding idle until a "
+            "scout assigns one -- storm-auto's confirmed architecture, where no worker is ever idle. "
+            "Also the practical fix for anchor lapse during hold: a worker running its own "
+            "getPeriodosOcupados rounds keeps the server-side booking anchor alive, which a bare "
+            "keepalive nav does not (147 lapses vs 42 restores, measured 2026-08-21). Scouts are "
+            "unnecessary in this mode but not forbidden."),
     _s("no_book", L.BOOKING, bool, False, group="mode", note="test dry-run: apply workers never submit"),
     # NOT IMPLEMENTED -- audited 2026-08-21, zero read sites anywhere in the codebase (the only
     # references are this line and a resolver test asserting the default). Kept rather than deleted
@@ -147,8 +154,12 @@ _BOOKING = [
     _s("persist_events", L.BOOKING, bool, False, group="mode",
        note="NOT IMPLEMENTED (nothing reads it) -- raw events live only in the capped Redis stream"),
     _s("TEST_POSTO_ID", L.BOOKING, str, group="mode"),
-    _s("ENGINE_MODE", L.BOOKING, str, "sim", group="mode",
-       note="'sim' | 'live' -- explicit per-booking opt-in; live is never inferred/defaulted"),
+    # Default flipped to "live" (operator, 2026-08-21). The original "sim" default came from the
+    # reconstruction, when live mode was unproven and an accidental real booking was the risk worth
+    # guarding against. Live is now the only mode anyone runs, and the guard had inverted into a
+    # foot-gun: a booking created without touching this ran a full fleet that could never book.
+    _s("ENGINE_MODE", L.BOOKING, str, "live", group="mode",
+       note="'live' books real appointments; 'sim' drives the same flow against SimEngineOps"),
     _s("PROXY_PROVIDER", L.BOOKING, str, "soax", group="mode",
        note="phase-1 (login/warmup) leased-proxy provider: 'soax' | 'webshare'"),
     # Exit countries the phase-1 pool may draw from, comma-separated (e.g. "DE,IT"); blank = all.
@@ -263,6 +274,13 @@ _BOOKING = [
     _s("BREAKER_TRIP_THRESHOLD", L.BOOKING, int, 5, group="guards",
        note="consecutive portal-down signals before RedisBreaker trips"),
     _s("BREAKER_COOLDOWN", L.BOOKING, float, 120.0, group="guards", min_value=1.0),
+    # Consecutive apply bounces before re-warming IN PLACE and trying again (operator, 2026-08-21).
+    # Two failures in a row is far more likely a stale server-side form anchor than two genuinely
+    # taken slots -- and a re-warm is ~38s against a re-login's CAPTCHA solve and sub-account spend.
+    # Sits INSIDE the APPLY_MAX_ATTEMPTS budget: re-warm at 2 and 4, park at 5, so the outer bound
+    # that protects the Hub's false-slot detection from one degraded session is unchanged.
+    _s("APPLY_REWARM_AFTER_BOUNCES", L.BOOKING, int, 2, group="guards", min_value=1,
+       note="re-warm after this many consecutive apply bounces instead of just retrying"),
     _s("APPLY_MAX_ATTEMPTS", L.BOOKING, int, 5, group="guards"),
     # Consecutive apply bounces across the fleet after which the Hub stops believing its own slot
     # pool. Operator's call 2026-08-14: "even when there are some slots found - they may be false
@@ -306,9 +324,24 @@ _TEMPLATE = [
             "permanently FAILED that way. 0 makes every failure count against the sub-account, "
             "i.e. the old (broken) behaviour."),
     _s("QUEST_STEP_RETRIES", L.TEMPLATE, int, 10, _WRK, "login_resilience"),
-    _s("QUEST_STEP_GAP", L.TEMPLATE, float, 0.0, _WRK, "login_resilience"),
+    _s("QUEST_STEP_GAP", L.TEMPLATE, float, 1.0, _WRK, "login_resilience",
+       note="seconds (+-30%% jitter) paced before each warm-up questionnaire step and before the "
+            "Questionario nav. Ported from storm-auto and then NEVER READ -- the classic unwired "
+            "setting: it sat here at 0.0 while the 7-step warm-up fired as a sub-second burst right "
+            "after login, which is exactly where quest-step 403s cluster (storm-auto's own note: "
+            "'the quest-step-1 403s were observed clustering on exactly this post-login burst'). "
+            "Wired to a real read site in ops_live._run_warmup_steps on 2026-08-22 and defaulted to "
+            "1.0. Costs ~7s per warm-up; a warm-up that 403s costs the whole session. 0 restores "
+            "the old no-gap behaviour."),
     _s("WARMUP_MAX_ATTEMPTS", L.TEMPLATE, int, 6, _WRK, "login_resilience"),
-    _s("PARTIAL_RENDER_RETRIES", L.TEMPLATE, int, 3, _WRK, "login_resilience"),
+    _s("PARTIAL_RENDER_RETRIES", L.TEMPLATE, int, 3, _WRK, "login_resilience",
+       note="refresh-retries when Schedule.jsp answers 200 but its form is not yet AJAX-populated. "
+            "storm-auto's 'manual reload': under load the portal renders the page without the form, "
+            "and a refresh fixes it far more cheaply than escalating to a full questionnaire "
+            "re-warm. Ported from storm-auto, parsed into EngineConfig.partial_render_retries "
+            "and then never CONSUMED by any decision -- the second such setting found on "
+            "2026-08-22, after QUEST_STEP_GAP. Wired to a real read site in "
+            "ops_live._schedule_state_ok."),
     # Wired 2026-08-14 (was inert since it was written -- nothing read it). This is storm-auto's
     # MAX_FORM_STALE_REWARMS: a bounce to the questionnaire/home page means the server-side workflow
     # anchor lapsed, NOT that the slot is gone, so the fix is a re-warm rather than a re-POST.
@@ -331,6 +364,12 @@ _TEMPLATE = [
     _s("KEEPALIVE_INTERVAL", L.TEMPLATE, float, 600.0, _WRK, "keepalive", min_value=1.0),
     _s("KEEPALIVE_DECAY_MIN", L.TEMPLATE, float, 30.0, _WRK, "keepalive"),
     _s("KEEPALIVE_DECAY_MAX", L.TEMPLATE, float, 60.0, _WRK, "keepalive"),
+    _s("REWARM_ESCALATE_AFTER", L.TEMPLATE, int, 3, _WRK, "keepalive", min_value=1.0,
+       note="consecutive failed in-place re-warms before the worker rebuilds its session on a fresh "
+            "proxy instead. A re-warm that keeps failing is usually a WAF/IP block, not a lapsed "
+            "form, and re-warming on the blocked proxy can never clear it (confirmed 2026-08-22: a "
+            "worker reached 7 consecutive failures, all quest steps 403, on a healthy auth session). "
+            "Only escalates once slot_found has fired -- before that the LOOSE HOLD rule applies."),
     _s("KEEPALIVE_NO_RESTORE", L.TEMPLATE, bool, False, _WRK, "keepalive"),
     _s("KEEPALIVE_BROWSER_CONFIRM", L.TEMPLATE, bool, True, _WRK, "keepalive"),
     _s("KEEPALIVE_BROWSER_FROM", L.TEMPLATE, str, "", _WRK, "keepalive"),

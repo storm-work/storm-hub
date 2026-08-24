@@ -8,6 +8,7 @@ same slot; on SQLite (tests) the lock is skipped. `release_proxy` frees the leas
 from __future__ import annotations
 
 import random
+import re
 from datetime import datetime, timezone
 
 from sqlalchemy import func, select
@@ -79,10 +80,54 @@ def _spread_candidates(rows, window: int):
         yield from buf
 
 
-def conn_url(proxy: M.Proxy, scheme: str = "http") -> str:
-    """Build a connection URL: http://user:pass@host:port (or http://host:port when no creds)."""
+def _inject_geo(credentials_ref: str, provider: str, geo: str) -> str:
+    """Put a country into a credential, in that provider's own format.
+
+    The pools carry NO country as of the 2026-08-22 regeneration -- a geo baked into 30,000 rows can
+    only be changed by regenerating them, so the country belongs at LEASE time instead. But wiping
+    it shipped without this half, and the consequence was silent: _candidate_query never excludes a
+    NULL geo (deliberately -- a filter must not empty the pool), and after the regeneration EVERY
+    row is NULL, so `PROXY_GEOS=DE` matched all 30,000 proxies. Geo targeting looked configured and
+    did nothing.
+
+    That matters more than it sounds: exit geo is the single biggest measured lever on login
+    success -- DE/IT ~23% against CZ ~2.9%.
+
+    Formats differ, so this cannot be generic:
+      soax      the country is a parameter:  package-335959-country-de-sessionid-...
+      webshare  the country is in the USERNAME: sodade2026-DE-17  (verified against the live
+                account 2026-08-22, alongside the no-country sodade2026-17 form)
+    Returns the credential unchanged if it already carries a country, or if the provider is unknown.
+    """
+    cred = credentials_ref or ""
+    if not geo or not cred:
+        return cred
+    cc = geo.strip().lower()
+    if provider == "soax":
+        if "-country-" in cred:
+            return cred
+        return re.sub(r"^(package-\d+)", r"\1-country-" + cc, cred, count=1)
+    if provider == "webshare":
+        user, sep, pw = cred.partition(":")
+        if not sep:
+            return cred
+        m = re.match(r"^(.*?)-(\d+)$", user)          # sodade2026-17 -> sodade2026-DE-17
+        if not m:
+            return cred
+        return f"{m.group(1)}-{cc.upper()}-{m.group(2)}{sep}{pw}"
+    return cred
+
+
+def conn_url(proxy: M.Proxy, scheme: str = "http", geo: str | None = None) -> str:
+    """Build a connection URL: http://user:pass@host:port (or http://host:port when no creds).
+
+    `geo` injects a country into the credential per provider (see _inject_geo). Passing None keeps
+    the credential exactly as stored, which is what every non-geo caller wants.
+    """
     if proxy.credentials_ref:
-        return f"{scheme}://{proxy.credentials_ref}@{proxy.endpoint}"
+        cred = _inject_geo(proxy.credentials_ref, str(proxy.provider), geo) if geo \
+            else proxy.credentials_ref
+        return f"{scheme}://{cred}@{proxy.endpoint}"
     return f"{scheme}://{proxy.endpoint}"
 
 
@@ -140,7 +185,8 @@ def _candidate_query(provider: str, kind: str | None, exclude_ids: set[str] | No
     return q
 
 
-def _claim_locked(db: Session, proxy_id: str, worker_id: str, is_pg: bool) -> tuple[M.Proxy, str] | None:
+def _claim_locked(db: Session, proxy_id: str, worker_id: str, is_pg: bool,
+                  geo: str | None = None) -> tuple[M.Proxy, str] | None:
     """Atomically re-check capacity and create the lease for ONE already-probed-healthy proxy,
     guarding against a concurrent caller having grabbed it during the (deliberately unlocked, see
     lease_proxy's docstring) probe window. Returns None if it lost that race -- caller tries the
@@ -157,12 +203,13 @@ def _claim_locked(db: Session, proxy_id: str, worker_id: str, is_pg: bool) -> tu
     proxy.last_used_at = now          # advance the pool cursor -- see _candidate_query
     db.add(M.ProxyLease(proxy_id=proxy.id, worker_id=worker_id, leased_at=now))
     db.commit()
-    return proxy, conn_url(proxy)
+    return proxy, conn_url(proxy, geo=geo)
 
 
 def lease_proxy(db: Session, worker_id: str, provider: str, *, kind: str | None = None,
                 exclude_ids: set[str] | None = None, health_check=None,
-                max_probes: int = 5, geos: set[str] | None = None) -> tuple[M.Proxy, str]:
+                max_probes: int = 5, geos: set[str] | None = None,
+                quick_screen=None) -> tuple[M.Proxy, str]:
     """Lease a healthy proxy of `provider` (e.g. 'soax' or 'webshare') with free capacity. Returns
     (proxy, conn_url). Raises ProxyLeaseError if the pool is exhausted. `exclude_ids` (P3, proxy
     rotation): a worker asking the Hub to ROTATE off a proxy must not just get handed the same one
@@ -192,6 +239,14 @@ def lease_proxy(db: Session, worker_id: str, provider: str, *, kind: str | None 
     pool. When `health_check` is None (the default), behavior is unchanged from before P4: a single
     DB-only, row-locked claim of the first eligible candidate."""
     is_pg = db.get_bind().dialect.name == "postgresql"
+    # Explicit, not auto-defaulted: a caller that injects a fake health_check is describing a fake
+    # environment, and silently adding a REAL network probe underneath it would make every such test
+    # reach the portal. Production wires both tiers at the call site (apps/hub).
+    _quick_screen = quick_screen
+    # Pick ONE country for this lease and use it for BOTH the health probe and the URL handed back,
+    # so we screen the exit we will actually use. Random rather than round-robin: leases are issued
+    # concurrently across a fleet, and a shared cursor would need locking to mean anything.
+    geo = random.choice(sorted(geos)) if geos else None
 
     if health_check is None:
         counts = _active_lease_counts(db)
@@ -204,7 +259,7 @@ def lease_proxy(db: Session, worker_id: str, provider: str, *, kind: str | None 
                 proxy.last_used_at = now      # advance the pool cursor -- see _candidate_query
                 db.add(M.ProxyLease(proxy_id=proxy.id, worker_id=worker_id, leased_at=now))
                 db.commit()
-                return proxy, conn_url(proxy)
+                return proxy, conn_url(proxy, geo=geo)
         raise ProxyLeaseError(f"no free {provider} proxy available (pool exhausted)")
 
     from .health import apply_result
@@ -232,7 +287,22 @@ def lease_proxy(db: Session, worker_id: str, provider: str, *, kind: str | None 
             break
         probes += 1
         tried_ids.append(proxy.id)
-        ok, detail = health_check(conn_url(proxy))
+        url = conn_url(proxy, geo=geo)
+        # TIER 1 -- cheap raw reachability, no browser. storm-auto's pattern: screen the obvious
+        # dead exits for ~4s each instead of paying ~20-25s of Chromium to discover a socket will
+        # not open. ~76% of our transient login failures are connectivity-level, so this is where
+        # most of the probe budget was being burned. A raw check can only ever REJECT here; anything
+        # that answers falls through to the authoritative browser probe below.
+        if _quick_screen is not None:
+            alive, why = _quick_screen(url)
+            if not alive:
+                apply_result(proxy, False, why)
+                proxy.last_used_at = datetime.now(timezone.utc)
+                db.commit()
+                unhealthy += 1
+                continue
+        # TIER 2 -- the real verdict.
+        ok, detail = health_check(url)
         apply_result(proxy, ok, detail)
         # Stamped on the ATTEMPT, not just on success: a candidate that just failed its probe must
         # rotate to the BACK of the queue. Otherwise it stays at the head and the next lease probes
@@ -243,7 +313,7 @@ def lease_proxy(db: Session, worker_id: str, provider: str, *, kind: str | None 
         if not ok:
             unhealthy += 1
             continue
-        claimed = _claim_locked(db, proxy.id, worker_id, is_pg)
+        claimed = _claim_locked(db, proxy.id, worker_id, is_pg, geo=geo)
         if claimed is not None:
             return claimed
         lost_races += 1   # healthy, but someone else committed first -- try the next candidate

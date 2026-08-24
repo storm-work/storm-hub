@@ -27,10 +27,13 @@ robust.
 """
 from __future__ import annotations
 
+from libs.domain.enums import NOT_BOOKABLE_PREFIX
+
 import json
 import random
 import re
 import time
+from urllib.parse import urlencode
 from datetime import date
 
 from libs.bus.breaker import RedisBreaker
@@ -105,6 +108,56 @@ _BOUNCE_KEYWORDS = ("questionario", "getslots", "captchadiv", "authentication.js
 # Schedule.jsp means ScheduleController was silently rejected and there is no form state to book
 # against -- see _run_warmup_steps.
 _SCHED_PAGE_MARKERS = ("getSlots", "captchaDiv", "SubmeterVistoCriaPDF", "f_date_c", "cmbPeriodo")
+# The portal's own "come back later" page. It is served in either language and is NOT about the
+# slot, the session or the network -- the portal simply declined to process the request.
+#
+# CONFIRMED 2026-08-23 by size correlation across three different endpoints in one run:
+#   28527B  the login auth-redirect, carrying this exact text
+#   28506B  a Schedule.jsp GET ("200 but no scheduling markers")
+#   28529B  a SubmeterVistoCriaPDF submit response (final_url WAS the submit endpoint)
+# The same refusal page answers login attempts and booking submits alike.
+_PORTAL_BUSY_MARKERS = (
+    "não foi possível de momento concretizar o seu pedido",
+    "nao foi possivel de momento concretizar o seu pedido",
+    "we were unable to complete your request at this time",
+)
+
+
+# The portal's permanent refusal: this applicant already holds a future appointment.
+_ALREADY_BOOKED_MARKERS = (
+    "already has an application registered",
+    "already has an application",
+    "já tem um pedido registado",
+    "ja tem um pedido registado",
+)
+
+
+def _classify_gettime_page(html: str) -> str:
+    """Name the page gettime answered with, so a rejection is actionable rather than a mystery."""
+    if _is_challenge_body(html):
+        return "waf_challenge"
+    if _is_portal_busy(html):
+        return "portal_try_again_later"
+    low = (html or "").lower()
+    if "authentication.jsp" in low or "/vistosonline/login" in low:   # quote-agnostic
+        return "auth_redirect"
+    return "unrecognised"
+
+
+def _is_portal_busy(html: str) -> bool:
+    """True when the portal answered with its generic 'try again later' refusal."""
+    low = (html or "").lower()
+    return any(m in low for m in _PORTAL_BUSY_MARKERS)
+# Fingerprints of an interstitial served INSTEAD of the page we asked for. bd.js is DataDome's
+# loader; the noindex/nofollow meta plus an empty styled body is its challenge shell.
+_CHALLENGE_MARKERS = ("/ch/bd.js", "captcha-delivery", "datadome",
+                      'name="robots" content="noindex,nofollow"')
+
+
+def _is_challenge_body(html: str) -> bool:
+    """True when a response is a bot-challenge interstitial rather than the requested page."""
+    low = (html or "").lower()
+    return any(m.lower() in low for m in _CHALLENGE_MARKERS)
 _HOME_MARKERS = ("solicitar pedido de visto", "consultar pedidos")
 _SCHEDULE_MARKERS = ("getperiodosocupados", "cmbperiodo", "getslots")
 
@@ -460,6 +513,58 @@ class LiveEngineOps(EngineOps):
         self.session = None
         return False
 
+    def _schedule_state_ok(self) -> bool:
+        """Is the booking anchor still live? One GET, no rebuild.
+
+        The cheap gate in front of do_apply's round-start re-warm, mirroring storm-auto's poll
+        cycle. Returns True only when Schedule.jsp actually carries the scheduling markers, so a
+        False here means "genuinely stale, rebuild it" rather than "we did not look".
+
+        Bails out (False) rather than retrying on a bot challenge or an auth redirect: neither is
+        something a re-warm on this session can fix, and the caller's ladder handles both. The
+        partial-render retry in between is storm-auto's: under load the portal answers 200 with the
+        form not yet AJAX-populated, and a refresh -- "a manual reload" -- fixes it far more cheaply
+        than a full questionnaire chain.
+        """
+        # The typed field, not cfg.raw: EngineConfig already parses this (and did so for months
+        # without anything consuming it).
+        self._portal_busy_seen = False
+        for attempt in range(1 + max(0, int(self.cfg.login.partial_render_retries))):
+            try:
+                final_url = self.session.browser_nav(
+                    SCHED_JSP + "?posto_id=" + str(self.posto_pdf or self.posto_id), timeout=30)
+                html = self.session.browser_eval("document.documentElement.outerHTML") or ""
+            except Exception as e:
+                self._log(f"schedule-state probe failed: {str(e)[:120]}")
+                return False
+            if _is_challenge_body(html):
+                self._log("schedule-state: bot challenge on Schedule.jsp -- session cannot POST")
+                return False
+            if _is_portal_busy(html):
+                # NOT a stale form. The portal is declining to serve this session right now, and it
+                # declines everything: CONFIRMED live 2026-08-23 on Test 2032 (AMILCAR LOPES) --
+                # the submit was refused with the 28531B "try again later" page, then Schedule.jsp
+                # returned the same page (28508B) four times, which read as "200 but no scheduling
+                # markers" and escalated into a full questionnaire re-warm. Every quest step was
+                # refused too ("quest_state_stale"), so the ladder went on to burn a full re-login.
+                #
+                # Rebuilding into a portal that is refusing everything cannot succeed, and the
+                # re-login costs a CAPTCHA solve and sub-account budget. Flag it so do_apply backs
+                # off and keeps the session instead.
+                self._portal_busy_seen = True
+                self._log("schedule-state: the portal is declining requests right now "
+                          f"({len(html)}B 'try again later') -- backing off, NOT rebuilding")
+                return False
+            if "Authentication.jsp" in (final_url or "") or "Authentication.jsp" in html:
+                self._log("schedule-state: redirected to auth -- session is dead")
+                return False
+            if any(m in html for m in _SCHED_PAGE_MARKERS):
+                return True
+            self._log(f"schedule-state: 200 but no scheduling markers (len={len(html)}) "
+                      f"-- refresh-retry (partial render under load)")
+            time.sleep(1.5)
+        return False
+
     def _probe_alive(self) -> bool:
         """Three-way alive check, mirrored from storm-auto's confirmed session_store.probe_session
         logic but via a real browser nav (no primp path exists in this architecture)."""
@@ -731,6 +836,17 @@ class LiveEngineOps(EngineOps):
         self._health.observe_failure(kind)
         self._log(f"{phase} failed [{kind}] after {seconds:.0f}s: {error[:140]}")
 
+        if kind == "unreachable":
+            # The request never landed, so nothing about THIS exit is going to work: re-warming and
+            # re-logging in over a dead tunnel just spends time, and eventually a CAPTCHA solve and
+            # a slice of the sub-account budget, to fail identically. Rotate the exit first and let
+            # the ladder's next attempt run on a live one. Best-effort -- if the Hub has nothing
+            # free, the ladder proceeds exactly as before.
+            new_proxy = self._request_proxy_rotation(self._current_phase)
+            if new_proxy:
+                self.warm_proxy = new_proxy
+                self._log(f"portal: {phase} unreachable -- rotated to a fresh exit before retrying")
+
         if kind == "slow" and self._health.is_degraded():
             # Not this worker's bad luck any more -- the window is degraded.
             if self._breaker is not None:
@@ -776,14 +892,32 @@ class LiveEngineOps(EngineOps):
                     if attempt == _QUEST_STEP_RETRIES:
                         raise RuntimeError(f"home-lang POST failed: {e}") from e
                     time.sleep(1.5)
+            # Same pacing before the Questionario nav: storm-auto paces the whole early burst
+            # (HOME -> lang POST -> Questionario), not just the steps.
+            _gap0 = max(0.0, float(self.cfg.raw.get("QUEST_STEP_GAP", 1.0)))
+            if _gap0 > 0:
+                time.sleep(_gap0 * random.uniform(0.7, 1.3))
             self.session.browser_nav(QUEST_URL, timeout=35, skip_cookie_sync=True)
 
             quest_key = self.residence if self.residence != self.nationality else self.nationality
             steps = self.quest_steps.get(quest_key, [])
             last_fields: dict = {}
+            # storm-auto merges these into EVERY quest step (`base_qs`); we sent only the step's own
+            # keys. Matching the confirmed path rather than guessing which of its parameters the
+            # portal actually needs -- it is the reference implementation precisely because it works.
+            base_qs = {"lang": "PT", "nacionalidade": self.nationality}
+            gap = max(0.0, float(self.cfg.raw.get("QUEST_STEP_GAP", 1.0)))
             for i, step in enumerate(steps):
                 is_last = i == len(steps) - 1
-                params = "&".join(f"{k}={v}" for k, v in step.items())
+                # PACE into each step (±30% jitter). storm-auto added this knob for exactly the
+                # failure we are seeing: "the quest-step-1 403s were observed clustering on exactly
+                # this post-login burst". Seven fetches fired back-to-back in well under a second is
+                # not a pattern a human produces, and it is the one place the burst happens.
+                if gap > 0:
+                    time.sleep(gap * random.uniform(0.7, 1.3))
+                # urlencode, not manual "&".join: an unencoded value containing a space, & or =
+                # silently corrupts the query string. storm-auto uses urlencode here.
+                params = urlencode({**base_qs, **step})
                 url = f"{QUEST_NEXT}?{params}"
                 js = (
                     "(async()=>{const r=await fetch(%r,{method:'GET',credentials:'include',"
@@ -822,6 +956,13 @@ class LiveEngineOps(EngineOps):
                         break
                     self._log(f"quest step {i+1}/{len(steps)} attempt {attempt}/"
                               f"{_QUEST_STEP_RETRIES} non-200: {res}")
+                    # storm-auto sleeps 1.5s here ("retrying -- like a manual page refresh"). We
+                    # slept only on the EXCEPTION path, so a non-200 burned all three attempts in
+                    # the same second -- visible in the live log: step 5 attempts 1 and 2 both at
+                    # 18:41:53, step 6 attempts 1-3 across 18:41:54-56. Against a rate limiter or a
+                    # WAF that is worse than not retrying at all: three hits where one would do.
+                    if attempt < _QUEST_STEP_RETRIES:
+                        time.sleep(1.5)
                 if is_last and isinstance(res, dict):
                     last_fields = res.get("fields") or {}
                     if not last_fields:
@@ -887,6 +1028,26 @@ class LiveEngineOps(EngineOps):
             if isinstance(sc, dict):
                 self._log(f"ScheduleController -> status={sc.get('status')} "
                           f"url={str(sc.get('url'))[:90]} len={sc_len}")
+            # Inspect ScheduleController's OWN response before trusting anything downstream.
+            #
+            # The marker check below validates the warm-up by NAVIGATING Schedule.jsp -- a GET --
+            # while the thing that actually has to succeed is this POST. Those come apart under the
+            # WAF pattern we see constantly: GETs render fine, POSTs get challenged. When that
+            # happens Schedule.jsp still returns a page carrying the scheduling markers, the guard
+            # passes, and the warm-up reports success on a session that cannot POST at all.
+            #
+            # Confirmed live 2026-08-22, worker SOFIA FILOMENA COSTA (Test 2032). It self-discovered
+            # a real slot (2026-08-28 period 3), then:
+            #   21:37:10  ScheduleController -> status=200 len=44699   <- the DataDome challenge page
+            #   (no "NOT warmed" -- Schedule.jsp still had markers, so the guard passed)
+            #   21:37:31  do_apply: submit response is a Chrome network-error page
+            # The 44699-byte body was captured here in sc_body, its length was LOGGED, and it was
+            # then discarded because the GET that followed looked healthy. 44699 is unmistakable --
+            # the same body appears 43 times as "quest step 7/7 returned NO input fields".
+            if _is_challenge_body(sc_body):
+                self._log(f"do_warmup: ScheduleController was answered with a bot challenge "
+                          f"({sc_len}B) -- the session cannot POST; NOT warmed")
+                return False
             # THE guard this file was missing, and the root cause of "applying doesn't work".
             # storm-auto: "ScheduleController POST can return 200 yet the server silently fails to
             # set up form state, causing Schedule.jsp to redirect to authenticated_index. Absence
@@ -918,6 +1079,23 @@ class LiveEngineOps(EngineOps):
                 if errs:
                     self._log("do_warmup: ScheduleController validation errors: "
                               + " | ".join(e[:120] for e in errs))
+                    # The portal saying this applicant ALREADY HOLDS a future appointment is not a
+                    # transient rejection -- it is permanent for as long as that appointment stands,
+                    # and it means our own records are wrong. Confirmed 2026-08-23 on Test 2032:
+                    # CLAUDIA BORGES and SOFIA RODRIGUES ANDRADE both hit it while still marked
+                    # status=active with no BookedAppointment row, so they were re-attached run
+                    # after run, each time consuming a worker slot, a proxy lease and a login --
+                    # the scarcest resource we have -- to fail identically.
+                    #
+                    # Report it so the Hub can retire the identity. The booking itself is NOT ours
+                    # to record (we do not know its date, and inventing one is worse than missing
+                    # one), so this marks the identity and nothing else.
+                    joined = " | ".join(errs).lower()
+                    if any(m in joined for m in _ALREADY_BOOKED_MARKERS):
+                        self._log("do_warmup: the portal says this applicant ALREADY HAS a future "
+                                  "appointment -- reporting it so the identity stops being reused")
+                        if self._emit is not None:
+                            self._emit("already_booked", detail=" | ".join(e[:200] for e in errs))
                 else:
                     # No recognisable error markup: record enough of the body to identify the page,
                     # so "rejected with no errors found" is still actionable rather than a dead end.
@@ -933,6 +1111,7 @@ class LiveEngineOps(EngineOps):
             if self.posto_pdf != self.posto_id:
                 self._log(f"do_warmup: posto_pdf={self.posto_pdf} differs from posto_id={self.posto_id}")
             self._note_portal("warmup", time.time() - _t0, ok=True)
+            self._note_exit_ip("warmed")
             return True
         except Exception as e:
             self._note_portal("warmup", time.time() - _t0, ok=False, error=str(e))
@@ -1092,6 +1271,9 @@ class LiveEngineOps(EngineOps):
         jitter = max(0.0, float(self.cfg.keepalive.jitter))
         return interval + random.uniform(0, jitter)
 
+    def _slot_open_seen(self) -> bool:
+        return self._signals is not None and getattr(self._signals, "slot_open_seen", False)
+
     def _slot_found_seen(self) -> bool:
         return self._signals is not None and getattr(self._signals, "slot_found_seen", False)
 
@@ -1101,9 +1283,58 @@ class LiveEngineOps(EngineOps):
         happened -- see _run_apply."""
         return self._slot_found_seen()
 
+    def _note_exit_ip(self, when: str) -> None:
+        """Record the exit address this session is presenting, and say so if it MOVED.
+
+        The portal binds a session to the IP that established it, and our exits rotate underneath us
+        (sessionlength 3600s, idlettl 900s, plus residential IPs simply going offline). MEASURED
+        2026-08-23: half of all warmed workers later died on the network. Until now nothing observed
+        its own exit, so a rotation surfaced as "form-state lapsed", "the portal is declining", or
+        "Por favor, confirma o reCAPTCHA" -- three different portal diagnoses for one event, each
+        answered by re-warming or re-logging in FROM THE NEW IP, which is why they so rarely worked.
+
+        Observation only. It changes no decision yet; it makes the fact available to the ladder and
+        to the operator, which is the precondition for acting on it.
+        """
+        try:
+            from libs.proxies.exit_ip import exit_changed, observe_exit_ip
+            ip = observe_exit_ip(self.warm_proxy) if self.warm_proxy else None
+        except Exception:
+            return
+        if ip is None:
+            return          # unknown, NEVER treated as changed -- see exit_changed's docstring
+        prev = getattr(self, "_exit_ip", None)
+        if exit_changed(prev, ip):
+            self._log(f"exit IP CHANGED under this session ({prev} -> {ip}) at {when} -- the portal "
+                      f"binds sessions to the establishing IP, so anything that fails from here is "
+                      f"our address moving, not the portal rejecting us")
+            if self._emit is not None:
+                self._emit("exit_ip_changed", before=prev, after=ip, at=when)
+        elif prev is None:
+            self._log(f"exit IP {ip} ({when})")
+        self._exit_ip = ip
+
+    def _mark_hold_bookable(self, bookable: bool, why: str = "") -> None:
+        """Publish whether this HOLDING worker can actually take a slot.
+
+        Emits the same `status_change` event the PhaseMachine's on_transition emits, so it flows
+        through the existing events.py -> Worker.substate/substate_detail path with no new plumbing.
+        The substate stays HOLDING (a holding -> holding transition is legal, and the worker really
+        is still holding -- authenticated, keepalive-ing, recoverable in place); only the DETAIL
+        changes, carrying apps/hub/scheduler.py's NOT_BOOKABLE_PREFIX marker that _assign_slots
+        filters on. Same machine-readable-prefix convention as LAUNCH_FAILED_PREFIX.
+        """
+        if self._emit is None:
+            return
+        detail = f"{NOT_BOOKABLE_PREFIX} {why}" if not bookable else ""
+        self._emit("status_change", substate="holding", detail=detail)
+
     def _do_keepalive(self, context: str) -> None:
         if self.cfg.keepalive.off:
             return
+        # Cheap (raw HTTP, no browser) and it runs before the probe, so a session whose exit moved
+        # says so BEFORE we start attributing the resulting failures to the portal.
+        self._note_exit_ip(f"keepalive/{context}")
         if self.session is None:
             # A prior restore attempt failed outright. Confirmed gap: the original version simply
             # stopped probing forever once this happened (`session is None` short-circuited every
@@ -1139,11 +1370,24 @@ class LiveEngineOps(EngineOps):
                     self._log(f"keepalive: form-state lapsed ({len(page)}B, no scheduling markers) "
                               f"-- re-warming in place ({context})")
                     if self._run_warmup_steps():
+                        self._rewarm_fail_streak = 0
                         self._log(f"keepalive: re-warm restored the schedule form ({context})")
+                        # Clear the not-bookable marker: this worker can take a slot again.
+                        self._mark_hold_bookable(True)
                     else:
-                        # Leave it to the phase machine's ladder rather than escalating here: this
-                        # is a keepalive, and a login is not its decision to make.
-                        self._log(f"keepalive: re-warm failed -- still holding ({context})")
+                        # Still no re-login here: before slot-found the login wall is the scarce
+                        # resource, and a lapsed FORM anchor is not a dead auth session (the LOOSE
+                        # HOLD rule below). That part was always right. What was wrong is that the
+                        # failure was recorded ONLY as a log line -- no substate, no detail, no
+                        # counter -- so the worker kept reporting a bare `holding`, the Hub counted
+                        # it as ready capacity, and it bounced the first slot it was handed.
+                        # Confirmed live 2026-08-21: 110 such failures against 42 recoveries.
+                        self._rewarm_fail_streak = getattr(self, "_rewarm_fail_streak", 0) + 1
+                        self._log(f"keepalive: re-warm failed -- holding but NOT BOOKABLE "
+                                  f"(streak={self._rewarm_fail_streak}, {context})")
+                        self._mark_hold_bookable(
+                            False, f"form-state lapsed, re-warm failed x{self._rewarm_fail_streak}")
+                        self._maybe_escalate_stuck_rewarm(context)
                     return
             if self._emit is not None:
                 self._emit("log_line", text=f"keepalive: probe OK ({context})")
@@ -1170,10 +1414,65 @@ class LiveEngineOps(EngineOps):
                 else:
                     self._attempt_keepalive_restore(context)
 
-    def _attempt_keepalive_restore(self, context: str = "") -> None:
-        """The session looks dead -- try the same checkpoint-restore-then-fresh-login chain a fresh
+    def _maybe_escalate_stuck_rewarm(self, context: str) -> None:
+        """A re-warm that keeps failing is not a lapsed form -- rebuild the session instead.
+
+        CONFIRMED LIVE 2026-08-22 (SOFIA FILOMENA COSTA on Test 2032). The worker held a perfectly
+        healthy AUTH session -- its keepalive nav returned a full 28,505-byte page every cycle -- but
+        every questionnaire POST came back 403 (a pt-pt block page, and once a 200 with an opaque
+        encoded body: the WAF challenging POSTs while letting GETs through). The exit IP was flagged,
+        not the session.
+
+        That state could not recover, because the two ladders each declined to act:
+          - the dead-session ladder never fired: browser_nav SUCCEEDS, so _keepalive_dead_streak
+            stayed 0 and the dead-trip never tripped. The session does not look dead because it
+            is not dead.
+          - the re-warm ladder marked NOT BOOKABLE and returned, by design.
+        So it looped lapse -> re-warm -> 403 -> mark -> wait, reaching streak 7 and climbing, on the
+        same proxy that was blocked the whole time. Re-warming cannot clear an IP-level block.
+
+        The remedy is the one the dead-session path already owns: drop the browser and rebuild
+        through a fresh login, which rotates the proxy on the way. Gated on slot_found because
+        before that the LOOSE HOLD rule applies -- a re-login costs a CAPTCHA solve and a slice of
+        the sub-account budget, and pre-slot-found there is nothing to book that would justify it.
+        Bounded by _MAX_KEEPALIVE_RESTORE_ATTEMPTS, so this cannot become a new unbounded loop.
+        """
+        after = max(1, int(self.cfg.raw.get("REWARM_ESCALATE_AFTER", 3)))
+        if self._rewarm_fail_streak < after:
+            return
+        # DEADLOCK, confirmed live 2026-08-23. Gating on slot_found is right for the SPLIT model,
+        # where an idle applier waits and scouts do the discovering. Under MONO_BOOKING the apply
+        # worker IS the discoverer, so the gate becomes circular: its form-state is lapsed -> it
+        # cannot discover -> no slots are found -> slot_found never fires -> escalation is refused
+        # forever. Four workers sat at "re-warm failed x7" for over an hour, displayed as `holding`,
+        # while the booking had nothing else that could ever find a slot.
+        #
+        # Once slot_OPEN has fired in mono mode there is real work to do and a rebuild is justified;
+        # the LOOSE HOLD rule still applies before that, and still applies throughout in split mode.
+        mono = bool(self.cfg.raw.get("MONO_BOOKING", False))
+        gate_open = self._slot_found_seen() or (mono and self._slot_open_seen())
+        if not gate_open:
+            self._log(f"keepalive: {self._rewarm_fail_streak} failed re-warms, but this booking has "
+                      f"not opened yet -- holding rather than burning a re-login ({context})")
+            return
+        self._log(f"keepalive: {self._rewarm_fail_streak} consecutive re-warm failures -- the form "
+                  f"is not the problem; rebuilding the session on a fresh proxy ({context})")
+        self._rewarm_fail_streak = 0          # the ladder owns it now; don't re-escalate every tick
+        # posto_pdf still holds the value from the warm-up that has since lapsed. Clearing it is what
+        # makes _attempt_keepalive_restore re-warm rather than stop at re-authenticating -- its
+        # `if ok and self.posto_pdf is None` guard exists for a launch-time restore, where a set
+        # posto_pdf really does mean the anchor is good. Here it means the opposite.
+        self.posto_pdf = None
+        if self._attempt_keepalive_restore(context) and self.posto_pdf is not None:
+            self._mark_hold_bookable(True)
+
+    def _attempt_keepalive_restore(self, context: str = "") -> bool:
+        """Returns whether the session came back. The session looks dead -- try the same checkpoint-restore-then-fresh-login chain a fresh
         launch uses, rather than silently sitting on a dead session until the next real signal
         arrives and do_apply/do_discover fails outright."""
+        # getattr, not attribute access: this counter is created lazily on first use.
+        if getattr(self, "_keepalive_restore_attempts", 0) >= _MAX_KEEPALIVE_RESTORE_ATTEMPTS:
+            return False        # bounded: never let escalation become its own unbounded loop
         self._keepalive_restore_attempts = getattr(self, "_keepalive_restore_attempts", 0) + 1
         if self._emit is not None:
             self._emit("log_line", text=f"keepalive: attempting restore "
@@ -1192,6 +1491,7 @@ class LiveEngineOps(EngineOps):
             self._keepalive_restore_attempts = 0
         if self._emit is not None:
             self._emit("log_line", text=f"keepalive: restore {'succeeded' if ok else 'FAILED'}")
+        return bool(ok)
 
     def do_discover(self, dates: list[str]) -> list[dict]:
         """Bug fix #6: 3-way per-date outcome (found/empty/failed). Uses gettime + real-browser-nav
@@ -1216,7 +1516,24 @@ class LiveEngineOps(EngineOps):
                 self._log(f"do_discover: gettime nav failed ({e}) -- all requested dates FAILED, not empty")
                 return [{"date": d, "outcome": "failed"} for d in dates]
 
-            if classify_gettime_body(gettime_body) != GettimeStatus.OK:
+            gt_status = classify_gettime_body(gettime_body)
+            if gt_status != GettimeStatus.OK:
+                # SAY WHY. This was a bare `return` -- no log, no emit, no reason -- and it is the
+                # single most misleading silence in the engine. CONFIRMED live 2026-08-23 on
+                # "Test 2032 (copy)": a worker flipped discovering -> holding fifteen times in seven
+                # minutes, 5-12s per cycle, emitting NOTHING. The dashboard showed a worker busily
+                # discovering; it had in fact scanned zero dates every single time, because gettime
+                # kept answering with a body this classifier rejects (WAF challenge or the portal's
+                # "try again later" page, the same two pages refusing everything else).
+                #
+                # The operator's read was "discovery works but the session can't do it" -- exactly
+                # right, and there was no way to see that from any log.
+                why = _classify_gettime_page(gettime_body)
+                self._log(f"do_discover: gettime returned {gt_status} ({why}, {len(gettime_body)}B) "
+                          f"-- scanned NOTHING; all {len(dates)} date(s) reported failed, not empty")
+                if self._emit is not None:
+                    self._emit("portal_health", phase="discover", kind=why,
+                               seconds=0.0, **self._health.snapshot())
                 return [{"date": d, "outcome": "failed"} for d in dates]
             special_days = parse_special_days(gettime_body)
             if self._emit is not None:
@@ -1338,7 +1655,31 @@ class LiveEngineOps(EngineOps):
             if self._breaker is not None and self._breaker.is_tripped():
                 return "bounced"
 
-            if not self._run_warmup_steps():
+            # LAZY re-warm, matching storm-auto's confirmed poll cycle: "check alive -> lazy
+            # re-warm if form state expired". We re-warmed UNCONDITIONALLY on every apply round --
+            # the full 7-step questionnaire + Formulario + ScheduleController chain before every
+            # single submit.
+            #
+            # That is the most expensive and most exposed thing we can do at the exact moment we
+            # should be fastest. Measured on this run: 8 apply rounds, 0 booked, and FIVE of the
+            # eight died inside that round-start re-warm ("session problem, not the slot") -- not at
+            # the submit. Every one of those chains is ~10 more portal requests, each a fresh chance
+            # to be 403'd or challenged, to rebuild an anchor that was very often still perfectly
+            # good. storm-auto instead does ONE Schedule.jsp GET and only re-warms if the markers
+            # are actually gone.
+            # ONE probe per round -- it is a real portal nav, so calling it twice would double the
+            # request count and could even answer differently the second time.
+            state_ok = self._schedule_state_ok()
+            if not state_ok and self._portal_busy_seen:
+                # The portal is refusing this session's requests. Hand the slot back with no
+                # penalty and keep the session -- a re-warm here is guaranteed to fail and the
+                # re-login it escalates to costs a CAPTCHA solve we cannot spare.
+                self._log("do_apply: portal is declining requests -- holding this session rather "
+                          "than rebuilding into a wall")
+                if self._breaker is not None:
+                    self._breaker.record_portal_down()
+                return "portal_unreachable"
+            if not state_ok and not self._run_warmup_steps():
                 # NOT "bounced". This is OUR session failing before we ever spoke to the portal
                 # about this slot, and calling it a bounce blames the slot for our dead proxy:
                 # the lease is released WITH a penalty, that penalty feeds the Hub's false-slot
@@ -1397,6 +1738,24 @@ class LiveEngineOps(EngineOps):
                 # tear down a demonstrably healthy login: confirmed live 2026-08-18, one dropped
                 # submit POST cost a full re-login and ~10 MINUTES back to bookable, three times
                 # over, while the run's real constraint is how rarely a login succeeds at all.
+                return "portal_unreachable"
+
+            # The portal declining to process the request is not the slot's fault. Without this it
+            # classified as a bare "error" -- no confirmation marker, no bounce marker -- and
+            # "error" falls through to the BOUNCE path in phases._run_apply: the slot is charged,
+            # bounce_streak climbs toward parking the worker, and the volume feeds the Hub's
+            # false-slot revert, which would retire the 16 genuinely-available slots this run
+            # discovered. Same misattribution already fixed for a dead tunnel and a dead session;
+            # this is the third sibling.
+            #
+            # Reuses the portal_unreachable outcome deliberately: its handling is exactly right
+            # (release the slot with no penalty, keep the session, retry) even though the request
+            # did technically arrive. The log below says what actually happened.
+            if _is_portal_busy(html):
+                self._log(f"do_apply: portal declined the request -- its 'try again later' page "
+                          f"({len(html or '')}B), NOT a problem with this slot | slot={slot}")
+                if self._breaker is not None:
+                    self._breaker.record_portal_down()
                 return "portal_unreachable"
 
             outcome = self._classify_submit_response(html, _final_url)

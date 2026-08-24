@@ -49,7 +49,13 @@ def seed_templates(db: Session) -> list[str]:
     apply = M.WorkerTemplate(
         name="Default Apply", role=WorkerRole.APPLY,
         settings_json={"ROLE": "apply", "NAV_TIMEOUT_SCALE": 4, "LOGIN_FIELD_RETRIES": 4,
-                       "KEEPALIVE_NO_RESTORE": True, "STICKY_RETRY_MAX": 3},
+                       # No STICKY_RETRY_MAX here: the catalog default is 2, and pinning 3 in the
+                       # template silently overrode it. Reduced to 2 (operator, 2026-08-21) because
+                       # every failed login attempt spends a CAPTCHA the portal counts against us --
+                       # it warns it blocks access after repeated reCAPTCHA failures, and the
+                       # 2026-08-21 07:29 run watched captcha rejections turn into outright
+                       # "Nao foi possivel ... tente mais tarde" throttling within six minutes.
+                       "KEEPALIVE_NO_RESTORE": True},
     )
     db.add_all([scout, apply])
     db.commit()
