@@ -1732,12 +1732,29 @@ class LiveEngineOps(EngineOps):
         storm-auto's actual proven submit code (see libs/engine/payload.py's module docstring) --
         NOT the full form_defaults merge, which is only correct for the earlier ScheduleController
         warmup POST. Bug fix #4: PDF via submit_form_binary (page.route() interception)."""
+        # NEITHER of these early exits is the slot's fault, and calling them "bounced" charges it:
+        # the lease is released WITH a penalty, the worker's bounce_streak climbs toward parking,
+        # and the volume convinces the Hub's false-slot revert that a real pool is phantom.
+        #
+        # CONFIRMED live 2026-08-24 on Test 2032: 13 applying transitions produced exactly ONE
+        # submit, and the other 12 returned here. All 12 were recorded as bounces, and all 17
+        # genuinely-available slots were duly closed. The breaker was tripped the whole time --
+        # which is the fleet-wide signal that THE PORTAL is refusing everyone, the strongest
+        # possible evidence that the slot is fine.
+        #
+        # portal_unreachable is the existing outcome for exactly this: hand the slot back with no
+        # penalty, keep the session, retry later. Fourth instance of this misattribution class
+        # (dead tunnel, dead session, refusing portal, and now our own gates).
         if self._apply_sem is not None:
             if not self._apply_sem.acquire(self.identity_id, timeout=60):
-                return "bounced"
+                self._log("do_apply: apply concurrency gate timed out -- OUR contention, not the "
+                          "slot; handing it back unpenalised")
+                return "portal_unreachable"
         try:
             if self._breaker is not None and self._breaker.is_tripped():
-                return "bounced"
+                self._log("do_apply: booking breaker is tripped -- the PORTAL is refusing the whole "
+                          "fleet, so this slot is not at fault; handing it back unpenalised")
+                return "portal_unreachable"
 
             # LAZY re-warm, matching storm-auto's confirmed poll cycle: "check alive -> lazy
             # re-warm if form state expired". We re-warmed UNCONDITIONALLY on every apply round --

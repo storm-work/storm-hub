@@ -2091,3 +2091,31 @@ def test_the_navigation_path_is_still_there_as_a_fallback():
     ops.session = _S()
     ops.do_apply({"date": "2026-09-23", "period": 5})
     assert used.get("nav") is True
+
+
+# ── our own gates must not be charged to the slot (2026-08-24) ──────────────
+def test_a_tripped_breaker_does_not_bounce_the_slot():
+    """CONFIRMED live on Test 2032: 13 applying transitions produced ONE submit; the other 12
+    returned at the breaker check and were all recorded as bounces, and all 17 genuinely-available
+    slots were closed by the false-slot revert. A tripped breaker is the fleet-wide signal that the
+    PORTAL is refusing everyone -- the strongest possible evidence the slot is fine."""
+    class _B:
+        def is_tripped(self): return True
+        def record_portal_down(self): pass
+        def record_success(self): pass
+
+    ops = _make_ops(emit=lambda t, **p: None)
+    ops._log = lambda *a, **k: None
+    ops._breaker = _B()
+    assert ops.do_apply({"date": "2026-08-28", "period": 3}) == "portal_unreachable"
+
+
+def test_a_full_concurrency_gate_does_not_bounce_the_slot():
+    """OUR contention, not the slot's fault."""
+    class _Sem:
+        def acquire(self, key, timeout=60): return False
+
+    ops = _make_ops(emit=lambda t, **p: None)
+    ops._log = lambda *a, **k: None
+    ops._apply_sem = _Sem()
+    assert ops.do_apply({"date": "2026-08-28", "period": 3}) == "portal_unreachable"
