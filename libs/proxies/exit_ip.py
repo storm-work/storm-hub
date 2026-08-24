@@ -37,6 +37,11 @@ _ECHO_URLS = (
 
 _MAX_IP_LEN = 45          # an IPv6 address in full form
 
+# Exported so callers that already hold a browser session can navigate to it themselves rather than
+# opening a second, raw connection through the same exit -- see ops_live._note_exit_ip for why that
+# distinction matters.
+IP_ECHO_URL = _ECHO_URLS[0]
+
 
 def observe_exit_ip(conn_url: str, timeout: float = 8.0) -> str | None:
     """The exit address this proxy is currently presenting, or None if it could not be determined.

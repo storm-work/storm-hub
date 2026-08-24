@@ -674,6 +674,9 @@ class LiveEngineOps(EngineOps):
                 self._close_session_quietly()
                 self.session = get_session(proxy=self.warm_proxy, headless=self.headless,
                                            fp_seed=self.account.get("username"))
+                # Baseline the exit before the CAPTCHA is solved, so a rejection can be attributed
+                # (or not) to the address moving underneath the solve.
+                self._note_exit_ip("before login attempt")
                 # No min_score: the parameter is gone. It gated the pre-solved token and forced
                 # race_all down its "wait for a good-enough score" path, which is what produced the
                 # 180s solver stalls -- to chase a score our tokens essentially never reach and that
@@ -743,6 +746,13 @@ class LiveEngineOps(EngineOps):
             # Stop early and let the caller rotate to another sub-account: a rotation is cheap, a
             # blocked account is permanent.
             if _is_recaptcha_verdict(reason):
+                # "Por favor, confirma o reCAPTCHA" is the TOKEN/IP MISMATCH signature: the token was
+                # minted against one exit and submitted from another, so the portal cannot verify it.
+                # Check the exit NOW, while the failed session is still open -- if it moved across
+                # the ~6s solve window, that is the cause and no amount of retrying fixes it. This is
+                # the one place the observation actually settles a live question, and until now it
+                # only ran at warm-up and keepalive, which almost no worker reaches.
+                self._note_exit_ip("after reCAPTCHA rejection")
                 captcha_fails += 1
                 if captcha_fails >= captcha_budget:
                     self._log(f"login: {captcha_fails} reCAPTCHA rejection(s) on "
@@ -1349,11 +1359,32 @@ class LiveEngineOps(EngineOps):
         Observation only. It changes no decision yet; it makes the fact available to the ladder and
         to the operator, which is the precondition for acting on it.
         """
+        # OBSERVE THROUGH THE BROWSER when a session exists, never with a raw client.
+        #
+        # A raw probe is not free: measured 2026-08-24, a primp request to the PORTAL flags the exit
+        # with DataDome and the browser nav that follows on the same sticky session then fails
+        # (browser-only 5/6 ok, primp-then-browser 0/6). This asks api.ipify.org rather than the
+        # portal, so it should not touch DataDome at all -- but "should not" is exactly the
+        # reasoning that produced that bug, so when a browser is already open we use it and take no
+        # chances. primp remains the fallback only when there is no session to borrow.
         try:
-            from libs.proxies.exit_ip import exit_changed, observe_exit_ip
-            ip = observe_exit_ip(self.warm_proxy) if self.warm_proxy else None
+            from libs.proxies.exit_ip import IP_ECHO_URL, exit_changed, observe_exit_ip
         except Exception:
             return
+        ip = None
+        if self.session is not None:
+            try:
+                self.session.browser_nav(IP_ECHO_URL, timeout=15)
+                body = (self.session.browser_eval("document.body.innerText") or "").strip()
+                if body and len(body) <= 45 and " " not in body and "<" not in body:
+                    ip = body
+            except Exception:
+                ip = None
+        if ip is None and self.warm_proxy:
+            try:
+                ip = observe_exit_ip(self.warm_proxy)
+            except Exception:
+                return
         if ip is None:
             return          # unknown, NEVER treated as changed -- see exit_changed's docstring
         prev = getattr(self, "_exit_ip", None)
