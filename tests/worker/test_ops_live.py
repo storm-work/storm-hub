@@ -1960,3 +1960,67 @@ def test_a_bounce_to_the_schedule_page_is_still_no_slot():
             "<select name='cmbPeriodo'></select> getPeriodosOcupados</body></html>")
     assert LiveEngineOps._classify_submit_response(
         html, "https://x/VistosOnline/SubmeterVistoCriaPDF") == "no_slot"
+
+
+# ── the submit falls back to a direct POST (2026-08-24) ─────────────────────
+class _BrowserErrorThenPrimpOK:
+    """browser_form_post lands on chrome-error; the direct POST succeeds."""
+    def __init__(self, fallback_html):
+        self._fb = fallback_html
+        self.posted = []
+
+    def browser_form_post(self, url, data, timeout=100):
+        return "chrome-error://chromewebdata/", "<html>" + "x" * 200000 + "</html>"
+
+    def post(self, url, data=None, headers=None, params=None, timeout=30, **kw):
+        self.posted.append(url)
+
+        class _R:
+            status_code = 200
+            text = self._fb if False else None
+        r = _R(); r.text = self._fb; r.url = url
+        return r
+
+    def browser_nav(self, *a, **k): return "u"
+    def browser_eval(self, *a, **k): return ""
+
+
+def test_a_chrome_error_submit_falls_back_to_a_direct_post():
+    """storm-auto EXPECTS the browser submit to land on blank/DataDome/chrome-error and retries
+    directly ("a real navigation is trusted; fall back to primp POST if blocked"). storm-hub treated
+    that page as terminal, which is why the same session logged in, warmed and discovered fine and
+    then 'failed' only at the submit -- 100% of submits, on a healthy proxy."""
+    ops = _make_ops(emit=lambda t, **p: None)
+    ops._log = lambda *a, **k: None
+    ops.posto_pdf = "2032"
+    ops._schedule_state_ok = lambda: True
+    ops._run_warmup_steps = lambda: True
+    ops.session = _BrowserErrorThenPrimpOK(
+        "<html><body><form action='MostrarPdf'>ok</form></body></html>")
+
+    out = ops.do_apply({"date": "2026-08-28", "period": 3})
+    assert ops.session.posted, "the fallback POST must actually be attempted"
+    assert out != "portal_unreachable", f"fallback result should be classified, got {out}"
+
+
+def test_the_browser_path_is_still_tried_first():
+    """A real navigation is what DataDome trusts -- the direct POST is a fallback, never a
+    replacement."""
+    ops = _make_ops(emit=lambda t, **p: None)
+    ops._log = lambda *a, **k: None
+    ops.posto_pdf = "2032"
+    ops._schedule_state_ok = lambda: True
+    ops._run_warmup_steps = lambda: True
+
+    class _BrowserOK:
+        posted = []
+        def browser_form_post(self, url, data, timeout=100):
+            return ("https://x/VistosOnline/SubmeterVistoCriaPDF",
+                    "<html><body><form action='MostrarPdf'></form></body></html>")
+        def post(self, *a, **k):
+            raise AssertionError("must not fall back when the browser path worked")
+        def browser_nav(self, *a, **k): return "u"
+        def browser_eval(self, *a, **k): return ""
+        def submit_form_binary(self, **k): return {"status": 200, "body": b"%PDF-1.4", "content_type": "application/pdf"}
+    ops.session = _BrowserOK()
+    ops.do_apply({"date": "2026-08-28", "period": 3})

@@ -1813,10 +1813,44 @@ class LiveEngineOps(EngineOps):
             if _blank or _blocked or _chrome_error:
                 why = ("Chrome network-error page" if _chrome_error else
                        "blank page" if _blank else "DataDome interstitial")
-                self._log(f"do_apply: submit response is a {why} ({len(html or '')}B) -- the request "
-                          f"never reached the portal | slot={slot} | final_url={_final_url}")
+                self._log(f"do_apply: submit via browser landed on a {why} ({len(html or '')}B) "
+                          f"| slot={slot} | final_url={_final_url}")
+                # FALL BACK TO A DIRECT POST -- storm-auto's confirmed behaviour, and the piece
+                # storm-hub lost when primp was removed from the pipeline.
+                #
+                # storm-auto EXPECTS this: "a bare primp POST (XHR-equivalent) can be blocked
+                # regardless of proxy quality, while a real navigation (form.submit()) is trusted.
+                # Try the real-navigation path first; fall back to primp POST if unavailable or
+                # blocked." It checks for exactly these three outcomes -- blank, DataDome, or
+                # chrome-error -- and retries the submit directly.
+                #
+                # We treated the same page as terminal, which is why the operator's observation was
+                # right and mine was wrong: the proxy logs in, warms and discovers perfectly and
+                # then "fails" only at the submit. It is not the proxy. It is the ONE step whose
+                # browser path storm-auto already knew needed a second route, on a session whose
+                # cookies the form_post handler has just reverse-synced into primp for this purpose.
+                #
+                # The browser attempt stays FIRST: a real navigation is what DataDome trusts, so
+                # this is a fallback, never a replacement.
+                try:
+                    r = self.session.post(
+                        SUBMIT_URL, data=body, params={"posto_id": str(self.posto_pdf)},
+                        headers={"Referer": SCHED_JSP + "?posto_id=" + str(self.posto_pdf)},
+                        timeout=30,
+                    )
+                    fb_html, fb_url = (r.text or ""), getattr(r, "url", "") or ""
+                    self._log(f"do_apply: primp fallback -> status={r.status_code} "
+                              f"({len(fb_html)}B)")
+                    if r.status_code == 200 and fb_html.strip():
+                        html, _final_url = fb_html, fb_url
+                        _blank = _blocked = _chrome_error = False
+                except Exception as e:
+                    self._log(f"do_apply: primp fallback also failed: {str(e)[:140]}")
+
+            if _blank or _blocked or _chrome_error:
                 if self._breaker is not None:
                     self._breaker.record_portal_down()
+                self._log(f"do_apply: submit never reached the portal by either route | slot={slot}")
                 # OUR network, not the slot -- but ALSO not our session: ScheduleController had
                 # just returned 200 seconds earlier. Distinct from "session" so the caller does not
                 # tear down a demonstrably healthy login: confirmed live 2026-08-18, one dropped
