@@ -59,6 +59,18 @@ def main() -> int:
     p.add_argument("--concurrency", type=int, default=6, help="parallel browser probes (default 6)")
     p.add_argument("--timeout", type=float, default=25.0,
                    help="per-proxy nav timeout, seconds (default 25)")
+    p.add_argument("--limit", type=int, default=None,
+                   help="sweep at most N proxies -- a bounded, resumable chunk rather than the "
+                        "whole pool. Combine with --only-unprobed to grow the proven set in "
+                        "sessions instead of one enormous run.")
+    p.add_argument("--only-unprobed", action="store_true",
+                   help="skip rows that already carry a verdict. After the 10x regeneration the "
+                        "pool was 91%% unprobed, and lease-time screening only ever discovers five "
+                        "candidates at a time WHILE A WORKER WAITS -- which is how a booking ended "
+                        "up at zero running workers on 2026-08-24.")
+    p.add_argument("--no-quick-screen", action="store_true",
+                   help="skip the cheap raw tier and browser-probe everything (slower; the tier is "
+                        "on by default because it rejects a dead exit in ~4s instead of ~25s)")
     args = p.parse_args()
 
     from sqlalchemy import select
@@ -74,6 +86,13 @@ def main() -> int:
         q = select(M.Proxy).where(M.Proxy.active.is_(True))
         if args.provider:
             q = q.where(M.Proxy.provider == args.provider)
+        if args.only_unprobed:
+            q = q.where(M.Proxy.health.is_(None))
+        # Oldest-first so repeated bounded runs march through the pool instead of re-sweeping the
+        # same head -- the same LRU cursor lease_proxy uses, reused here for resumability.
+        q = q.order_by(M.Proxy.last_used_at.asc().nullsfirst(), M.Proxy.created_at.asc())
+        if args.limit:
+            q = q.limit(args.limit)
         proxies = list(db.scalars(q).all())
         if not proxies:
             print("No active proxies match -- nothing to check.")
@@ -96,6 +115,35 @@ def main() -> int:
             return 2
 
         targets = {pr.id: build_conn_url(pr) for pr in proxies}
+        # TIER 1 first: a dead exit costs ~4s of raw connect here instead of ~25s of Chromium, which
+        # is what makes sweeping thousands of rows practical at all. Only survivors reach the
+        # browser probe. A rejection is recorded exactly as the browser tier would record it, so the
+        # verdict lease_proxy reads is the same either way.
+        if not args.no_quick_screen:
+            from libs.proxies.health import quick_screen
+            t0 = time.time()
+            dead: dict[str, str] = {}
+            with ThreadPoolExecutor(max_workers=max(args.concurrency * 4, 8)) as ex:
+                futs = {ex.submit(quick_screen, url): pid for pid, url in targets.items()}
+                for f in as_completed(futs):
+                    pid = futs[f]
+                    try:
+                        alive, why = f.result()
+                    except Exception as e:
+                        alive, why = True, f"quick screen raised: {e}"
+                    if not alive:
+                        dead[pid] = why
+            for pid, why in dead.items():
+                targets.pop(pid, None)
+                pr = db.get(M.Proxy, pid)
+                if pr is not None:
+                    apply_result(pr, False, why)
+            db.commit()
+            print(f"tier 1 (raw, no browser): rejected {len(dead)} dead exit(s) in "
+                  f"{time.time() - t0:.0f}s -- {len(targets)} reach the browser probe")
+        if not targets:
+            print("nothing survived the cheap tier -- no browser probes needed.")
+            return 0
         print(f"Checking {len(targets)} active proxy(ies), concurrency={args.concurrency}, "
               f"timeout={args.timeout}s ...")
 
