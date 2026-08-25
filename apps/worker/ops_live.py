@@ -1842,7 +1842,31 @@ class LiveEngineOps(EngineOps):
                 if self._breaker is not None:
                     self._breaker.record_portal_down()
                 return "portal_unreachable"
-            if not state_ok and not self._run_warmup_steps():
+            # ALWAYS RE-WARM. The probe above is a DIAGNOSTIC (is the portal willing to talk to
+            # us at all), never a licence to skip the chain.
+            #
+            # REGRESSION, introduced 2026-08-24, reverted 2026-08-25. ad1c570 -- the code behind all
+            # 17 real bookings -- re-warmed unconditionally here, and said why in its first line:
+            #
+            #   "Bug fix #3: re-warm at the START of every round (ScheduleController form-state TTL
+            #    is ~90-120s and lapses during a long hold -- submitting on stale context bounces
+            #    -> false 'taken')."
+            #
+            # I gated it on _schedule_state_ok() to save the ~10 requests, and that gate tests the
+            # WRONG THING: Schedule.jsp's markers are a PAGE RENDER, while the form state the submit
+            # is validated against is a SERVER-SIDE CURSOR in the session. The page can render every
+            # marker while the portal's cursor sits back at `questionario` -- which is exactly what
+            # it reports when we submit:
+            #
+            #   10:45:49 warmed (ScheduleController 200) -> 10:46:04 DISCOVERING -> 10:47:13
+            #   applying -> 10:47:24 submit 200, 65180B -> "form_stale, bounced to ['questionario']"
+            #
+            # Discovery ran in between and moved the cursor. Both of this run's submits reached the
+            # portal cleanly and both came back as the questionnaire; the transport was never the
+            # problem. The checkpoint-restore path ("session alive and bookable -- skipping
+            # login+warmup") lands in the same place and is covered by this same unconditional
+            # re-warm on its first round.
+            if not self._run_warmup_steps():
                 # NOT "bounced". This is OUR session failing before we ever spoke to the portal
                 # about this slot, and calling it a bounce blames the slot for our dead proxy:
                 # the lease is released WITH a penalty, that penalty feeds the Hub's false-slot
