@@ -8,6 +8,20 @@ from libs.engine.phases import EngineOps
 from apps.worker.ops_live import LiveEngineOps, _extract_csrf, _submit_bounce_reason
 
 
+def _origin_reply(js, otherwise=""):
+    """Answer the opaque-origin probe with a LIVE portal origin, pass everything else through.
+
+    Stubs that returned a bare "" for every eval made `_on_portal_origin` read them as a
+    chrome-error page, so the guard correctly re-anchored and bailed out before the submit. These
+    stubs are modelling a healthy page, so they have to say so.
+    """
+    import json as _j
+    if "location.origin" in (js or ""):
+        return _j.dumps({"o": "https://pedidodevistos.mne.gov.pt",
+                         "h": "https://pedidodevistos.mne.gov.pt/VistosOnline/Schedule.jsp"})
+    return otherwise
+
+
 def _cfg(**template):
     return EngineConfig.from_settings(resolve({L.TEMPLATE: {"ROLE": "apply", **template}}))
 
@@ -57,6 +71,7 @@ class _FakeSession:
         return url
 
     def browser_eval(self, js):
+        if "location.origin" in (js or ""): return _origin_reply(js)
         return "<html>cmbPeriodo</html>" if self._alive else "<html>Authentication.jsp</html>"
 
     def close_browser(self):
@@ -740,6 +755,7 @@ class _RecordingSession(_FakeSession):
         return url
 
     def browser_eval(self, js):
+        if "location.origin" in (js or ""): return _origin_reply(js)
         if "gettime" in self._last_url:
             return self.GETTIME_BODY
         return self.PERIODOS_BODY
@@ -1076,6 +1092,7 @@ class _SubmitSession(_FakeSession):
         return ("https://pedidodevistos.mne.gov.pt/VistosOnline/MostrarPdf?", _PDF_SHELL)
 
     def browser_eval(self, js, timeout=30):
+        if "location.origin" in (js or ""): return _origin_reply(js)
         import base64
         return base64.b64encode(self._pdf).decode()
 
@@ -1208,6 +1225,7 @@ class _WarmupSession(_FakeSession):
         self.navs = []
 
     def browser_eval(self, js, timeout=30):
+        if "location.origin" in (js or ""): return _origin_reply(js)
         if "outerHTML" in js:
             return self._sched_html
         # last quest step must yield fields, and the rest just need a 200
@@ -1275,6 +1293,7 @@ class _FlakyQuestSession(_WarmupSession):
         self.quest_calls = 0
 
     def browser_eval(self, js, timeout=30):
+        if "location.origin" in (js or ""): return _origin_reply(js)
         if "outerHTML" in js:
             return self._sched_html
         self.quest_calls += 1
@@ -1308,6 +1327,7 @@ class _RaisingQuestSession(_WarmupSession):
         self.quest_calls = 0
 
     def browser_eval(self, js, timeout=30):
+        if "location.origin" in (js or ""): return _origin_reply(js)
         if "outerHTML" in js:
             return self._sched_html
         if "lang=ENG&lang=PT" in js:
@@ -1339,6 +1359,7 @@ def test_persistent_in_page_fetch_failure_still_fails_the_warmup(monkeypatch):
 
 class _DeadHomeSession(_WarmupSession):
     def browser_eval(self, js, timeout=30):
+        if "location.origin" in (js or ""): return _origin_reply(js)
         if "lang=ENG&lang=PT" in js:
             raise RuntimeError("Page.evaluate: TypeError: Failed to fetch")
         return super().browser_eval(js, timeout)
@@ -1363,6 +1384,7 @@ class _FlakyHomeSession(_WarmupSession):
         self.home_calls = 0
 
     def browser_eval(self, js, timeout=30):
+        if "location.origin" in (js or ""): return _origin_reply(js)
         if "lang=ENG&lang=PT" in js:
             self.home_calls += 1
             if self.home_calls <= self.fail_n:
@@ -1469,6 +1491,7 @@ class _KeepaliveSession(_FakeSession):
         return url
 
     def browser_eval(self, js, timeout=30):
+        if "location.origin" in (js or ""): return _origin_reply(js)
         return self._page if "outerHTML" in js else {"status": 200, "fields": {"a": "1"}}
 
 
@@ -1629,6 +1652,7 @@ class _SchedPageSession:
         return self._url
 
     def browser_eval(self, js):
+        if "location.origin" in (js or ""): return _origin_reply(js)
         return self._html
 
 
@@ -1820,7 +1844,7 @@ def test_a_rejected_gettime_says_why_instead_of_returning_silently():
 
     class _Waf:
         def browser_nav(self, *a, **k): return "u"
-        def browser_eval(self, *a, **k): return waf
+        def browser_eval(self, js="", *a, **k): return _origin_reply(js, waf)
     ops.session = _Waf()
 
     out = ops.do_discover(["2026-09-01", "2026-09-02"])
@@ -1982,7 +2006,7 @@ class _BrowserErrorThenPrimpOK:
         return r
 
     def browser_nav(self, *a, **k): return "u"
-    def browser_eval(self, *a, **k): return ""
+    def browser_eval(self, js="", *a, **k): return _origin_reply(js, "")
 
 
 def test_a_chrome_error_submit_falls_back_to_a_direct_post():
@@ -2020,7 +2044,7 @@ def test_the_browser_path_is_still_tried_first():
         def post(self, *a, **k):
             raise AssertionError("must not fall back when the browser path worked")
         def browser_nav(self, *a, **k): return "u"
-        def browser_eval(self, *a, **k): return ""
+        def browser_eval(self, js="", *a, **k): return _origin_reply(js, "")
         def submit_form_binary(self, **k): return {"status": 200, "body": b"%PDF-1.4", "content_type": "application/pdf"}
     ops.session = _BrowserOK()
     ops.do_apply({"date": "2026-08-28", "period": 3})
@@ -2048,7 +2072,7 @@ def test_the_submit_goes_out_as_an_xhr_with_the_har_headers():
         def browser_form_post(self, *a, **k):
             raise AssertionError("navigation must not be used while the XHR succeeds")
         def browser_nav(self, *a, **k): return "u"
-        def browser_eval(self, *a, **k): return ""
+        def browser_eval(self, js="", *a, **k): return _origin_reply(js, "")
         def submit_form_binary(self, **k):
             return {"status": 200, "body": b"%PDF-1.4", "content_type": "application/pdf"}
 
@@ -2079,7 +2103,7 @@ def test_the_navigation_path_is_still_there_as_a_fallback():
             return "https://x/VistosOnline/SubmeterVistoCriaPDF", \
                    "<html><form action='MostrarPdf'></form></html>"
         def browser_nav(self, *a, **k): return "u"
-        def browser_eval(self, *a, **k): return ""
+        def browser_eval(self, js="", *a, **k): return _origin_reply(js, "")
         def submit_form_binary(self, **k):
             return {"status": 200, "body": b"%PDF-1.4", "content_type": "application/pdf"}
 

@@ -56,6 +56,7 @@ from libs.engine.vendor import get_session
 from .bus_signals import TIMEOUT
 
 BASE = "https://pedidodevistos.mne.gov.pt/VistosOnline"
+_PORTAL_ORIGIN = "https://pedidodevistos.mne.gov.pt"
 HOME_URL = BASE + "/"
 AUTH_URL = BASE + "/Authentication.jsp"
 QUEST_URL = BASE + "/Questionario"
@@ -537,6 +538,62 @@ class LiveEngineOps(EngineOps):
         self.session = None
         return False
 
+    def _on_portal_origin(self) -> bool:
+        """Is the browser sitting on a live portal page RIGHT NOW?
+
+        Every in-page call we make -- the home-lang POST, all seven quest steps, ScheduleController,
+        and (since 2026-08-24) the submit itself -- is a `fetch()` executed in the CURRENT page's
+        context. `browser_fetch` never navigates first; it inherits whatever origin the page happens
+        to be on. So a page left on `chrome-error://chromewebdata/` by ANY earlier failed navigation
+        is an OPAQUE origin with no network access, and every subsequent fetch from it throws
+        exactly `TypeError: Failed to fetch` -- forever, because nothing ever put the page back.
+
+        CONFIRMED live 2026-08-25 on Test 2032, and it explains the operator's observation that
+        login, warm-up and discovery all work on the very same proxy and session while ONLY applying
+        fails. Those three paths each BEGIN with a real navigation, so they self-heal. do_apply was
+        the one path that issued an in-page fetch without first proving it had a live origin:
+
+            /slots primer navigates -> lands on chrome-error -> page stays there
+              -> submit XHR            "TypeError: Failed to fetch"          (8 of 8)
+              -> next round's probe    "Execution context was destroyed"     (8)
+              -> next round's warm-up  "Failed to fetch" x3 -> warm-up fails (48)
+              -> outcome "session", 32 leases, and finally a full re-login
+
+        `location.origin` is the exact signal, not the href: a chrome-error page reports `"null"`
+        (the opaque origin), which is precisely the condition that makes fetch throw.
+        """
+        try:
+            raw = self.session.browser_eval("JSON.stringify({o:location.origin,h:location.href})")
+        except Exception:
+            # "Execution context was destroyed" lands here too -- also a page we cannot fetch from.
+            return False
+        try:
+            st = json.loads(raw) if isinstance(raw, str) else (raw or {})
+        except Exception:
+            return False
+        return str(st.get("o") or "") == _PORTAL_ORIGIN and str(st.get("h") or "").startswith(BASE)
+
+    def _ensure_portal_origin(self, why: str) -> bool:
+        """Put the page back on a real portal origin before issuing an in-page fetch.
+
+        Cheap when it is already there (one eval, no request). When it is not, ONE nav to
+        Schedule.jsp re-anchors the session -- the same self-heal login/warm-up/discovery get for
+        free by starting with a navigation.
+        """
+        if self._on_portal_origin():
+            return True
+        self._log(f"page is not on a live portal origin before {why} -- re-anchoring to Schedule.jsp")
+        try:
+            self.session.browser_nav(
+                SCHED_JSP + "?posto_id=" + str(self.posto_pdf or self.posto_id), timeout=30)
+        except Exception as e:
+            self._log(f"re-anchor nav failed: {str(e)[:120]}")
+            return False
+        ok = self._on_portal_origin()
+        if not ok:
+            self._log("re-anchor did not restore a portal origin -- the tunnel is genuinely down")
+        return ok
+
     def _schedule_state_ok(self) -> bool:
         """Is the booking anchor still live? One GET, no rebuild.
 
@@ -935,6 +992,11 @@ class LiveEngineOps(EngineOps):
         """Questionnaire -> Formulario -> ScheduleController -> Schedule.jsp (confirmed URLs/flow,
         ported from storm-auto batch_apply._run_steps_2_to_6)."""
         _t0 = time.time()
+        # Every step below is an in-page fetch. If a prior failed navigation left the page on
+        # chrome-error, all three retries of the home-lang POST are guaranteed to raise
+        # "TypeError: Failed to fetch" -- that is an opaque origin, not the transient network blip
+        # the retry loop was written for. Re-anchor first so the retries mean something.
+        self._ensure_portal_origin("the warm-up chain")
         try:
             # Retried like every other in-page fetch in this chain. When the labelling went in I
             # made this one raise on the FIRST failure while giving the quest steps below three
@@ -1789,14 +1851,39 @@ class LiveEngineOps(EngineOps):
                 self._log("do_apply: re-warm at round start failed -- session problem, not the slot")
                 return "session"
 
+            # THE PRIMER IS AN XHR, NOT A NAVIGATION.
+            #
+            # data/new_booking.har serves /slots with `Sec-Fetch-Dest: empty` / `Mode: cors` --
+            # an in-page fetch, exactly like every other ajax step in that capture. We were sending
+            # it as `browser_form_post`, i.e. a real top-level NAVIGATION, which is both the wrong
+            # request shape AND actively destructive: it moves the page off Schedule.jsp
+            # immediately before a submit that is itself an in-page fetch, and when the navigation
+            # fails it parks the page on chrome-error -- an opaque origin from which the submit,
+            # the next round's probe and the next round's warm-up can never fetch again. See
+            # _on_portal_origin: this single line was the head of that whole chain.
+            #
+            # Non-fatal on failure, as before: the primer only refreshes the portal's session state.
             try:
-                self.session.browser_form_post(
-                    SLOTS_URL + "?posto_id=" + str(self.posto_pdf),
-                    {"posto_id": self.posto_pdf, "captcha": ""},
+                self.session.browser_fetch(
+                    SLOTS_URL, {"posto_id": str(self.posto_pdf), "captcha": ""},
+                    method="POST", params={"posto_id": str(self.posto_pdf)},
+                    headers={
+                        "Accept": "*/*",
+                        "X-Requested-With": "XMLHttpRequest",
+                        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                        "Referer": SCHED_JSP + "?posto_id=" + str(self.posto_pdf),
+                    },
                     timeout=45,
                 )
             except Exception as e:
                 self._log(f"do_apply: /slots primer failed (non-fatal): {e}")
+
+            # The submit below is an in-page fetch. Prove we have a live origin to issue it from,
+            # rather than discovering we do not via "TypeError: Failed to fetch".
+            if not self._ensure_portal_origin("the submit"):
+                self._log("do_apply: no live portal origin for the submit -- session problem, "
+                          "not the slot")
+                return "session"
 
             body = booking_payload(self.quest_steps, slot, residence=self.residence)
             submit_url = SUBMIT_URL + "?posto_id=" + str(self.posto_pdf)
@@ -1873,6 +1960,11 @@ class LiveEngineOps(EngineOps):
                        "blank page" if _blank else "DataDome interstitial")
                 self._log(f"do_apply: submit via browser landed on a {why} ({len(html or '')}B) "
                           f"| slot={slot} | final_url={_final_url}")
+                # The navigation fallback has just parked the page somewhere we cannot fetch from.
+                # Put it back NOW: the primp fallback below does not need the browser, but the next
+                # apply round does, and until 2026-08-25 nothing ever restored it -- one failed
+                # submit silently disabled every in-page fetch for the rest of the worker's life.
+                self._ensure_portal_origin("the next round")
                 # FALL BACK TO A DIRECT POST -- storm-auto's confirmed behaviour, and the piece
                 # storm-hub lost when primp was removed from the pipeline.
                 #
