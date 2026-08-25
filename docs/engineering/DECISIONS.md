@@ -1,0 +1,128 @@
+# Decisions
+
+Deliberate engineering choices. A decision is not a fact about the world — it is a commitment
+we made, with reasoning, that can be revisited when the reasoning changes. Each entry records
+what would reverse it.
+
+---
+
+### D1. Workers never touch the database
+The Hub is the only DB client. Everything a worker needs arrives in its `launch` payload;
+everything it reports leaves as a bus event.
+**Why:** a worker is then cheap to kill, cheap to relaunch, and cannot corrupt shared state or
+exhaust the connection pool. It is the property that makes every other resilience mechanism
+possible.
+**Reverse if:** never, without a redesign of the whole resilience model.
+
+### D2. The session id is the proxy's identity
+Hold it to keep an exit; change it to get a different one. Log it. Never invent one.
+**Why:** the endpoint is constant across every credential, so it identifies nothing; the
+session id is the only thing that selects an exit.
+**Reverse if:** a provider is added whose stickiness is not credential-encoded.
+
+### D3. Never raw-probe an exit we intend to browse from
+Tier-1 quick-screen stays disabled by default.
+**Why:** measured 83% → 0% (`CONFIRMED_FACTS.md` §4).
+**Reverse if:** primp becomes our primary transport, so the fingerprint stays consistent —
+which is exactly why storm-auto can screen this way and we cannot.
+
+### D4. Submit by navigation, never by in-page fetch
+The proven apply round is navigation + navigation.
+**Why:** an in-page fetch is origin-dependent and dies permanently on an opaque origin; a
+navigation is origin-independent. Also, storm-auto's own comment: a bare POST can be blocked
+regardless of proxy quality while a real navigation is trusted.
+**Reverse if:** never, on current evidence. A HAR showing the portal's own XHR succeeding is
+**not** evidence that *our* XHR is trusted — that inference was made once and was wrong.
+
+### D5. Only `%PDF` bytes prove a booking
+Reaching `MostrarPdf` is not success.
+**Why:** verified against the portal. Inventing a booking is strictly worse than missing one.
+**Reverse if:** never.
+
+### D6. Confirm before marking
+A signal is latched as sent only after the send call returns successfully; a worker is marked
+RUNNING only after both spawn and consumer-group creation succeed.
+**Why:** marking first and acting second produces silent starvation that is invisible after
+the fact.
+**Reverse if:** never — this is a general correctness pattern, applied in several places.
+
+### D7. The signal latch is durable across a Hub restart but must be cleared on a *worker's*
+restart
+**Why:** the latch correctly survives a Hub restart. It wrongly also survived a worker's own
+restart, starving every relaunched worker of `slot_open`/`slot_found` forever.
+**Mechanism:** `_reset_worker_bus_state`, which also clears the stale command stream.
+
+### D8. Every `/start` is a fresh run
+It clears the slot latch, retires the previous run's slots, and re-warms. It does not resume
+into RUNNING.
+**Why:** operator decision, 2026-08-14 — deliberately replaces the earlier resume shortcut.
+
+### D9. Checkpoints live on the filesystem, never in Redis
+`var/checkpoints/`, atomic tmp-write + rename, keyed by `identity_id`.
+**Why:** payloads carry full cookie jars that have no business inflating the Redis working
+set; file storage is what is proven in storm-auto (113 bookings). Keyed by identity because a
+worker owns one identity for its whole life, while the sub-account picker can drift.
+**Reverse if:** never for Redis. The keying may change — but only via D14.
+
+### D10. A throttle that resolves below its floor raises, never clamps
+`BelowMinimum` in the settings resolver.
+**Why:** `HOLD_POLL_GAP: 0.0` once drove a worker to 150–280 writes/sec for 66 minutes.
+Silently clamping to a working value hides the bug that produced it.
+**Reverse if:** never.
+
+### D11. Redis is `noeviction` with an explicit `maxmemory`
+**Why:** loud failure beats silent data loss. Eviction on a control-plane stream would drop
+commands and events with no error anywhere.
+**Reverse if:** never, without a durability design for the streams.
+
+### D12. `held` is not a failure
+It means the phase machine ran to a clean end without booking.
+**Why:** mapping it to FAILED showed healthy workers red and burned their respawn budget.
+**Reverse if:** never — it is a distinct outcome from FAILED (something broke) and STOPPED
+(someone decided).
+
+### D13. `STOPPED` is not `COMPLETED`, for both bookings and workers
+Stop is resumable; completed is terminal.
+**Why:** conflating them made a stopped booking un-restartable — restart silently no-opped.
+
+### D14. Format/keying migrations ship as offline, assert-driven, reversible code first
+Never as a live operation against a running booking.
+**Why:** a live, unverified checkpoint-keying change against a running booking is what this
+project was doing in the last captured minutes before its original catastrophic data loss.
+**Pattern:** `probes/checkpoint_format_probe.py`, ported from storm-auto's save/resume probes.
+
+### D15. Destructive cleanup is scoped, reviewed, dry-run-by-default tooling
+`scripts/cleanup_checkpoints.py` is the only sanctioned way to clear checkpoints.
+**Why:** the original data loss was a human fixing an infrastructure problem by hand, at
+speed, with an unscoped `rm`. No ad-hoc `rm -rf` against a production path, ever.
+
+### D16. Live-apply testing books REAL appointments
+The assistant does not start bookings autonomously; it hands the operator the exact command.
+**Why:** these are real appointments for real people.
+
+### D17. Never attribute a portal failure to portal downtime
+Diagnose the proxy exit, the IP, or our own session handling first.
+**Why:** standing operator instruction, correct every time it has been tested. `RedisBreaker`
+is deliberately zero-HTTP-aware so the classification stays at the call site where this rule
+is enforceable.
+
+### D18. Live-vs-sim engine is an explicit per-worker Hub decision
+`_engine: "sim" | "live"` in the launch payload — never an env var, never a default-to-live.
+**Why:** live execution must be auditable to whoever launched the worker.
+
+### D19. `is_healthy` is not a selection filter
+**Why:** a row is a session template, not an IP; a failed probe describes an exit, not the
+row. Filtering discarded 639 good rows once.
+
+### D20. A lost claim race is not a health failure
+Counted separately in `lease_proxy`.
+**Why:** conflating them reported pool exhaustion during ordinary contention.
+
+### D21. The apply path is reverted verbatim to the last commit that booked
+`do_apply` is `ad1c570`'s implementation, with exactly one deviation: two
+`return "bounced"` → `return "portal_unreachable"` so our own gates are not charged to the
+slot.
+**Why:** operator instruction after repeated failed fixes. Speculative changes to the apply
+path are suspended.
+**Status:** **still untested live** — no run since the revert has produced enough warmed
+workers to exercise it.
