@@ -1912,12 +1912,24 @@ class LiveEngineOps(EngineOps):
         storm-auto's actual proven submit code (see libs/engine/payload.py's module docstring) --
         NOT the full form_defaults merge, which is only correct for the earlier ScheduleController
         warmup POST. Bug fix #4: PDF via submit_form_binary (page.route() interception)."""
+        # THE ONE DEVIATION FROM ad1c570 IN THIS METHOD, isolated in its own commit so it can be
+        # dropped with a single `git revert` if you want the byte-exact original.
+        #
+        # These two gates are not "how we apply" -- they are what we report when we DID NOT apply at
+        # all. ad1c570 returned "bounced" for both, which charges OUR gate to the SLOT: the lease is
+        # released with a penalty, the penalty feeds the Hub's false-slot revert, the slot is marked
+        # phantom and closed, and the worker parks on "5 consecutive bounces". Measured 2026-08-15:
+        # 5082 bounced leases against a pool that was never phantom.
+        #
+        # Left as "bounced", a run of this branch would destroy its own slot pool and could not tell
+        # us whether the reverted apply path works -- which is the only question this branch exists
+        # to answer.
         if self._apply_sem is not None:
             if not self._apply_sem.acquire(self.identity_id, timeout=60):
-                return "bounced"
+                return "portal_unreachable"
         try:
             if self._breaker is not None and self._breaker.is_tripped():
-                return "bounced"
+                return "portal_unreachable"      # see the note above: our gate, not the slot's fault
 
             if not self._run_warmup_steps():
                 # NOT "bounced". This is OUR session failing before we ever spoke to the portal
