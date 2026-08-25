@@ -2051,18 +2051,18 @@ def test_the_browser_path_is_still_tried_first():
 
 
 # ── the submit is an XHR, matching the real booking HAR (2026-08-24) ────────
-def test_the_submit_goes_out_as_an_xhr_with_the_har_headers():
-    """data/new_booking.har -- a REAL successful manual booking (posto 3059) -- shows the submit as
-    an AJAX call, not a navigation:
+def test_the_xhr_fallback_carries_the_har_headers():
+    """The XHR is the SECOND submit route, and when it is used it must look like the real capture.
 
-        X-Requested-With: XMLHttpRequest
-        Sec-Fetch-Dest: empty   Sec-Fetch-Mode: cors   Accept: */*
-        Referer: .../Schedule.jsp?posto_id=3059
-
-    Every ajax step in that capture has Dest: empty / Mode: cors -- /slots and QuestNextQuestion
-    included. We were sending a DOM form.submit(), i.e. a real page NAVIGATION (Dest: document,
-    Mode: navigate) -- a different request shape from the one the portal answers, and the one step
-    that had never once succeeded."""
+    data/new_booking.har (a real manual booking, posto 3059) shows the portal's own page submitting
+    via AJAX -- X-Requested-With: XMLHttpRequest, Sec-Fetch-Dest: empty, Mode: cors, Accept: */*,
+    Referer .../Schedule.jsp?posto_id=3059. That capture is real, but it is what the portal's JS
+    does from a page DataDome has already blessed; it is not evidence our headless XHR is treated
+    the same way. Both PROVEN implementations submit by navigation instead -- storm-auto (113 real
+    bookings, with an explicit comment that an XHR-equivalent gets blocked where a navigation is
+    trusted) and our own ad1c570 (all 17 of ours, browser_form_post as the only path). So the
+    navigation goes first and the XHR is the fallback; this test pins the fallback's SHAPE, not its
+    primacy. See test_the_navigation_is_the_primary_submit_route below."""
     seen = {}
 
     class _S:
@@ -2092,8 +2092,9 @@ def test_the_submit_goes_out_as_an_xhr_with_the_har_headers():
 
 
 def test_the_navigation_path_is_still_there_as_a_fallback():
-    """If the XHR returns nothing, fall through rather than losing the booking path to one portal
-    change."""
+    """If the primary route returns nothing, fall through rather than losing the booking path to
+    one portal change. (Roles reversed 2026-08-25: the navigation is primary, the XHR the fallback --
+    this now pins that the FALLBACK still runs, whichever way round they are.)"""
     used = {}
 
     class _S:
@@ -2143,3 +2144,36 @@ def test_a_full_concurrency_gate_does_not_bounce_the_slot():
     ops._log = lambda *a, **k: None
     ops._apply_sem = _Sem()
     assert ops.do_apply({"date": "2026-08-28", "period": 3}) == "portal_unreachable"
+
+
+def test_the_navigation_is_the_primary_submit_route():
+    """Navigation first, XHR only if it comes back empty.
+
+    REGRESSION GUARD for f02041d, which made the XHR primary on the strength of the HAR alone.
+    storm-auto's comment on this exact endpoint: "a bare primp POST (XHR-equivalent) can be blocked
+    regardless of proxy quality, while a real navigation (form.submit()) is trusted. Try the
+    real-navigation path first." Our own 17 bookings used the navigation as the only route.
+    """
+    order = []
+
+    class _S:
+        def browser_form_post(self, url, data, timeout=30, **kw):
+            order.append("navigation")
+            return (url, "<html>mostrarpdf</html>")     # a confirmed booking
+        def browser_fetch(self, url, *a, **k):
+            # /slots is ALSO a browser_fetch (the primer); only the submit counts here.
+            if "SubmeterVistoCriaPDF" in url:
+                order.append("xhr")
+            return {"status": 200, "body": "<html>mostrarpdf</html>"}
+        def browser_nav(self, *a, **k): return "u"
+        def browser_eval(self, js="", *a, **k): return _origin_reply(js, "")
+
+    ops = _make_ops(emit=lambda t, **p: None)
+    ops._log = lambda *a, **k: None
+    ops.posto_pdf = "3059"
+    ops._schedule_state_ok = lambda: True
+    ops._run_warmup_steps = lambda: True
+    ops.session = _S()
+    ops.do_apply({"date": "2026-09-23", "period": 5})
+    assert order and order[0] == "navigation", f"navigation must be tried first, got {order}"
+    assert "xhr" not in order, f"the XHR must not run when the navigation answered: {order}"

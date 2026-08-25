@@ -2036,40 +2036,53 @@ class LiveEngineOps(EngineOps):
             #
             # browser_fetch runs inside the live browser context, so it keeps the session's cookies
             # and TLS fingerprint -- the same call ScheduleController already uses successfully.
+            # SUBMIT AS A NAVIGATION FIRST. Both proven implementations do, and storm-auto -- the
+            # code behind 113 real bookings -- says why, in a comment on this exact endpoint:
+            #
+            #   "Same DataDome risk /slots had: a bare primp POST (XHR-equivalent) can be blocked
+            #    regardless of proxy quality, while a real navigation (form.submit()) is trusted.
+            #    Try the real-navigation path first; fall back to primp POST if unavailable/blocked."
+            #
+            # Our own ad1c570 -- the code behind all 17 of OUR bookings -- had browser_form_post as
+            # the ONLY submit path. I made the XHR primary in f02041d because data/new_booking.har
+            # shows the portal's own page submitting via XHR (Sec-Fetch-Dest: empty, Mode: cors).
+            # That capture is real, but it is what the portal's JS does from a page DataDome has
+            # already blessed; it is not evidence that our headless XHR is treated the same way.
+            # Two independent proven paths against one inference from a capture: the navigation wins.
+            #
+            # The XHR is kept as the SECOND route, not deleted -- when the navigation lands on a
+            # chrome-error/DataDome/blank page the XHR is a genuinely different request shape and
+            # has already been seen to reach the portal (200, this run) where the navigation could
+            # not. primp stays third.
             html, _final_url = "", submit_url
             try:
-                _fx = self.session.browser_fetch(
-                    SUBMIT_URL, body, method="POST",
-                    params={"posto_id": str(self.posto_pdf)},
-                    headers={
-                        "Accept": "*/*",
-                        "X-Requested-With": "XMLHttpRequest",
-                        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                        "Referer": SCHED_JSP + "?posto_id=" + str(self.posto_pdf),
-                    },
-                    timeout=60,
-                )
-                html = str(_fx.get("body") or "")
-                self._log(f"do_apply: submit via XHR -> status={_fx.get('status')} ({len(html)}B)")
+                _final_url, html = self.session.browser_form_post(submit_url, body, timeout=100)
+                self._log(f"do_apply: submit via navigation -> ({len(html or '')}B) "
+                          f"url={str(_final_url)[:90]}")
             except Exception as e:
-                self._log(f"do_apply: XHR submit failed ({str(e)[:110]}) -- trying the "
-                          f"navigation path")
-            if not html.strip():
-                # Fall back to the navigation path, then to a direct POST below. Keeping both means
-                # a portal that changes shape again does not take the booking path with it.
+                self._log(f"do_apply: navigation submit failed ({str(e)[:110]}) -- trying the XHR")
+            if not (html or "").strip():
                 try:
-                    _final_url, html = self.session.browser_form_post(submit_url, body, timeout=100)
+                    _fx = self.session.browser_fetch(
+                        SUBMIT_URL, body, method="POST",
+                        params={"posto_id": str(self.posto_pdf)},
+                        headers={
+                            "Accept": "*/*",
+                            "X-Requested-With": "XMLHttpRequest",
+                            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                            "Referer": SCHED_JSP + "?posto_id=" + str(self.posto_pdf),
+                        },
+                        timeout=60,
+                    )
+                    html = str(_fx.get("body") or "")
+                    self._log(f"do_apply: submit via XHR -> status={_fx.get('status')} "
+                              f"({len(html)}B)")
                 except Exception as e:
-                    self._log(f"do_apply: SubmeterVistoCriaPDF POST failed: {e}")
+                    self._log(f"do_apply: XHR submit also failed: {str(e)[:110]}")
                     if self._breaker is not None:
                         self._breaker.record_portal_down()
                     return "bounced"
 
-            # storm-auto guards the submit response before classifying it, because a blank
-            # chrome-error page or a DataDome interstitial is not a portal answer at all -- it
-            # falls back to a primp POST there. We have no primp path, so the honest outcome is
-            # "the portal never answered": report it as a bounce and let the breaker see it,
-            # rather than mis-reading an interstitial as a rejection of the slot.
             _snip = (html or "")[:300]
             _blank = (html or "").strip() in ("", "<html><head></head><body></body></html>")
             _blocked = "body{margin:0;background:#fff}" in _snip or "datadome" in _snip.lower()
