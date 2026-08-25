@@ -85,3 +85,64 @@ age at measurement start was not controlled — an already-bound session has les
 a fresh one, which would produce exactly this spread.
 **Settled by:** repeating the measurement with session ids never used before, so t=0 is a true
 binding start.
+
+### Q15. Which holding strategy replaces the invalidated assumption? — OPTIONS ONLY, none chosen
+Enumerated 2026-08-25 from the Q1 evidence. **No option is adopted.** Each states what it solves,
+what it assumes, and what evidence it needs before it could be chosen.
+
+| | Option | Solves | Assumes | Evidence needed | Cost / risk |
+|---|---|---|---|---|---|
+| A | **Short holds** — warm close to slot_open | exit outlives the hold (92-100% under 60 min) | warm lead time can be compressed below ~60 min | how long warming N workers actually takes, incl. login-wall retries | cheap; risks arriving unwarmed at slot_open, the failure the long lead exists to prevent |
+| B | **Detect exit change, classify** | stops misdiagnosing one event as three | detection is reliable (it already is) | none — `_note_exit_ip` is already called every keepalive and discarded | cheapest; does not by itself keep any session alive |
+| C | **Re-establish proxy identity** | recover the *same* exit after a move | provider can re-bind a specific exit | soax `bindttl` does this within its window; webshare offers no equivalent | limited: no mechanism for webshare, and Q1 shows soax's ceiling is absolute |
+| D | **Treat exit change as a lifecycle event** — rebuild/re-auth | correctness under instability | a fresh login is affordable at that rate | the login wall rejects ~90% and two reCAPTCHA verdicts burn a sub-account | at 0.278 changes/session-hour this consumes the scarcest resource in the system |
+| E | **Static ISP proxies for the hold phase** | removes the instability at its source | portal session survives the migration | **Q16** — plus ISP inventory, which we have none of | this is what storm-auto does across 113 bookings (§19); needs procurement + Q16 |
+| F | **Decouple holding from exit continuity** | hold cheaply through moves | the portal does not bind session to IP | **Q16** — the same experiment | free if true; the whole hold design simplifies |
+
+**E and F share one blocking question (Q16), and it is the same question.** Answer it first.
+
+### Q16. Does a proxy exit change actually invalidate the portal session? — THE BLOCKING QUESTION
+Everything in Q15 turns on this, and it has never been tested in storm-hub.
+
+**What we have:** storm-auto's `_swap_to_hold_pool` asserts *"booking form-state is server-side /
+Vistos_sid-keyed → transfers to a fresh browser+IP while alive — validated 0724"*, and its whole
+holding architecture depends on that being true. That is a **predecessor's claim**, not our
+measurement, and our own `do_swap` — which implements the identical migration — has **never run**.
+
+**Smallest safe experiment (no booking attempt, no submit):**
+1. Log in and warm one worker on proxy P1 (existing code path, `WARMUP_ONLY`).
+2. Capture the browser cookie jar — `get_all_cookies()`, already implemented.
+3. Open a fresh browser on proxy **P2** (a different exit) and inject that jar — `get_session(...,
+   inject_cookies_full=...)`, already implemented.
+4. Call the existing `_probe_alive()`: navigate `Schedule.jsp?posto_id=…` and assert it does not
+   redirect to `Authentication.jsp` and still carries `cmbPeriodo` / `getPeriodosOcupados`.
+
+Outcome: still bookable on a different IP → session is **not** IP-bound → F becomes viable and E is
+merely an optimisation. Redirected to `Authentication.jsp` → session **is** IP-bound → F is dead, E
+becomes necessary, and the hold ceiling is a hard architectural constraint.
+
+**This is exactly `do_swap` executed once, deliberately, against `_probe_alive` — every component
+already exists and is tested.** It reaches no further than Schedule.jsp: no `ScheduleController`
+submit, no `SubmeterVistoCriaPDF`, so it cannot book anything. Cost: one login, one warm, two
+proxies, ~5 minutes. It needs a real login, so it consumes one sub-account login attempt.
+
+**Deliberate limitation:** it tests lifetimes 1 and 2 surviving a *deliberate* migration. It does
+not prove an *involuntary* mid-flight exit move behaves identically — the portal may treat a clean
+new connection differently from a connection whose address changes underneath it. That is a
+follow-up, not a reason to delay this.
+
+### Q17. How long does warming actually take, end to end?
+Option A's viability depends entirely on this, and it has never been measured. Login dominates —
+the wall rejects ~90% of attempts and workers retry sticky-then-rotate — so warm lead time is
+mostly *login retry* time, not the ~40 s warm itself. Planned holds of 64-116 min
+(`CONFIRMED_FACTS.md` §20) suggest the lead time was chosen generously, but no measurement backs
+either the 64 or the 116.
+**Settled by:** instrumenting login→warmed duration per worker from existing events; the data may
+already be recoverable from `var/worker-logs/`.
+
+### Q18. Does soax support a `sessionlength` above 3600?
+Our 3600 is self-imposed and carries no recorded justification (`PROXY_CONTRACTS.md`). If soax
+permits a longer session, the measured 60-minute ceiling — which six of eight bookings planned to
+hold straight through — may be self-inflicted rather than a constraint.
+**Settled by:** provider documentation or a single generated credential at a higher value, probed
+with the existing `proxy_exit_stability_probe.py`. **Do not change the pool to find out.**

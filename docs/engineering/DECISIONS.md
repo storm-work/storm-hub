@@ -126,3 +126,22 @@ slot.
 path are suspended.
 **Status:** **still untested live** — no run since the revert has produced enough warmed
 workers to exercise it.
+
+### D22. INVALIDATED — "keepalive preserves the proxy exit"
+**This was never written down as a decision; it was an unexamined assumption underlying the hold
+design, and it is now measured false** (`CONFIRMED_FACTS.md` §17).
+
+Recorded here explicitly so it cannot be silently re-adopted. Keepalive acts on the portal auth
+session and the server-side form state. It has no measurable effect on the proxy exit, and cannot
+extend a soax proxy session past its `sessionlength` ceiling.
+
+**What replaces it is not yet decided.** Options are enumerated in `OPEN_QUESTIONS.md` Q15 with
+their evidence requirements; none is adopted, and the deciding evidence (Q16) has not been gathered.
+
+### D23. Analysis-phase boundary, 2026-08-25
+Q1's result was mapped onto the architecture **without** changing holding logic, proxy selection,
+proxy configuration, worker lifecycle, `do_apply`, or the vendored engine — by operator instruction.
+Documentation and memory only.
+**Why it matters:** the strongest finding (§19-§20) points at an obvious-looking change — enable
+`do_swap` onto ISP proxies. That change rests on a claim we have inherited but never verified here
+(§18, row 2), and acting on it before Q16 would repeat the pattern this project is trying to break.

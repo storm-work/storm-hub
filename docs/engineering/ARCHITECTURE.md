@@ -108,19 +108,55 @@ its predecessor consumed (CONFIRMED bug, fixed via `_reset_worker_bus_state`).
 Command dedup: `Bus.has_pending_commands()` prevents re-sending while one is outstanding —
 the general fix for a worker that once accrued 56 unconsumed `assign` commands.
 
-## 5. Session lifecycle and TTLs
+## 5. Session lifecycles and TTLs — FIVE independent lifetimes
 
-| Session | Created by | Kept alive by | Expiry | Detection | Status |
+**Corrected 2026-08-25.** These were previously treated as one thing. They are five, and none
+guarantees another. See `CONFIRMED_FACTS.md` §18.
+
+| # | Lifetime | Created by | Bound to | Refreshed by | TTL |
 |---|---|---|---|---|---|
-| Portal login (JSESSIONID) | `browser_login` | keepalive nav | UNKNOWN duration | page markers | **UNKNOWN TTL** |
-| ScheduleController form state | warmup chain | round-start re-warm | ~90–120 s (inherited from storm-auto) | submit bounces to questionnaire | **HYPOTHESIS — never measured in storm-hub** |
-| Webshare sticky exit | first connection | *nothing we control* | see below | `_note_exit_ip` | **CONFIRMED unstable** |
-| Browser context | `get_session` | — | process lifetime | — | CONFIRMED |
-| Checkpoint file | `save_checkpoint_now` | overwritten at HOLDING/POLLING | `cleanup_stale` | — | **sweep never called** |
+| 1 | Portal auth session | `browser_login` | `Vistos_sid` cookie | any authed GET | **UNKNOWN** |
+| 2 | Server-side form state | warmup chain | `Vistos_sid`, server-side | any authed GET on that sid | ~90–120 s, **HYPOTHESIS** |
+| 3 | Proxy session | credential/session id | the credential string | nothing | soax **60 min CONFIRMED**; webshare none observed |
+| 4 | **Proxy exit / IP** | provider binding | provider policy | **nothing — traffic does not hold it** | **unstable, CONFIRMED** |
+| 5 | Browser session | `get_session` | worker process | — | process lifetime |
+| — | Checkpoint file | `save_checkpoint_now` | `identity_id` | overwritten at HOLDING/POLLING | `cleanup_stale` never called |
 
-The keepalive design assumes traffic preserves the proxy exit. **A measurement on 2026-08-25
-contradicts that** — see `CONFIRMED_FACTS.md` §1. This is the most important open structural
-risk in the system.
+**The invalidated assumption:** *"keeping the session alive also keeps the proxy exit stable."*
+Measured false (§17). Keepalive acts on lifetimes 1 and 2; it has no measurable effect on 4 and
+cannot extend 3.
+
+### Where IP continuity is actually required
+
+| operation | IP continuity | evidence |
+|---|---|---|
+| reCAPTCHA solve → login submit | **REQUIRED** | 554 `Por favor, confirma o reCAPTCHA` rejections correlating with logged exit moves; two burn a sub-account |
+| Authenticated session (`Vistos_sid`) across an IP change | **OPTIONAL** | storm-auto's `_swap_to_hold_pool`, "validated 0724": form-state is server-side and Vistos_sid-keyed, *"transfers to a fresh browser/IP while alive"*. **Never verified in storm-hub** |
+| Form-state survival across an IP change | **OPTIONAL** (same source) | same claim; **UNKNOWN here** |
+| Discovery (`gettime`, `getPeriodosOcupados`) | **UNKNOWN** | never isolated from other failure causes |
+| Apply (`ScheduleController` → `SubmeterVistoCriaPDF`) | **UNKNOWN** | never isolated |
+| Keepalive nav | **not required** | plain authed GET |
+
+The second row is the load-bearing one and it rests on a *predecessor's* claim, not on our own
+measurement. It is the target of the smallest next experiment.
+
+### The discovery/apply boundary
+
+`PhaseMachine` runs login → warmup → swap → hold → discover → apply **inside one process, one
+browser, one portal session**, and — because `do_swap` is off — **one proxy and one exit**.
+
+Coupling audit:
+
+| coupling | required by | evidence |
+|---|---|---|
+| same worker process | our implementation | `LiveEngineOps` holds `self.session`, `self.posto_pdf`, `self.account` as instance state |
+| same browser | our implementation | in-page fetches and `browser_eval` read live page state |
+| same portal session | **the portal** | form state is server-side, keyed to `Vistos_sid` |
+| same proxy session | our implementation | one `conn_url` per worker for its whole life |
+| same **exit IP** | **UNKNOWN — assumed, never verified** | see table above |
+
+`do_swap` exists precisely to break the last two couplings, and its very existence is an
+assertion that they are *not* portal requirements. It has never run here.
 
 ## 6. Browser layer
 

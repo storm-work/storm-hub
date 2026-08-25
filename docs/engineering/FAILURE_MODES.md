@@ -174,3 +174,22 @@ APP (our logic/state) · OPS (configuration, deployment, human action).
 - **What is not known:** whether the remaining cause is in the apply path at all. The reverted
   `do_apply` (D21) has never been exercised by a run that produced enough warmed workers.
 - **Rule:** measurement taken under a broken regime is not data. Do not tune against it.
+
+## F21 — Three distinct events are not distinguished
+- **Class:** APP
+- **The three:** (a) **proxy failure** — the tunnel will not carry a request; (b) **proxy exit
+  change** — the proxy works fine, its external IP moved; (c) **portal session failure** — the
+  portal rejected our authenticated state.
+- **Current behaviour:** partially separated. `_note_exit_ip()` detects (b) and the login path acts
+  on it. But the hold loop's ladders key off *symptoms*: `_keepalive_dead_streak` counts nav
+  failures (a-ish), `_rewarm_fail_streak` counts form-state failures (c-ish), and neither consults
+  the exit observation that `_do_keepalive` has *already taken* one line earlier.
+- **Consequence, confirmed live 2026-08-22:** a worker held a healthy auth session (28,505-byte
+  keepalive page every cycle) while every questionnaire POST returned 403 — the *exit* was flagged,
+  not the session. Neither ladder fired: the dead-session ladder never tripped because nav
+  succeeded, and the re-warm ladder marked NOT BOOKABLE and returned. It looped to streak 7+ on the
+  same blocked IP. `_maybe_escalate_stuck_rewarm` was added to break that specific deadlock.
+- **Gap:** the escalation is still driven by a *failure count*, not by the classification. The exit
+  observation is taken every keepalive and then discarded.
+- **Improvement:** feed the existing `_note_exit_ip` result into the recovery ladder as a
+  first-class input. No new measurement is needed — the data is already collected and thrown away.
