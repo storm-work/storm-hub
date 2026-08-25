@@ -1976,39 +1976,33 @@ class LiveEngineOps(EngineOps):
                 self._log("do_apply: re-warm at round start failed -- session problem, not the slot")
                 return "session"
 
-            # THE PRIMER IS AN XHR, NOT A NAVIGATION.
+            # THE PRIMER IS A NAVIGATION, like the submit that follows it.
             #
-            # data/new_booking.har serves /slots with `Sec-Fetch-Dest: empty` / `Mode: cors` --
-            # an in-page fetch, exactly like every other ajax step in that capture. We were sending
-            # it as `browser_form_post`, i.e. a real top-level NAVIGATION, which is both the wrong
-            # request shape AND actively destructive: it moves the page off Schedule.jsp
-            # immediately before a submit that is itself an in-page fetch, and when the navigation
-            # fails it parks the page on chrome-error -- an opaque origin from which the submit,
-            # the next round's probe and the next round's warm-up can never fetch again. See
-            # _on_portal_origin: this single line was the head of that whole chain.
+            # ad1c570 -- the code behind all 17 of our bookings -- used browser_form_post here, and
+            # sent captcha:"" exactly as we do. So the empty token is NOT what stops us (the HAR's
+            # manual booking does solve a reCAPTCHA before /slots, but our own proven code never
+            # did), and neither is /slots being a "primer" rather than our discovery mechanism.
             #
-            # Non-fatal on failure, as before: the primer only refreshes the portal's session state.
+            # What matters is the KIND of call, and it is the thing I broke on 2026-08-24:
+            #
+            #   browser_form_post -> a NAVIGATION.     Origin-independent: it navigates, so
+            #                                          whatever page we are on is irrelevant.
+            #   browser_fetch     -> an in-page fetch. Origin-DEPENDENT: it inherits the page's
+            #                                          origin, and dies on an opaque one.
+            #
+            # ad1c570's apply round was navigation + navigation, so it could not be poisoned by a
+            # stray page at all. Making both of these in-page fetches is what opened the door to
+            # every apply failure since -- the chrome-error cascade (e86d8fa) and the ipify
+            # stranding (19fb922) were both only *able* to break applying because the round had
+            # become origin-dependent. Restoring the proven shape closes the whole class.
             try:
-                self.session.browser_fetch(
-                    SLOTS_URL, {"posto_id": str(self.posto_pdf), "captcha": ""},
-                    method="POST", params={"posto_id": str(self.posto_pdf)},
-                    headers={
-                        "Accept": "*/*",
-                        "X-Requested-With": "XMLHttpRequest",
-                        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                        "Referer": SCHED_JSP + "?posto_id=" + str(self.posto_pdf),
-                    },
+                self.session.browser_form_post(
+                    SLOTS_URL + "?posto_id=" + str(self.posto_pdf),
+                    {"posto_id": self.posto_pdf, "captcha": ""},
                     timeout=45,
                 )
             except Exception as e:
                 self._log(f"do_apply: /slots primer failed (non-fatal): {e}")
-
-            # The submit below is an in-page fetch. Prove we have a live origin to issue it from,
-            # rather than discovering we do not via "TypeError: Failed to fetch".
-            if not self._ensure_portal_origin("the submit"):
-                self._log("do_apply: no live portal origin for the submit -- session problem, "
-                          "not the slot")
-                return "session"
 
             # The anchor's age at the moment of submit. The ~90-120s TTL in the docstring above is
             # inherited from storm-auto and has never been measured HERE; logging it on every submit
@@ -2056,12 +2050,20 @@ class LiveEngineOps(EngineOps):
             # not. primp stays third.
             html, _final_url = "", submit_url
             try:
+                # No origin guard in front of this: a navigation does not care where the page is,
+                # and a guard here would spend a full Schedule.jsp nav on the critical path to buy
+                # nothing. It guards the XHR fallback below, which genuinely needs it.
                 _final_url, html = self.session.browser_form_post(submit_url, body, timeout=100)
                 self._log(f"do_apply: submit via navigation -> ({len(html or '')}B) "
                           f"url={str(_final_url)[:90]}")
             except Exception as e:
                 self._log(f"do_apply: navigation submit failed ({str(e)[:110]}) -- trying the XHR")
             if not (html or "").strip():
+                # NOW the origin matters: the fallback is an in-page fetch.
+                if not self._ensure_portal_origin("the XHR submit fallback"):
+                    self._log("do_apply: no live portal origin for the XHR fallback -- session "
+                              "problem, not the slot")
+                    return "session"
                 try:
                     _fx = self.session.browser_fetch(
                         SUBMIT_URL, body, method="POST",
