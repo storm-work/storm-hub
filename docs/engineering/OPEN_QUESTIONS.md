@@ -5,13 +5,14 @@ it is an admission, and several of them block work that would otherwise proceed 
 
 ---
 
-### Q1. How often does a sticky exit move under load?
-We now know it **can** move inside 10 minutes while actively used (`CONFIRMED_FACTS.md` §1).
-We do not know the distribution — one credential, one 21-minute window.
-**Why it matters:** it determines whether holding is viable at all, or whether the design must
-treat exit loss as the normal case. This is the single highest-value unknown in the system.
-**Settled by:** N credentials probed on a fixed cadence for several hours, recording
-time-to-first-move. Cheap, offline, no portal contact.
+### Q1. How often does a sticky exit move under load? — **ANSWERED 2026-08-25**
+Measured: 56 sessions, 4,445 probes, 100% probe success, ~90 session-hours.
+**Traffic does not preserve an exit** (`CONFIRMED_FACTS.md` §17). Webshare loses its exit at
+0.278/session-hour (95% CI [0.159, 0.451]); 50-67% of sessions still held their original exit at
+100 min. soax loses it at a hard ~60-minute ceiling, 20/20, under continuous traffic.
+Traffic volume (30x range) and connection reuse both showed no protective effect.
+**Residual unknown:** session age at t=0 was not controlled, so the shape of the webshare hazard
+(clustered, not constant) is not explained. That is now Q14.
 
 ### Q2. Does an established session id actually outperform a fresh one?
 The tier ordering in `_candidate_query` rests on a measurement its own file declares invalid
@@ -77,3 +78,10 @@ The architecture targets hundreds of concurrent workers. The largest observed ru
 smaller. Untested: Postgres pool saturation (10 + 20), Chromium memory per host, `evt` stream
 throughput, WebSocket fanout cost.
 **Settled by:** a sim run at target worker count with `/ops/status` sampled throughout.
+
+### Q14. Why does the webshare hazard cluster rather than stay constant?
+Observed changes cluster (1.0 min, then 69-92 min) instead of arriving at a constant rate. Session
+age at measurement start was not controlled — an already-bound session has less remaining life than
+a fresh one, which would produce exactly this spread.
+**Settled by:** repeating the measurement with session ids never used before, so t=0 is a true
+binding start.
