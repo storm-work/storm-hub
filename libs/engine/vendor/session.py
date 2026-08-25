@@ -689,6 +689,39 @@ class PlaywrightSession:
                 args=_args,
                 proxy=proxy_config,
             )
+            # ALIGN THE ADVERTISED VERSION WITH THE BROWSER WE ARE ACTUALLY RUNNING.
+            #
+            # _FP_POOL hardcodes Chrome 130/131. The Chromium that Playwright now ships is 149. So
+            # every request advertised Chrome/131 while presenting 149's TLS handshake, JS feature
+            # set and header ordering -- an 18-version mismatch, and one of the cheapest automation
+            # signals there is to detect. It is also PROXY-INDEPENDENT, which is exactly the
+            # operator's observation (2026-08-24): manual Chrome books fine through the very same
+            # webshare and soax exits that our sessions cannot use.
+            #
+            # The pool was presumably correct when this engine was proven -- a Playwright upgrade
+            # moved the browser and left the fingerprint behind, silently. Deriving the major
+            # version from browser.version keeps them aligned across every future upgrade instead
+            # of re-rotting; the pool still supplies the viewport/platform/brand variety it exists
+            # for.
+            try:
+                _real_major = (browser.version or "").split(".")[0]
+                if _real_major.isdigit() and _real_major not in ua:
+                    import re as _re
+                    _old_major = (_re.search(r"Chrome/(\d+)", ua) or [None, "?"])[1]
+                    ua = _re.sub(r"(Chrome|Edg)/\d+", lambda m: f"{m.group(1)}/{_real_major}", ua)
+                    # Only the REAL brands get the version bumped. The deliberately-fake
+                    # "Not_A Brand" entry carries its own arbitrary version (the working HAR shows
+                    # "Not;A=Brand";v="99" beside "Google Chrome";v="139"), and rewriting it to
+                    # match would itself be an anomaly.
+                    sec_ch_ua = _re.sub(
+                        r'("(?:Google Chrome|Chromium|Microsoft Edge)";v=")\d+"',
+                        lambda m: f'{m.group(1)}{_real_major}"', sec_ch_ua)
+                    self._fp = (ua, sec_ch_ua, vp_w, vp_h, platform)
+                    print(f"[session] fp version aligned: claimed Chrome/{_old_major} -> "
+                          f"actual Chrome/{_real_major}")
+            except Exception as _ve:
+                print(f"[session] fp version alignment skipped: {_ve}")
+
             ctx_kwargs = dict(
                 user_agent=ua,
                 viewport={"width": vp_w, "height": vp_h},
