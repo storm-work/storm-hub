@@ -1510,9 +1510,29 @@ class LiveEngineOps(EngineOps):
             return False
         ip = None
         if self.session is not None:
+            # FETCH, NEVER NAVIGATE.
+            #
+            # This used to browser_nav() to the echo, which took the live browser OFF the portal --
+            # and _run_warmup_steps calls it at "warmed", i.e. immediately after the chain finishes
+            # establishing the anchor. Everything downstream is an in-page fetch, so they were all
+            # then issued from api.ipify.org: cross-origin, blocked, "TypeError: Failed to fetch".
+            # CONFIRMED live 2026-08-25, SERGIO PEREIRA, and it cost ~20s of critical path too:
+            #
+            #   12:17:45  ScheduleController -> 200      <- anchor built, page on Schedule.jsp
+            #   12:18:06  /slots primer failed: TypeError: Failed to fetch
+            #   12:18:06  page is not on a live portal origin before the submit -- re-anchoring
+            #   12:18:21  submit -> form_stale
+            #
+            # Exactly the mistake the /slots primer made (see do_apply), in the same file, from the
+            # same assumption that a navigation is a free way to read one value. A cross-origin
+            # fetch reads the same value, keeps the page where it is, and takes about a second --
+            # the echo sends Access-Control-Allow-Origin: *, so it is readable from any origin.
             try:
-                self.session.browser_nav(IP_ECHO_URL, timeout=15)
-                body = (self.session.browser_eval("document.body.innerText") or "").strip()
+                body = self.session.browser_eval(
+                    "(async()=>{try{const r=await fetch(%r,{cache:'no-store'});"
+                    "return (await r.text()).trim();}catch(e){return '';}})()" % IP_ECHO_URL,
+                    timeout=15)
+                body = (body or "").strip() if isinstance(body, str) else ""
                 if body and len(body) <= 45 and " " not in body and "<" not in body:
                     ip = body
             except Exception:

@@ -60,14 +60,18 @@ def test_a_checkpoint_anchor_does_not_suppress_the_keepalive_rewarm():
 # ── the login's IP-mismatch excuse ───────────────────────────────────────────
 def test_exit_ip_reports_movement_rather_than_only_logging():
     class _S:
-        def __init__(self, ip): self.ip = ip
-        def browser_nav(self, *a, **k): return "u"
+        def __init__(self, ip): self.ip = ip; self.navs = []
+        def browser_nav(self, url, *a, **k): self.navs.append(url); return url
         def browser_eval(self, *a, **k): return self.ip
     o = _ops(session=_S("1.1.1.1"), warm_proxy="", _emit=None)
     assert o._note_exit_ip("first") is False           # a baseline is not a change
     o.session.ip = "2.2.2.2"
     assert o._note_exit_ip("later") is True            # moved -> the caller can act
     assert o._note_exit_ip("again") is False           # stable -> no excuse available
+    # AND IT MUST NOT NAVIGATE. It used to browser_nav() to the echo, which took the browser off
+    # the portal at "warmed" -- immediately after the chain built the anchor -- so every in-page
+    # fetch after it was cross-origin and threw "Failed to fetch". Confirmed live 2026-08-25.
+    assert o.session.navs == [], f"the exit probe must never navigate: {o.session.navs}"
 
 
 def test_an_unknown_exit_is_never_reported_as_moved():
