@@ -330,6 +330,14 @@ _TEMPLATE = [
             "-- and blocks platform access beyond it, so the default of 1 leaves a margin. The "
             "login path used to spend its whole sticky budget walking an account to that edge; "
             "measured 2026-08-23, 34 accounts were taken there."),
+    _s("LOGIN_IP_MISMATCH_RETRIES", L.TEMPLATE, int, 2, _WRK, "login_resilience", min_value=0.0,
+       note="reCAPTCHA rejections that may be excused as OUR exit moving rather than charged to "
+            "the sub-account, per login. 'Por favor, confirma o reCAPTCHA' is the token/IP mismatch "
+            "signature -- the token is minted against one exit and submitted from another -- so "
+            "when the exit demonstrably moved across the solve window the account did nothing "
+            "wrong. Measured 2026-08-25: two workers burned 3/3 and 2/2 candidate sub-accounts on "
+            "this verdict, each preceded by 'exit IP CHANGED', and both ended FAILED with slots "
+            "open. Set 0 to disable the excuse and charge every rejection."),
     _s("QUEST_STEP_GAP", L.TEMPLATE, float, 1.0, _WRK, "login_resilience",
        note="seconds (+-30%% jitter) paced before each warm-up questionnaire step and before the "
             "Questionario nav. Ported from storm-auto and then NEVER READ -- the classic unwired "

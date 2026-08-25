@@ -403,6 +403,15 @@ class LiveEngineOps(EngineOps):
 
         self.session = None
         self.posto_pdf: str | None = None
+        # HOW and WHEN the booking anchor was established. `posto_pdf` alone cannot answer either,
+        # and it means two different things depending on which of its two writers set it:
+        #   _run_warmup_steps  -- parsed out of a Schedule.jsp we just rebuilt: anchor is FRESH.
+        #   a checkpoint       -- copied from a file: the anchor may be minutes or hours old, and
+        #                         nothing on this session has verified it.
+        # The ScheduleController form state has a ~90-120s TTL (measured; see do_apply), so "is it
+        # set" was never the right question -- "how old, and did we build it" is.
+        self._anchor_src: str | None = None      # "chain" | "checkpoint" | None
+        self._anchor_at: float | None = None     # monotonic stamp; None = age unknown
         self._restore_stage: str | None = None   # "alive" | "rewarmed" | "none", set by do_login
         # Rolling view of how the portal is behaving FOR THIS WORKER: per-phase durations plus
         # consecutive slow/unreachable streaks. Lets a slow window be waited out instead of
@@ -506,6 +515,9 @@ class LiveEngineOps(EngineOps):
 
         if self._probe_alive():
             self.posto_pdf = data.get("posto_pdf")
+            # UNVERIFIED on this session: copied from a file, not rebuilt. _anchor_at stays None so
+            # nothing downstream can mistake it for a fresh chain.
+            self._set_anchor("checkpoint")
             self._restore_stage = "alive"
             self._log(f"checkpoint restore: session alive and bookable after {spent():.0f}s "
                       f"-- skipping login+warmup")
@@ -537,6 +549,26 @@ class LiveEngineOps(EngineOps):
             pass
         self.session = None
         return False
+
+    def _set_anchor(self, src: str) -> None:
+        """Record that the booking anchor was (re)established, and by which route."""
+        self._anchor_src = src
+        self._anchor_at = time.time() if src == "chain" else None
+
+    def _clear_anchor(self) -> None:
+        self.posto_pdf = None
+        self._anchor_src = None
+        self._anchor_at = None
+
+    def _anchor_age(self) -> float | None:
+        """Seconds since the chain last rebuilt the anchor, or None when we did not build it."""
+        return None if self._anchor_at is None else time.time() - self._anchor_at
+
+    def _anchor_desc(self) -> str:
+        age = self._anchor_age()
+        if self._anchor_src is None:
+            return "none"
+        return f"{self._anchor_src}/{age:.0f}s" if age is not None else f"{self._anchor_src}/age-unknown"
 
     def _on_portal_origin(self) -> bool:
         """Is the browser sitting on a live portal page RIGHT NOW?
@@ -701,6 +733,10 @@ class LiveEngineOps(EngineOps):
         max_transient = max(0, int(self.cfg.login.transient_retry_max))
         captcha_fails = 0
         captcha_budget = max(1, int(self.cfg.raw.get("CAPTCHA_FAILURE_BUDGET", 1)))
+        # Rejections attributable to OUR exit moving across the solve window. Bounded like
+        # `transient` and, like it, not charged to the sub-account -- see the use site below.
+        ip_moves = 0
+        max_ip_moves = max(0, int(self.cfg.raw.get("LOGIN_IP_MISMATCH_RETRIES", 2)))
         rounds = 0
         while attempt < sticky_max:
             rounds += 1
@@ -763,7 +799,7 @@ class LiveEngineOps(EngineOps):
                 # incorrectly skipped re-warming after a fresh login, reporting "restore succeeded"
                 # while holding an unwarmed session -- and poisoning the next checkpoint save with a
                 # stage="schedule_jsp" that isn't true.
-                self.posto_pdf = None
+                self._clear_anchor()
                 if self._breaker is not None:
                     self._breaker.record_success()
                 return True
@@ -779,6 +815,31 @@ class LiveEngineOps(EngineOps):
                           f"(sticky still {attempt}/{sticky_max})")
                 self._backoff(transient)
                 continue
+            # OUR FAULT, NOT THE ACCOUNT'S -- and therefore checked HERE, beside `transient` and
+            # before `attempt` is charged, not after.
+            #
+            # "Por favor, confirma o reCAPTCHA" is the token/IP mismatch signature: the token was
+            # minted against one exit and submitted from another, so the portal cannot verify it.
+            # When the exit demonstrably moved across the ~6s solve window, that is the cause, and
+            # spending the account's two-strike budget on it spends a sub-account on our own
+            # rotation -- at two strikes the portal blocks the account permanently. MEASURED
+            # 2026-08-25: PEDRO TEIXEIRA RAMOS burned 3 of 3 candidates and AMILCAR WANDERSON 2 of
+            # 2, every one on this verdict with "exit IP CHANGED" logged immediately before, and
+            # both ended FAILED with no accounts left while slots sat open.
+            #
+            # Bounded by max_ip_moves: past the cap we stop making excuses and charge it, because at
+            # that point we genuinely cannot tell an unstable exit from a failing account.
+            if (_is_recaptcha_verdict(reason) and ip_moves < max_ip_moves
+                    and self._note_exit_ip("after reCAPTCHA rejection")):
+                ip_moves += 1
+                self._log(f"login: reCAPTCHA rejection coincided with the exit moving "
+                          f"({ip_moves}/{max_ip_moves}) -- token/IP mismatch, NOT charged to "
+                          f"{self.sub_account_id[:8]}; rotating to a fresh exit and retrying")
+                new_proxy = self._request_proxy_rotation(self._current_phase)
+                if new_proxy:
+                    self.warm_proxy = new_proxy
+                self._backoff(ip_moves)
+                continue          # deliberately does NOT advance `attempt` or `captcha_fails`
             attempt += 1
             self._log(f"login attempt {attempt}/{sticky_max} [{_proxy_label(self.warm_proxy)}"
                       f" acct={self.sub_account_id[:8]}]: rejected ({reason})")
@@ -809,7 +870,6 @@ class LiveEngineOps(EngineOps):
                 # the ~6s solve window, that is the cause and no amount of retrying fixes it. This is
                 # the one place the observation actually settles a live question, and until now it
                 # only ran at warm-up and keepalive, which almost no worker reaches.
-                self._note_exit_ip("after reCAPTCHA rejection")
                 captcha_fails += 1
                 if captcha_fails >= captcha_budget:
                     self._log(f"login: {captcha_fails} reCAPTCHA rejection(s) on "
@@ -921,6 +981,12 @@ class LiveEngineOps(EngineOps):
             # The worker could never recover, and each cycle churned a slot lease: leased, released
             # (reopening the slot), re-leased. Consuming the flag makes the second call do real work.
             self._restore_stage = "none"
+            # Honest about what this is: the checkpoint probe found the session bookable, but the
+            # questionnaire chain did NOT run, so the anchor is as old as the file. do_apply
+            # re-warms unconditionally at round start, which is what makes this safe -- without
+            # that, this is a worker displaying `warmed` on form state nobody verified.
+            self._log(f"do_warmup: skipped -- checkpoint restore left the session bookable "
+                      f"(anchor={self._anchor_desc()}); the first apply round re-warms")
             return True   # checkpoint restore already got us to a bookable state
         return self._run_warmup_steps()
 
@@ -1233,6 +1299,7 @@ class LiveEngineOps(EngineOps):
             # the schedule page itself advertises -- we hardcoded posto_id and never read this.
             m_pdf = re.search(r"SubmeterVistoCriaPDF\?posto_id=(\d+)", sched_html)
             self.posto_pdf = m_pdf.group(1) if m_pdf else self.posto_id
+            self._set_anchor("chain")
             if self.posto_pdf != self.posto_id:
                 self._log(f"do_warmup: posto_pdf={self.posto_pdf} differs from posto_id={self.posto_id}")
             self._note_portal("warmup", time.time() - _t0, ok=True)
@@ -1408,7 +1475,7 @@ class LiveEngineOps(EngineOps):
         happened -- see _run_apply."""
         return self._slot_found_seen()
 
-    def _note_exit_ip(self, when: str) -> None:
+    def _note_exit_ip(self, when: str) -> bool:
         """Record the exit address this session is presenting, and say so if it MOVED.
 
         The portal binds a session to the IP that established it, and our exits rotate underneath us
@@ -1418,8 +1485,16 @@ class LiveEngineOps(EngineOps):
         "Por favor, confirma o reCAPTCHA" -- three different portal diagnoses for one event, each
         answered by re-warming or re-logging in FROM THE NEW IP, which is why they so rarely worked.
 
-        Observation only. It changes no decision yet; it makes the fact available to the ladder and
-        to the operator, which is the precondition for acting on it.
+        Returns True only when the exit is KNOWN to have moved since the last observation. An
+        unknown reading is never "changed" -- see exit_changed's docstring for why that bias matters.
+
+        No longer observation-only. `login` acts on it: a "Por favor, confirma o reCAPTCHA" that
+        coincides with the exit moving is OUR address rotating across the solve window, not the
+        account failing a challenge, and charging it to the account's 2-strike budget spends a
+        sub-account on our own infrastructure. MEASURED 2026-08-25 on Test 2032: PEDRO TEIXEIRA
+        RAMOS burned 3 of 3 candidate sub-accounts and AMILCAR WANDERSON 2 of 2, every one on this
+        verdict, with "exit IP CHANGED under this session" logged immediately beforehand -- and both
+        workers ended FAILED with no accounts left while slots sat open.
         """
         # OBSERVE THROUGH THE BROWSER when a session exists, never with a raw client.
         #
@@ -1432,7 +1507,7 @@ class LiveEngineOps(EngineOps):
         try:
             from libs.proxies.exit_ip import IP_ECHO_URL, exit_changed, observe_exit_ip
         except Exception:
-            return
+            return False
         ip = None
         if self.session is not None:
             try:
@@ -1446,11 +1521,12 @@ class LiveEngineOps(EngineOps):
             try:
                 ip = observe_exit_ip(self.warm_proxy)
             except Exception:
-                return
+                return False
         if ip is None:
-            return          # unknown, NEVER treated as changed -- see exit_changed's docstring
+            return False    # unknown, NEVER treated as changed -- see exit_changed's docstring
         prev = getattr(self, "_exit_ip", None)
-        if exit_changed(prev, ip):
+        moved = exit_changed(prev, ip)
+        if moved:
             self._log(f"exit IP CHANGED under this session ({prev} -> {ip}) at {when} -- the portal "
                       f"binds sessions to the establishing IP, so anything that fails from here is "
                       f"our address moving, not the portal rejecting us")
@@ -1459,6 +1535,7 @@ class LiveEngineOps(EngineOps):
         elif prev is None:
             self._log(f"exit IP {ip} ({when})")
         self._exit_ip = ip
+        return moved
 
     def _mark_hold_bookable(self, bookable: bool, why: str = "") -> None:
         """Publish whether this HOLDING worker can actually take a slot.
@@ -1608,7 +1685,7 @@ class LiveEngineOps(EngineOps):
         # makes _attempt_keepalive_restore re-warm rather than stop at re-authenticating -- its
         # `if ok and self.posto_pdf is None` guard exists for a launch-time restore, where a set
         # posto_pdf really does mean the anchor is good. Here it means the opposite.
-        self.posto_pdf = None
+        self._clear_anchor()
         if self._attempt_keepalive_restore(context) and self.posto_pdf is not None:
             self._mark_hold_bookable(True)
 
@@ -1631,7 +1708,11 @@ class LiveEngineOps(EngineOps):
             pass
         self.session = None
         ok = self._try_restore_from_checkpoint() or self._fresh_login()
-        if ok and self.posto_pdf is None:
+        # `posto_pdf is None` was the wrong test. A checkpoint restore SETS posto_pdf from the file
+        # without rebuilding anything, so an unverified anchor silently suppressed this re-warm and
+        # the restore reported success on form state nothing had checked. Re-warm unless the chain
+        # itself established the anchor on THIS session.
+        if ok and self._anchor_src != "chain":
             ok = self._run_warmup_steps()   # restore only re-authenticates; form-state needs re-warming
         if ok:
             self._keepalive_restore_attempts = 0
@@ -1909,6 +1990,10 @@ class LiveEngineOps(EngineOps):
                           "not the slot")
                 return "session"
 
+            # The anchor's age at the moment of submit. The ~90-120s TTL in the docstring above is
+            # inherited from storm-auto and has never been measured HERE; logging it on every submit
+            # turns the next form_stale into evidence instead of another guess.
+            self._log(f"do_apply: submitting with anchor={self._anchor_desc()}")
             body = booking_payload(self.quest_steps, slot, residence=self.residence)
             submit_url = SUBMIT_URL + "?posto_id=" + str(self.posto_pdf)
             # SUBMIT AS AN XHR, not a navigation -- matching data/new_booking.har, a real successful

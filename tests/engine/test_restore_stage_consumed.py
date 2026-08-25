@@ -16,6 +16,15 @@ class _Ops(LiveEngineOps):
     def __init__(self, stage):
         self._restore_stage = stage
         self.warmup_calls = 0
+        # do_warmup now reports the anchor's PROVENANCE when it short-circuits -- a checkpoint
+        # restore leaves form state nothing on this session has verified, and saying so is the
+        # difference between "warmed" meaning something and [[holding-is-a-lie]].
+        self.logs: list[str] = []
+        self._anchor_src = "checkpoint"
+        self._anchor_at = None
+
+    def _log(self, msg):
+        self.logs.append(msg)
 
     def _run_warmup_steps(self):
         self.warmup_calls += 1
@@ -27,6 +36,8 @@ def test_the_restore_shortcircuit_applies_only_once(stage):
     ops = _Ops(stage)
     assert ops.do_warmup() is True, "the warm-up right after a restore is legitimately free"
     assert ops.warmup_calls == 0
+    # ...and it must SAY the anchor was not rebuilt here, rather than reporting a bare "warmed".
+    assert any("checkpoint" in m and "anchor=" in m for m in ops.logs), ops.logs
 
     # Every LATER call is the recovery ladder asking for a real re-warm.
     assert ops.do_warmup() is False, "a second re-warm must do real work, not short-circuit"
