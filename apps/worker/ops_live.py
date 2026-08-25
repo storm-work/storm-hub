@@ -1885,6 +1885,23 @@ class LiveEngineOps(EngineOps):
             return self._signals.scouts_invalid()
         return False
 
+    # ─────────────────────────────────────────────────────────────────────────────────────────
+    # REVERTED VERBATIM TO ad1c570 (2026-08-21), the last commit under which this system actually
+    # booked -- 17 real appointments. Restored on branch `apply-revert-proven`, 2026-08-25, at the
+    # operator's instruction after a week of incremental fixes failed to make applying work again.
+    #
+    # Everything I changed here between 2026-08-22 and 2026-08-25 is GONE, deliberately, including
+    # changes I still believe were individually correct:
+    #   - the XHR submit and XHR /slots primer (f02041d)   -> back to navigation + navigation
+    #   - the _schedule_state_ok() round-start gate        -> back to an unconditional re-warm
+    #   - _ensure_portal_origin guards inside do_apply     -> unnecessary: a navigation does not
+    #                                                         care what page the browser is on
+    #   - the primp third route, the anchor= logging, the
+    #     portal-busy back-off, form_stale reclassification
+    #
+    # The bug-fix comments below are ad1c570's own and refer to ITS history, not to anything from
+    # this week. Do not "improve" this method again without a booking to prove the change.
+    # ─────────────────────────────────────────────────────────────────────────────────────────
     def do_apply(self, slot: dict) -> str:
         """Bug fix #3: re-warm at the START of every round (ScheduleController form-state TTL is
         ~90-120s and lapses during a long hold -- submitting on stale context bounces -> false
@@ -1895,78 +1912,13 @@ class LiveEngineOps(EngineOps):
         storm-auto's actual proven submit code (see libs/engine/payload.py's module docstring) --
         NOT the full form_defaults merge, which is only correct for the earlier ScheduleController
         warmup POST. Bug fix #4: PDF via submit_form_binary (page.route() interception)."""
-        # NEITHER of these early exits is the slot's fault, and calling them "bounced" charges it:
-        # the lease is released WITH a penalty, the worker's bounce_streak climbs toward parking,
-        # and the volume convinces the Hub's false-slot revert that a real pool is phantom.
-        #
-        # CONFIRMED live 2026-08-24 on Test 2032: 13 applying transitions produced exactly ONE
-        # submit, and the other 12 returned here. All 12 were recorded as bounces, and all 17
-        # genuinely-available slots were duly closed. The breaker was tripped the whole time --
-        # which is the fleet-wide signal that THE PORTAL is refusing everyone, the strongest
-        # possible evidence that the slot is fine.
-        #
-        # portal_unreachable is the existing outcome for exactly this: hand the slot back with no
-        # penalty, keep the session, retry later. Fourth instance of this misattribution class
-        # (dead tunnel, dead session, refusing portal, and now our own gates).
         if self._apply_sem is not None:
             if not self._apply_sem.acquire(self.identity_id, timeout=60):
-                self._log("do_apply: apply concurrency gate timed out -- OUR contention, not the "
-                          "slot; handing it back unpenalised")
-                return "portal_unreachable"
+                return "bounced"
         try:
             if self._breaker is not None and self._breaker.is_tripped():
-                self._log("do_apply: booking breaker is tripped -- the PORTAL is refusing the whole "
-                          "fleet, so this slot is not at fault; handing it back unpenalised")
-                return "portal_unreachable"
+                return "bounced"
 
-            # LAZY re-warm, matching storm-auto's confirmed poll cycle: "check alive -> lazy
-            # re-warm if form state expired". We re-warmed UNCONDITIONALLY on every apply round --
-            # the full 7-step questionnaire + Formulario + ScheduleController chain before every
-            # single submit.
-            #
-            # That is the most expensive and most exposed thing we can do at the exact moment we
-            # should be fastest. Measured on this run: 8 apply rounds, 0 booked, and FIVE of the
-            # eight died inside that round-start re-warm ("session problem, not the slot") -- not at
-            # the submit. Every one of those chains is ~10 more portal requests, each a fresh chance
-            # to be 403'd or challenged, to rebuild an anchor that was very often still perfectly
-            # good. storm-auto instead does ONE Schedule.jsp GET and only re-warms if the markers
-            # are actually gone.
-            # ONE probe per round -- it is a real portal nav, so calling it twice would double the
-            # request count and could even answer differently the second time.
-            state_ok = self._schedule_state_ok()
-            if not state_ok and self._portal_busy_seen:
-                # The portal is refusing this session's requests. Hand the slot back with no
-                # penalty and keep the session -- a re-warm here is guaranteed to fail and the
-                # re-login it escalates to costs a CAPTCHA solve we cannot spare.
-                self._log("do_apply: portal is declining requests -- holding this session rather "
-                          "than rebuilding into a wall")
-                if self._breaker is not None:
-                    self._breaker.record_portal_down()
-                return "portal_unreachable"
-            # ALWAYS RE-WARM. The probe above is a DIAGNOSTIC (is the portal willing to talk to
-            # us at all), never a licence to skip the chain.
-            #
-            # REGRESSION, introduced 2026-08-24, reverted 2026-08-25. ad1c570 -- the code behind all
-            # 17 real bookings -- re-warmed unconditionally here, and said why in its first line:
-            #
-            #   "Bug fix #3: re-warm at the START of every round (ScheduleController form-state TTL
-            #    is ~90-120s and lapses during a long hold -- submitting on stale context bounces
-            #    -> false 'taken')."
-            #
-            # I gated it on _schedule_state_ok() to save the ~10 requests, and that gate tests the
-            # WRONG THING: Schedule.jsp's markers are a PAGE RENDER, while the form state the submit
-            # is validated against is a SERVER-SIDE CURSOR in the session. The page can render every
-            # marker while the portal's cursor sits back at `questionario` -- which is exactly what
-            # it reports when we submit:
-            #
-            #   10:45:49 warmed (ScheduleController 200) -> 10:46:04 DISCOVERING -> 10:47:13
-            #   applying -> 10:47:24 submit 200, 65180B -> "form_stale, bounced to ['questionario']"
-            #
-            # Discovery ran in between and moved the cursor. Both of this run's submits reached the
-            # portal cleanly and both came back as the questionnaire; the transport was never the
-            # problem. The checkpoint-restore path ("session alive and bookable -- skipping
-            # login+warmup") lands in the same place and is covered by this same unconditional
-            # re-warm on its first round.
             if not self._run_warmup_steps():
                 # NOT "bounced". This is OUR session failing before we ever spoke to the portal
                 # about this slot, and calling it a bounce blames the slot for our dead proxy:
@@ -1976,25 +1928,6 @@ class LiveEngineOps(EngineOps):
                 self._log("do_apply: re-warm at round start failed -- session problem, not the slot")
                 return "session"
 
-            # THE PRIMER IS A NAVIGATION, like the submit that follows it.
-            #
-            # ad1c570 -- the code behind all 17 of our bookings -- used browser_form_post here, and
-            # sent captcha:"" exactly as we do. So the empty token is NOT what stops us (the HAR's
-            # manual booking does solve a reCAPTCHA before /slots, but our own proven code never
-            # did), and neither is /slots being a "primer" rather than our discovery mechanism.
-            #
-            # What matters is the KIND of call, and it is the thing I broke on 2026-08-24:
-            #
-            #   browser_form_post -> a NAVIGATION.     Origin-independent: it navigates, so
-            #                                          whatever page we are on is irrelevant.
-            #   browser_fetch     -> an in-page fetch. Origin-DEPENDENT: it inherits the page's
-            #                                          origin, and dies on an opaque one.
-            #
-            # ad1c570's apply round was navigation + navigation, so it could not be poisoned by a
-            # stray page at all. Making both of these in-page fetches is what opened the door to
-            # every apply failure since -- the chrome-error cascade (e86d8fa) and the ipify
-            # stranding (19fb922) were both only *able* to break applying because the round had
-            # become origin-dependent. Restoring the proven shape closes the whole class.
             try:
                 self.session.browser_form_post(
                     SLOTS_URL + "?posto_id=" + str(self.posto_pdf),
@@ -2004,87 +1937,21 @@ class LiveEngineOps(EngineOps):
             except Exception as e:
                 self._log(f"do_apply: /slots primer failed (non-fatal): {e}")
 
-            # The anchor's age at the moment of submit. The ~90-120s TTL in the docstring above is
-            # inherited from storm-auto and has never been measured HERE; logging it on every submit
-            # turns the next form_stale into evidence instead of another guess.
-            self._log(f"do_apply: submitting with anchor={self._anchor_desc()}")
             body = booking_payload(self.quest_steps, slot, residence=self.residence)
             submit_url = SUBMIT_URL + "?posto_id=" + str(self.posto_pdf)
-            # SUBMIT AS AN XHR, not a navigation -- matching data/new_booking.har, a real successful
-            # manual booking (posto 3059, 2026-08-24):
-            #
-            #   POST /VistosOnline/SubmeterVistoCriaPDF?posto_id=3059
-            #   X-Requested-With: XMLHttpRequest
-            #   Sec-Fetch-Dest: empty        Sec-Fetch-Mode: cors      Accept: */*
-            #   Referer: .../Schedule.jsp?posto_id=3059
-            #   body: lang=PT&txtHuman=&back=&f_date_c=2026%2F09%2F23&cmbPeriodo=5
-            #   -> 200, text/html, 1572 bytes
-            #
-            # EVERY ajax step in that capture has Sec-Fetch-Dest: empty / Mode: cors -- /slots and
-            # QuestNextQuestion included. We were sending the submit as a DOM form.submit(), i.e. a
-            # real page NAVIGATION (Dest: document, Mode: navigate) -- a fundamentally different
-            # request shape from the one the portal actually answers. Our questionnaire steps
-            # already use in-page fetch and work; the submit was the odd one out, and it is the one
-            # step that has never once succeeded (14 applying transitions -> 2 submits -> both
-            # abandoned on chrome-error).
-            #
-            # browser_fetch runs inside the live browser context, so it keeps the session's cookies
-            # and TLS fingerprint -- the same call ScheduleController already uses successfully.
-            # SUBMIT AS A NAVIGATION FIRST. Both proven implementations do, and storm-auto -- the
-            # code behind 113 real bookings -- says why, in a comment on this exact endpoint:
-            #
-            #   "Same DataDome risk /slots had: a bare primp POST (XHR-equivalent) can be blocked
-            #    regardless of proxy quality, while a real navigation (form.submit()) is trusted.
-            #    Try the real-navigation path first; fall back to primp POST if unavailable/blocked."
-            #
-            # Our own ad1c570 -- the code behind all 17 of OUR bookings -- had browser_form_post as
-            # the ONLY submit path. I made the XHR primary in f02041d because data/new_booking.har
-            # shows the portal's own page submitting via XHR (Sec-Fetch-Dest: empty, Mode: cors).
-            # That capture is real, but it is what the portal's JS does from a page DataDome has
-            # already blessed; it is not evidence that our headless XHR is treated the same way.
-            # Two independent proven paths against one inference from a capture: the navigation wins.
-            #
-            # The XHR is kept as the SECOND route, not deleted -- when the navigation lands on a
-            # chrome-error/DataDome/blank page the XHR is a genuinely different request shape and
-            # has already been seen to reach the portal (200, this run) where the navigation could
-            # not. primp stays third.
-            html, _final_url = "", submit_url
             try:
-                # No origin guard in front of this: a navigation does not care where the page is,
-                # and a guard here would spend a full Schedule.jsp nav on the critical path to buy
-                # nothing. It guards the XHR fallback below, which genuinely needs it.
                 _final_url, html = self.session.browser_form_post(submit_url, body, timeout=100)
-                self._log(f"do_apply: submit via navigation -> ({len(html or '')}B) "
-                          f"url={str(_final_url)[:90]}")
             except Exception as e:
-                self._log(f"do_apply: navigation submit failed ({str(e)[:110]}) -- trying the XHR")
-            if not (html or "").strip():
-                # NOW the origin matters: the fallback is an in-page fetch.
-                if not self._ensure_portal_origin("the XHR submit fallback"):
-                    self._log("do_apply: no live portal origin for the XHR fallback -- session "
-                              "problem, not the slot")
-                    return "session"
-                try:
-                    _fx = self.session.browser_fetch(
-                        SUBMIT_URL, body, method="POST",
-                        params={"posto_id": str(self.posto_pdf)},
-                        headers={
-                            "Accept": "*/*",
-                            "X-Requested-With": "XMLHttpRequest",
-                            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                            "Referer": SCHED_JSP + "?posto_id=" + str(self.posto_pdf),
-                        },
-                        timeout=60,
-                    )
-                    html = str(_fx.get("body") or "")
-                    self._log(f"do_apply: submit via XHR -> status={_fx.get('status')} "
-                              f"({len(html)}B)")
-                except Exception as e:
-                    self._log(f"do_apply: XHR submit also failed: {str(e)[:110]}")
-                    if self._breaker is not None:
-                        self._breaker.record_portal_down()
-                    return "bounced"
+                self._log(f"do_apply: SubmeterVistoCriaPDF POST failed: {e}")
+                if self._breaker is not None:
+                    self._breaker.record_portal_down()
+                return "bounced"
 
+            # storm-auto guards the submit response before classifying it, because a blank
+            # chrome-error page or a DataDome interstitial is not a portal answer at all -- it
+            # falls back to a primp POST there. We have no primp path, so the honest outcome is
+            # "the portal never answered": report it as a bounce and let the breaker see it,
+            # rather than mis-reading an interstitial as a rejection of the slot.
             _snip = (html or "")[:300]
             _blank = (html or "").strip() in ("", "<html><head></head><body></body></html>")
             _blocked = "body{margin:0;background:#fff}" in _snip or "datadome" in _snip.lower()
@@ -2102,72 +1969,15 @@ class LiveEngineOps(EngineOps):
             if _blank or _blocked or _chrome_error:
                 why = ("Chrome network-error page" if _chrome_error else
                        "blank page" if _blank else "DataDome interstitial")
-                self._log(f"do_apply: submit via browser landed on a {why} ({len(html or '')}B) "
-                          f"| slot={slot} | final_url={_final_url}")
-                # The navigation fallback has just parked the page somewhere we cannot fetch from.
-                # Put it back NOW: the primp fallback below does not need the browser, but the next
-                # apply round does, and until 2026-08-25 nothing ever restored it -- one failed
-                # submit silently disabled every in-page fetch for the rest of the worker's life.
-                self._ensure_portal_origin("the next round")
-                # FALL BACK TO A DIRECT POST -- storm-auto's confirmed behaviour, and the piece
-                # storm-hub lost when primp was removed from the pipeline.
-                #
-                # storm-auto EXPECTS this: "a bare primp POST (XHR-equivalent) can be blocked
-                # regardless of proxy quality, while a real navigation (form.submit()) is trusted.
-                # Try the real-navigation path first; fall back to primp POST if unavailable or
-                # blocked." It checks for exactly these three outcomes -- blank, DataDome, or
-                # chrome-error -- and retries the submit directly.
-                #
-                # We treated the same page as terminal, which is why the operator's observation was
-                # right and mine was wrong: the proxy logs in, warms and discovers perfectly and
-                # then "fails" only at the submit. It is not the proxy. It is the ONE step whose
-                # browser path storm-auto already knew needed a second route, on a session whose
-                # cookies the form_post handler has just reverse-synced into primp for this purpose.
-                #
-                # The browser attempt stays FIRST: a real navigation is what DataDome trusts, so
-                # this is a fallback, never a replacement.
-                try:
-                    r = self.session.post(
-                        SUBMIT_URL, data=body, params={"posto_id": str(self.posto_pdf)},
-                        headers={"Referer": SCHED_JSP + "?posto_id=" + str(self.posto_pdf)},
-                        timeout=30,
-                    )
-                    fb_html, fb_url = (r.text or ""), getattr(r, "url", "") or ""
-                    self._log(f"do_apply: primp fallback -> status={r.status_code} "
-                              f"({len(fb_html)}B)")
-                    if r.status_code == 200 and fb_html.strip():
-                        html, _final_url = fb_html, fb_url
-                        _blank = _blocked = _chrome_error = False
-                except Exception as e:
-                    self._log(f"do_apply: primp fallback also failed: {str(e)[:140]}")
-
-            if _blank or _blocked or _chrome_error:
+                self._log(f"do_apply: submit response is a {why} ({len(html or '')}B) -- the request "
+                          f"never reached the portal | slot={slot} | final_url={_final_url}")
                 if self._breaker is not None:
                     self._breaker.record_portal_down()
-                self._log(f"do_apply: submit never reached the portal by either route | slot={slot}")
                 # OUR network, not the slot -- but ALSO not our session: ScheduleController had
                 # just returned 200 seconds earlier. Distinct from "session" so the caller does not
                 # tear down a demonstrably healthy login: confirmed live 2026-08-18, one dropped
                 # submit POST cost a full re-login and ~10 MINUTES back to bookable, three times
                 # over, while the run's real constraint is how rarely a login succeeds at all.
-                return "portal_unreachable"
-
-            # The portal declining to process the request is not the slot's fault. Without this it
-            # classified as a bare "error" -- no confirmation marker, no bounce marker -- and
-            # "error" falls through to the BOUNCE path in phases._run_apply: the slot is charged,
-            # bounce_streak climbs toward parking the worker, and the volume feeds the Hub's
-            # false-slot revert, which would retire the 16 genuinely-available slots this run
-            # discovered. Same misattribution already fixed for a dead tunnel and a dead session;
-            # this is the third sibling.
-            #
-            # Reuses the portal_unreachable outcome deliberately: its handling is exactly right
-            # (release the slot with no penalty, keep the session, retry) even though the request
-            # did technically arrive. The log below says what actually happened.
-            if _is_portal_busy(html):
-                self._log(f"do_apply: portal declined the request -- its 'try again later' page "
-                          f"({len(html or '')}B), NOT a problem with this slot | slot={slot}")
-                if self._breaker is not None:
-                    self._breaker.record_portal_down()
                 return "portal_unreachable"
 
             outcome = self._classify_submit_response(html, _final_url)

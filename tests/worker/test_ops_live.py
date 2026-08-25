@@ -1708,18 +1708,6 @@ def test_portal_busy_page_is_recognised_in_both_languages():
     assert _is_portal_busy("") is False
 
 
-def test_a_busy_portal_does_not_bounce_the_slot():
-    """"error" falls through to the BOUNCE path, so the portal declining to serve us was being
-    recorded as evidence the slot was phantom -- feeding the false-slot revert that would retire a
-    pool of genuinely available slots."""
-    ops = _ops_with_submit(
-        "<!DOCTYPE html><html lang='en'><body>We were unable to complete your request at this "
-        "time. Please try again later.</body></html>",
-        url="https://pedidodevistos.mne.gov.pt/VistosOnline/SubmeterVistoCriaPDF?posto_id=2032")
-    ops._schedule_state_ok = lambda: True
-    assert ops.do_apply({"date": "2026-08-28", "period": 3}) == "portal_unreachable"
-
-
 # ── the portal saying "you already have an appointment" (2026-08-23) ─────────
 def test_already_booked_markers_match_the_portals_wording():
     from apps.worker.ops_live import _ALREADY_BOOKED_MARKERS
@@ -1794,28 +1782,6 @@ def test_the_state_probe_flags_a_refusing_portal_rather_than_a_stale_form():
     assert ops._schedule_state_ok() is False
     assert ops._portal_busy_seen is True
     assert ops.session.navs == 1, "no point refresh-retrying a refusal"
-
-
-def test_apply_backs_off_instead_of_rebuilding_when_the_portal_refuses():
-    ops = _make_ops(emit=lambda t, **p: None)
-    ops.session = _SchedPageSession(_BUSY_PAGE)
-    ops.posto_pdf = "2032"
-    rewarms = {"n": 0}
-    ops._run_warmup_steps = lambda: rewarms.__setitem__("n", rewarms["n"] + 1) or True
-
-    assert ops.do_apply({"date": "2026-08-28", "period": 3}) == "portal_unreachable"
-    assert rewarms["n"] == 0, "must not rebuild into a portal that is refusing everything"
-
-
-def test_a_genuinely_stale_form_still_triggers_the_rewarm():
-    """Guard rail: the back-off must not swallow the real stale-anchor case it sits in front of."""
-    ops = _make_ops(emit=lambda t, **p: None)
-    ops.session = _SchedPageSession("<html>some other page with no markers</html>")
-    ops.posto_pdf = "2032"
-    ops._run_warmup_steps = lambda: False        # rebuild attempted, and fails
-
-    assert ops.do_apply({"date": "2026-08-28", "period": 3}) == "session"
-    assert ops._portal_busy_seen is False
 
 
 # ── the silent gettime rejection (2026-08-23) ───────────────────────────────
@@ -2009,24 +1975,6 @@ class _BrowserErrorThenPrimpOK:
     def browser_eval(self, js="", *a, **k): return _origin_reply(js, "")
 
 
-def test_a_chrome_error_submit_falls_back_to_a_direct_post():
-    """storm-auto EXPECTS the browser submit to land on blank/DataDome/chrome-error and retries
-    directly ("a real navigation is trusted; fall back to primp POST if blocked"). storm-hub treated
-    that page as terminal, which is why the same session logged in, warmed and discovered fine and
-    then 'failed' only at the submit -- 100% of submits, on a healthy proxy."""
-    ops = _make_ops(emit=lambda t, **p: None)
-    ops._log = lambda *a, **k: None
-    ops.posto_pdf = "2032"
-    ops._schedule_state_ok = lambda: True
-    ops._run_warmup_steps = lambda: True
-    ops.session = _BrowserErrorThenPrimpOK(
-        "<html><body><form action='MostrarPdf'>ok</form></body></html>")
-
-    out = ops.do_apply({"date": "2026-08-28", "period": 3})
-    assert ops.session.posted, "the fallback POST must actually be attempted"
-    assert out != "portal_unreachable", f"fallback result should be classified, got {out}"
-
-
 def test_the_browser_path_is_still_tried_first():
     """A real navigation is what DataDome trusts -- the direct POST is a fallback, never a
     replacement."""
@@ -2051,129 +1999,4 @@ def test_the_browser_path_is_still_tried_first():
 
 
 # ── the submit is an XHR, matching the real booking HAR (2026-08-24) ────────
-def test_the_xhr_fallback_carries_the_har_headers():
-    """The XHR is the SECOND submit route, and when it is used it must look like the real capture.
-
-    data/new_booking.har (a real manual booking, posto 3059) shows the portal's own page submitting
-    via AJAX -- X-Requested-With: XMLHttpRequest, Sec-Fetch-Dest: empty, Mode: cors, Accept: */*,
-    Referer .../Schedule.jsp?posto_id=3059. That capture is real, but it is what the portal's JS
-    does from a page DataDome has already blessed; it is not evidence our headless XHR is treated
-    the same way. Both PROVEN implementations submit by navigation instead -- storm-auto (113 real
-    bookings, with an explicit comment that an XHR-equivalent gets blocked where a navigation is
-    trusted) and our own ad1c570 (all 17 of ours, browser_form_post as the only path). So the
-    navigation goes first and the XHR is the fallback; this test pins the fallback's SHAPE, not its
-    primacy. See test_the_navigation_is_the_primary_submit_route below."""
-    seen = {}
-
-    class _S:
-        def browser_fetch(self, url, data, method="POST", headers=None, timeout=30, params=None, **kw):
-            seen["url"], seen["headers"], seen["params"], seen["data"] = url, headers or {}, params, data
-            return {"status": 200, "body": "<html><form action='MostrarPdf'></form></html>"}
-        def browser_form_post(self, *a, **k):
-            raise AssertionError("navigation must not be used while the XHR succeeds")
-        def browser_nav(self, *a, **k): return "u"
-        def browser_eval(self, js="", *a, **k): return _origin_reply(js, "")
-        def submit_form_binary(self, **k):
-            return {"status": 200, "body": b"%PDF-1.4", "content_type": "application/pdf"}
-
-    ops = _make_ops(emit=lambda t, **p: None)
-    ops._log = lambda *a, **k: None
-    ops.posto_pdf = "3059"
-    ops._schedule_state_ok = lambda: True
-    ops._run_warmup_steps = lambda: True
-    ops.session = _S()
-    ops.do_apply({"date": "2026-09-23", "period": 5})
-
-    assert seen["headers"].get("X-Requested-With") == "XMLHttpRequest"
-    assert seen["headers"].get("Accept") == "*/*"
-    assert "Schedule.jsp" in seen["headers"].get("Referer", "")
-    assert seen["params"] == {"posto_id": "3059"}
-    assert seen["data"]["f_date_c"] == "2026/09/23" and str(seen["data"]["cmbPeriodo"]) == "5"
-
-
-def test_the_navigation_path_is_still_there_as_a_fallback():
-    """If the primary route returns nothing, fall through rather than losing the booking path to
-    one portal change. (Roles reversed 2026-08-25: the navigation is primary, the XHR the fallback --
-    this now pins that the FALLBACK still runs, whichever way round they are.)"""
-    used = {}
-
-    class _S:
-        def browser_fetch(self, *a, **k): return {"status": 200, "body": ""}
-        def browser_form_post(self, url, data, timeout=100):
-            used["nav"] = True
-            return "https://x/VistosOnline/SubmeterVistoCriaPDF", \
-                   "<html><form action='MostrarPdf'></form></html>"
-        def browser_nav(self, *a, **k): return "u"
-        def browser_eval(self, js="", *a, **k): return _origin_reply(js, "")
-        def submit_form_binary(self, **k):
-            return {"status": 200, "body": b"%PDF-1.4", "content_type": "application/pdf"}
-
-    ops = _make_ops(emit=lambda t, **p: None)
-    ops._log = lambda *a, **k: None
-    ops.posto_pdf = "3059"
-    ops._schedule_state_ok = lambda: True
-    ops._run_warmup_steps = lambda: True
-    ops.session = _S()
-    ops.do_apply({"date": "2026-09-23", "period": 5})
-    assert used.get("nav") is True
-
-
 # ── our own gates must not be charged to the slot (2026-08-24) ──────────────
-def test_a_tripped_breaker_does_not_bounce_the_slot():
-    """CONFIRMED live on Test 2032: 13 applying transitions produced ONE submit; the other 12
-    returned at the breaker check and were all recorded as bounces, and all 17 genuinely-available
-    slots were closed by the false-slot revert. A tripped breaker is the fleet-wide signal that the
-    PORTAL is refusing everyone -- the strongest possible evidence the slot is fine."""
-    class _B:
-        def is_tripped(self): return True
-        def record_portal_down(self): pass
-        def record_success(self): pass
-
-    ops = _make_ops(emit=lambda t, **p: None)
-    ops._log = lambda *a, **k: None
-    ops._breaker = _B()
-    assert ops.do_apply({"date": "2026-08-28", "period": 3}) == "portal_unreachable"
-
-
-def test_a_full_concurrency_gate_does_not_bounce_the_slot():
-    """OUR contention, not the slot's fault."""
-    class _Sem:
-        def acquire(self, key, timeout=60): return False
-
-    ops = _make_ops(emit=lambda t, **p: None)
-    ops._log = lambda *a, **k: None
-    ops._apply_sem = _Sem()
-    assert ops.do_apply({"date": "2026-08-28", "period": 3}) == "portal_unreachable"
-
-
-def test_the_navigation_is_the_primary_submit_route():
-    """Navigation first, XHR only if it comes back empty.
-
-    REGRESSION GUARD for f02041d, which made the XHR primary on the strength of the HAR alone.
-    storm-auto's comment on this exact endpoint: "a bare primp POST (XHR-equivalent) can be blocked
-    regardless of proxy quality, while a real navigation (form.submit()) is trusted. Try the
-    real-navigation path first." Our own 17 bookings used the navigation as the only route.
-    """
-    order = []
-
-    class _S:
-        def browser_form_post(self, url, data, timeout=30, **kw):
-            order.append("navigation")
-            return (url, "<html>mostrarpdf</html>")     # a confirmed booking
-        def browser_fetch(self, url, *a, **k):
-            # /slots is ALSO a browser_fetch (the primer); only the submit counts here.
-            if "SubmeterVistoCriaPDF" in url:
-                order.append("xhr")
-            return {"status": 200, "body": "<html>mostrarpdf</html>"}
-        def browser_nav(self, *a, **k): return "u"
-        def browser_eval(self, js="", *a, **k): return _origin_reply(js, "")
-
-    ops = _make_ops(emit=lambda t, **p: None)
-    ops._log = lambda *a, **k: None
-    ops.posto_pdf = "3059"
-    ops._schedule_state_ok = lambda: True
-    ops._run_warmup_steps = lambda: True
-    ops.session = _S()
-    ops.do_apply({"date": "2026-09-23", "period": 5})
-    assert order and order[0] == "navigation", f"navigation must be tried first, got {order}"
-    assert "xhr" not in order, f"the XHR must not run when the navigation answered: {order}"
