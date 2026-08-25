@@ -145,3 +145,23 @@ Documentation and memory only.
 **Why it matters:** the strongest finding (§19-§20) points at an obvious-looking change — enable
 `do_swap` onto ISP proxies. That change rests on a claim we have inherited but never verified here
 (§18, row 2), and acting on it before Q16 would repeat the pattern this project is trying to break.
+
+### D24. The portal session is cookie-bound, not IP-bound — verified here, not inherited
+**CONFIRMED 2026-08-25** (`CONFIRMED_FACTS.md` §22, 3/3). `Vistos_sid` carries the session across a
+browser change and an exit change.
+
+This retires an assumption that shaped the whole holding design. **It does not by itself choose a
+holding strategy** — Q19 (involuntary changes) and Q20 (session TTL) are still open, and Q20 is now
+the binding constraint on how long a worker can usefully hold.
+
+**Reverse if:** Q19 shows involuntary changes behave differently, or the portal changes its session
+handling.
+
+### D25. `sessionLost.jsp` is a first-class portal verdict
+The portal has a dedicated endpoint for "your server-side session is gone". It is distinct from an
+`Authentication.jsp` redirect and was previously unclassified, falling through to "inconclusive"
+wherever it appeared.
+**Why it matters:** it is the signal that separates *session expiry* from *auth rejection* from *WAF
+challenge* — three things F21 says the worker must tell apart. The Q16 probe classifies it; the
+production classifier in `ops_live.py` does **not** yet. Recorded, not implemented, per the
+analysis-only boundary.

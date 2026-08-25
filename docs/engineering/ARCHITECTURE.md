@@ -131,8 +131,8 @@ cannot extend 3.
 | operation | IP continuity | evidence |
 |---|---|---|
 | reCAPTCHA solve → login submit | **REQUIRED** | 554 `Por favor, confirma o reCAPTCHA` rejections correlating with logged exit moves; two burn a sub-account |
-| Authenticated session (`Vistos_sid`) across an IP change | **OPTIONAL** | storm-auto's `_swap_to_hold_pool`, "validated 0724": form-state is server-side and Vistos_sid-keyed, *"transfers to a fresh browser/IP while alive"*. **Never verified in storm-hub** |
-| Form-state survival across an IP change | **OPTIONAL** (same source) | same claim; **UNKNOWN here** |
+| Authenticated session (`Vistos_sid`) across an IP change | **NOT REQUIRED** | **VERIFIED HERE 2026-08-25, 3/3** (`CONFIRMED_FACTS.md` §22): survives a fresh browser on a different exit |
+| Form-state survival across an IP change | **NOT REQUIRED** | same 3/3 runs: all five scheduling markers present after migration |
 | Discovery (`gettime`, `getPeriodosOcupados`) | **UNKNOWN** | never isolated from other failure causes |
 | Apply (`ScheduleController` → `SubmeterVistoCriaPDF`) | **UNKNOWN** | never isolated |
 | Keepalive nav | **not required** | plain authed GET |
@@ -153,7 +153,7 @@ Coupling audit:
 | same browser | our implementation | in-page fetches and `browser_eval` read live page state |
 | same portal session | **the portal** | form state is server-side, keyed to `Vistos_sid` |
 | same proxy session | our implementation | one `conn_url` per worker for its whole life |
-| same **exit IP** | **UNKNOWN — assumed, never verified** | see table above |
+| same **exit IP** | **NOT required by the portal** | Q16, 3/3 — the coupling is ours, not the portal's |
 
 `do_swap` exists precisely to break the last two couplings, and its very existence is an
 assertion that they are *not* portal requirements. It has never run here.

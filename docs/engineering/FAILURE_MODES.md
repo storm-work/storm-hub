@@ -193,3 +193,15 @@ APP (our logic/state) · OPS (configuration, deployment, human action).
   observation is taken every keepalive and then discarded.
 - **Improvement:** feed the existing `_note_exit_ip` result into the recovery ladder as a
   first-class input. No new measurement is needed — the data is already collected and thrown away.
+
+## F22 — `sessionLost.jsp` is not recognised in production
+- **Class:** APP
+- **Cause:** the portal answers a dead server-side session with a dedicated `sessionLost.jsp`
+  endpoint. `ops_live.py`'s classifiers know `Authentication.jsp`, the WAF challenge markers, the
+  busy markers and the bounce keywords — but not this one.
+- **Detection:** found 2026-08-25 while running Q16; four archived checkpoints all landed there and
+  the probe's own classifier initially reported them as INCONCLUSIVE.
+- **Consequence:** the clearest possible "your session expired" signal the portal offers is
+  currently read as an unrecognised page, so the recovery ladder cannot act on it as expiry.
+- **Improvement:** classify it, and feed it into F21's three-way split (proxy failure / exit change /
+  session failure) as the unambiguous third case. Not implemented — analysis-only phase.

@@ -101,35 +101,21 @@ what it assumes, and what evidence it needs before it could be chosen.
 
 **E and F share one blocking question (Q16), and it is the same question.** Answer it first.
 
-### Q16. Does a proxy exit change actually invalidate the portal session? — THE BLOCKING QUESTION
-Everything in Q15 turns on this, and it has never been tested in storm-hub.
+### Q16. Does a proxy exit change invalidate the portal session? — **ANSWERED 2026-08-25: NO**
+**3 of 3 valid runs: `SESSION_SURVIVES`** (`CONFIRMED_FACTS.md` §22). An authenticated, warmed
+session moved to a fresh browser on a different exit IP stayed authenticated and still rendered all
+five scheduling markers. The portal carries the session on `Vistos_sid`, not on the IP.
 
-**What we have:** storm-auto's `_swap_to_hold_pool` asserts *"booking form-state is server-side /
-Vistos_sid-keyed → transfers to a fresh browser+IP while alive — validated 0724"*, and its whole
-holding architecture depends on that being true. That is a **predecessor's claim**, not our
-measurement, and our own `do_swap` — which implements the identical migration — has **never run**.
+storm-auto's inherited "validated 0724" claim is now **independently verified here**.
 
-**Smallest safe experiment (no booking attempt, no submit):**
-1. Log in and warm one worker on proxy P1 (existing code path, `WARMUP_ONLY`).
-2. Capture the browser cookie jar — `get_all_cookies()`, already implemented.
-3. Open a fresh browser on proxy **P2** (a different exit) and inject that jar — `get_session(...,
-   inject_cookies_full=...)`, already implemented.
-4. Call the existing `_probe_alive()`: navigate `Schedule.jsp?posto_id=…` and assert it does not
-   redirect to `Authentication.jsp` and still carries `cmbPeriodo` / `getPeriodosOcupados`.
+**Limits:** n=3, migration gaps 36.8-70.2 s (inside the form-state window), deliberate clean
+migrations only, same provider and geo on both sides. It does not prove an *involuntary* mid-flight
+exit change is harmless — see Q19.
 
-Outcome: still bookable on a different IP → session is **not** IP-bound → F becomes viable and E is
-merely an optimisation. Redirected to `Authentication.jsp` → session **is** IP-bound → F is dead, E
-becomes necessary, and the hold ceiling is a hard architectural constraint.
-
-**This is exactly `do_swap` executed once, deliberately, against `_probe_alive` — every component
-already exists and is tested.** It reaches no further than Schedule.jsp: no `ScheduleController`
-submit, no `SubmeterVistoCriaPDF`, so it cannot book anything. Cost: one login, one warm, two
-proxies, ~5 minutes. It needs a real login, so it consumes one sub-account login attempt.
-
-**Deliberate limitation:** it tests lifetimes 1 and 2 surviving a *deliberate* migration. It does
-not prove an *involuntary* mid-flight exit move behaves identically — the portal may treat a clean
-new connection differently from a connection whose address changes underneath it. That is a
-follow-up, not a reason to delay this.
+**Consequence for Q15:** Option **F** (decouple holding from exit continuity) is no longer blocked
+on a portal constraint that does not exist. Option **E** (static ISP proxies) is demoted from
+"necessary" to "an optimisation that buys transport reliability, not session survival." Nothing is
+adopted — that decision is the operator's.
 
 ### Q17. How long does warming actually take, end to end?
 Option A's viability depends entirely on this, and it has never been measured. Login dominates —
@@ -146,3 +132,19 @@ permits a longer session, the measured 60-minute ceiling — which six of eight 
 hold straight through — may be self-inflicted rather than a constraint.
 **Settled by:** provider documentation or a single generated credential at a higher value, probed
 with the existing `proxy_exit_stability_probe.py`. **Do not change the pool to find out.**
+
+### Q19. Does an INVOLUNTARY exit change behave like a deliberate migration?
+Q16 tested a controlled migration: a new browser dialling out from a new address. A live connection
+whose exit moves underneath it is a different event — existing sockets break mid-flight, and the
+page may be left on an error origin (`FAILURE_MODES.md` F3).
+**Why it matters:** Q16 makes Option F look safe. Option F is only actually safe if this is true too.
+**Settled by:** hold a warmed session, force an exit change under it (roll the session id on a live
+worker, or wait out a soax `sessionlength`), then probe — no submit needed, same classifier.
+
+### Q20. How long does a portal session live, independent of IP?
+Q16's positive runs all completed within ~70 s. The four archived checkpoints (4.7 h+) all returned
+`sessionLost.jsp`. So the session dies somewhere between ~70 s and 4.7 h — a range spanning two
+orders of magnitude, and it is now the binding constraint on hold duration rather than the exit.
+**Settled by:** hold one authenticated session with keepalive ON, probe on a schedule until
+`sessionLost.jsp` appears. No login beyond the first, no submit. This is the natural successor
+experiment and it subsumes the old Q4.

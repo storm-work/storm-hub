@@ -414,3 +414,82 @@ So session age is: **not known, not tracked, not persisted, not observable, and 
 selection.** This is exactly why Q14's hazard-shape question is open, and it is the one piece of
 missing instrumentation that a follow-up experiment would need — obtainable without schema changes
 by using session ids that have provably never been used.
+
+---
+
+## 22. An authenticated portal session SURVIVES a proxy exit change — Q16 ANSWERED, 2026-08-25
+
+**CONFIRMED. 3 of 3 valid runs: `SESSION_SURVIVES`.** Raw: `var/q16_session_migration.jsonl`;
+probe: `probes/session_ip_migration_probe.py`.
+
+Method: authenticate and warm on P1, capture the browser cookie jar, open a **fresh browser on P2**
+with a **different exit IP**, inject the jar, navigate `Schedule.jsp?posto_id=…`. The experiment
+stops there — it never POSTs `ScheduleController` and never touches `SubmeterVistoCriaPDF`, so no
+booking is reachable from it.
+
+| run | P1 exit | P2 exit | gap | verdict | `_probe_alive` |
+|---|---|---|---|---|---|
+| `cc0395d3` | 79.26.199.8 | 81.57.97.124 | 39.5 s | SESSION_SURVIVES | agrees |
+| `f8df92c8` | 37.159.125.149 | 79.45.135.224 | 36.8 s | SESSION_SURVIVES | agrees |
+| `713c1928` | 146.241.99.100 | 5.77.106.70 | 70.2 s | SESSION_SURVIVES | agrees |
+
+Each used a different identity and sub-account. Every migrated session returned a ~55 KB page
+carrying **all five** scheduling markers (`getSlots`, `captchaDiv`, `SubmeterVistoCriaPDF`,
+`f_date_c`, `cmbPeriodo`) — not merely "still logged in", but still in the bookable state.
+
+**So the portal does NOT bind its authenticated session to the establishing IP.** The session is
+carried by the `Vistos_sid` cookie, exactly as storm-auto's inherited claim asserted. That claim is
+now independently verified in storm-hub rather than inherited.
+
+**5 further runs were INVALID and are not counted** — 4 could not establish P1 at all (login
+refused) and 1 had an unreachable P2. Per the experiment's own rule, a failed login or a dead P2 is
+a transport/account fact and says nothing about session/IP binding.
+
+### Limitations — what this does NOT establish
+
+1. **n = 3**, all within one hour on one day.
+2. **All gaps were 36.8–70.2 s**, inside the ~90–120 s form-state window. It does not test whether a
+   session survives an exit change *plus* a longer gap — and the negative checkpoint results below
+   suggest elapsed time is the thing that actually kills it.
+3. **All migrations were deliberate and clean**: a new browser dialling out from a new address. An
+   *involuntary* exit change underneath a live connection may behave differently, and this does not
+   prove otherwise.
+4. Same provider (webshare) and same requested geo (IT) on both sides — cross-provider and
+   cross-geo migration untested.
+
+### Corroborating negative, and why it is not counted as evidence
+
+Four archived checkpoints (ages 4.7 h, 47.2 h, 103.4 h, 103.8 h) were loaded onto fresh exits. All
+four returned the portal's dedicated **`sessionLost.jsp`** endpoint. This was recorded as
+INCONCLUSIVE, never as invalidation: those jars are far older than any plausible session TTL, so
+expiry fully explains them and the design cannot separate expiry from IP-binding. storm-auto reports
+hitting the same page during its swaps and attributes it to form-state ageing out during the
+browser-open window — i.e. to **time**, not to the address change.
+
+Read together with the positive result, the picture is that **elapsed time ends a portal session;
+an IP change does not.**
+
+---
+
+## 23. The login wall — not the portal — is what blocks work right now
+
+**CONFIRMED** while attempting Q16, 2026-08-25 22:00–22:40 UTC.
+
+The portal is **up**: an unauthenticated browser nav to the home page returned 58,266 bytes with
+login markers present, no DataDome challenge, no throttle text.
+
+But 5 of 8 login attempts were refused, across **both providers**, **many distinct exits**
+(95.81.16.219, 93.208.48.66, 185.203.123.40, 93.192.211.59, 91.67.178.218, 37.4.250.119,
+93.255.249.197, 91.17.225.21 …) and several sub-accounts. The dominant refusal was the portal's
+explicit throttle: *"Não foi possível de momento concretizar o seu pedido, por favor tente mais
+tarde."*
+
+**Correction to an earlier belief recorded in this project:** the throttle message was previously
+noted as rare (8 occurrences) against 554 reCAPTCHA rejections. Across the full worker-log corpus it
+is in fact the **most common** login rejection: **1416 throttle vs 988 reCAPTCHA**. Today's mix is
+therefore not anomalous — it is normal for this system, and the earlier "8" was a small early
+sample generalised too far.
+
+Because many distinct exits were refused identically, this is **not** exit-reputation and must not
+be diagnosed as one. Successful logins did still occur (3 of 8, in 50.8 s, 63.1 s and 214.1 s), so
+the wall is probabilistic, not closed.
