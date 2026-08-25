@@ -210,10 +210,22 @@ def _proxy_label(conn_url: str | None) -> str:
     Every login attempt records which proxy it used. Without it a failure cannot be attributed to a
     proxy vs an account vs the portal, which is exactly the ambiguity behind "why is one role's
     login rate worse" -- the roles run identical code with identical accounts, so proxy draw is the
-    remaining variable and it was unobservable."""
+    remaining variable and it was unobservable.
+
+    NOTE the endpoint alone is NOT an identity. Every webshare credential we own points at the same
+    gateway, so this used to print `proxy=p.webshare.io:80` for every worker in every run -- exactly
+    the attribution the docstring above claims it provides, and it provided none of it. The sticky
+    SESSION ID is what says which exit a worker is actually on (hold it to keep the exit, change it
+    to get another), so it belongs in the label."""
     if not conn_url:
         return "proxy=none"
-    return "proxy=" + conn_url.rsplit("@", 1)[-1]
+    label = "proxy=" + conn_url.rsplit("@", 1)[-1]
+    try:
+        from libs.proxies.lease import session_id
+        sid = session_id(conn_url)
+    except Exception:
+        sid = ""
+    return f"{label}#{sid}" if sid else label
 
 
 def _submit_bounce_reason(html: str) -> str:
@@ -593,7 +605,7 @@ class LiveEngineOps(EngineOps):
             return False
         self.warm_proxy = rolled
         self._exit_ip = None          # a new exit: the next observation is a baseline, not a change
-        self._log(f"proxy: rolled to a fresh sticky exit ({why})")
+        self._log(f"proxy: rolled to a fresh sticky exit [{_proxy_label(rolled)}] ({why})")
         return True
 
     def _on_portal_origin(self) -> bool:
@@ -1406,9 +1418,24 @@ class LiveEngineOps(EngineOps):
                           f"{attempt}/{total_attempts})")
                 if hold_secs:
                     time.sleep(hold_secs)
-                new_proxy = self._request_proxy_rotation("hold")
-                if new_proxy:
-                    self.hold_proxy = new_proxy
+                # Roll the hold proxy's SESSION ID first -- same rule as every other retry path:
+                # the session id is the exit's identity, so retrying a failed swap against the
+                # unchanged id aims at the same exit that just refused us. Free, unbounded, and no
+                # lease needed; _request_proxy_rotation stays as the fallback.
+                rolled = None
+                try:
+                    from libs.proxies.lease import roll_sticky_session
+                    rolled = roll_sticky_session(self.hold_proxy) if self.hold_proxy else None
+                except Exception:
+                    rolled = None
+                if rolled and rolled != self.hold_proxy:
+                    self.hold_proxy = rolled
+                    self._log(f"do_swap: rolled the hold proxy to a fresh exit "
+                              f"[{_proxy_label(rolled)}]")
+                else:
+                    new_proxy = self._request_proxy_rotation("hold")
+                    if new_proxy:
+                        self.hold_proxy = new_proxy
 
             swap_id = self._attempt_swap(cookies, cookies_full)
             if swap_id is not None:
@@ -1446,7 +1473,7 @@ class LiveEngineOps(EngineOps):
             old_session.close_browser()
         except Exception:
             pass
-        swap_id = self.hold_proxy.rsplit("@", 1)[-1]   # host:port, credentials stripped for logging
+        swap_id = _proxy_label(self.hold_proxy)[len("proxy="):]   # endpoint#session-id, no creds
         self._log(f"do_swap: swapped to hold proxy {swap_id}")
         return swap_id
 

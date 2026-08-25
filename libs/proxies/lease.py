@@ -179,14 +179,44 @@ def roll_sticky_session(url: str, *, provider: str = "") -> str:
 
     # webshare grammar: {username}-{country}-{geo}-{session_id}. Replace a trailing numeric session
     # id if there is one; otherwise append a fresh one, which is additive and always legal.
+    # ONLY roll something we recognise as a session id. Appending one blindly rewrites the
+    # USERNAME, which authenticates fine against a gateway that parses suffixes and fails outright
+    # against any proxy that does not -- an arbitrary `u` would become `u-276569` and stop
+    # authenticating. Returning unchanged lets the caller fall back to a real proxy rotation, which
+    # is the correct behaviour for a credential we cannot roll.
     parts = user.split("-")
     if len(parts) > 1 and parts[-1].isdigit():
         parts[-1] = new_id
     elif len(parts) > 1 and parts[-1].lower() == "rotate":
         parts[-1] = new_id          # an explicitly-rotating credential becomes sticky, deliberately
     else:
-        parts.append(new_id)
+        return url
     return f"{scheme}://{'-'.join(parts)}{sep}{pwd}@{tail}"
+
+
+def session_id(url: str) -> str:
+    """The sticky SESSION ID -- the only thing that identifies which exit a credential holds.
+
+    On a gateway provider the host:port is a constant (`p.webshare.io:80` for every single webshare
+    credential we own), so identifying a proxy by its endpoint identifies nothing. The session id is
+    the identity: hold it to keep the same exit, change it to get a different one.
+
+    Returns "" when there is no session id to report. Never returns any part of the password.
+    """
+    if not url or "@" not in url:
+        return ""
+    user = url.rpartition("@")[0].partition("://")[2].partition(":")[0]
+    if not user:
+        return ""
+    m = _SOAX_SESSIONID_RE.search(user)
+    if m:
+        return m.group(2)
+    parts = user.split("-")
+    if len(parts) > 1 and parts[-1].isdigit():
+        return parts[-1]
+    if len(parts) > 1 and parts[-1].lower() == "rotate":
+        return "rotate"
+    return ""
 
 
 def _active_lease_counts(db: Session) -> dict[str, int]:
