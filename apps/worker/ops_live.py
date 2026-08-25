@@ -570,6 +570,32 @@ class LiveEngineOps(EngineOps):
             return "none"
         return f"{self._anchor_src}/{age:.0f}s" if age is not None else f"{self._anchor_src}/age-unknown"
 
+    def _roll_exit(self, why: str) -> bool:
+        """Move THIS worker onto a fresh sticky exit without asking the Hub for another lease.
+
+        The sticky session id is a number we choose, so the supply of exits is effectively unlimited
+        and costs nothing -- no Hub round-trip, no lease, no pool contention. That matters because
+        the alternative, _request_proxy_rotation, is bounded by the pool and by what is free.
+
+        MEASURED 2026-08-25: our credentials are already sticky (5 requests, 1 exit IP), so a dead
+        tunnel stays dead for every retry against it. The login's transient budget was spending all
+        six attempts on the SAME dead exit -- "transient 1/6, 2/6, 3/6" back to back on one tunnel
+        in every recent run. Retrying a dead tunnel cannot succeed; rolling off it can.
+        """
+        try:
+            from libs.proxies.lease import roll_sticky_session
+        except Exception:
+            return False
+        if not self.warm_proxy:
+            return False
+        rolled = roll_sticky_session(self.warm_proxy)
+        if rolled == self.warm_proxy:
+            return False
+        self.warm_proxy = rolled
+        self._exit_ip = None          # a new exit: the next observation is a baseline, not a change
+        self._log(f"proxy: rolled to a fresh sticky exit ({why})")
+        return True
+
     def _on_portal_origin(self) -> bool:
         """Is the browser sitting on a live portal page RIGHT NOW?
 
@@ -784,6 +810,9 @@ class LiveEngineOps(EngineOps):
                     self._log(f"login: transient {transient}/{max_transient} "
                               f"[{_proxy_label(self.warm_proxy)}] ({e}) -- infrastructure, not "
                               f"charged to sub-account (sticky still {attempt}/{sticky_max})")
+                    # ROLL OFF THE DEAD EXIT. Our credential is sticky, so retrying without this
+                    # aims all six attempts at the identical dead tunnel.
+                    self._roll_exit(f"transient {transient}/{max_transient}")
                     self._backoff(transient)
                     continue          # deliberately does NOT advance `attempt`
                 attempt += 1
@@ -813,6 +842,7 @@ class LiveEngineOps(EngineOps):
                 self._log(f"login: transient {transient}/{max_transient} rejected ({reason}) -- "
                           f"infrastructure, not charged to sub-account "
                           f"(sticky still {attempt}/{sticky_max})")
+                self._roll_exit(f"transient {transient}/{max_transient}")
                 self._backoff(transient)
                 continue
             # OUR FAULT, NOT THE ACCOUNT'S -- and therefore checked HERE, beside `transient` and
@@ -835,9 +865,10 @@ class LiveEngineOps(EngineOps):
                 self._log(f"login: reCAPTCHA rejection coincided with the exit moving "
                           f"({ip_moves}/{max_ip_moves}) -- token/IP mismatch, NOT charged to "
                           f"{self.sub_account_id[:8]}; rotating to a fresh exit and retrying")
-                new_proxy = self._request_proxy_rotation(self._current_phase)
-                if new_proxy:
-                    self.warm_proxy = new_proxy
+                if not self._roll_exit("recaptcha token/ip mismatch"):
+                    new_proxy = self._request_proxy_rotation(self._current_phase)
+                    if new_proxy:
+                        self.warm_proxy = new_proxy
                 self._backoff(ip_moves)
                 continue          # deliberately does NOT advance `attempt` or `captcha_fails`
             attempt += 1
@@ -1028,10 +1059,16 @@ class LiveEngineOps(EngineOps):
             # a slice of the sub-account budget, to fail identically. Rotate the exit first and let
             # the ladder's next attempt run on a live one. Best-effort -- if the Hub has nothing
             # free, the ladder proceeds exactly as before.
-            new_proxy = self._request_proxy_rotation(self._current_phase)
-            if new_proxy:
-                self.warm_proxy = new_proxy
-                self._log(f"portal: {phase} unreachable -- rotated to a fresh exit before retrying")
+            # Prefer rolling the sticky session id: it always works, needs no Hub round-trip and
+            # no free pool row, and the exit it lands on is as good as any the Hub could lease.
+            # _request_proxy_rotation stays as the fallback for a credential with no session id.
+            if self._roll_exit(f"{phase} unreachable"):
+                pass
+            else:
+                new_proxy = self._request_proxy_rotation(self._current_phase)
+                if new_proxy:
+                    self.warm_proxy = new_proxy
+                    self._log(f"portal: {phase} unreachable -- rotated to a fresh exit before retrying")
 
         if kind == "slow" and self._health.is_degraded():
             # Not this worker's bad luck any more -- the window is degraded.

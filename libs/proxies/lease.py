@@ -7,6 +7,9 @@ same slot; on SQLite (tests) the lock is skipped. `release_proxy` frees the leas
 """
 from __future__ import annotations
 
+import random as _random
+import re as _re
+
 import random
 import re
 from datetime import datetime, timezone
@@ -129,6 +132,61 @@ def conn_url(proxy: M.Proxy, scheme: str = "http", geo: str | None = None) -> st
             else proxy.credentials_ref
         return f"{scheme}://{cred}@{proxy.endpoint}"
     return f"{scheme}://{proxy.endpoint}"
+
+
+# ── rolling a dead sticky exit ────────────────────────────────────────────────────────────────
+# MEASURED 2026-08-25, five requests each through the SAME credential:
+#
+#   sodade2026-51        (ours)  -> 1 distinct exit IP    STICKY
+#   sodade2026-PT-777            -> 1 distinct exit IP    STICKY
+#   sodade2026-rotate            -> 5 distinct exit IPs   rotating
+#
+# So the gateway is NOT rotating under us -- our credentials are already sticky, and Webshare's
+# documented grammar is {username}-{country}-{geo}-{session_id}, where a numeric suffix pins one
+# exit and `-rotate` explicitly asks for a new IP per request.
+#
+# The real failure is that a sticky exit can be DEAD (ERR_TUNNEL_CONNECTION_FAILED /
+# ERR_CONNECTION_CLOSED / ERR_TIMED_OUT), and the login's transient budget retried the SAME dead
+# exit up to six times in a row -- visible in every run as "transient 1/6, 2/6, 3/6" back to back on
+# one tunnel. Retrying a dead tunnel cannot succeed.
+#
+# The session id is just a number we choose, so the supply of exits is effectively UNLIMITED and
+# costs no Hub round-trip and no lease: rolling it is how you get off a dead exit. This is why the
+# pool's SIZE was never the constraint (see proxy-pool-size-is-not-capacity).
+
+_SOAX_SESSIONID_RE = _re.compile(r"(sessionid-)([A-Za-z0-9]+)")
+
+
+def roll_sticky_session(url: str, *, provider: str = "") -> str:
+    """Return the same proxy URL pointing at a FRESH sticky session (a different exit).
+
+    Pure and total: anything it does not recognise comes back unchanged, so a caller can always
+    use the result. Never touches the host, port, scheme or password.
+    """
+    if not url or "@" not in url:
+        return url
+    head, _, tail = url.rpartition("@")
+    scheme, _, cred = head.partition("://")
+    user, sep, pwd = cred.partition(":")
+    if not user:
+        return url
+    new_id = str(_random.randint(100000, 999999))
+
+    # soax carries the session in a `sessionid-<x>` segment.
+    if "sessionid-" in user:
+        user = _SOAX_SESSIONID_RE.sub(lambda m: m.group(1) + new_id, user, count=1)
+        return f"{scheme}://{user}{sep}{pwd}@{tail}"
+
+    # webshare grammar: {username}-{country}-{geo}-{session_id}. Replace a trailing numeric session
+    # id if there is one; otherwise append a fresh one, which is additive and always legal.
+    parts = user.split("-")
+    if len(parts) > 1 and parts[-1].isdigit():
+        parts[-1] = new_id
+    elif len(parts) > 1 and parts[-1].lower() == "rotate":
+        parts[-1] = new_id          # an explicitly-rotating credential becomes sticky, deliberately
+    else:
+        parts.append(new_id)
+    return f"{scheme}://{'-'.join(parts)}{sep}{pwd}@{tail}"
 
 
 def _active_lease_counts(db: Session) -> dict[str, int]:
