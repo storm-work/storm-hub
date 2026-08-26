@@ -333,3 +333,31 @@ APP (our logic/state) · OPS (configuration, deployment, human action).
   `tmp_path/var/worker-logs/` tree respectively) — `reset_run_state`'s own fixture docstring
   documents having fixed this exact class of bug once before. This was the one remaining gap, not a
   systemic pattern; no broader test-infrastructure change was made.
+
+## F27 — Live credentials committed to git, three of them pushed
+- **Class:** OPS (security incident, 2026-08-26)
+- **What:** four real credentials existed as plaintext literals in tracked files.
+
+| credential | location | earliest commit | reached remote |
+|---|---|---|---|
+| `WEBSHARE_PASSWORD` | `importers.py` comment, 2 test files | `ac5645c` 2026-08-19 | **yes** — 3 branches |
+| admin `storm` pw **= Postgres pw (reused)** | `user.sh` | `43a9681` 2026-08-14 | **yes** — 3 branches |
+| viewer account pw | `user.sh` | `43a9681` 2026-08-14 | **yes** — 3 branches |
+| `SOAX_PASSWORD` | `tests/proxies/test_credentials.py` | `5dbfe05` 2026-08-26 | no — unpushed |
+
+- **Why it mattered most for the reused one:** one literal exposed both the database and an admin
+  login to an internet-reachable Hub (Caddy → 127.0.0.1:8123, and external scanners are already
+  probing it), and that admin can export booked identities' stored passwords via
+  `/identities/booked/credentials`.
+- **How it was found:** a hash-based scan comparing `.env` values against every ref, run as part of
+  a pre-commit review. The viewer password was **not** in `.env`, so the hash scan could not have
+  found it — it surfaced only by reading `user.sh` directly.
+- **Detection gap:** nothing scans for secrets. This is the same class as `gen_proxy_pool.py`'s own
+  warning ("would have put live proxy credentials into git history permanently"), which was written
+  after an earlier near-miss and did not prevent this.
+- **Remediated:** literals removed from the working tree (`e67f678`); `user.sh` rewritten to take
+  credentials from the environment and refuse to run without them.
+- **NOT remediated:** rotation (requires provider/dashboard access) and history rewriting (touches
+  3 remote branches, 43-60 commits each). `origin/main` is unaffected.
+- **Improvement:** a pre-commit secret scan, and stop reusing one password across Postgres and the
+  admin login.

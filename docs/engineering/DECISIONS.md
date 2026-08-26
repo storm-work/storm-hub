@@ -506,3 +506,16 @@ architecture change.
 
 **Reverse if:** never expected, but trivially — remove the two scheduler calls and the method;
 `find_orphaned_worker_ids` has no other caller and no side effects of its own.
+
+### D32. No real credential is ever a literal in the repository — and rotation, not rewriting, is containment
+Credentials come from the environment (`.env`, gitignored) or a secret store. Tests use obvious
+dummies (`test-password`); no test needs a real value. Scripts read from the environment and refuse
+to run when it is unset, and never take a secret as a command-line argument (argv is visible in
+`/proc` and in shell history).
+
+**When a credential does leak (F27):** rotate first. Rewriting history reduces *further* exposure
+but cannot un-publish what was already fetched, so a rewrite is never a substitute for rotation and
+must never be reported as containment.
+
+**Do not reuse one password across systems.** In F27 a single literal exposed both Postgres and an
+admin login to an internet-reachable Hub, turning one mistake into two compromises.
