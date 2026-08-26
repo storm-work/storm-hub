@@ -345,3 +345,82 @@ def _tick_until(sched, fleet, pred, ticks=30):
             return True
         time.sleep(0.05)
     return bool(pred())
+
+
+def test_pipeline_runs_to_the_apply_boundary_and_stops_there(env):
+    """PRE-APPLY PROOF: every production stage up to the `do_apply` call, and not one step past it.
+
+    This is the validation that matters when the final submission is irreversible -- it books a real
+    public appointment in a real applicant's name -- so the pipeline has to be provable without
+    performing it. `no_book` is the production setting for exactly that (catalog: "test dry-run:
+    apply workers never submit"); it gates in phases.py's _run_apply AFTER the worker has taken the
+    assignment and entered APPLYING, and returns PhaseResult("dry_run") instead of calling do_apply.
+
+    So this asserts the whole chain fired -- scout discovery -> push_slots -> Hub persistence ->
+    slot_found -> scheduler assignment -> SlotLease -> the slot crossing the bus to the worker ->
+    the worker entering APPLYING -- while do_apply itself was NEVER invoked and no appointment
+    exists. The difference from test_long_hold_...: that one proves the pipeline BOOKS; this proves
+    the pipeline is complete and correct right up to the boundary, which is the strongest statement
+    available without a real submission.
+    """
+    Session, bus, r, fleets = env
+    bid, wids = _seed(Session)
+    scout_id, apply_id = wids[WorkerRole.SCOUT], wids[WorkerRole.APPLY]
+    fleet = _Fleet(Session, bus, r); fleets.append(fleet)
+
+    sched = Scheduler(session_local=Session, on_start=lambda db, bk: None,
+                      on_slot_open=lambda db, bk: None,
+                      on_assign=lambda db, w, s: bus.send_command(
+                          w.id, "assign", slot={"id": s.id, "date": s.date, "period": s.period}),
+                      bus=bus, redis_client=r)
+
+    fleet.start(scout_id, _cfg("scout"), dict(
+        discover_tasks=[DATES],
+        discover_outcomes={DATES[0]: {"outcome": "found", "periods": [8]},
+                           DATES[1]: {"outcome": "empty"}},
+        stop_after_polls=40,
+    ))
+    # apply_outcome is deliberately "booked": if the no_book gate ever regressed, this worker WOULD
+    # book and the appointment assertion below would fail loudly rather than passing by accident.
+    apply_ops = fleet.start(apply_id, _cfg("apply", no_book=True), dict(
+        assignment=None, apply_outcome="booked", stop_after_polls=200,
+    ))
+
+    assert _wait(lambda: _substate(Session, apply_id) == WorkerSubstate.HOLDING, pump=fleet)
+
+    db = Session(); bk = db.get(M.Booking, bid)
+    bk.status = BookingStatus.RUNNING; bk.slot_open_fired_at = _now()
+    db.commit(); db.close()
+    for _ in range(6):
+        sched._tick_once(); fleet.pump()
+
+    # discovery -> push_slots -> Hub persistence
+    assert _wait(lambda: _slot_count(Session) > 0, pump=fleet), "scout never pushed a slot"
+
+    # scheduler assignment -> SlotLease -> handoff -> worker enters APPLYING and stops at the gate
+    assert _tick_until(sched, fleet,
+                       lambda: fleet.results.get(apply_id) is not None, ticks=60), (
+        f"apply worker never reached a terminal state; substate={_substate(Session, apply_id)}")
+
+    # _Fleet records PhaseResult.outcome (a str), not the PhaseResult itself.
+    assert fleet.results[apply_id] == "dry_run", \
+        f"expected the no_book boundary, got {fleet.results[apply_id]!r}"
+
+    # THE POINT: the boundary was reached, and not crossed.
+    assert apply_ops.applied == 0, "do_apply was invoked despite no_book"
+
+    db = Session()
+    # the scheduler really did assign and lease -- this is not a test that simply never got there
+    lease = db.scalars(select(M.SlotLease).where(M.SlotLease.worker_id == apply_id)).all()
+    assert len(lease) == 1, f"expected exactly one slot lease from the scheduler, got {len(lease)}"
+    slot = db.get(M.Slot, lease[0].slot_id)
+    assert (slot.date, slot.period) == (DATES[0], 8)
+    # APPLYING was entered: the substate hop is emitted over the real bus before the gate returns.
+    applying_seen = any(
+        m.type == "status_change" and m.payload.get("substate") == str(WorkerSubstate.APPLYING)
+        and m.payload.get("worker_id") == apply_id
+        for m in bus.read_events(last_id="0", block_ms=1, count=2000))
+    assert applying_seen, "worker never entered APPLYING -- the boundary was not actually reached"
+    # and nothing irreversible happened
+    assert db.scalar(select(func.count()).select_from(M.BookedAppointment)) == 0
+    db.close()

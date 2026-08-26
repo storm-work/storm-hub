@@ -2286,3 +2286,38 @@ def test_the_browser_path_is_still_tried_first():
 
 # ── the submit is an XHR, matching the real booking HAR (2026-08-24) ────────
 # ── our own gates must not be charged to the slot (2026-08-24) ──────────────
+
+
+def test_push_slots_emits_exactly_what_the_hub_persister_consumes():
+    """The scout->Hub slot seam, which had no direct test.
+
+    push_slots is one line, but it is a SEAM, and every bug this project actually hit lived in one:
+    a payload key dropped between worker and Hub, an event type the consumer does not match on. The
+    Hub's persister (apps/hub/events.py's _persist_slots) matches on the event type `slots_found`
+    and reads `payload["slots"]`, then requires `date` and `period` on each entry -- anything else
+    is silently skipped by its `continue`, which is exactly the kind of silence that costs a run.
+
+    So this pins the contract from the producing side rather than trusting the two ends to agree.
+    """
+    emitted = []
+    ops = _make_ops(emit=lambda t, **p: emitted.append((t, p)))
+    found = [{"date": "2026-09-01", "period": 4}, {"date": "2026-09-02", "period": 8}]
+    ops.push_slots(found)
+
+    assert len(emitted) == 1
+    etype, payload = emitted[0]
+    assert etype == "slots_found", "the Hub consumer matches on this exact type"
+    assert payload["slots"] == found, "the Hub reads payload['slots']"
+    # every entry must carry the two keys _persist_slots requires, or it drops them silently
+    for s in payload["slots"]:
+        assert s.get("date") is not None and s.get("period") is not None
+
+
+def test_push_slots_with_nothing_found_emits_nothing_worth_persisting():
+    """An empty discovery round must not manufacture a slot push. `empty` is a successful 'no
+    slots' answer (see do_discover's 3-way outcome) -- turning it into an event would let a clean
+    empty scan look like a find."""
+    emitted = []
+    ops = _make_ops(emit=lambda t, **p: emitted.append((t, p)))
+    ops.push_slots([])
+    assert emitted == [] or emitted[0][1]["slots"] == []
