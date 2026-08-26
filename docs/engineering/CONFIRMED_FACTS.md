@@ -671,3 +671,48 @@ evidence, not the answer.
 **Also worth noting against Q1:** the other two sessions held a single webshare exit for the full
 ~180 minutes. Q1's rate of 0.278 changes/session-hour predicts ~2.5 changes across 9 session-hours;
 one was observed. Small numbers, but a reminder that the rate is an average over a wide CI.
+
+---
+
+## 29. The 33-45 min "TTL" was a single portal-side invalidation event — Q22-A, 2026-08-26
+
+**SUPPORTED, and it retires the TTL reading entirely.** The two Q20 sessions did not expire
+independently. Compared on **wall clock** rather than elapsed time:
+
+| arm | provider | identity | last AUTHENTICATED | first LOGGED_OUT | page served at the transition |
+|---|---|---|---|---|---|
+| `q19_soax_involuntary` | **soax** | 2ac3d5ba | 01:05:18 | 01:10:50 | **20,972 B** |
+| `q20_active_ws` | **webshare** | 7f04af2e | 01:05:39 | 01:10:55 | **9,651 B** |
+
+Two sessions on **different providers**, with **different identities**, created a minute apart,
+transitioned within a **5-second window** — each serving a truncated page against a normal ~59 KB.
+A per-session TTL fires at each session's own age and would have separated them by ~1 minute. This
+did not.
+
+**The third arm corroborates:** `q20_idle_ws` was still authenticated at 01:09:31 and never probed
+again inside the window.
+
+**Conclusion:** a portal-side event invalidated live sessions simultaneously at ~01:10:50 UTC. The
+"33-45 minutes" was the distance from each session's creation to that single event, nothing more.
+
+### Candidate explanations, classified
+
+| explanation | verdict | why |
+|---|---|---|
+| Portal-side simultaneous invalidation (restart / session-store flush / deploy) | **SUPPORTED** | 5-second co-timing across two providers and identities, plus truncated response bodies at exactly that moment |
+| Fixed authentication TTL | **UNSUPPORTED** | would separate the two by ~1 min; contradicted outright by 3/3 sessions at ~180 min (§27) |
+| Proxy / provider differences | **UNSUPPORTED** | soax and webshare died together |
+| Account / identity differences | **UNSUPPORTED** as the cause | different identities cannot synchronise to 5 seconds |
+| Session-creation or authentication path | **UNSUPPORTED** | identical code (`acquire_session`) in both runs |
+| Request pattern | **UNSUPPORTED** | Q20's active arm and Q21's control both probed HOME_URL every 5 min |
+| Time-of-day / maintenance window | **PLAUSIBLE** | 01:10 UTC is a plausible window and all Q20 arms were nocturnal — but n=1 event, and this project's standing rule is not to charge failures to "downtime" without evidence. **Not established.** |
+| Which portal node served us | **UNKNOWN** | no visibility |
+| Cookie differences | **UNKNOWN** | `Vistos_sid` presence was not recorded in Q20 (it was in Q21). Irrelevant given the simultaneity |
+
+### The architectural lesson, which is stronger than a TTL would have been
+
+**A portal session can be invalidated at any moment, by an event unrelated to its age, with no
+warning.** That is a worse world than a known TTL — you cannot schedule around it — and it is the
+single fact the holding design must absorb. It is also good news in one respect: sessions are
+capable of lasting 3+ hours (§27), so nothing forces short holds; what is required is *detection and
+recovery*, not a duration budget.

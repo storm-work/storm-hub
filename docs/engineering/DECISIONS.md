@@ -192,3 +192,35 @@ Measured lifetimes differ 4x across twelve hours with no known cause (Q22). Unti
 understood, the holding architecture must **tolerate a session dying at any moment** rather than
 plan around a number. This retires both the "~40 minute ceiling" reading of §24 and any temptation
 to rely on the ~180 minute figure from §27.
+
+### D30. Session-state classification is positive-evidence based
+**THE RULE:** `SESSION_AUTHENTICATED` and `SESSION_EXPIRED` are explicit states, each established
+only by evidence that has been independently validated against a known-authenticated and a
+known-logged-out response. An unrecognised response is `UNKNOWN` — **never implicitly LOGGED_OUT,
+and never implicitly healthy.**
+
+**Two historical failures are why this rule exists, both from this project, eight hours apart:**
+
+1. *Any-marker instead of all-markers* (Q20, 2026-08-26). The classifier accepted `solicitar pedido
+   de visto` as proof of authentication. It is a **public** menu item, present on the logged-out
+   page. Logged-out pages were reported AUTHENTICATED for 25+ minutes on two arms, and the wrong
+   result was reported to the operator before being caught.
+
+2. *Unrecognised inferred as logged-out* (Q21, 2026-08-26). The classifier fell back to
+   `bytes > 0 -> LOGGED_OUT`. It fired once, on a 1,920-byte body with no markers, no password
+   field and no redirect — and would have recorded a session expiry that never happened, at exactly
+   the moment the experiment was hunting for one.
+
+The two errors point in **opposite directions** — one manufactured health, the other manufactured
+failure — which is the argument for the rule rather than for any particular marker. Both were
+recoverable only because raw evidence was persisted (D26).
+
+**Validated markers are listed in `ARCHITECTURE.md` §11.1.** Adding a signal to that table requires
+measuring it against both a known-authenticated and a known-logged-out response first.
+
+### D31. An exit change is informational, not fatal
+Current evidence — Q16 (3/3 deliberate migrations survived) and Q19 (n=1 involuntary change, session
+survived a further 69 min on an auth-gated endpoint) — says an IP change does not invalidate a
+portal session. **An exit change must therefore not trigger re-login or session rebuild.**
+`_note_exit_ip` should feed the classifier as context, not as a failure trigger.
+**Reverse if:** a repeat of Q19 at larger n shows involuntary changes behaving differently.

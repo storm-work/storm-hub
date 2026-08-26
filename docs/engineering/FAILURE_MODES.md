@@ -205,3 +205,49 @@ APP (our logic/state) · OPS (configuration, deployment, human action).
   currently read as an unrecognised page, so the recovery ladder cannot act on it as expiry.
 - **Improvement:** classify it, and feed it into F21's three-way split (proxy failure / exit change /
   session failure) as the unambiguous third case. Not implemented — analysis-only phase.
+
+## F23 — A pre-warm keepalive cannot see session expiry AT ALL
+- **Class:** APP
+- **Code path:** `_do_keepalive` with `posto_pdf is None` navigates `HOME_URL`. The portal serves the
+  **logged-out** home with HTTP 200 (58,266 B). `browser_nav` returns normally, so
+  `_keepalive_dead_streak` is reset to 0 and the worker logs `keepalive: probe OK`.
+- **Consequence:** a worker that lost its session before warming holds indefinitely, reporting
+  healthy, and is counted by the Hub as ready capacity. Nothing in the loop reads the body.
+- **Evidence:** the logged-out home carries `solicitar pedido de visto` but **not** `consultar
+  pedidos` and **not** the logout link — the discriminator exists and is simply not consulted.
+- **Improvement:** classify the response (§11.1). This is the same defect class as F21: the
+  information is already in hand and is discarded.
+
+## F24 — Session expiry after warm is misdiagnosed as form-state lapse
+- **Class:** APP
+- **Code path:** post-warm `_do_keepalive` navigates `Schedule.jsp`, finds no `_SCHED_PAGE_MARKERS`,
+  and logs *"form-state lapsed -- re-warming in place"*. It then runs `_run_warmup_steps()`, whose
+  in-page POSTs cannot succeed without a session; `_rewarm_fail_streak` climbs and the worker is
+  marked NOT BOOKABLE.
+- **Consequence:** the correct recovery (re-login) is reached only via
+  `_maybe_escalate_stuck_rewarm` after `REWARM_ESCALATE_AFTER` failures **and** only if the
+  slot_found / mono+slot_open gate is open. With the gate shut, the worker re-warms into a dead
+  session forever. This is the deadlock already recorded for the 2026-08-22 incident, reached by a
+  different route.
+- **Improvement:** distinguish `SESSION_EXPIRED` from a missing schedule anchor before choosing
+  between re-login and re-warm.
+
+## F25 — A portal-busy page during hold is read as form-state lapse
+- **Class:** APP
+- **Code path:** `_is_portal_busy` is consulted at three sites (gettime classification, the schedule
+  probe, login) — **not** in the keepalive's marker check. The "não foi possível de momento" page
+  lacks `_SCHED_PAGE_MARKERS`, so the same "form-state lapsed" branch fires.
+- **Consequence:** the worker re-warms against a portal that is declining to serve anyone, fails,
+  and accrues NOT-BOOKABLE strikes for a condition that is neither its session nor its form.
+- **Improvement:** `PORTAL_ERROR` is a distinct state whose correct action is to back off, not to
+  re-warm and not to re-login.
+
+## F26 — There is no UNKNOWN state anywhere in production
+- **Class:** APP
+- **Cause:** every classifier resolves to a specific verdict or falls through to a failure default —
+  `events.py`'s `_TERMINAL_STATUS.get()` maps anything unmapped to FAILED, and the keepalive treats
+  "nav returned" as health.
+- **Consequence:** unrecognised portal responses are silently absorbed into whichever branch happens
+  to catch them, which is how both historical classifier failures (§26, §28-note) produced confident
+  wrong answers rather than an admission of ignorance.
+- **Improvement:** `UNKNOWN` as an explicit, first-class outcome that backs off and re-probes.

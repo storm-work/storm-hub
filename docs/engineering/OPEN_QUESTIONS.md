@@ -173,24 +173,30 @@ control probed HOME_URL every 5 min.
 **What it did establish is bigger than what it asked:** Q20's 33-45 min figure does not generalise.
 See Q22.
 
-### Q22. Why did two sessions die at 33-45 min when three others lasted 180+ min? — **THE NEW BLOCKER**
-The same setup, the same HOME_URL probe, twelve hours apart, produced a 4x difference in session
-lifetime (`CONFIRMED_FACTS.md` §24 vs §27). Whatever ended the first pair was **not** a fixed
-authentication TTL, and the cause is unknown. Candidates, none established: a portal-side
-invalidation event, a time-of-day policy, per-node session configuration, or something specific to
-those two sessions.
+### Q22. Why did two sessions die at 33-45 min? — **ANSWERED 2026-08-26**
+A single portal-side invalidation event, not a TTL (`CONFIRMED_FACTS.md` §29). Two sessions on
+different providers with different identities transitioned within a 5-second wall-clock window
+(01:10:50 / 01:10:55 UTC), both serving truncated bodies. A per-session TTL would have separated
+them by ~1 minute.
 
-**Why it now matters most:** hold duration is the central architectural parameter, and it is not a
-constant. A design that assumes 3 hours will break on a 40-minute night; a design that assumes 40
-minutes throws away most of the available window. Until this is understood, **any holding
-architecture must tolerate a session dying at any time** rather than plan around a number.
+**What it means architecturally:** a session can be invalidated at any moment by an event unrelated
+to its age. That cannot be scheduled around — only detected and recovered from. Sessions are
+otherwise capable of 3+ hours (§27), so nothing forces short holds.
 
-**Settled by:** repeated lifetime runs across different times of day, recording the full raw evidence
-each time (2-3 sessions per run, cheap once the harness exists). The instrument already exists --
-`probes/session_lifetime_probe.py` and `probes/q21_auth_refresh_probe.py`.
+**Residual unknown:** the nature of the event (restart / flush / deploy) and whether it recurs on a
+schedule. Worth a cheap standing measurement rather than a dedicated experiment — see Q23.
+
 
 ### Q19 (update). Involuntary exit change — one supporting observation
 `q21_test_1` moved exit involuntarily at t=109.4 min (178.99.60.149 -> 87.15.27.74) and stayed
 AUTHENTICATED on the auth-gated endpoint, surviving another 69 min (`CONFIRMED_FACTS.md` §28).
 n=1, and the change was detected between probes ~5 min apart. Q19 stays formally open, but the
 evidence now points the same way as Q16.
+
+### Q23. Do portal-side invalidation events recur, and on what cadence?
+One event is observed (§29). If these recur nightly, holds spanning that window are futile and the
+scheduler should know it; if they are rare, recovery alone suffices.
+**Settled by:** the cheapest possible standing measurement — keep 2-3 authenticated sessions alive
+across a full 24h and record every simultaneous invalidation. The harness already exists
+(`probes/q21_auth_refresh_probe.py`). **Not a blocker for the recovery design**, which must handle
+the event whatever its cadence.

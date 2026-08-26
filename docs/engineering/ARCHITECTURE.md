@@ -250,3 +250,66 @@ Workers are spawned by the Hub with `start_new_session=True`, so they survive a 
   point that was never the code's.
 - The dashboard duplicates the worker action-legality table (`WORKER_ACTIONS` in `App.jsx`)
   that `state_machines.py:WORKER_ACTION_STATUSES` owns — two copies that can drift.
+
+## 11. Session-state model and recovery — DESIGN ONLY, not implemented
+
+Written 2026-08-26 after Q22. **Nothing in this section is built.** It is the target the current
+implementation is measured against in `FAILURE_MODES.md` F23-F25.
+
+### 11.1 The five states
+
+Classification must be **positive-evidence based**. Each state names the evidence that establishes
+it; anything else is UNKNOWN.
+
+| State | Established ONLY by | Never inferred from |
+|---|---|---|
+| `SESSION_AUTHENTICATED` | an auth-gated marker in the body: `consultar pedidos`, or the `Terminar Sessão` logout link | nav success, HTTP 200, body size, presence of `solicitar pedido de visto` |
+| `SESSION_EXPIRED` | `sessionLost.jsp` in the final URL; **or** a redirect to `Authentication.jsp`; **or** a recognised portal page that positively lacks the auth-gated marker (the 58,266 B home / 28,717 B `Pedidos`) | absence of an expected marker on an *unrecognised* page |
+| `PROXY_TRANSPORT_FAILURE` | the navigation raised: `ERR_TUNNEL_CONNECTION_FAILED`, `ERR_CONNECTION_CLOSED`, `ERR_TIMED_OUT`, `ERR_PROXY_*` | any portal-served page, whatever it contains |
+| `PORTAL_ERROR` | `_PORTAL_BUSY_MARKERS` ("não foi possível de momento…"); `_ERROR_KEYWORDS`; a DataDome challenge body | a page we merely do not recognise |
+| `UNKNOWN` | **the default.** Anything not positively matched above | — |
+
+**Validated marker table** (measured 2026-08-26, authenticated vs cookie-less browser, same URL):
+
+| marker | authenticated | logged out | usable |
+|---|---|---|---|
+| `consultar pedidos` | present | **absent** | **yes — gated** |
+| `Terminar Sessão` | present | **absent** | **yes — gated** |
+| `iniciar sess` | present | present | **NO — on both pages** |
+| `solicitar pedido de visto` | present | present | **NO — public menu item** |
+| body size | 59,244 / 59,689 B | 58,266 / 28,717 B | **NO — use as corroboration only** |
+
+The last two rows are exactly the signals that produced this project's two classifier failures.
+
+### 11.2 Minimal recovery machine
+
+Four transitions added to the existing hold loop. No new worker statuses, no new substates — this
+rides on `WorkerSubstate.HOLDING` and the existing `_rebuild_session` ladder.
+
+```
+                    ┌──────────────────────────────────────────┐
+  READY → WARM → HOLD ──(SESSION_AUTHENTICATED)──────────────► stay
+                    │
+                    ├─(SESSION_EXPIRED)──► REAUTHENTICATE ──► WARM ──► HOLD
+                    │                       (existing _fresh_login + _run_warmup_steps)
+                    │
+                    ├─(PROXY_TRANSPORT_FAILURE)──► roll session id, retry
+                    │                              (existing _roll_exit; N strikes → rotate proxy)
+                    │
+                    ├─(EXIT_CHANGED)────► CONTINUE HOLDING, log only
+                    │                     (Q16 3/3 + Q19 n=1 say the session survives)
+                    │
+                    ├─(PORTAL_ERROR)────► back off, do NOT re-login, do NOT re-warm
+                    │
+                    └─(UNKNOWN)─────────► back off and RE-PROBE; escalate only on a
+                                          repeated, bounded streak — never act on one unknown
+```
+
+**Why it is compatible with what exists:** every action is already implemented and already reached
+from the hold loop — `_fresh_login`, `_run_warmup_steps`, `_roll_exit`, `_request_proxy_rotation`,
+`_park`, `_attempt_keepalive_restore`. What is missing is the **classifier that decides between
+them**. Today the hold loop branches on symptom counters (`_keepalive_dead_streak`,
+`_rewarm_fail_streak`), not on a state.
+
+**The single highest-value change** this implies is not a new state machine — it is making
+`_do_keepalive` classify its own response instead of treating "the navigation returned" as health.
