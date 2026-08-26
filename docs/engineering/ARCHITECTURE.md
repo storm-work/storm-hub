@@ -115,7 +115,7 @@ guarantees another. See `CONFIRMED_FACTS.md` §18.
 
 | # | Lifetime | Known value / range | Evidence | What refreshes it | What ends it |
 |---|---|---|---|---|---|
-| 1 | **Portal auth session** (`Vistos_sid`) | **33-45 min** | MEASURED 2026-08-26, 2 independent sessions (§24) | **nothing we have found** — a 5-min authenticated GET did not extend it | elapsed time; survives a browser change and an IP change |
+| 1 | **Portal auth session** (`Vistos_sid`) | **highly variable: 33-45 min observed once (§24), ~180 min observed on 3/3 sessions (§27)** | MEASURED twice, 12 h apart, contradicting | **UNKNOWN** — HOME_URL and an auth-gated GET performed identically; neither is inadequate | **UNKNOWN** — not a fixed TTL; survives a browser change and an IP change |
 | 2 | **Server-side form/draft state** | ~90-120 s | **HYPOTHESIS** — storm-auto's figure, never measured here | any authed GET on that `Vistos_sid` (storm-auto's claim) | idle time; **not** an IP change (§22) |
 | 3 | **Proxy session** (session id) | soax **60.2-63.4 min** (20/20); webshare no ceiling observed | MEASURED, Q1 (§17) | nothing — a hard ceiling on soax | provider policy (`sessionlength`) |
 | 4 | **Proxy exit / IP** | webshare **0.278 changes/session-h** (CI 0.159-0.451); soax bounded by #3 | MEASURED, Q1 (§17) | **nothing — traffic has no effect** | provider-side, independent of our activity |
@@ -126,9 +126,10 @@ guarantees another. See `CONFIRMED_FACTS.md` §18.
 architecture are #1 (shortest, and nothing we know refreshes it) and #4 (uncontrollable, but
 **harmless to the session** per §22).
 
-**Ordering matters:** #1 (33-45 min) is SHORTER than #3 on soax (60 min). A soax exit can therefore
-never rotate under a live portal session — the session always dies first. That ordering is what
-invalidated Q19's experimental vehicle (§25).
+**Ordering is NOT stable.** On the night of 2026-08-26 lifetime #1 (33-45 min) was shorter than #3
+on soax (60 min), which is what invalidated Q19's vehicle (§25). The next morning #1 exceeded 180
+min on 3/3 sessions (§27), which reverses the ordering. **Treat #1 as variable, not as a constant** —
+this is the single most important open item in the table.
 
 **The invalidated assumption:** *"keeping the session alive also keeps the proxy exit stable."*
 Measured false (§17). Keepalive acts on lifetimes 1 and 2; it has no measurable effect on 4 and

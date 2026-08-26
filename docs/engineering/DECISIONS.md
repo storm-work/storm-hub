@@ -179,3 +179,16 @@ would have been unrecoverable.
 Q19's soax transition fired exactly on schedule and still answered nothing, because the session had
 already expired. The result recorded is "not answered, here is why, here is the corrected design" —
 not a verdict extracted from an invalid observation (`CONFIRMED_FACTS.md` §25).
+
+### D28. A verdict must be positively evidenced, never inferred from "not recognised"
+Q21's classifier originally fell back to `bytes > 0 -> LOGGED_OUT`. It fired exactly once, on a
+1,920-byte body with no markers, no password field and no redirect — and would have recorded a
+session expiry that never happened, at precisely the moment the experiment was looking for one.
+**Rule:** AUTHENTICATED requires the auth marker; LOGGED_OUT requires a positive logged-out signal;
+everything else is INCONCLUSIVE.
+
+### D29. Hold duration is not a constant, and must not be designed around as one
+Measured lifetimes differ 4x across twelve hours with no known cause (Q22). Until that is
+understood, the holding architecture must **tolerate a session dying at any moment** rather than
+plan around a number. This retires both the "~40 minute ceiling" reading of §24 and any temptation
+to rely on the ~180 minute figure from §27.

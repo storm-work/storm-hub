@@ -496,7 +496,15 @@ the wall is probabilistic, not closed.
 
 ---
 
-## 24. The portal authentication session lives ~33-45 minutes, and traffic does not extend it — Q20, 2026-08-26
+## 24. ~~The portal authentication session lives ~33-45 minutes~~ — **CORRECTED by §27, see below**
+
+> **THIS ENTRY'S HEADLINE NUMBER IS WRONG AS A GENERAL FACT.** Q21 (§27) ran three sessions for
+> ~180 minutes on 2026-08-26 and **none expired** — 4x longer than the figure below, one of them
+> using the very same HOME_URL probe. What §24 records is a real observation of *those two sessions
+> on that night*, not the portal's authentication TTL. The measurement stands; the generalisation
+> does not. Read §27 first.
+
+### Original entry (2026-08-26, Q20), preserved
 
 **CONFIRMED, two independent sessions.** Raw: `var/session_lifetime.jsonl`; probe:
 `probes/session_lifetime_probe.py --report` (verdicts are re-derived from raw evidence, never
@@ -582,3 +590,84 @@ the *logged-out* home page during Q16 — and carried one marker where earlier p
 (byte count, marker list, password field, final URL). Verdicts are now re-derived offline by
 `reclassify()` and the report never trusts the recorded verdict. **Persisting raw evidence rather
 than conclusions is what made a bad classifier a recoverable error instead of a lost night.**
+
+---
+
+## 27. The portal session survived ~180 minutes on all three arms — Q21, 2026-08-26
+
+**CONFIRMED. No session expired in 3 hours.** Raw: `var/q21_auth_refresh.jsonl`; probe:
+`probes/q21_auth_refresh_probe.py --report` (verdicts re-derived offline).
+
+| arm | endpoint | probes | last AUTHENTICATED | expired? |
+|---|---|---|---|---|
+| `q21_test_1` | `/VistosOnline/Pedidos` (auth-gated) | 34 | t = 178.6 min | **no** |
+| `q21_test_2` | `/VistosOnline/Pedidos` (auth-gated) | 34 | t = 177.7 min | **no** |
+| `q21_control_1` | `/VistosOnline/` (production keepalive url) | 34 | t = 174.8 min | **no** |
+
+### The auth-gated endpoint, and how it was proven
+
+No auth-gated url existed in this codebase. `/VistosOnline/Pedidos` was discovered from a live
+authenticated page and then **verified** against a cookie-less browser on the same proxy:
+
+| `GET /VistosOnline/Pedidos` | bytes | `Terminar Sessão` | `Consultar pedidos` |
+|---|---|---|---|
+| authenticated | 59,244 | **present** | present |
+| no cookies | 28,717 | absent | absent |
+
+Same url, no redirect either way. The marker is the **logout link** — semantically it can only exist
+when there is a session to end. This replaces the page-size and public-menu-item heuristics that
+produced §26's wrong verdicts.
+
+### What this answers, and what it does not
+
+**"An auth-gated GET refreshes authentication while HOME_URL does not" — NOT SUPPORTED.** The
+control held a session for 174.8 minutes on HOME_URL alone. Production's pre-warm keepalive url is
+not the inadequate request it was suspected of being.
+
+**The underlying mechanism — INCONCLUSIVE.** No arm expired, so "both requests refresh the session"
+and "the TTL is simply longer than 180 minutes" fit the data equally. A differential test cannot
+resolve this when neither side dies. Distinguishing them needs a run long enough to reach an actual
+expiry, or a true no-traffic idle arm.
+
+### The important consequence: §24's number does not generalise
+
+Two sessions died at 33-45 min on the night of 2026-08-26; three sessions survived ~180 min the
+next morning, one of them under the identical HOME_URL probe. **Whatever ended the first pair was
+not a fixed authentication TTL.** The cause is **UNKNOWN** — a portal-side invalidation event, a
+time-of-day policy, and per-node session configuration are all consistent with the evidence, and
+none is established.
+
+**Operationally this is the more useful fact:** a held session is capable of lasting at least 3
+hours, which is longer than every planned hold on record (§20, max 116 min). But it is not
+*reliable* — the same setup produced 40-minute sessions twelve hours earlier. Hold duration cannot
+be treated as a constant.
+
+---
+
+## 28. An INVOLUNTARY exit change did not invalidate the session — Q19 partial, n=1
+
+**OBSERVED, once, and it is genuine Q19 evidence** — the event Q19's own experiment failed to
+capture (§25).
+
+`q21_test_1` held one exit for 109 minutes, then moved **involuntarily**, provider-driven, under a
+live browser:
+
+```
+t=  2.2m   178.99.60.149   AUTHENTICATED
+t=109.4m   87.15.27.74     AUTHENTICATED   <- exit changed, session unaffected
+...
+t=178.6m   87.15.27.74     AUTHENTICATED
+```
+
+The probe immediately after the change returned 59,246 bytes from the **auth-gated** endpoint with
+the logout marker present, and the session went on to survive another 69 minutes. This is stronger
+than §22's deliberate migration: the same browser, the same session, an address change nobody asked
+for.
+
+**Limits: n = 1.** The change was detected between two probes ~5 minutes apart, so this shows an
+exit moving between requests rather than mid-request. Q19 remains formally open; this is supporting
+evidence, not the answer.
+
+**Also worth noting against Q1:** the other two sessions held a single webshare exit for the full
+~180 minutes. Q1's rate of 0.278 changes/session-hour predicts ~2.5 changes across 9 session-hours;
+one was observed. Small numbers, but a reminder that the rate is an average over a wide CI.

@@ -1,0 +1,115 @@
+{
+  "discovered_at": 1787736040.2198584,
+  "proxy_session_id": "121377",
+  "home_bytes": 59686,
+  "links": [
+    {
+      "href": "/VistosOnline/politicaPrivacidade.jsp",
+      "text": "Pol\u00edtica de privacidade"
+    },
+    {
+      "href": "https://www.cnpd.pt/",
+      "text": "Comiss\u00e3o Nacional de Prote\u00e7\u00e3o de Dados (CNPD)"
+    },
+    {
+      "href": "/VistosOnline/politicaPrivacidade.jsp",
+      "text": "Pol\u00edtica de privacidade"
+    },
+    {
+      "href": "https://vistos.mne.gov.pt/pt/",
+      "text": "vistos.mne.gov.pt/pt/"
+    },
+    {
+      "href": "https://www.puc-spoc.pt/uo/sirene",
+      "text": "www.puc-spoc.pt/uo/sirene"
+    },
+    {
+      "href": "https://www.cnpd.pt/cidadaos/direitos/",
+      "text": "www.cnpd.pt/cidadaos/direitos/"
+    },
+    {
+      "href": "/VistosOnline/politicaPrivacidade.jsp",
+      "text": "Pol\u00edtica de privacidade"
+    },
+    {
+      "href": "/VistosOnline/profile.jsp",
+      "text": "Dados pessoais"
+    },
+    {
+      "href": "/VistosOnline/profile.jsp?area=changePassword",
+      "text": "Alterar Password"
+    },
+    {
+      "href": "/VistosOnline/logout",
+      "text": "Terminar Sess\u00e3o"
+    },
+    {
+      "href": "/VistosOnline/Questionario",
+      "text": "Solicitar pedido de Visto"
+    },
+    {
+      "href": "/VistosOnline/Pedidos",
+      "text": "Consultar pedidos"
+    },
+    {
+      "href": "/VistosOnline",
+      "text": "E-VISA Minist\u00e9rio dos Neg\u00f3cios Estrangeiros"
+    },
+    {
+      "href": "/VistosOnline/Questionario",
+      "text": "Solicitar pedido de Visto"
+    },
+    {
+      "href": "/VistosOnline/Pedidos",
+      "text": "Consultar pedidos"
+    },
+    {
+      "href": "/VistosOnline/profile.jsp",
+      "text": "&nbsp;Dados pessoais"
+    },
+    {
+      "href": "/VistosOnline/profile.jsp?area=changePassword",
+      "text": "&nbsp;Alterar Password"
+    },
+    {
+      "href": "/VistosOnline/logout",
+      "text": "&nbsp;Terminar Sess\u00e3o"
+    },
+    {
+      "href": "https://developers.google.com/analytics/devguides/collection/analyticsjs/cookie-usage",
+      "text": "(ver utiliza\u00e7\u00e3o de cookies do Google Analytics)"
+    },
+    {
+      "href": "/VistosOnline/sugestoes.jsp",
+      "text": "Sugest\u00f5es, elogios e reclama\u00e7\u00f5es"
+    },
+    {
+      "href": "/VistosOnline/politicaPrivacidade.jsp",
+      "text": "Pol\u00edtica de Privacidade"
+    }
+  ],
+  "candidate": {
+    "href": "/VistosOnline/Pedidos",
+    "text": "Consultar pedidos",
+    "url": "https://pedidodevistos.mne.gov.pt/VistosOnline/Pedidos"
+  },
+  "authed": {
+    "requested": "https://pedidodevistos.mne.gov.pt/VistosOnline/Pedidos",
+    "final_url": "https://pedidodevistos.mne.gov.pt/VistosOnline/Pedidos",
+    "bytes": 59244,
+    "title": "Inicio",
+    "has_password_field": false,
+    "has::consultar pedidos": true,
+    "has::solicitar pedido de visto": true,
+    "has::sessionlost": false,
+    "has::authentication.jsp": false,
+    "has::iniciar sess": false,
+    "has::terminar sess": true,
+    "has::sair": false
+  },
+  "anonymous": {
+    "error": "Error: Page.goto: net::ERR_TUNNEL_CONNECTION_FAILED at https://pedidodevistos.mne.gov.pt/VistosOnline/\nCall log:\n  - navigating to \"https://pedidodevistos.mne.gov.pt/VistosOnline/\", waiting until \"dom"
+  },
+  "is_auth_gated": false,
+  "gate_evidence": []
+}

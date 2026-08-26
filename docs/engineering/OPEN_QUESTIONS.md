@@ -158,15 +158,39 @@ shorter than every planned hold in §20 except one.
 *idle* timeout where our home-page GET does not count as activity. See Q21 — and note production's
 pre-warm keepalive navigates exactly that URL.
 
-### Q21. Does an authenticated GET actually refresh the portal session?
-The blocking follow-up to Q20, and cheap. Q20's probe used the portal **home** page, which may be
-served without touching the server-side session — in which case Q20 measured an idle timeout, not an
-absolute lifetime, and a *genuinely* session-touching request might hold a session open indefinitely.
+### Q21. Does an auth-gated GET refresh portal authentication? — **ANSWERED 2026-08-26: the premise was wrong**
+`/VistosOnline/Pedidos` was discovered and **proven** auth-gated (59,244B with the logout link when
+authenticated; 28,717B without it anonymously, same url). Two test arms probed it every 5 min; one
+control probed HOME_URL every 5 min.
 
-**Why it matters most:** if an auth-gated GET does refresh the session, long holds become possible
-and the keepalive simply needs to request the right URL. If it does not, ~40 minutes is a hard
-ceiling on any held session and the architecture must re-login instead of hold.
+**All three survived ~175-180 minutes. None expired.** (`CONFIRMED_FACTS.md` §27)
 
-**Settled by:** one login, then probe the `consultar pedidos` target (auth-gated) every 5 min past
-the 45-minute mark. If it survives well past 45 min, Q20 measured our probe's inadequacy rather than
-the portal's TTL. No warm, no submit; the same classifier applies.
+- "auth-gated refreshes while HOME_URL does not" -> **NOT SUPPORTED**. The control held 174.8 min on
+  HOME_URL alone, so production's keepalive url is not the inadequate request it was suspected of.
+- the mechanism -> **INCONCLUSIVE**. With no expiry on either side, "both refresh" and "TTL > 180
+  min" fit equally.
+
+**What it did establish is bigger than what it asked:** Q20's 33-45 min figure does not generalise.
+See Q22.
+
+### Q22. Why did two sessions die at 33-45 min when three others lasted 180+ min? — **THE NEW BLOCKER**
+The same setup, the same HOME_URL probe, twelve hours apart, produced a 4x difference in session
+lifetime (`CONFIRMED_FACTS.md` §24 vs §27). Whatever ended the first pair was **not** a fixed
+authentication TTL, and the cause is unknown. Candidates, none established: a portal-side
+invalidation event, a time-of-day policy, per-node session configuration, or something specific to
+those two sessions.
+
+**Why it now matters most:** hold duration is the central architectural parameter, and it is not a
+constant. A design that assumes 3 hours will break on a 40-minute night; a design that assumes 40
+minutes throws away most of the available window. Until this is understood, **any holding
+architecture must tolerate a session dying at any time** rather than plan around a number.
+
+**Settled by:** repeated lifetime runs across different times of day, recording the full raw evidence
+each time (2-3 sessions per run, cheap once the harness exists). The instrument already exists --
+`probes/session_lifetime_probe.py` and `probes/q21_auth_refresh_probe.py`.
+
+### Q19 (update). Involuntary exit change — one supporting observation
+`q21_test_1` moved exit involuntarily at t=109.4 min (178.99.60.149 -> 87.15.27.74) and stayed
+AUTHENTICATED on the auth-gated endpoint, surviving another 69 min (`CONFIRMED_FACTS.md` §28).
+n=1, and the change was detected between probes ~5 min apart. Q19 stays formally open, but the
+evidence now points the same way as Q16.
