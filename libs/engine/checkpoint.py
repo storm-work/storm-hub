@@ -28,10 +28,24 @@ whenever healthy and valid").
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 
-_CHECKPOINTS_DIR = Path(__file__).resolve().parents[2] / "var" / "checkpoints"
+# CHECKPOINTS_DIR_TEST_OVERRIDE exists ONLY so a subprocess-invoked test (scripts/cleanup_checkpoints.py
+# is deliberately invoked as a real subprocess, matching how it's actually run operationally -- see
+# that script's own docstring) can point this module at an isolated directory instead of the real
+# var/checkpoints/, the same way in-process tests already do via
+# `monkeypatch.setattr(ckpt, "_CHECKPOINTS_DIR", tmp_path)` (tests/engine/test_checkpoint.py,
+# tests/hub/test_action_guard_parity.py). This is NOT a settings-catalog knob and NOT a CLI flag on
+# cleanup_checkpoints.py -- that script still accepts no path argument at all (D15's guarantee is
+# unchanged: it can only ever touch whatever this module resolves to, never an arbitrary caller path).
+# Unset in every real deployment, so production always resolves to the same hardcoded path it always
+# has.
+_CHECKPOINTS_DIR = Path(
+    os.environ.get("CHECKPOINTS_DIR_TEST_OVERRIDE")
+    or (Path(__file__).resolve().parents[2] / "var" / "checkpoints")
+)
 
 
 def _path(identity_id: str) -> Path:
