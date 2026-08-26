@@ -809,3 +809,46 @@ def test_an_appointment_is_never_hidden_by_a_missing_name(client):
     assert len(rows) == 1
     assert rows[0]["identity_name"] == "GHOST"
     assert rows[0]["sub_account_username"] is None
+
+
+def test_attach_refuses_identity_that_already_holds_an_appointment(client):
+    """An identity with a real BookedAppointment can never warm -- the portal answers
+    ScheduleController with "already has an application registered with a future schedule", so the
+    worker burns a login, a CAPTCHA solve and a proxy lease before failing.
+
+    The guard deliberately keys on the APPOINTMENT ROW, not Identity.status. Confirmed live
+    2026-08-26: an identity that booked on 2026-08-18 was still ACTIVE eight days later (the
+    booking flow wrote the appointment and never marked the identity), and two others were in the
+    same state -- so the derived status field cannot be trusted for this. This test reproduces that
+    exact shape: status left ACTIVE, appointment present.
+    """
+    from apps.hub.db import get_db
+    from libs.db import models as M
+
+    h = _operate_headers(client)
+    iid = client.post("/identities", json={"full_name": "Already Booked", "type": "real"},
+                      headers=h).json()["id"]
+    bid = client.post("/bookings", json={"name": "b", "type": "real", "posto_id": "5084"},
+                      headers=h).json()["id"]
+
+    # The appointment came from an EARLIER booking, which is the real shape: the identity booked
+    # once, that booking ended, and the identity was later offered again.
+    prior = client.post("/bookings", json={"name": "prior", "type": "real", "posto_id": "5084"},
+                        headers=h).json()["id"]
+    db = next(app.dependency_overrides[get_db]())
+    sa = M.SubAccount(identity_id=iid, username="u1", password="test-password", email="u1@e.test")
+    db.add(sa); db.commit()
+    # Status stays ACTIVE on purpose -- that is the stale state observed in production.
+    db.add(M.BookedAppointment(identity_id=iid, booking_id=prior, sub_account_id=sa.id))
+    db.commit()
+    assert db.get(M.Identity, iid).status != "booked"
+
+    r = client.post(f"/bookings/{bid}/identities", json={"identity_id": iid}, headers=h)
+    assert r.status_code == 409, r.text
+    assert "already holds a booked appointment" in r.json()["detail"]
+
+    # and a clean identity still attaches
+    ok = client.post("/identities", json={"full_name": "Clean", "type": "real"},
+                     headers=h).json()["id"]
+    assert client.post(f"/bookings/{bid}/identities", json={"identity_id": ok},
+                       headers=h).status_code == 201

@@ -1978,6 +1978,29 @@ def attach_identity(
             f"(status {stale_bk.status if stale_bk else '?'}) -- detach it there first",
         )
 
+    # An identity that ALREADY HOLDS a real appointment can never warm: the portal answers
+    # ScheduleController with "This applicant already has an application registered with a future
+    # schedule", so the worker burns a login, a CAPTCHA solve and a proxy lease before failing.
+    #
+    # Confirmed live 2026-08-26 during single-worker validation: ESPERANCA CUNHA booked on
+    # 2026-08-18 but her Identity.status was still ACTIVE eight days later -- the Aug-18 flow wrote
+    # the BookedAppointment row and never marked the identity, and there is no IdentityEvent from
+    # that date either. Two more identities are in the same state right now.
+    #
+    # So this guard deliberately does NOT trust Identity.status, which is a DERIVED field that was
+    # demonstrably stale. It asks the authoritative question instead: does an appointment row exist?
+    # (The status check still has value and stays where it is -- this is a second, independent
+    # gate, in the same spirit as every other positive-evidence rule in this codebase.)
+    existing_appt = db.scalar(
+        select(M.BookedAppointment).where(M.BookedAppointment.identity_id == ident.id)
+    )
+    if existing_appt is not None:
+        raise HTTPException(
+            409,
+            f"identity {ident.full_name or ident.id} already holds a booked appointment "
+            f"(since {existing_appt.created_at:%Y-%m-%d}) -- the portal will reject its warm-up",
+        )
+
     # Template: default to the first template matching the resolved role if none given.
     template_id = body.template_id
     if template_id:
