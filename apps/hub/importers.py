@@ -23,7 +23,7 @@ _URL_RE = re.compile(r"^(?:https?://)?(?:([^:@/]+):([^@/]+)@)?([^:/@]+):(\d+)/?$
 
 # Both providers encode the exit country in the credential, in different shapes:
 #   soax     package-335959-country-pt-sessionid-...      -> PT
-#   webshare sodade2026-DE-17:sempre2026                  -> DE
+#   webshare sodade2026-DE-17:test-password                  -> DE
 _GEO_RE = re.compile(r"-([A-Za-z]{2})-")
 
 

@@ -88,14 +88,14 @@ def test_soax_session_id_never_reuses_a_pre_seeded_value(monkeypatch):
 
 # ── Webshare ─────────────────────────────────────────────────────────────────────────────────
 def test_webshare_credential_with_country():
-    cred = build_webshare_credential(prefix="sodade2026", password="sempre2026", session_id=544147,
+    cred = build_webshare_credential(prefix="sodade2026", password="test-password", session_id=544147,
                                      country="af")
-    assert cred == "p.webshare.io:80:sodade2026-AF-544147:sempre2026"
+    assert cred == "p.webshare.io:80:sodade2026-AF-544147:test-password"
 
 
 def test_webshare_credential_without_country():
-    cred = build_webshare_credential(prefix="sodade2026", password="sempre2026", session_id=51)
-    assert cred == "p.webshare.io:80:sodade2026-51:sempre2026"
+    cred = build_webshare_credential(prefix="sodade2026", password="test-password", session_id=51)
+    assert cred == "p.webshare.io:80:sodade2026-51:test-password"
     assert "random" not in cred.lower()
 
 
@@ -137,16 +137,16 @@ def test_builder_output_geo_detection_matches_country_argument():
 #    builders can't silently drift the grammar without this test noticing. ──────────────────────
 def test_soax_golden_sample_matches_pre_relocation_format():
     cred = re.sub(r"sessionid-\w{16}", "sessionid-XXXXXXXXXXXXXXXX",
-                  build_soax_credential(package="335959", password="ulUve74DtH3Zv2H0",
+                  build_soax_credential(package="335959", password="test-password",
                                         session_id=soax_session_id(), sessionlength=3600,
                                         bindttl=600, idlettl=900, country="pt"))
     assert cred == (
         "package-335959-country-pt-sessionid-XXXXXXXXXXXXXXXX-"
-        "sessionlength-3600-bindttl-600-idlettl-900-opt-wb:ulUve74DtH3Zv2H0@proxy.soax.com:5000"
+        "sessionlength-3600-bindttl-600-idlettl-900-opt-wb:test-password@proxy.soax.com:5000"
     )
 
 
 def test_webshare_golden_sample_matches_pre_relocation_format():
-    cred = build_webshare_credential(prefix="sodade2026", password="sempre2026", session_id=544147,
+    cred = build_webshare_credential(prefix="sodade2026", password="test-password", session_id=544147,
                                      country="af")
-    assert cred == "p.webshare.io:80:sodade2026-AF-544147:sempre2026"
+    assert cred == "p.webshare.io:80:sodade2026-AF-544147:test-password"

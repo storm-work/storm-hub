@@ -74,6 +74,6 @@ def test_parse_geo_reads_both_provider_credential_formats():
     from apps.hub.importers import parse_geo
     assert parse_geo("package-335959-country-pt-sessionid-X-sessionlength-3600-opt-wb:pw") == "PT"
     assert parse_geo("package-350716-country-de-sessionid-X-sessionlength-3600-opt-wb:pw") == "DE"
-    assert parse_geo("sodade2026-IT-17:sempre2026") == "IT"
+    assert parse_geo("sodade2026-IT-17:test-password") == "IT"
     assert parse_geo("package-350716-sessionid-X-sessionlength-3600-opt-wb:pw") is None
     assert parse_geo(None) is None
