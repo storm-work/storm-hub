@@ -1832,3 +1832,252 @@ def test_a_scheduled_slot_open_is_still_reverted(db):
 
     assert sched._maybe_inactivate_slot_open(db, bk, NOW) is True
     assert bk.slot_open_fired_at is None
+
+
+# ── Phase 8 (D-NEW-1): static resource health reactivation ──────────────────────────────────────
+def _static_proxy(db, *, pid, healthy, active=True, last_used_at=None):
+    p = M.Proxy(id=pid, provider="isp", kind="static_res", endpoint=f"{pid}:80",
+               credentials_ref="u:p", resource_type="static", active=active,
+               is_healthy=healthy, last_used_at=last_used_at, max_sessions=1)
+    db.add(p); db.commit()
+    return p
+
+
+def test_reprobe_static_proxies_failing_probe_leaves_it_unhealthy(db):
+    p = _static_proxy(db, pid="s1", healthy=False)
+    sched = _scheduler()
+    calls = []
+
+    def fake_check(url):
+        calls.append(url)
+        return False, "ERR_CONNECTION_CLOSED"
+
+    sched._reprobe_static_proxies(db, NOW, health_check=fake_check)
+
+    db.refresh(p)
+    assert len(calls) == 1
+    assert p.is_healthy is False
+    assert p.health == "ERR_CONNECTION_CLOSED"
+
+
+def test_reprobe_static_proxies_successful_probe_reactivates_and_is_then_leasable(db):
+    """The hand-off to normal leasing: this test does NOT reimplement _candidate_query's logic --
+    it proves the reactivated row becomes selectable by calling the real, unmodified lease_proxy."""
+    from libs.proxies import lease_proxy
+
+    _static_proxy(db, pid="s1", healthy=False)
+    sched = _scheduler()
+
+    sched._reprobe_static_proxies(db, NOW, health_check=lambda url: (True, "ok"))
+
+    px, _ = lease_proxy(db, "w1", "isp", resource_type="static")
+    assert px.id == "s1"
+    assert px.is_healthy is True
+
+
+def test_reprobe_static_proxies_never_touches_rotating_resources(db):
+    """Regression guard for D19: a pool of only unhealthy ROTATING rows must produce zero probes and
+    zero mutations from this sweep -- rotating health exclusion stays exactly as it was."""
+    rot = M.Proxy(id="r1", provider="soax", kind="dc", endpoint="r1:80", credentials_ref="u:p",
+                 resource_type="rotating", active=True, is_healthy=False, health="old-verdict")
+    db.add(rot); db.commit()
+    sched = _scheduler()
+    calls = []
+
+    sched._reprobe_static_proxies(db, NOW, health_check=lambda url: (calls.append(url), (True, "ok"))[1])
+
+    db.refresh(rot)
+    assert calls == []
+    assert rot.is_healthy is False           # untouched
+    assert rot.health == "old-verdict"       # untouched
+
+
+def test_reprobe_static_proxies_is_time_gated():
+    db = _launch_failed_db()
+    _static_proxy(db, pid="s1", healthy=False)
+    sched = _scheduler()
+    calls = []
+    probe = lambda url: (calls.append(url), (True, "ok"))[1]
+
+    sched._reprobe_static_proxies(db, NOW, health_check=probe)      # first call runs
+    assert len(calls) == 1
+    sched._reprobe_static_proxies(db, NOW, health_check=probe)      # immediate second call: skipped
+    assert len(calls) == 1
+
+
+def test_reprobe_static_proxies_failure_never_kills_the_tick():
+    db = _launch_failed_db()
+    sched = _scheduler()
+
+    def boom(url):
+        raise RuntimeError("browser crashed")
+
+    _static_proxy(db, pid="s1", healthy=False)
+    sched._reprobe_static_proxies(db, NOW, health_check=boom)   # must not raise
+
+
+# ── Phase 8 (D-NEW-2): F5 orphaned proxy-lease reconciliation ───────────────────────────────────
+def test_reconcile_orphaned_leases_recovers_launch_failure_after_lease_worker(db):
+    """Phase 7's confirmed path 2: a worker whose launch fails (spawn/command-group/send-command)
+    AFTER a successful proxy lease is set FAILED directly by apps/hub/main.py's except block and
+    NEVER touches RUNNING -- invisible to _reap_dead_workers/_reap_stalled_workers/
+    _reap_runaway_workers, all three of which only ever scan status==RUNNING. This test reproduces
+    that exact STATE (not the launch code path itself, which lives in main.py and is out of this
+    phase's scope) and proves the new sweep is the first mechanism that can ever recover it."""
+    bk = _make_booking(db)
+    ident = _make_identity(db)
+    w = _make_worker(db, bk, ident, status=WorkerStatus.FAILED)   # never was RUNNING
+    proxy = M.Proxy(provider="isp", kind="static_res", endpoint="1.2.3.4:80", active=True,
+                    is_healthy=True, max_sessions=1)
+    db.add(proxy); db.commit()
+    lease = M.ProxyLease(proxy_id=proxy.id, worker_id=w.id, leased_at=NOW - timedelta(seconds=400))
+    db.add(lease); db.commit()
+
+    sched = _scheduler(bus=_FakeBus())
+    sched._reconcile_orphaned_leases(db, NOW)
+
+    db.refresh(lease)
+    assert lease.released_at is not None
+
+
+def test_reconcile_orphaned_leases_recovers_terminal_release_failure_worker(db):
+    """Phase 7's confirmed path 1: a worker reaches a normal terminal status (its own `terminal`
+    bus event correctly applied `status`), but `_release_on_terminal`'s call to
+    release_worker_resources raised and was silently swallowed by the `_step()` wrapper in
+    events.py -- the lease is left active with no retry. Reproduces the resulting STATE: a
+    COMPLETED worker with a still-active lease."""
+    bk = _make_booking(db)
+    ident = _make_identity(db)
+    w = _make_worker(db, bk, ident, status=WorkerStatus.COMPLETED)
+    proxy = M.Proxy(provider="isp", kind="static_res", endpoint="5.6.7.8:80", active=True,
+                    is_healthy=True, max_sessions=1)
+    db.add(proxy); db.commit()
+    lease = M.ProxyLease(proxy_id=proxy.id, worker_id=w.id, leased_at=NOW - timedelta(seconds=400))
+    db.add(lease); db.commit()
+
+    sched = _scheduler(bus=_FakeBus())
+    sched._reconcile_orphaned_leases(db, NOW)
+
+    db.refresh(lease)
+    assert lease.released_at is not None
+
+
+def test_reconcile_orphaned_leases_also_releases_slot_leases(db):
+    """release_worker_resources releases proxy AND slot leases in one call -- confirms the sweep
+    reuses the real function (with its full cleanup), not a lease-only shortcut."""
+    bk = _make_booking(db)
+    ident = _make_identity(db)
+    w = _make_worker(db, bk, ident, status=WorkerStatus.FAILED)
+    proxy = M.Proxy(provider="isp", kind="static_res", endpoint="1.2.3.4:80", active=True,
+                    is_healthy=True, max_sessions=1)
+    db.add(proxy); db.commit()
+    db.add(M.ProxyLease(proxy_id=proxy.id, worker_id=w.id, leased_at=NOW - timedelta(seconds=400)))
+    slot = M.Slot(booking_id=bk.id, posto_id="5084", date="2026-08-20", period=3,
+                  status=SlotStatus.LEASED)
+    db.add(slot); db.commit()
+    slot_lease = M.SlotLease(slot_id=slot.id, worker_id=w.id, leased_at=NOW - timedelta(seconds=400))
+    db.add(slot_lease); db.commit()
+
+    sched = _scheduler(bus=_FakeBus())
+    sched._reconcile_orphaned_leases(db, NOW)
+
+    db.refresh(slot_lease)
+    db.refresh(slot)
+    assert slot_lease.released_at is not None
+    assert slot.status == SlotStatus.AVAILABLE
+
+
+def test_reconcile_orphaned_leases_never_touches_running_workers(db):
+    bk = _make_booking(db)
+    ident = _make_identity(db)
+    w = _make_worker(db, bk, ident, status=WorkerStatus.RUNNING)
+    proxy = M.Proxy(provider="isp", kind="static_res", endpoint="1.2.3.4:80", active=True,
+                    is_healthy=True, max_sessions=1)
+    db.add(proxy); db.commit()
+    lease = M.ProxyLease(proxy_id=proxy.id, worker_id=w.id, leased_at=NOW - timedelta(hours=10))
+    db.add(lease); db.commit()
+
+    sched = _scheduler(bus=_FakeBus())
+    sched._reconcile_orphaned_leases(db, NOW)
+
+    db.refresh(lease)
+    assert lease.released_at is None
+
+
+def test_reconcile_orphaned_leases_respects_grace_period_for_in_flight_launches(db):
+    """A worker that leased moments ago and hasn't flipped to RUNNING yet (a launch genuinely in
+    progress) must not be reconciled -- this is the false-positive the grace period exists to
+    prevent."""
+    bk = _make_booking(db)
+    ident = _make_identity(db)
+    w = _make_worker(db, bk, ident, status=WorkerStatus.READY)   # about to become RUNNING
+    proxy = M.Proxy(provider="isp", kind="static_res", endpoint="1.2.3.4:80", active=True,
+                    is_healthy=True, max_sessions=1)
+    db.add(proxy); db.commit()
+    lease = M.ProxyLease(proxy_id=proxy.id, worker_id=w.id, leased_at=NOW - timedelta(seconds=10))
+    db.add(lease); db.commit()
+
+    sched = _scheduler(bus=_FakeBus())
+    sched._reconcile_orphaned_leases(db, NOW)
+
+    db.refresh(lease)
+    assert lease.released_at is None
+
+
+def test_reconcile_orphaned_leases_is_idempotent_across_two_runs(db):
+    bk = _make_booking(db)
+    ident = _make_identity(db)
+    w = _make_worker(db, bk, ident, status=WorkerStatus.FAILED)
+    proxy = M.Proxy(provider="isp", kind="static_res", endpoint="1.2.3.4:80", active=True,
+                    is_healthy=True, max_sessions=1)
+    db.add(proxy); db.commit()
+    lease = M.ProxyLease(proxy_id=proxy.id, worker_id=w.id, leased_at=NOW - timedelta(seconds=400))
+    db.add(lease); db.commit()
+
+    sched = _scheduler(bus=_FakeBus())
+    sched._reconcile_orphaned_leases(db, NOW)
+    db.refresh(lease)
+    first_released_at = lease.released_at
+    assert first_released_at is not None
+
+    # Force the throttle open again to actually re-run the query (not just skip on the timer).
+    sched._last_lease_reconcile = 0.0
+    sched._reconcile_orphaned_leases(db, NOW)   # must not raise, must not double-release
+
+    db.refresh(lease)
+    assert lease.released_at == first_released_at
+
+
+def test_reconcile_orphaned_leases_is_time_gated():
+    db = _launch_failed_db()
+    bk = _make_booking(db)
+    ident = _make_identity(db)
+    w = _make_worker(db, bk, ident, status=WorkerStatus.FAILED)
+    proxy = M.Proxy(provider="isp", kind="static_res", endpoint="1.2.3.4:80", active=True,
+                    is_healthy=True, max_sessions=1)
+    db.add(proxy); db.commit()
+    lease = M.ProxyLease(proxy_id=proxy.id, worker_id=w.id, leased_at=NOW - timedelta(seconds=400))
+    db.add(lease); db.commit()
+
+    sched = _scheduler(bus=_FakeBus())
+    sched._reconcile_orphaned_leases(db, NOW)          # first call runs
+    db.refresh(lease)
+    assert lease.released_at is not None
+
+    w2 = _make_worker(db, bk, ident, status=WorkerStatus.FAILED)
+    lease2 = M.ProxyLease(proxy_id=proxy.id, worker_id=w2.id, leased_at=NOW - timedelta(seconds=400))
+    db.add(lease2); db.commit()
+    sched._reconcile_orphaned_leases(db, NOW)          # immediate second call: skipped by the throttle
+    db.refresh(lease2)
+    assert lease2.released_at is None
+
+
+def test_reconcile_orphaned_leases_failure_never_kills_the_tick(db, monkeypatch):
+    sched = _scheduler(bus=_FakeBus())
+
+    def boom(*a, **k):
+        raise RuntimeError("db exploded")
+
+    import libs.proxies as proxies_pkg
+    monkeypatch.setattr(proxies_pkg, "find_orphaned_worker_ids", boom)
+    sched._reconcile_orphaned_leases(db, NOW)   # must not raise

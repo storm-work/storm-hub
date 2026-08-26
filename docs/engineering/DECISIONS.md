@@ -146,6 +146,8 @@ Documentation and memory only.
 `do_swap` onto ISP proxies. That change rests on a claim we have inherited but never verified here
 (§18, row 2), and acting on it before Q16 would repeat the pattern this project is trying to break.
 
+**Superseded 2026-08-26 by D32.**
+
 ### D24. The portal session is cookie-bound, not IP-bound — verified here, not inherited
 **CONFIRMED 2026-08-25** (`CONFIRMED_FACTS.md` §22, 3/3). `Vistos_sid` carries the session across a
 browser change and an exit change.
@@ -165,6 +167,11 @@ wherever it appeared.
 challenge* — three things F21 says the worker must tell apart. The Q16 probe classifies it; the
 production classifier in `ops_live.py` does **not** yet. Recorded, not implemented, per the
 analysis-only boundary.
+
+**Implemented 2026-08-26 (Phase 1, under D32's recorded exception):** `ops_live.py`'s
+`classify_session_state()` now recognises `sessionLost.jsp` in the keepalive loop — see
+`FAILURE_MODES.md` F22. Recognition in the login path (the vendored session's own classifiers)
+remains as it was; this note covers the keepalive loop only.
 
 ### D26. Persist raw evidence, never conclusions
 Every probe in this project writes its own byte counts, marker lists, URLs and errors, and reports
@@ -224,3 +231,278 @@ survived a further 69 min on an auth-gated endpoint) — says an IP change does 
 portal session. **An exit change must therefore not trigger re-login or session rebuild.**
 `_note_exit_ip` should feed the classifier as context, not as a failure trigger.
 **Reverse if:** a repeat of Q19 at larger n shows involuntary changes behaving differently.
+
+### D32. D23 reconciled: Q16 satisfied, Q22 changes the reason for caution
+D23's stated condition (Q16) is satisfied and independently verified here, not merely inherited.
+D23 is **superseded, not simply lifted**, because Q22/D29 introduced a new, evidence-backed reason
+for caution that D23 could not have anticipated (it predates Q22 by a day): an authenticated
+session can be invalidated by a portal-side event unrelated to proxy behavior, of unknown cause and
+unknown recurrence.
+
+**Authorized by this decision:** proxy-subsystem ARCHITECTURE DESIGN — specification, evaluation of
+prior proposals against evidence, architectural modeling, comparison of alternatives, a written
+design, and any experiments needed to answer a design question. **This does not authorize
+implementation.**
+
+**Still frozen, and why (each verified against the current repository, not assumed):**
+- Enabling `do_swap`, or any change to active proxy selection, active proxy configuration, default
+  providers, or static/ISP routing. Two independent reasons, either one sufficient on its own: no
+  static/ISP proxy inventory exists to route traffic onto (`PROXY_CONTRACTS.md`: "we own none"),
+  and Q22/D29 show proxy behavior is not the sole, or even the dominant, explanation for a held
+  session dying — a proxy-focused fix would not address the threat that actually matters most.
+- `do_apply` — independently frozen by D21, on D21's own grounds. **D32 does not lift D21.**
+- The vendored engine and worker lifecycle beyond the keepalive loop — no evidence anywhere in the
+  current ledger argues for touching either; they stay frozen by default, not by a specific new
+  argument.
+- Holding *duration* — no fixed-duration strategy is adopted. D29 stands: current evidence does not
+  support planning around a number.
+
+**The Phase 1 exception, recorded for the historical record:** D23's freeze list named "holding
+logic" among the frozen areas. Phase 1 (2026-08-26) nonetheless changed `_do_keepalive`'s
+classification logic — implementing `ARCHITECTURE.md §11`'s already-written design — under an
+explicit, narrow operator instruction scoped to exactly that one change. This was not a
+reinterpretation of D23 by inference; it was a fresh, specific instruction authorizing one carved-out
+exception. It does not mean the rest of the holding architecture, or holding duration, was unfrozen
+alongside it.
+
+**Reverse if:** Q23 shows the portal-side invalidation event recurs on a predictable cadence (this
+would reopen the holding-design conversation on new terms), or static/ISP inventory is procured
+(removes one of the two independent reasons `do_swap`/proxy-config changes stay frozen — the other,
+Q22/D29, would still apply on its own).
+
+### D33. Proxy architecture evolution, Phase 3: four scoped structural changes, implemented under D32
+D32 authorized proxy-subsystem ARCHITECTURE DESIGN only. A separate, explicit operator instruction
+(Phase 3, 2026-08-26) then authorized implementing exactly four items drawn from that design — this
+decision is the record of what was actually built, not a new authorization in itself.
+
+**Implemented:**
+1. **`Proxy.resource_type` ('rotating' | 'static')**, migration `cd000resourcetype`, DB CHECK
+   constraint. Every existing row defaults to `'rotating'`. `libs/proxies/lease.py`'s
+   `_candidate_query` now scopes D19's "health is never a filter" rule to `resource_type='rotating'`
+   only — a `static` row with `is_healthy=False` is excluded, on the reasoning that a static/ISP
+   resource is a genuinely finite, individually-owned thing (a bad probe means THIS resource is
+   bad), unlike a rotating session template (a bad probe means the exit BEHIND it moved). No static
+   inventory exists (`PROXY_CONTRACTS.md`: "we own none"), so this is a no-op today and takes effect
+   only once a static row is actually imported.
+2. **Worker-level proxy setting overrides**, via the *existing* settings resolver — no second
+   precedence system. `PROXY_PROVIDER`/`PROXY_GEOS`/`PROXY_KIND`/`HOLD_PROXY_PROVIDER`/
+   `HOLD_PROXY_GEOS`/`HOLD_PROXY_KIND` gained `L.WORKER` to their `override_layers`. This required
+   adding the WORKER layer's one missing input mechanism: `Worker.settings_json` (migration
+   `ce000workersettings`, mirroring `WorkerTemplate.settings_json`'s existing pattern), validated at
+   `attach_identity` via `validate_layer(L.WORKER, ...)`, and wired into `_do_launch_worker`'s
+   `layers` dict. This gap (the resolver's precedence was already correct end-to-end, but nothing
+   could ever populate the WORKER layer for these six keys) was discovered during implementation,
+   not anticipated by the design phase, and was the one point this phase's own stop-condition list
+   was checked against before proceeding — it did not create a new precedence model, only wired an
+   already-designed, already-unused input layer.
+3. **`libs/proxies/credentials.py`**: `build_soax_credential`, `build_webshare_credential`,
+   `soax_session_id` — relocated from inline f-strings in `scripts/gen_proxy_pool.py`, which is now
+   a thin CLI wrapper (argparse + country-splitting) around the same module `libs/proxies` exports.
+   Grammar is byte-for-byte unchanged (golden-sample tests pin the pre-relocation format); the CLI
+   still runs as a real subprocess and still writes to `data/proxies_{provider}.txt` by default.
+4. **Static-only post-swap validation**: when `HOLD_SWAP_AFTER_FOUND=True`, `_do_launch_worker` now
+   requires at least one active `resource_type='static'` proxy matching the resolved
+   `HOLD_PROXY_PROVIDER`/`HOLD_PROXY_KIND` *before* attempting to lease one — fails with `409` and
+   releases the already-succeeded phase-1 (warm) lease, rather than leasing a rotating proxy as a
+   silent fallback. Because no static inventory exists, this rejects every `HOLD_SWAP_AFTER_FOUND`
+   launch today; that is judged correct, not a regression — the alternative (silently using a
+   rotating exit for the post-swap/hold pool) is exactly the instability the swap exists to move
+   away from.
+
+**Explicitly NOT done, per the phase's own scope:** no static/ISP inventory was procured or
+enabled; `do_swap` was not enabled by default (D32/D21 stand); `do_apply`, holding duration, the
+vendored engine, worker lifecycle, and Redis/Postgres orchestration were untouched; `sessionlength`/
+`bindttl`/`idlettl` values were not changed (Q18 remains open, not addressed here); no universal
+`ProxyProvider` class hierarchy was introduced (`credentials.py` is functions, not a provider
+abstraction — evaluated and rejected as unnecessary for two providers with genuinely different
+grammars).
+
+**Backward compatibility, verified by test:** every pre-existing proxy/settings/launch test passes
+unchanged in behavior (`resource_type` defaults to `'rotating'`, `Worker.settings_json` defaults to
+`{}` and is skipped entirely from `layers` when empty, `HOLD_SWAP_AFTER_FOUND=False` launches never
+reach the new validation branch at all). One pre-existing test
+(`test_live_launch_leases_hold_proxy_only_when_swap_enabled`) required a fixture update — its
+hold-pool proxy fixture had to become genuinely `resource_type='static'` to remain a *valid*
+`HOLD_SWAP_AFTER_FOUND` configuration under item 4's new, correct rule; its original intent (hold
+proxy gets leased when swap is enabled) is unchanged.
+
+**Reverse if:** none of these four items individually — each is additive and independently
+reversible (drop the migration, drop the override_layers widening, revert the script to inline
+credential construction, remove the validation branch) without touching the others.
+
+### D34. The static-hold invariant is enforced at every lease/rotation, not only at launch — Phase 5
+The Phase 4 audit found D33's `resource_type='static'` guarantee held only at a worker's initial
+hold-proxy lease. Re-investigation while implementing this decision found the gap was more precise
+than that: even the launch-time lease itself was never actually constrained to `resource_type=
+'static'` — `_do_launch_worker`'s pre-lease count check only proved a static row existed somewhere in
+the pool; the `lease_proxy` call that followed it had no `resource_type` parameter to enforce with,
+and passed only by the coincidence of the existing test fixture's phase-1 lease exhausting the only
+matching rotating row. Both the count check's true intent and the mid-hold rotation gap are the same
+underlying defect: **`resource_type` was a filter inside `_candidate_query`'s health scoping (D33),
+never an explicit requirement any caller could ask for.**
+
+**Implemented:**
+1. `lease_proxy`/`_candidate_query` (`libs/proxies/lease.py`) gained an optional `resource_type`
+   parameter — an exact-match `WHERE` clause, `None` by default (identical behavior to every
+   pre-Phase-5 caller). This is a genuinely new capability, not a reuse of D33's health-scoping
+   `or_(...)` clause, which only ever excludes an unhealthy static row from a mixed pool and was
+   never a requirement that a lease actually return one.
+2. `_do_launch_worker` (`apps/hub/main.py`) now passes `resource_type="static"` on the hold-phase
+   lease itself, not only the pre-check — the pre-check remains, for its clearer 409 message, but is
+   no longer the only thing standing between a mixed pool and a silently-rotating hold proxy.
+3. `_handle_proxy_request` (`apps/hub/events.py`) now (a) includes the WORKER settings layer in its
+   `layers` dict, matching `_do_launch_worker` exactly — a worker's override on any of the six Phase 3
+   proxy settings now applies identically at launch and at every subsequent rotation, closing the
+   configuration-inconsistency half of the Phase 4 finding; and (b) requires `resource_type="static"`
+   on a `phase="hold"` lease whenever the resolved `HOLD_SWAP_AFTER_FOUND` is on, mirroring
+   `_do_launch_worker`'s own gate exactly, including its use of the deprecated alias specifically (see
+   the note below). No rotating fallback: a static-required request with no static candidate fails
+   cleanly via the existing `proxy_unavailable` reply, exactly like ordinary pool exhaustion.
+4. **A static hold identity is never locally rolled.** `roll_sticky_session` (D2) is a grammar-based
+   string transform with no concept of `resource_type` and structurally cannot be given one without
+   the worker gaining DB-shaped knowledge (D1 forbids this). Instead, a new runtime-only fact —
+   `hold_proxy_static: bool` — rides the existing launch payload (set by the Hub from whether a hold
+   proxy was leased at all, since one is now only ever leased static) and the existing
+   `proxy_assigned` bus-command payload (`resource_type`, set by the Hub from the leased row, carried
+   through `wait_proxy`'s reply and applied by `_request_proxy_rotation` on every successful "hold"
+   reply). `do_swap`'s retry ladder (`apps/worker/ops_live.py`) now skips the local roll attempt
+   entirely when `self.hold_proxy_static` is true, falling straight through to the existing
+   `_request_proxy_rotation("hold")` Hub round-trip — which, per item 3, now itself enforces
+   `resource_type='static'`. Nothing about this required a Proxy model, a provider class, or any new
+   persistence layer: two plain fields riding two payloads that already exist.
+5. `_request_proxy_rotation`'s previously-discarded failure reason (Phase 4 finding) is now logged —
+   the Hub already generated and transmitted it; nothing consumed it.
+
+**Explicitly NOT done:** no static inventory was procured or enabled (none exists); `do_swap` was not
+redesigned, only its retry ladder's one roll-vs-rotate decision point; no change to `do_apply`,
+holding duration, worker lifecycle, or the vendored engine; no migration (both new facts are runtime
+payload fields, never persisted); the canonical/deprecated `HOLD_SWAP_AFTER_WARMUP`/
+`HOLD_SWAP_AFTER_FOUND` alias semantics were not touched.
+
+**Discovered, not fixed (out of this decision's scope):** `_do_launch_worker`'s hold-lease trigger
+(`main.py`) and this decision's new `_handle_proxy_request` gate both key off the *deprecated*
+`HOLD_SWAP_AFTER_FOUND` alias specifically — `libs/engine/config.py`'s `EngineConfig` (the worker's
+own `do_swap()` gate) correctly OR's both spellings, but the Hub-side launch/rotation gates do not. An
+operator setting only the canonical `HOLD_SWAP_AFTER_WARMUP` would make the worker believe swap is on
+while the Hub never leases a hold proxy at all. Pre-existing, unrelated to the launch-vs-rotation
+invariant this decision closes; flagged here rather than silently reconciled, per this project's own
+epistemic discipline (`SYSTEM_MEMORY.md`).
+
+**Corrected 2026-08-26 by D35: this framing was itself wrong.** `HOLD_SWAP_AFTER_FOUND` was not a
+legitimate alias whose precedence merely needed reconciling with `HOLD_SWAP_AFTER_WARMUP` — it named
+a trigger point the code never had, and was never meant to be a second permanently-supported spelling.
+D35 removes it outright. This paragraph's diagnosis (the Hub-side gates and the worker's own
+`EngineConfig` gate read different keys) was accurate as a description of the bug; its framing of the
+fix — reconciling which of two settings wins — was not the correct resolution. See D35.
+
+**Still unresolved, unchanged by this decision:** static resource reactivation (no mechanism exists
+for a static row once marked unhealthy — still whole-pool manual `POST /proxies/reset-health` only);
+the static/ISP credential grammar itself (still undefined — no provider to validate against); the
+dashboard's lack of a `resource_type` UI surface; F5's lease-leak sweep; Q13; Q18. None of these were
+in this decision's scope, and closing the launch-vs-rotation invariant does not make static
+procurement safe on its own — see the remaining items above.
+
+**Reverse if:** none of the five items individually — each is additive (an optional parameter with a
+backward-compatible default, two new payload fields, one narrowed retry-ladder branch) and
+independently reversible without touching the others.
+
+### D35. HOLD_SWAP_AFTER_FOUND is removed outright — it was never a legitimate alias
+Every prior phase (D33, D34) treated `HOLD_SWAP_AFTER_FOUND` as a deprecated-but-still-honoured
+spelling of `HOLD_SWAP_AFTER_WARMUP`, kept alive by an OR in `libs/engine/config.py` on the theory
+that dropping a key an operator had already saved would make the resolver reject the whole layer.
+That theory was correct about the *mechanism* (an unknown key does reject the whole layer) but wrong
+about the *conclusion*: the fix for a bad key an operator already saved is to remove the key, not to
+keep two settings semantically alive indefinitely. `HOLD_SWAP_AFTER_FOUND` was never a second
+supported spelling — it named a trigger point ("after found") the code never actually implemented
+(the swap fires right after warmup, unconditionally, per `HoldSwapConfig`'s own comment), and its
+continued existence was actively harmful: it let `_do_launch_worker`'s hold-lease trigger and (as of
+D34) `_handle_proxy_request`'s hold-rotation gate drift onto reading the deprecated name specifically
+while `EngineConfig`'s own `do_swap()` gate read both, OR'd — an inconsistency D34 diagnosed but
+deliberately did not fix, reading it as a precedence-reconciliation question. It was not one.
+
+**Removed:** the catalog entry, the resolver-visible key, the `EngineConfig` OR-fallback, every
+Hub-side (`main.py`, `events.py`) and worker-side (`ops_live.py`) code/comment reference, and the
+dashboard's booking-settings checkbox, which read AND wrote `HOLD_SWAP_AFTER_FOUND` specifically
+(`apps/dashboard/src/App.jsx`) — a real, functional dependency, not documentation. `HOLD_SWAP_AFTER_WARMUP`
+is now the sole recognized key anywhere in the system; setting the old name at any layer now raises
+`UnknownSetting`, exactly like any other unrecognized key, with no special-cased rejection message.
+
+**No migration:** `settings_json` (bookings, templates, workers) is an opaque JSON column with no
+per-key schema field (`libs/db/models.py`) — there was never a column named after this setting to
+drop. This is a pure Python/catalog change.
+
+**Operational risk, disclosed rather than resolved here (repository evidence does not settle it):**
+any *already-stored* booking or template `settings_json` blob in the live production database that
+still contains a literal `"HOLD_SWAP_AFTER_FOUND"` key (plausible — the dashboard checkbox wrote
+exactly this key before this decision) will now fail to resolve at all — `resolve()` validates every
+key in every stored layer, so one unrecognized key rejects that booking's *entire* settings
+resolution, not just the swap toggle, blocking every future launch for that booking until an operator
+edits the stored JSON to drop the key. **UNKNOWN:** whether any such row currently exists in
+production — this cannot be determined from the repository, and checking the live database is outside
+this phase's read-only/no-production-access boundary. **Recommended precaution before deploying this
+change** (not performed here): a one-time read-only query of `bookings.settings_json` and
+`worker_templates.settings_json` for the literal string `HOLD_SWAP_AFTER_FOUND`, and if found, an
+operator-run `UPDATE` stripping the key (or setting `HOLD_SWAP_AFTER_WARMUP` to the same value it
+held) before this code deploys.
+
+**Reverse if:** never, as a reintroduction of the alias — `HOLD_SWAP_AFTER_FOUND` must not come back
+as an alias, a fallback, or a second precedence system. If the deployment risk above is ever realized
+(a booking fails to launch on this exact `UnknownSetting`), the fix is a one-time data correction on
+that row, not restoring the setting.
+
+### D36. Static resource reactivation — Phase 8, D-NEW-1
+Before this decision, a `resource_type='static'` row that failed one health probe (D33) was excluded
+from `_candidate_query` **permanently** — the only reset was the operator's manual, whole-pool
+`POST /proxies/reset-health`. `apps/hub/scheduler.py`'s `_reprobe_static_proxies` (600s interval,
+operator decision, Phase 8) now periodically re-probes exactly that excluded set —
+`resource_type='static' AND active AND is_healthy=false`, ordered `last_used_at ASC NULLS FIRST` —
+using the existing `check_proxy`/`apply_result` unchanged, with no row lock held during the probe.
+
+**No new persisted state.** `last_used_at` is frozen at the last failed-probe timestamp for exactly
+these excluded rows (nothing else ever touches it while they're excluded), so it already provides
+"oldest still down first" ordering with no new column.
+
+**No new race.** A row stays invisible to `lease_proxy` for as long as it's unhealthy (D33's own
+query-level exclusion); the instant this sweep flips it healthy, it becomes an ordinary candidate,
+claimed through the unmodified `_claim_locked`/`FOR UPDATE SKIP LOCKED` path — this sweep never
+claims or leases anything itself.
+
+**Does not touch `resource_type='rotating'` rows** — structurally, by the query's own `WHERE`
+clause, not by convention. D19 is unaffected; proven by regression test
+(`test_reprobe_static_proxies_never_touches_rotating_resources`).
+
+**Reverse if:** never expected, but trivially — remove the two scheduler calls and the method;
+`find_reactivation_candidates` (`libs/proxies/lease.py`) has no other caller and no side effects of
+its own.
+
+### D37. F5 lease reconciliation — Phase 8, D-NEW-2
+Closes F5 (`FAILURE_MODES.md`). `apps/hub/scheduler.py`'s `_reconcile_orphaned_leases` (300s grace
+period AND 300s sweep interval — one operator-supplied number used for both, not two independently
+invented values) periodically releases any `ProxyLease` whose `released_at IS NULL`, whose owning
+`Worker.status != RUNNING`, and whose `leased_at` is older than the grace period.
+
+Reuses `release_worker_resources` (via the same `_release_worker_resources` wrapper the three
+existing reap paths already call) — no second, lease-only release path. Idempotent by construction:
+`release_proxy`'s own `WHERE released_at IS NULL` makes a repeat call on an already-released lease a
+harmless no-op, proven by test (`test_reconcile_orphaned_leases_is_idempotent_across_two_runs`).
+
+**No new persisted state.** `ProxyLease.leased_at`/`released_at` and `Worker.status` already existed;
+`Worker` still has no `updated_at` (`TimestampMixin` provides only `created_at`) and none was added —
+the lease's own `leased_at` is the age reference, not a worker-side timestamp.
+
+**Two confirmed leak paths this closes** (traced in Phase 7, restated in `FAILURE_MODES.md` F5):
+`events.py`'s `_release_on_terminal` silently swallowing a `release_worker_resources` exception with
+no retry, and `main.py`'s `_do_launch_worker` setting a worker `FAILED` after a successful lease
+without releasing it, leaving a worker that never touches `RUNNING` and is therefore invisible to
+every one of the three existing reap paths. Both are covered by dedicated regression tests
+reproducing the resulting state (not the originating code path, which lives in files this phase does
+not touch): `test_reconcile_orphaned_leases_recovers_launch_failure_after_lease_worker` and
+`test_reconcile_orphaned_leases_recovers_terminal_release_failure_worker`.
+
+**Operator parameters (Phase 8, explicit decision, not derived from `_DEAD_GRACE` or any other
+existing constant):** reactivation interval 600s (D36), reconciliation grace period 300s (this
+decision) — both are pure tuning parameters; changing either later is a config change, not an
+architecture change.
+
+**Reverse if:** never expected, but trivially — remove the two scheduler calls and the method;
+`find_orphaned_worker_ids` has no other caller and no side effects of its own.

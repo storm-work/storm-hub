@@ -33,6 +33,7 @@ import json
 import random
 import re
 import time
+from enum import Enum
 from urllib.parse import urlencode
 from datetime import date
 
@@ -192,6 +193,60 @@ def _is_home_url(final_url: str) -> bool:
     deeper path -- SubmeterVistoCriaPDF, Schedule.jsp and friends all say something different."""
     path = (final_url or "").split("?", 1)[0].split("#", 1)[0].rstrip("/")
     return path.endswith("/VistosOnline")
+
+
+class SessionState(str, Enum):
+    """What a keepalive probe's response actually says about the session -- not "did the
+    navigation raise" (that's a transport failure and stays a separate, pre-existing branch in
+    _do_keepalive) but "is the page we got back proof of a live session, proof of a dead one,
+    evidence the portal is refusing everyone, or none of the above."
+
+    docs/engineering/FAILURE_MODES.md F21-F26 are six symptoms of one cause: this evidence was
+    already being fetched (the page IS read, or -- pre-warm -- was one `browser_eval` away from
+    being read) and then discarded, so a logged-out home page read as healthy (F23), a lapsed
+    Schedule.jsp read as "form-state lapsed" whether the real cause was a lapsed form OR a dead
+    session (F24), a busy portal read the same way (F25), and no response ever had a name for
+    "none of the above, we don't actually know" (F26)."""
+    AUTHENTICATED = "authenticated"
+    SESSION_EXPIRED = "session_expired"
+    PORTAL_ERROR = "portal_error"
+    UNKNOWN = "unknown"
+
+
+def classify_session_state(page: str, final_url: str, *, warmed: bool) -> SessionState:
+    """Classify a keepalive probe's response into a SessionState.
+
+    `warmed` selects which page was actually requested -- Schedule.jsp once posto_pdf is set,
+    the bare home page before that -- since the positive evidence for "authenticated" differs
+    per page and the same page content must not be judged the same way in both cases.
+
+    Order matters. sessionLost.jsp/Authentication.jsp (an explicit expiry signal, F22) and a
+    portal-busy "try again later" page (F25) are both checked BEFORE either page-specific marker
+    check, so a busy or genuinely-expired portal is never misread as a lapsed form just because it
+    also happens to be missing the markers a healthy page would carry.
+
+    Absence of a positive marker is UNKNOWN, never promoted to SESSION_EXPIRED on its own (F26) --
+    the one exception is the home page's own measured discriminator (CONFIRMED_FACTS.md §24):
+    the logged-out home carries the public menu item but not the auth-gated one, which IS a
+    positive (if page-specific) signal of expiry, not a mere absence.
+    """
+    url_low = (final_url or "").lower()
+    if "sessionlost" in url_low or "authentication.jsp" in url_low:
+        return SessionState.SESSION_EXPIRED
+    if _is_portal_busy(page):
+        return SessionState.PORTAL_ERROR
+    if warmed:
+        if any(m in page for m in _SCHED_PAGE_MARKERS):
+            return SessionState.AUTHENTICATED
+        return SessionState.UNKNOWN
+    low = (page or "").lower()
+    has_public = _HOME_MARKERS[0] in low        # "solicitar pedido de visto" -- present either way
+    has_auth_gated = _HOME_MARKERS[1] in low    # "consultar pedidos" -- present only when authenticated
+    if has_public and has_auth_gated:
+        return SessionState.AUTHENTICATED
+    if has_public and not has_auth_gated:
+        return SessionState.SESSION_EXPIRED
+    return SessionState.UNKNOWN
 
 # storm-auto bounds its equivalent restore<->re-warm chain with MAX_WARMUP_RESTORES=3 ("a session
 # whose re-warm keeps bouncing to home can't churn fresh proxies forever"). Mirrored here as the
@@ -381,6 +436,7 @@ class LiveEngineOps(EngineOps):
         booking_id: str | None = None,
         identity_id: str | None = None,
         hold_proxy: str | None = None,
+        hold_proxy_static: bool = False,
     ):
         self.cfg = cfg
         self.account = account
@@ -391,10 +447,19 @@ class LiveEngineOps(EngineOps):
         self.form_defaults = form_defaults
         self.capsolver_keys = capsolver_keys
         self.warm_proxy = warm_proxy
-        # phase-2 (hold/apply/discovery) proxy -- only used when HOLD_SWAP_AFTER_FOUND is on
+        # phase-2 (hold/apply/discovery) proxy -- only used when HOLD_SWAP_AFTER_WARMUP is on
         # (do_swap() below). None is the correct/expected value when swap is off; the Hub only
         # leases and passes this when the setting is actually enabled (apps/hub/main.py).
         self.hold_proxy = hold_proxy
+        # Phase 5: whether self.hold_proxy is a resource_type='static' resource -- a plain runtime
+        # fact from the launch payload (apps/hub/main.py sets it from whether a hold proxy was leased
+        # at all, since one is only ever leased static as of this phase), NOT a DB lookup (D1: this
+        # worker never touches Postgres). Updated again on a successful mid-hold rotation by
+        # _request_proxy_rotation. Used ONLY to decide whether do_swap()'s retry ladder may locally
+        # roll the credential (roll_sticky_session) or must request a fresh lease through the Hub
+        # instead -- never consulted by anything session-state-related (classify_session_state stays
+        # completely proxy-blind, by design).
+        self.hold_proxy_static = hold_proxy_static
         self.headless = headless
         self.sub_account_id = sub_account_id
         # Sub-account rotation candidates, ranked best-first by the Hub (_rank_live_sub_accounts) --
@@ -435,7 +500,7 @@ class LiveEngineOps(EngineOps):
 
         # P3 -- proxy rotation: which pool a rotation request should draw from. do_swap() flips this
         # to "hold" unconditionally the moment warmup finishes, regardless of whether
-        # HOLD_SWAP_AFTER_FOUND is actually on (see do_swap()'s docstring and
+        # HOLD_SWAP_AFTER_WARMUP is actually on (see do_swap()'s docstring and
         # _request_proxy_rotation()) -- the operator's explicit requirement that pool selection "will
         # not be different when swap is off".
         self._current_phase = "warmup"
@@ -981,17 +1046,30 @@ class LiveEngineOps(EngineOps):
         `proxy_request`, block for the Hub's `proxy_assigned`/`proxy_unavailable` reply
         (apps/hub/events.py's `_handle_proxy_request`). `phase` defaults to `self._current_phase`,
         which do_swap() sets to "hold" unconditionally the instant warmup finishes -- so a rotation
-        during holding always draws from the hold pool even when HOLD_SWAP_AFTER_FOUND is off (the
+        during holding always draws from the hold pool even when HOLD_SWAP_AFTER_WARMUP is off (the
         operator's explicit requirement: "it will not be different when swap is off"). Returns the
         new proxy URL on success, or None (caller keeps its current proxy) if there's no bus wired,
         the pool is exhausted, or the reply times out -- the same safe-degrade pattern do_swap()
-        itself already uses on failure."""
+        itself already uses on failure. On a successful "hold" reply, also updates
+        self.hold_proxy_static from the Hub's resource_type -- the Hub is the one side that actually
+        enforces the static requirement (Phase 5), so this is authoritative, not a guess."""
         if self._emit is None or self._signals is None or not hasattr(self._signals, "wait_proxy"):
             return None
-        self._emit("proxy_request", phase=phase or self._current_phase)
+        resolved_phase = phase or self._current_phase
+        self._emit("proxy_request", phase=resolved_phase)
         result = self._signals.wait_proxy(timeout=30)
         if not isinstance(result, dict) or not result.get("ok"):
+            # Phase 5 (Phase-4-identified gap): this reason used to be generated by the Hub and then
+            # silently discarded here -- the single biggest "why did this fail" hole in the whole
+            # proxy subsystem. Never includes credentials: `reason` is built from ProxyLeaseError's
+            # own message (pool/health/resource_type facts only) or this phase's own static-required
+            # wording, both plain text with no proxy/session objects involved.
+            reason = result.get("reason") if isinstance(result, dict) else None
+            if reason:
+                self._log(f"proxy rotation ({resolved_phase}) failed: {reason}")
             return None
+        if resolved_phase == "hold":
+            self.hold_proxy_static = result.get("resource_type") == "static"
         return result.get("proxy")
 
     def _backoff(self, attempt: int) -> None:
@@ -1361,7 +1439,7 @@ class LiveEngineOps(EngineOps):
     def do_swap(self) -> str | None:
         """Phase-1 (login/warmup) proxy -> phase-2 (hold/apply/discovery) proxy migration.
 
-        Off by default (HOLD_SWAP_AFTER_FOUND, catalog default False) -- most bookings just hold on
+        Off by default (HOLD_SWAP_AFTER_WARMUP, catalog default False) -- most bookings just hold on
         the same proxy they logged in with, and that's the safe, unsurprising default. When the
         operator explicitly turns it on, the Hub leases a second proxy (HOLD_PROXY_PROVIDER/
         HOLD_PROXY_KIND) and passes it as `hold_proxy`; this carries the authoritative browser cookie
@@ -1397,7 +1475,7 @@ class LiveEngineOps(EngineOps):
             return None
         self._current_phase = "hold"
         if not self.hold_proxy:
-            self._log("do_swap: HOLD_SWAP_AFTER_FOUND is on but no hold_proxy was provided -- skipping")
+            self._log("do_swap: HOLD_SWAP_AFTER_WARMUP is on but no hold_proxy was provided -- skipping")
             return None
         if self.session is None:
             return None
@@ -1422,17 +1500,33 @@ class LiveEngineOps(EngineOps):
                 # the session id is the exit's identity, so retrying a failed swap against the
                 # unchanged id aims at the same exit that just refused us. Free, unbounded, and no
                 # lease needed; _request_proxy_rotation stays as the fallback.
+                #
+                # Phase 5 (D33 follow-up): NOT when self.hold_proxy_static is True. roll_sticky_session
+                # is a grammar-based string transform with no idea what resource_type means -- it was
+                # only ever safe for a static credential by the accident of an undefined static
+                # grammar (PROXY_CONTRACTS.md: "we own none"). The instant a real static credential
+                # happens to carry a pattern the roller recognises (plausible: PROXY_CONTRACTS.md
+                # frames "static ISP proxy" as possibly the same providers' own static tier), rolling
+                # it would silently reassign the "static" resource's actual exit IP -- exactly the
+                # instability a static hold resource exists to avoid, and invisibly, since D2's
+                # design is a zero-DB-write local transform. A static hold identity is never locally
+                # transformed; the Hub (which now enforces resource_type='static' on every hold lease,
+                # not just the first one) is asked for a fresh one instead.
                 rolled = None
-                try:
-                    from libs.proxies.lease import roll_sticky_session
-                    rolled = roll_sticky_session(self.hold_proxy) if self.hold_proxy else None
-                except Exception:
-                    rolled = None
+                if not self.hold_proxy_static:
+                    try:
+                        from libs.proxies.lease import roll_sticky_session
+                        rolled = roll_sticky_session(self.hold_proxy) if self.hold_proxy else None
+                    except Exception:
+                        rolled = None
                 if rolled and rolled != self.hold_proxy:
                     self.hold_proxy = rolled
                     self._log(f"do_swap: rolled the hold proxy to a fresh exit "
                               f"[{_proxy_label(rolled)}]")
                 else:
+                    if self.hold_proxy_static:
+                        self._log("do_swap: hold resource is static -- requesting a fresh lease "
+                                  "through the Hub instead of rolling")
                     new_proxy = self._request_proxy_rotation("hold")
                     if new_proxy:
                         self.hold_proxy = new_proxy
@@ -1669,35 +1763,80 @@ class LiveEngineOps(EngineOps):
         else:
             url = HOME_URL if probe == "home" else probe
         try:
-            self.session.browser_nav(url, timeout=30)
+            final_url = self.session.browser_nav(url, timeout=30)
             self._keepalive_dead_streak = 0
-            if warmed and probe == "home":
-                page = self.session.browser_eval("document.documentElement.outerHTML") or ""
-                if not any(m in page for m in _SCHED_PAGE_MARKERS):
-                    self._log(f"keepalive: form-state lapsed ({len(page)}B, no scheduling markers) "
-                              f"-- re-warming in place ({context})")
-                    if self._run_warmup_steps():
-                        self._rewarm_fail_streak = 0
-                        self._log(f"keepalive: re-warm restored the schedule form ({context})")
-                        # Clear the not-bookable marker: this worker can take a slot again.
-                        self._mark_hold_bookable(True)
-                    else:
-                        # Still no re-login here: before slot-found the login wall is the scarce
-                        # resource, and a lapsed FORM anchor is not a dead auth session (the LOOSE
-                        # HOLD rule below). That part was always right. What was wrong is that the
-                        # failure was recorded ONLY as a log line -- no substate, no detail, no
-                        # counter -- so the worker kept reporting a bare `holding`, the Hub counted
-                        # it as ready capacity, and it bounced the first slot it was handed.
-                        # Confirmed live 2026-08-21: 110 such failures against 42 recoveries.
-                        self._rewarm_fail_streak = getattr(self, "_rewarm_fail_streak", 0) + 1
-                        self._log(f"keepalive: re-warm failed -- holding but NOT BOOKABLE "
-                                  f"(streak={self._rewarm_fail_streak}, {context})")
-                        self._mark_hold_bookable(
-                            False, f"form-state lapsed, re-warm failed x{self._rewarm_fail_streak}")
-                        self._maybe_escalate_stuck_rewarm(context)
-                    return
-            if self._emit is not None:
-                self._emit("log_line", text=f"keepalive: probe OK ({context})")
+            if probe != "home":
+                # A custom KEEPALIVE_PROBE URL: no positive/negative content evidence is known for
+                # an arbitrary operator-chosen page, so this stays exactly what it was -- a
+                # successful nav is all that's checked. Only the two real pages (home, Schedule.jsp)
+                # get classified below.
+                if self._emit is not None:
+                    self._emit("log_line", text=f"keepalive: probe OK ({context})")
+                return
+            page = self.session.browser_eval("document.documentElement.outerHTML") or ""
+            state = classify_session_state(page, final_url, warmed=warmed)
+            if state == SessionState.AUTHENTICATED:
+                # Only fires on a RECOVERY transition (streak was > 0), matching the original
+                # behaviour of never emitting a bookable/streak-reset event on an already-healthy
+                # cycle -- an event on every single healthy tick is exactly the kind of
+                # write-amplification F6 exists to guard against.
+                if warmed and getattr(self, "_rewarm_fail_streak", 0) > 0:
+                    self._rewarm_fail_streak = 0
+                    self._mark_hold_bookable(True)
+                if self._emit is not None:
+                    self._emit("log_line", text=f"keepalive: probe OK ({context})")
+                return
+            if state == SessionState.SESSION_EXPIRED:
+                # F22/F24's fix: a dead session must never be re-warmed (there is no session left
+                # to POST a questionnaire step against) -- it must be re-authenticated. This is the
+                # SAME chain the transport-failure branch below already uses, reused, not new
+                # machinery.
+                self._log(f"keepalive: session expired ({len(page)}B, exit={getattr(self, '_exit_ip', None)}, "
+                          f"{context}) -- re-authenticating rather than re-warming a dead session")
+                self._attempt_keepalive_restore(context)
+                return
+            if state == SessionState.PORTAL_ERROR:
+                # F25's fix: a portal declining everyone is neither a lapsed form nor a dead
+                # session. Back off and let the next keepalive cycle re-probe -- no re-warm
+                # (cannot succeed against a refusing portal), no re-login (would burn a CAPTCHA
+                # solve for a condition that has nothing to do with our credentials).
+                self._log(f"keepalive: portal is refusing requests ({len(page)}B, "
+                          f"exit={getattr(self, '_exit_ip', None)}, {context}) -- "
+                          f"backing off, not re-warming and not re-logging in")
+                return
+            # UNKNOWN: no positive AND no negative evidence. Pre-warm, there is nothing to re-warm
+            # (no ScheduleController anchor exists yet) -- wait for the next cycle rather than
+            # guess. Warmed, this is exactly the original "form-state lapsed" path: markers are
+            # absent, but nothing here says the SESSION is dead (that's the SESSION_EXPIRED branch
+            # above), so re-warming in place remains the correct bounded attempt, escalating to a
+            # full session rebuild via _maybe_escalate_stuck_rewarm if it keeps failing (F26: an
+            # unrecognised response gets a real "we don't know" branch instead of being silently
+            # forced into a specific verdict).
+            if not warmed:
+                self._log(f"keepalive: unrecognised pre-warm response ({len(page)}B, {context}) -- "
+                          f"inconclusive, will re-probe")
+                return
+            self._log(f"keepalive: form-state lapsed ({len(page)}B, no scheduling markers) "
+                      f"-- re-warming in place ({context})")
+            if self._run_warmup_steps():
+                self._rewarm_fail_streak = 0
+                self._log(f"keepalive: re-warm restored the schedule form ({context})")
+                # Clear the not-bookable marker: this worker can take a slot again.
+                self._mark_hold_bookable(True)
+            else:
+                # Still no re-login here: before slot-found the login wall is the scarce
+                # resource, and a lapsed FORM anchor is not a dead auth session (the LOOSE
+                # HOLD rule below). That part was always right. What was wrong is that the
+                # failure was recorded ONLY as a log line -- no substate, no detail, no
+                # counter -- so the worker kept reporting a bare `holding`, the Hub counted
+                # it as ready capacity, and it bounced the first slot it was handed.
+                # Confirmed live 2026-08-21: 110 such failures against 42 recoveries.
+                self._rewarm_fail_streak = getattr(self, "_rewarm_fail_streak", 0) + 1
+                self._log(f"keepalive: re-warm failed -- holding but NOT BOOKABLE "
+                          f"(streak={self._rewarm_fail_streak}, {context})")
+                self._mark_hold_bookable(
+                    False, f"form-state lapsed, re-warm failed x{self._rewarm_fail_streak}")
+                self._maybe_escalate_stuck_rewarm(context)
         except Exception as e:
             self._keepalive_dead_streak = getattr(self, "_keepalive_dead_streak", 0) + 1
             dead_trip = max(1, int(self.cfg.keepalive.dead_trip))

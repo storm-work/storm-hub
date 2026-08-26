@@ -184,7 +184,12 @@ def test_wait_proxy_returns_assigned_reply():
     bus = _bus()
     sig = BusSignals(bus, "w1", "c1")
     bus.send_command("w1", "proxy_assigned", proxy="http://u:p@newhost:1234")
-    assert sig.wait_proxy(timeout=2) == {"ok": True, "proxy": "http://u:p@newhost:1234"}
+    # resource_type (Phase 5): rides alongside the proxy URL so a caller can tell a static hold
+    # assignment apart from a rotating one without any DB access; None when the sender omits it
+    # (e.g. an older/warmup-phase reply that never carried the field).
+    assert sig.wait_proxy(timeout=2) == {
+        "ok": True, "proxy": "http://u:p@newhost:1234", "resource_type": None,
+    }
 
 
 def test_wait_proxy_returns_unavailable_reply():

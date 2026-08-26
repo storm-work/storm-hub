@@ -50,16 +50,30 @@ APP (our logic/state) · OPS (configuration, deployment, human action).
 - **Note:** this is why portal *slowness* caused corruption rather than just delay. Caller
   timeouts must keep margin above the callee's internal worst case.
 
-## F5 — Proxy leases leak — **OPEN, live**
+## F5 — Proxy leases leak
 - **Class:** APP
-- **Cause:** every release path is edge-triggered (terminal event, reap, explicit stop). There
-  is **no level-triggered sweep** asking whether an active lease belongs to a live worker.
-- **Detection:** none automatic. Found by querying the DB during this audit.
-- **Current state:** 107 orphaned leases, median age 101.8 h, max 271.8 h, 0 running workers.
-- **Severity:** currently 0.3% of a 32,600-row pool — low. Mechanism is unbounded, and was
+- **Cause:** every release path was edge-triggered (terminal event, reap, explicit stop). There
+  was **no level-triggered sweep** asking whether an active lease belongs to a live worker.
+- **Detection:** none automatic. Found by querying the DB during a 2026-08-25 audit.
+- **Historical state:** 107 orphaned leases, median age 101.8 h, max 271.8 h, 0 running workers.
+- **Severity:** was 0.3% of a 32,600-row pool — low. Mechanism was unbounded, and had been
   severe at 1,238 rows.
-- **Improvement:** a periodic reconciling sweep in the scheduler tick. This is the correct
-  shape (level-triggered, idempotent) rather than another edge-triggered call site.
+- **Root cause, precisely traced 2026-08-26 (Phase 7):** two distinct code paths, both producing
+  exactly the "0 running workers" signature. (1) `apps/hub/events.py`'s `_release_on_terminal`
+  runs inside a `_step()` wrapper that catches and logs any exception from
+  `release_worker_resources`, with no retry — a transient failure there permanently orphans the
+  lease even though the worker reached its correct terminal status. (2) `apps/hub/main.py`'s
+  `_do_launch_worker` sets a worker `FAILED` directly if `supervisor.spawn`/command-group
+  creation/`send_command` raises *after* a proxy lease already succeeded, without releasing it —
+  that worker never touches `RUNNING`, so it is invisible to all three of the scheduler's
+  RUNNING-only reap paths forever.
+- **Fixed 2026-08-26 (Phase 8, `DECISIONS.md` D-NEW-2 / D37):** `apps/hub/scheduler.py`'s
+  `_reconcile_orphaned_leases`, a periodic reconciling sweep in the scheduler tick — exactly the
+  shape this entry originally recommended (level-triggered, idempotent, reusing
+  `release_worker_resources`) rather than another edge-triggered call site. Orphan predicate:
+  `ProxyLease.released_at IS NULL AND Worker.status != RUNNING AND ProxyLease.leased_at <
+  now - 300s` (operator-chosen grace period). No new persisted state — `leased_at`,
+  `released_at`, and `Worker.status` already existed.
 
 ## F6 — Unbounded write-amplifying loop
 - **Class:** OPS → APP
@@ -193,6 +207,16 @@ APP (our logic/state) · OPS (configuration, deployment, human action).
   observation is taken every keepalive and then discarded.
 - **Improvement:** feed the existing `_note_exit_ip` result into the recovery ladder as a
   first-class input. No new measurement is needed — the data is already collected and thrown away.
+- **2026-08-26 update — the exit observation now stays deliberately discarded, not accidentally:**
+  `classify_session_state` (F22-F26's fix) classifies (a) and (c) from page/URL evidence alone and
+  never consults `_note_exit_ip`'s result. This is no longer an oversight: Q16 and Q19
+  (`docs/engineering/OPEN_QUESTIONS.md`) since confirmed that an exit change — deliberate or
+  involuntary — does not by itself invalidate the portal session (one involuntary webshare move
+  survived another 69 min authenticated). Folding "exit changed" into the classifier as a *trigger*
+  would reintroduce exactly the misattribution this failure mode describes. What *is* still true:
+  the exit-changed flag is logged/emitted but not surfaced next to the session-state verdict in one
+  place — the two write to the log independently. Low priority given the flag is not a decision
+  input.
 
 ## F22 — `sessionLost.jsp` is not recognised in production
 - **Class:** APP
@@ -205,6 +229,11 @@ APP (our logic/state) · OPS (configuration, deployment, human action).
   currently read as an unrecognised page, so the recovery ladder cannot act on it as expiry.
 - **Improvement:** classify it, and feed it into F21's three-way split (proxy failure / exit change /
   session failure) as the unambiguous third case. Not implemented — analysis-only phase.
+- **Fixed 2026-08-26:** `apps/worker/ops_live.py`'s `classify_session_state()` checks the final
+  navigated URL for `sessionlost` before any other evidence and returns `SessionState.SESSION_EXPIRED`
+  — the keepalive loop (both pre-warm and post-warm probes) now recognises it. Login-path recognition
+  (the vendored session's own classifiers) is unchanged — this fix is scoped to the keepalive loop,
+  per the Phase 1 implementation boundary.
 
 ## F23 — A pre-warm keepalive cannot see session expiry AT ALL
 - **Class:** APP
@@ -217,6 +246,13 @@ APP (our logic/state) · OPS (configuration, deployment, human action).
   pedidos` and **not** the logout link — the discriminator exists and is simply not consulted.
 - **Improvement:** classify the response (§11.1). This is the same defect class as F21: the
   information is already in hand and is discarded.
+- **Fixed 2026-08-26:** `_do_keepalive` now reads the pre-warm home page's body (previously it
+  never did — a successful `browser_nav` alone was treated as healthy) and classifies it via
+  `classify_session_state(page, final_url, warmed=False)`, which applies exactly this
+  discriminator (`consultar pedidos` present = authenticated, absent with only the public marker
+  present = expired). A logged-out pre-warm home now triggers `_attempt_keepalive_restore`
+  instead of being logged as `probe OK`. Zero new HTTP requests — the body is read via
+  `browser_eval` on the page already navigated to.
 
 ## F24 — Session expiry after warm is misdiagnosed as form-state lapse
 - **Class:** APP
@@ -231,6 +267,13 @@ APP (our logic/state) · OPS (configuration, deployment, human action).
   different route.
 - **Improvement:** distinguish `SESSION_EXPIRED` from a missing schedule anchor before choosing
   between re-login and re-warm.
+- **Fixed 2026-08-26:** `classify_session_state` checks `sessionLost.jsp`/`Authentication.jsp`
+  redirects (explicit expiry evidence) before the `_SCHED_PAGE_MARKERS` check. When those are
+  absent, marker-absence alone now classifies `UNKNOWN`, not an assumed form lapse — `_do_keepalive`
+  still re-warms in that case (there is no positive evidence either way, and re-warming remains a
+  legitimate bounded probe, escalating via the existing `_maybe_escalate_stuck_rewarm` ladder
+  unchanged), but a genuinely dead session (positive redirect evidence) now routes straight to
+  `_attempt_keepalive_restore` and never reaches `_run_warmup_steps()` at all.
 
 ## F25 — A portal-busy page during hold is read as form-state lapse
 - **Class:** APP
@@ -241,6 +284,10 @@ APP (our logic/state) · OPS (configuration, deployment, human action).
   and accrues NOT-BOOKABLE strikes for a condition that is neither its session nor its form.
 - **Improvement:** `PORTAL_ERROR` is a distinct state whose correct action is to back off, not to
   re-warm and not to re-login.
+- **Fixed 2026-08-26:** `classify_session_state` calls the existing `_is_portal_busy` (already used
+  at 3 other sites, never here) before either marker check, returning `SessionState.PORTAL_ERROR`.
+  `_do_keepalive` logs it and returns without calling `_run_warmup_steps()` or
+  `_attempt_keepalive_restore` — the next keepalive cycle re-probes naturally.
 
 ## F26 — There is no UNKNOWN state anywhere in production
 - **Class:** APP
@@ -251,3 +298,38 @@ APP (our logic/state) · OPS (configuration, deployment, human action).
   to catch them, which is how both historical classifier failures (§26, §28-note) produced confident
   wrong answers rather than an admission of ignorance.
 - **Improvement:** `UNKNOWN` as an explicit, first-class outcome that backs off and re-probes.
+- **Partially fixed 2026-08-26, keepalive only:** `SessionState.UNKNOWN` is now an explicit member
+  produced by `classify_session_state` whenever neither positive nor negative evidence is found —
+  pre-warm it logs and waits for the next cycle without touching any streak or bookable state;
+  warmed it preserves today's bounded re-warm-then-escalate behaviour rather than guessing a
+  specific verdict. `events.py`'s `_TERMINAL_STATUS.get()` defaulting unmapped outcomes to FAILED
+  is a **separate, still-open** instance of this same defect class, outside this fix's scope
+  (worker-terminal-status mapping, not the keepalive loop).
+
+## F27 — The test suite could delete real checkpoint data
+- **Class:** OPS
+- **Cause:** `tests/test_cleanup_checkpoints_script.py` ran `scripts/cleanup_checkpoints.py` as a real
+  subprocess (deliberately — it exercises the actual CLI, not just internal logic) against the real
+  `var/checkpoints/` directory, cleaning up only the one fixture file it created itself. This was
+  correct when written; it stopped being correct once real workers had run long enough for other
+  files in that directory to independently cross the test's own 7-day age threshold.
+- **Consequence:** running the full suite on 2026-08-26 invoked `cleanup_checkpoints.py --confirm`
+  against production data and deleted 3 real checkpoint files, one of them live. `D15`'s guarantee
+  (destructive cleanup is scoped, reviewed, dry-run-by-default tooling) held at the *tool* level —
+  the script did exactly what a real operator invocation would have done — but the *test* had no
+  equivalent scoping of its own.
+- **Fixed 2026-08-26:** `libs/engine/checkpoint.py`'s `_CHECKPOINTS_DIR` now resolves from
+  `CHECKPOINTS_DIR_TEST_OVERRIDE` when set, falling back to the unchanged hardcoded production path
+  otherwise — mirroring the in-process `monkeypatch.setattr(ckpt, "_CHECKPOINTS_DIR", tmp_path)`
+  pattern already used by `tests/engine/test_checkpoint.py`/`tests/hub/test_action_guard_parity.py`,
+  extended to reach a subprocess. The test now points every invocation at pytest's own `tmp_path`.
+  `cleanup_checkpoints.py` itself still accepts no path argument at all — D15's "no arbitrary path,
+  ever" guarantee for the *tool* is unchanged; the override lives one layer below it, is off by
+  default, and nothing in production ever sets it. Verified by snapshotting `var/checkpoints/`
+  (file list + md5) before and after the isolated test run: byte-for-byte identical.
+- **Improvement, not done here (checked, found already handled):** the other two subprocess-invoking
+  script tests, `tests/test_reset_run_state_script.py` and `tests/test_cleanup_worker_logs_script.py`,
+  already isolate themselves (a `tmp_path`-backed SQLite DB passed via env, and a scratch
+  `tmp_path/var/worker-logs/` tree respectively) — `reset_run_state`'s own fixture docstring
+  documents having fixed this exact class of bug once before. This was the one remaining gap, not a
+  systemic pattern; no broader test-infrastructure change was made.

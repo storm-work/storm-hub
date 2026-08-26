@@ -7,7 +7,10 @@ from sqlalchemy.pool import StaticPool
 
 from libs.db import metadata
 from libs.db import models as M
-from libs.proxies import ProxyLeaseError, conn_url, lease_proxy, release_proxy, release_worker_resources
+from libs.proxies import (
+    ProxyLeaseError, conn_url, find_orphaned_worker_ids, find_reactivation_candidates, lease_proxy,
+    release_proxy, release_worker_resources,
+)
 
 
 @pytest.fixture()
@@ -594,6 +597,196 @@ def test_proven_ok_still_outranks_an_established_but_unverified_row(db):
 
     proxy, _ = lease_proxy(db, "w1", provider="soax")
     assert proxy.id == proven.id, "a proven verdict outranks mere LRU recency"
+
+
+# ── resource_type gating (Phase 3, D32): static/ISP resources are a finite thing whose health IS
+#    the row's own state, not an exit that will rotate away on its own (D19 stays true, but only for
+#    resource_type='rotating' now) ────────────────────────────────────────────────────────────────
+def test_default_resource_type_is_rotating_and_preserves_existing_unhealthy_behavior(db):
+    """Every row created before this column existed -- and every row _proxy() makes without saying
+    otherwise -- must default to 'rotating' and keep D19's exact pre-Phase-3 behavior: an unhealthy
+    row stays leasable. Byte-for-byte the same assertion as test_an_unhealthy_row_is_still_leasable,
+    just pinning that the new column's default is what makes it still true."""
+    p = _proxy(db, endpoint="legacy:80")
+    assert p.resource_type == "rotating"
+    p.is_healthy, p.health, p.score = False, "ERR_CONNECTION_CLOSED", -5.0
+    db.commit()
+
+    got, _ = lease_proxy(db, "w1", "soax")
+    assert got.endpoint == "legacy:80"
+
+
+def test_static_resource_marked_unhealthy_is_excluded(db):
+    """The new half of the rule: a resource_type='static' row IS a finite, individually-owned
+    resource, so an unhealthy verdict means this specific resource is bad, not that an exit moved
+    underneath it -- excluding it is correct, unlike the rotating case above."""
+    bad = M.Proxy(provider="isp", kind="static_res", resource_type="static", endpoint="badstatic:80",
+                  credentials_ref="u:p", max_sessions=1, is_healthy=False)
+    db.add(bad); db.commit()
+
+    with pytest.raises(ProxyLeaseError):
+        lease_proxy(db, "w1", "isp")
+
+
+def test_static_resource_marked_healthy_is_still_selectable(db):
+    """The exclusion is on is_healthy, not on resource_type itself -- a healthy static row must
+    still lease normally."""
+    good = M.Proxy(provider="isp", kind="static_res", resource_type="static", endpoint="goodstatic:80",
+                   credentials_ref="u:p", max_sessions=1, is_healthy=True)
+    db.add(good); db.commit()
+
+    got, _ = lease_proxy(db, "w1", "isp")
+    assert got.endpoint == "goodstatic:80"
+
+
+def test_static_and_rotating_pools_coexist_only_the_unhealthy_static_row_is_cut(db):
+    """A mixed pool (same provider) proves the filter is scoped to resource_type, not applied
+    globally the moment any static row exists."""
+    rotating_bad = M.Proxy(provider="isp", kind="s", resource_type="rotating", endpoint="rot:80",
+                           credentials_ref="u:p", max_sessions=1, is_healthy=False)
+    static_bad = M.Proxy(provider="isp", kind="s", resource_type="static", endpoint="stat:80",
+                         credentials_ref="u:p", max_sessions=1, is_healthy=False)
+    db.add_all([rotating_bad, static_bad]); db.commit()
+
+    got, _ = lease_proxy(db, "w1", "isp")
+    assert got.endpoint == "rot:80", "the unhealthy static row must be excluded, leaving only the rotating one"
+
+
+# ── Phase 8 (D-NEW-1): static reactivation candidate query ─────────────────────────────────────
+def test_reactivation_candidates_selects_only_static_unhealthy_active(db):
+    """The exact five-way matrix Phase 7/8 specified: only static+unhealthy+active is a candidate."""
+    db.add_all([
+        M.Proxy(id="a", provider="isp", kind="s", endpoint="a:1", resource_type="static",
+               active=True, is_healthy=False),               # SELECTED
+        M.Proxy(id="b", provider="isp", kind="s", endpoint="b:1", resource_type="static",
+               active=True, is_healthy=True),                 # healthy -- not excluded, nothing to reactivate
+        M.Proxy(id="c", provider="isp", kind="s", endpoint="c:1", resource_type="static",
+               active=False, is_healthy=False),                # inactive -- operator turned it off
+        M.Proxy(id="d", provider="soax", kind="s", endpoint="d:1", resource_type="rotating",
+               active=True, is_healthy=False),                 # rotating -- D19, never excluded to begin with
+        M.Proxy(id="e", provider="soax", kind="s", endpoint="e:1", resource_type="rotating",
+               active=True, is_healthy=True),
+    ])
+    db.commit()
+
+    got = {p.id for p in find_reactivation_candidates(db)}
+    assert got == {"a"}
+
+
+def test_reactivation_candidates_ordered_oldest_failed_first_nulls_first(db):
+    p_recent = M.Proxy(id="recent", provider="isp", kind="s", endpoint="r:1", resource_type="static",
+                       active=True, is_healthy=False,
+                       last_used_at=datetime(2026, 8, 20, tzinfo=timezone.utc))
+    p_old = M.Proxy(id="old", provider="isp", kind="s", endpoint="o:1", resource_type="static",
+                    active=True, is_healthy=False,
+                    last_used_at=datetime(2026, 8, 1, tzinfo=timezone.utc))
+    p_never = M.Proxy(id="never", provider="isp", kind="s", endpoint="n:1", resource_type="static",
+                      active=True, is_healthy=False, last_used_at=None)
+    db.add_all([p_recent, p_old, p_never])
+    db.commit()
+
+    got = [p.id for p in find_reactivation_candidates(db)]
+    assert got == ["never", "old", "recent"], got   # NULL first, then oldest-to-newest
+
+
+def test_reactivation_candidates_empty_when_pool_is_all_rotating(db):
+    """Regression guard for D19: a pool with only rotating rows must never produce a reactivation
+    candidate, healthy or not."""
+    db.add_all([
+        M.Proxy(id="r1", provider="soax", kind="s", endpoint="1:1", resource_type="rotating",
+               active=True, is_healthy=False),
+        M.Proxy(id="r2", provider="soax", kind="s", endpoint="2:1", resource_type="rotating",
+               active=True, is_healthy=True),
+    ])
+    db.commit()
+    assert find_reactivation_candidates(db) == []
+
+
+# ── Phase 8 (D-NEW-2): F5 orphaned-lease predicate ──────────────────────────────────────────────
+def _worker_with_status(db, wid, status):
+    from libs.domain.enums import WorkerRole
+    bk = db.get(M.Booking, "bk1") or M.Booking(id="bk1", name="b", type="test", posto_id="2032")
+    idn = db.get(M.Identity, "id1") or M.Identity(id="id1", full_name="X", type="test")
+    if not db.get(M.Booking, "bk1"):
+        db.add(bk)
+    if not db.get(M.Identity, "id1"):
+        db.add(idn)
+    db.flush()
+    w = M.Worker(id=wid, booking_id="bk1", identity_id="id1", role=WorkerRole.APPLY, status=status)
+    db.add(w); db.commit()
+    return w
+
+
+_NOW = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
+
+
+@pytest.mark.parametrize("status", ["ready", "stopped", "held", "completed", "failed"])
+def test_orphaned_worker_ids_finds_non_running_aged_leases(db, status):
+    from libs.domain.enums import WorkerStatus
+
+    w = _worker_with_status(db, "w1", WorkerStatus(status))
+    px = _proxy(db, endpoint="h:1")
+    db.add(M.ProxyLease(proxy_id=px.id, worker_id=w.id, leased_at=_NOW - timedelta(seconds=400)))
+    db.commit()
+
+    assert find_orphaned_worker_ids(db, grace_seconds=300, now=_NOW) == [w.id]
+
+
+def test_orphaned_worker_ids_never_includes_running_workers(db):
+    from libs.domain.enums import WorkerStatus
+
+    w = _worker_with_status(db, "w1", WorkerStatus.RUNNING)
+    px = _proxy(db, endpoint="h:1")
+    db.add(M.ProxyLease(proxy_id=px.id, worker_id=w.id, leased_at=_NOW - timedelta(hours=10)))
+    db.commit()
+
+    assert find_orphaned_worker_ids(db, grace_seconds=300, now=_NOW) == []
+
+
+def test_orphaned_worker_ids_excludes_already_released_leases(db):
+    """Idempotency at the query level: a lease already released must never be reported as orphaned,
+    regardless of worker status or age."""
+    from libs.domain.enums import WorkerStatus
+
+    w = _worker_with_status(db, "w1", WorkerStatus.FAILED)
+    px = _proxy(db, endpoint="h:1")
+    db.add(M.ProxyLease(proxy_id=px.id, worker_id=w.id, leased_at=_NOW - timedelta(hours=10),
+                        released_at=_NOW))
+    db.commit()
+
+    assert find_orphaned_worker_ids(db, grace_seconds=300, now=_NOW) == []
+
+
+def test_orphaned_worker_ids_grace_boundary(db):
+    from libs.domain.enums import WorkerStatus
+
+    w_under = _worker_with_status(db, "w-under", WorkerStatus.FAILED)
+    w_over = _worker_with_status(db, "w-over", WorkerStatus.FAILED)
+    px1 = _proxy(db, endpoint="h:1", max_sessions=5)
+    px2 = _proxy(db, endpoint="h:2", max_sessions=5)
+    # Just under the grace period -- must NOT be reconciled yet (still legitimately in-flight).
+    db.add(M.ProxyLease(proxy_id=px1.id, worker_id=w_under.id,
+                        leased_at=_NOW - timedelta(seconds=299)))
+    # Just over the grace period -- must be reconciled.
+    db.add(M.ProxyLease(proxy_id=px2.id, worker_id=w_over.id,
+                        leased_at=_NOW - timedelta(seconds=301)))
+    db.commit()
+
+    got = set(find_orphaned_worker_ids(db, grace_seconds=300, now=_NOW))
+    assert got == {"w-over"}, got
+
+
+def test_orphaned_worker_ids_exactly_at_grace_boundary_is_not_yet_orphaned(db):
+    """`leased_at < cutoff` is a strict inequality -- a lease aged EXACTLY grace_seconds is not yet
+    past it. Pinned explicitly so the boundary can't silently flip to <= in a future edit."""
+    from libs.domain.enums import WorkerStatus
+
+    w = _worker_with_status(db, "w1", WorkerStatus.FAILED)
+    px = _proxy(db, endpoint="h:1")
+    db.add(M.ProxyLease(proxy_id=px.id, worker_id=w.id, leased_at=_NOW - timedelta(seconds=300)))
+    db.commit()
+
+    assert find_orphaned_worker_ids(db, grace_seconds=300, now=_NOW) == []
 
 
 def test_tier1_is_disabled_because_it_poisons_the_exit():

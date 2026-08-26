@@ -76,6 +76,7 @@ def _build_ops(engine_kind: str, cfg: EngineConfig, payload: dict, bus: Bus, wor
             capsolver_keys=payload["capsolver_keys"],
             warm_proxy=payload["warm_proxy"],
             hold_proxy=payload.get("hold_proxy"),
+            hold_proxy_static=bool(payload.get("hold_proxy_static", False)),
             sub_account_id=payload["sub_account_id"],
             identity_id=payload.get("identity_id"),
             booking_id=payload.get("booking_id"),

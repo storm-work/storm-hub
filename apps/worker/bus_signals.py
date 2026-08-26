@@ -178,15 +178,19 @@ class BusSignals:
         """Bounded single-window wait for the Hub's reply to a `proxy_request` event (P3 -- proxy
         rotation: a worker asks the Hub, the only side with DB access, for a fresh proxy drawn from
         the pool matching its current phase). Mirrors wait_assignment's TIMEOUT-sentinel contract:
-        `TIMEOUT` if the window elapses with nothing to report, `{"ok": True, "proxy": <url>}` /
-        `{"ok": False, "reason": ...}` for a real reply, or `None` for stop. Default timeout is short
+        `TIMEOUT` if the window elapses with nothing to report, `{"ok": True, "proxy": <url>,
+        "resource_type": "rotating"|"static"|None}` / `{"ok": False, "reason": ...}` for a real
+        reply, or `None` for stop. Default timeout is short
         (30s, not 900s like the orchestration waits) -- this blocks a specific failure-recovery call
         site (a login retry, a keepalive restore), never the worker's main loop."""
         deadline = time.time() + timeout
         while time.time() < deadline and not self.stopped:
             for m in self._drain():
                 if m.type == "proxy_assigned":
-                    return {"ok": True, "proxy": m.payload.get("proxy")}
+                    # Phase 5: resource_type rides alongside the proxy URL so the caller can tell a
+                    # static hold assignment apart from a rotating one without any DB access.
+                    return {"ok": True, "proxy": m.payload.get("proxy"),
+                           "resource_type": m.payload.get("resource_type")}
                 if m.type == "proxy_unavailable":
                     return {"ok": False, "reason": m.payload.get("reason", "")}
                 if m.type in ("stop", "shutdown"):

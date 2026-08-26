@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -171,6 +172,11 @@ class AttachIdentity(BaseModel):
     identity_id: str
     assigned_role: WorkerRole | None = None  # required for TEST bookings; ignored for REAL
     template_id: str | None = None           # worker template to arm this worker with
+    # Phase 3: the WORKER settings layer had no input source at all before this (only its OUTPUT,
+    # effective_settings_json, existed) -- L.WORKER is fully implemented in the resolver's
+    # precedence but nothing ever populated it. Validated the same way booking/template settings
+    # already are (validate_layer) before being stored.
+    worker_settings: dict | None = None
 
 
 class WorkerOut(BaseModel):
@@ -190,12 +196,15 @@ class ProxyOut(BaseModel):
     id: str
     provider: str
     kind: str
+    # rotating (default) = session template, health never excludes it from selection (D19).
+    # static = a finite resource; health DOES exclude it (Phase 3, libs/proxies/lease.py).
+    resource_type: str = "rotating"
     endpoint: str
     active: bool
     health: str | None = None
-    # Surfaced so the Proxies page can show WHAT is condemned, not just how many. lease_proxy
-    # filters on is_healthy, so a False here means the proxy is out of the pool entirely -- the
-    # single most consequential field on this row, and it was not being returned at all.
+    # Surfaced so the Proxies page can show WHAT is condemned, not just how many. Whether a False
+    # here actually removes the proxy from selection now depends on resource_type: never, for
+    # rotating (D19); yes, for static (Phase 3).
     is_healthy: bool = True
     score: float = 0.0
     geo: str | None = None
@@ -206,6 +215,7 @@ class ProxyOut(BaseModel):
 class ProxyCreate(BaseModel):
     provider: str = "soax"
     kind: str = "mobile"
+    resource_type: Literal["rotating", "static"] = "rotating"
     endpoint: str
     credentials_ref: str | None = None
     max_sessions: int = 2
@@ -214,6 +224,7 @@ class ProxyCreate(BaseModel):
 class ProxyImport(BaseModel):
     provider: str = "soax"
     kind: str = "mobile"
+    resource_type: Literal["rotating", "static"] = "rotating"
     max_sessions: int = 2
     text: str                    # newline-separated proxy lines
 

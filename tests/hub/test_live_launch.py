@@ -183,19 +183,90 @@ def test_live_launch_sends_full_payload_and_marks_running(client, monkeypatch):
     assert got[0]["sub_account_id"] == captured["sub_account_id"]
 
 
+def test_launch_and_mid_hold_rotation_resolve_the_same_worker_override(client, monkeypatch):
+    """Phase 5, end-to-end: booking-level PROXY_PROVIDER='soax' (A), worker-level override
+    'webshare' (B). Proves BOTH halves of the invariant in one test -- launch resolves B (already
+    covered individually by test_live_launch_sends_full_payload_and_marks_running's provider-neutral
+    assertions, but pinned again here for the direct A/B contrast) AND a subsequent mid-hold rotation
+    request resolves the SAME B, not booking A. Before Phase 5, apps/hub/events.py's
+    _handle_proxy_request never included the WORKER settings layer at all, so this second half would
+    have resolved 'soax' -- silently reverting the worker's own override the instant it rotated."""
+    h = _operate_headers(client)
+    tpl = client.post("/templates", json={"name": "Worker Override", "role": "apply", "settings": {}},
+                      headers=h).json()
+    iid = client.post("/identities", json={"full_name": "Override Test", "type": "real"},
+                      headers=h).json()["id"]
+    client.post("/identities/gen-subaccounts", json={"identity_ids": [iid], "count": 1}, headers=h)
+    client.post("/proxies", json={"provider": "soax", "kind": "rotating", "endpoint": "soax:1",
+                                  "credentials_ref": "u:p", "max_sessions": 5}, headers=h)
+    client.post("/proxies", json={"provider": "webshare", "kind": "rotating", "endpoint": "webshare:1",
+                                  "credentials_ref": "u:p", "max_sessions": 5}, headers=h)
+    bid = client.post(
+        "/bookings",
+        json={"name": "worker-override", "type": "real", "posto_id": "5084",
+              "settings": {"ENGINE_MODE": "live", "PROXY_PROVIDER": "soax"}},
+        headers=h,
+    ).json()["id"]
+    w = client.post(
+        f"/bookings/{bid}/identities",
+        json={"identity_id": iid, "template_id": tpl["id"],
+             "worker_settings": {"PROXY_PROVIDER": "webshare"}},
+        headers=h,
+    ).json()
+
+    import apps.hub.events as events_mod
+    import apps.hub.main as hub_main
+
+    captured = {}
+    orig_send = hub_main._bus.send_command
+
+    def _spy_send_command(worker_id, type, **payload):
+        if type == "launch":
+            captured.update(payload)
+        return orig_send(worker_id, type, **payload)
+
+    monkeypatch.setattr(hub_main._bus, "send_command", _spy_send_command)
+
+    r = client.post(f"/workers/{w['id']}/launch", headers=h)
+    assert r.status_code == 200
+    assert captured["warm_proxy"].endswith("webshare:1")   # launch resolves B, not booking A ("soax")
+
+    class _FakeBus:
+        def __init__(self):
+            self.sent = []
+
+        def send_command(self, worker_id, type, **payload):
+            self.sent.append((worker_id, type, payload))
+
+    monkeypatch.setattr(events_mod, "SessionLocal", hub_main.SessionLocal)
+    bus = _FakeBus()
+    hub = events_mod.EventHub.__new__(events_mod.EventHub)
+    hub._handle_proxy_request(w["id"], "warmup", bus, health_check=lambda url: (True, "ok"))
+
+    assert len(bus.sent) == 1
+    worker_id, typ, payload = bus.sent[0]
+    assert typ == "proxy_assigned"
+    assert payload["proxy"].endswith("webshare:1"), (
+        "mid-hold rotation resolved a different effective PROXY_PROVIDER than launch did")
+
+
 def test_live_launch_leases_hold_proxy_only_when_swap_enabled(client, monkeypatch):
     h = _operate_headers(client)
     tpl = client.post(
         "/templates",
-        json={"name": "Apply Swap", "role": "apply", "settings": {"HOLD_SWAP_AFTER_FOUND": True}},
+        json={"name": "Apply Swap", "role": "apply", "settings": {"HOLD_SWAP_AFTER_WARMUP": True}},
         headers=h,
     ).json()
     iid = client.post("/identities", json={"full_name": "Swap Test", "type": "real"}, headers=h).json()["id"]
     client.post("/identities/gen-subaccounts", json={"identity_ids": [iid], "count": 1}, headers=h)
     client.post("/proxies", json={"provider": "soax", "kind": "static", "endpoint": "1.1.1.1:1111",
                                   "credentials_ref": "u1:p1", "max_sessions": 1}, headers=h)
-    client.post("/proxies", json={"provider": "soax", "kind": "residential", "endpoint": "2.2.2.2:2222",
-                                  "credentials_ref": "u2:p2", "max_sessions": 1}, headers=h)
+    # Phase 3 (D32): the post-swap (hold) pool must resolve to a resource_type='static' proxy or
+    # _do_launch_worker rejects the launch outright (no rotating fallback) -- this is the fixture
+    # that makes an already-otherwise-valid HOLD_SWAP_AFTER_WARMUP configuration actually launchable.
+    client.post("/proxies", json={"provider": "soax", "kind": "residential", "resource_type": "static",
+                                  "endpoint": "2.2.2.2:2222", "credentials_ref": "u2:p2",
+                                  "max_sessions": 1}, headers=h)
     bid = client.post(
         "/bookings",
         json={"name": "live-swap", "type": "real", "posto_id": "5084",
@@ -224,10 +295,57 @@ def test_live_launch_leases_hold_proxy_only_when_swap_enabled(client, monkeypatc
     assert captured["warm_proxy"] != captured["hold_proxy"]
 
 
+def test_live_launch_swap_enabled_without_static_pool_rejects_and_releases_phase1_lease(client):
+    """Phase 3 (D32): HOLD_SWAP_AFTER_WARMUP=True but the resolved post-swap pool has no active
+    resource_type='static' proxy -- the launch must be rejected outright, with NO rotating
+    fallback, and the phase-1 (warm) proxy lease that already succeeded must be released rather
+    than left stranded (mirrors the existing ProxyLeaseError-on-hold-lease path just above, which
+    already proves the release-on-failure behavior for a different failure cause)."""
+    h = _operate_headers(client)
+    tpl = client.post(
+        "/templates",
+        json={"name": "Apply Swap No Static", "role": "apply", "settings": {"HOLD_SWAP_AFTER_WARMUP": True}},
+        headers=h,
+    ).json()
+    iid = client.post("/identities", json={"full_name": "No Static Test", "type": "real"}, headers=h).json()["id"]
+    client.post("/identities/gen-subaccounts", json={"identity_ids": [iid], "count": 1}, headers=h)
+    # Only a rotating (default resource_type) proxy exists for provider=soax -- no static resource
+    # anywhere, so the post-swap pool cannot be satisfied under the new validation.
+    client.post("/proxies", json={"provider": "soax", "kind": "static", "endpoint": "4.4.4.4:4444",
+                                  "credentials_ref": "u4:p4", "max_sessions": 1}, headers=h)
+    bid = client.post(
+        "/bookings",
+        json={"name": "live-swap-no-static", "type": "real", "posto_id": "5084",
+              "settings": {"ENGINE_MODE": "live", "HOLD_PROXY_PROVIDER": "soax"}},
+        headers=h,
+    ).json()["id"]
+    w = client.post(f"/bookings/{bid}/identities",
+                    json={"identity_id": iid, "template_id": tpl["id"]}, headers=h).json()
+
+    r = client.post(f"/workers/{w['id']}/launch", headers=h)
+    assert r.status_code == 409
+    assert "no active static" in r.json()["detail"]
+    assert "HOLD_SWAP_AFTER_WARMUP" in r.json()["detail"]
+
+    import apps.hub.main as hub_main
+    from libs.db import models as M
+    db = hub_main.SessionLocal()
+    try:
+        leases = db.query(M.ProxyLease).filter(M.ProxyLease.worker_id == w["id"]).all()
+        assert leases, "the phase-1 (warm) lease should exist -- it succeeded before the swap check"
+        assert all(lease.released_at is not None for lease in leases), (
+            "the phase-1 lease was left stranded instead of being released on the swap rejection")
+    finally:
+        db.close()
+
+    got = client.get(f"/bookings/{bid}/workers", headers=h).json()
+    assert got[0]["status"] != "running"
+
+
 def test_live_launch_swap_disabled_leases_no_hold_proxy(client, monkeypatch):
     h = _operate_headers(client)
     tpl = client.post("/templates", json={"name": "Apply NoSwap", "role": "apply", "settings": {}},
-                      headers=h).json()   # HOLD_SWAP_AFTER_FOUND defaults False
+                      headers=h).json()   # HOLD_SWAP_AFTER_WARMUP defaults False
     iid = client.post("/identities", json={"full_name": "No Swap", "type": "real"}, headers=h).json()["id"]
     client.post("/identities/gen-subaccounts", json={"identity_ids": [iid], "count": 1}, headers=h)
     client.post("/proxies", json={"provider": "soax", "kind": "static", "endpoint": "3.3.3.3:3333",

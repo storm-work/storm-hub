@@ -66,23 +66,42 @@ def test_unknown_setting_rejected():
         validate_layer(L.GLOBAL, {"NOPE_NOT_A_KNOB": 1})
 
 
-def test_hold_swap_after_found_settable_at_booking_layer():
-    """Regression: HOLD_SWAP_AFTER_FOUND's home layer is TEMPLATE, but the dashboard's Booking
+def test_hold_swap_after_warmup_settable_at_booking_layer():
+    """Regression: HOLD_SWAP_AFTER_WARMUP's home layer is TEMPLATE, but the dashboard's Booking
     Settings panel exposes it as a per-booking shortcut checkbox -- it must be settable at BOOKING
     without requiring a template edit, and a booking-level choice must actually take effect when
     no template/worker override is present."""
-    eff = resolve({L.BOOKING: {"HOLD_SWAP_AFTER_FOUND": True}})
-    assert eff["HOLD_SWAP_AFTER_FOUND"] is True
+    eff = resolve({L.BOOKING: {"HOLD_SWAP_AFTER_WARMUP": True}})
+    assert eff["HOLD_SWAP_AFTER_WARMUP"] is True
 
 
-def test_hold_swap_after_found_template_still_wins_over_booking():
+def test_hold_swap_after_warmup_template_still_wins_over_booking():
     # Precedence is WORKER > TEMPLATE > BOOKING > GLOBAL -- an explicit template override must
     # still beat the booking-level shortcut, matching every other layered setting's behavior.
     eff = resolve({
-        L.BOOKING: {"HOLD_SWAP_AFTER_FOUND": True},
-        L.TEMPLATE: {"HOLD_SWAP_AFTER_FOUND": False},
+        L.BOOKING: {"HOLD_SWAP_AFTER_WARMUP": True},
+        L.TEMPLATE: {"HOLD_SWAP_AFTER_WARMUP": False},
     })
-    assert eff["HOLD_SWAP_AFTER_FOUND"] is False
+    assert eff["HOLD_SWAP_AFTER_WARMUP"] is False
+
+
+def test_hold_swap_after_found_is_no_longer_a_recognized_setting():
+    """Phase 6: HOLD_SWAP_AFTER_FOUND was never a supported alias/compatibility mechanism -- it
+    named a trigger point the code never had, and was removed rather than reconciled. The resolver
+    must reject it exactly like any other unknown key, at every layer that ever accepted it."""
+    with pytest.raises(UnknownSetting):
+        validate_layer(L.BOOKING, {"HOLD_SWAP_AFTER_FOUND": True})
+    with pytest.raises(UnknownSetting):
+        validate_layer(L.TEMPLATE, {"HOLD_SWAP_AFTER_FOUND": True})
+    assert "HOLD_SWAP_AFTER_FOUND" not in CATALOG
+
+
+def test_hold_swap_after_warmup_has_no_fallback_reading_from_the_old_key():
+    """A layer setting ONLY the (now-nonexistent) old key must not silently resolve
+    HOLD_SWAP_AFTER_WARMUP to anything other than its catalog default -- there is no OR/fallback
+    logic anywhere in the resolver; the old key simply does not exist."""
+    eff = resolve({})
+    assert eff["HOLD_SWAP_AFTER_WARMUP"] is False   # catalog default, nothing implicitly enables it
 
 
 def test_booking_knob_not_overridable_below_or_above():
@@ -162,6 +181,66 @@ def test_below_minimum_rejected_at_write_time_too():
         validate_layer(L.TEMPLATE, {"HOLD_POLL_GAP": 0.0})
     with pytest.raises(BelowMinimum):
         validate_layer(L.TEMPLATE, {"KEEPALIVE_INTERVAL": 0.0})
+
+
+# ── Phase 3 (D32): worker-level proxy setting overrides ────────────────────────────────────────
+# PROXY_PROVIDER/PROXY_GEOS/PROXY_KIND/HOLD_PROXY_PROVIDER/HOLD_PROXY_GEOS/HOLD_PROXY_KIND all had
+# override=frozenset() -- L.WORKER could never win regardless of what workers.settings_json carried,
+# because nothing was allowed to SET them there. These prove the precedence now actually reaches
+# every one of the six, using the SAME resolve()/validate_layer() this file already tests everything
+# else through -- no second resolver, no new precedence model.
+_PROXY_WORKER_SETTINGS = (
+    "PROXY_PROVIDER", "PROXY_GEOS", "PROXY_KIND",
+    "HOLD_PROXY_PROVIDER", "HOLD_PROXY_GEOS", "HOLD_PROXY_KIND",
+)
+
+
+@pytest.mark.parametrize("key", _PROXY_WORKER_SETTINGS)
+def test_proxy_setting_booking_only(key):
+    eff = resolve({L.BOOKING: {key: "booking-value"}})
+    assert eff[key] == "booking-value"
+
+
+@pytest.mark.parametrize("key", _PROXY_WORKER_SETTINGS)
+def test_proxy_setting_worker_overrides_booking(key):
+    eff = resolve({L.BOOKING: {key: "booking-value"}, L.WORKER: {key: "worker-value"}})
+    assert eff[key] == "worker-value"
+    src = effective_source({L.BOOKING: {key: "booking-value"}, L.WORKER: {key: "worker-value"}})
+    assert src[key] == L.WORKER
+
+
+@pytest.mark.parametrize("key", _PROXY_WORKER_SETTINGS)
+def test_proxy_setting_worker_absent_booking_wins(key):
+    eff = resolve({L.BOOKING: {key: "booking-value"}})
+    src = effective_source({L.BOOKING: {key: "booking-value"}})
+    assert eff[key] == "booking-value"
+    assert src[key] == L.BOOKING
+
+
+@pytest.mark.parametrize("key", _PROXY_WORKER_SETTINGS)
+def test_proxy_setting_settable_at_worker_layer(key):
+    """The write-time gate (attach_identity validates worker_settings via validate_layer(L.WORKER,
+    ...)) must accept these six keys -- confirms the override, not just the read-time resolve()."""
+    validate_layer(L.WORKER, {key: "x"})  # must not raise
+
+
+def test_proxy_setting_template_layer_still_rejected():
+    """These six are home=L.BOOKING, override={L.WORKER} only -- TEMPLATE was never requested and
+    must still be illegal, confirming the widen was exactly the six keys' override set, not a
+    blanket relaxation."""
+    with pytest.raises(WrongLayer):
+        validate_layer(L.TEMPLATE, {"PROXY_PROVIDER": "soax"})
+
+
+def test_random_geo_is_omission_never_a_literal_string():
+    """PROXY_GEOS/HOLD_PROXY_GEOS's established representation (D2, PROXY_CONTRACTS.md) is: blank/
+    absent means no restriction, applied as omission at credential-build time -- never the literal
+    string "random" flowing through the resolver. This did not change in Phase 3 and must not."""
+    eff = resolve({})
+    assert eff["PROXY_GEOS"] == ""
+    assert eff["HOLD_PROXY_GEOS"] == ""
+    eff = resolve({L.BOOKING: {"PROXY_GEOS": "DE,IT"}, L.WORKER: {"PROXY_GEOS": ""}})
+    assert eff["PROXY_GEOS"] == ""   # worker can explicitly go back to "no restriction" too
 
 
 def test_unimplemented_settings_say_so_in_their_note():

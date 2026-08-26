@@ -123,6 +123,14 @@ class Proxy(Base, PKMixin, TimestampMixin):
     __tablename__ = "proxies"
     provider: Mapped[str] = mapped_column(String(16), nullable=False)     # soax | isp
     kind: Mapped[str] = mapped_column(String(24), nullable=False)         # rotating | mobile
+    # rotating = reusable session template (the exit behind the row moves on its own; a failed probe
+    # says nothing about the row -- D19). static = a genuinely finite, individually-owned resource
+    # (a failed probe DOES mean the row is bad). Every row is 'rotating' until a static/ISP pool
+    # actually exists (docs/engineering/PROXY_CONTRACTS.md: "we own none", as of this column's
+    # introduction). Constrained to the two values by a Postgres CHECK (migration cd000) and by the
+    # Pydantic schema at the API boundary -- unlike `provider`/`kind`, this field's whole purpose is
+    # a clean binary distinction, so it is held stricter than its free-text siblings deliberately.
+    resource_type: Mapped[str] = mapped_column(String(16), nullable=False, default="rotating")
     endpoint: Mapped[str] = mapped_column(String(255), nullable=False)
     credentials_ref: Mapped[str | None] = mapped_column(String(255))
     active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
@@ -212,6 +220,13 @@ class Worker(Base, PKMixin, TimestampMixin):
     substate: Mapped[E.WorkerSubstate | None] = mapped_column(_enum(E.WorkerSubstate))
     substate_detail: Mapped[str | None] = mapped_column(String(255))
     effective_settings_json: Mapped[dict] = mapped_column(JSON, default=dict)  # frozen at launch
+    # Phase 3: the WORKER settings layer's INPUT. The resolver (WORKER > TEMPLATE > BOOKING > GLOBAL)
+    # already implemented this precedence correctly; nothing populated it because there was nowhere
+    # to store a per-worker override before this column existed. Set at attach time
+    # (AttachIdentity.worker_settings), validated the same way Booking/WorkerTemplate settings
+    # already are. Distinct from effective_settings_json, which is the resolved OUTPUT frozen at
+    # launch -- this is one of that resolution's inputs.
+    settings_json: Mapped[dict] = mapped_column(JSON, default=dict)
     # Which sub-account this worker is actually logged in with right now -- set at launch, then kept
     # in sync by do_login()'s sticky-then-rotate loop (ops_live.py) via the "account_rotated" event,
     # since a worker can rotate off its launch-time pick after repeated login failures.

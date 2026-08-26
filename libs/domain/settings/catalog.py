@@ -160,7 +160,13 @@ _BOOKING = [
     # foot-gun: a booking created without touching this ran a full fleet that could never book.
     _s("ENGINE_MODE", L.BOOKING, str, "live", group="mode",
        note="'live' books real appointments; 'sim' drives the same flow against SimEngineOps"),
-    _s("PROXY_PROVIDER", L.BOOKING, str, "soax", group="mode",
+    # Phase 3 (D32): all six proxy settings below now take _WRK -- a worker can override its
+    # booking's proxy configuration. Previously override=frozenset() on every one of them, meaning
+    # NO worker-level override existed for any proxy setting despite the resolver already
+    # implementing WORKER > TEMPLATE > BOOKING > GLOBAL precedence correctly; this was a missing
+    # opt-in, not a missing mechanism. See workers.settings_json (Worker model) for where a
+    # worker's override value now actually comes from.
+    _s("PROXY_PROVIDER", L.BOOKING, str, "soax", _WRK, group="mode",
        note="phase-1 (login/warmup) leased-proxy provider: 'soax' | 'webshare'"),
     # Exit countries the phase-1 pool may draw from, comma-separated (e.g. "DE,IT"); blank = all.
     # Measured over 1392 real login attempts 2026-08-18: DE 23.7% / IT 23.4% / PT 10.8% / NL 10.6%
@@ -169,17 +175,17 @@ _BOOKING = [
     # highest-leverage change available against the login wall, which is where ~90% of this fleet's
     # time goes. Left blank by default: it trades pool breadth for pass rate, and how far to push
     # that is an operator call, not a default.
-    _s("PROXY_GEOS", L.BOOKING, str, "", group="mode"),
-    _s("HOLD_PROXY_GEOS", L.BOOKING, str, "", group="mode",
+    _s("PROXY_GEOS", L.BOOKING, str, "", _WRK, group="mode"),
+    _s("HOLD_PROXY_GEOS", L.BOOKING, str, "", _WRK, group="mode",
        note="same, for the phase-2 (hold/apply) pool; blank = all"),
-    _s("PROXY_KIND", L.BOOKING, str, group="mode",
+    _s("PROXY_KIND", L.BOOKING, str, override=_WRK, group="mode",
        note="optional phase-1 proxy kind filter (Proxy.kind): 'rotating' | 'mobile'; blank = no filter"),
-    _s("HOLD_PROXY_PROVIDER", L.BOOKING, str, "webshare", group="mode",
-       note="phase-2 (hold/apply/discovery) leased-proxy provider, used only when HOLD_SWAP_AFTER_FOUND "
+    _s("HOLD_PROXY_PROVIDER", L.BOOKING, str, "webshare", _WRK, group="mode",
+       note="phase-2 (hold/apply/discovery) leased-proxy provider, used only when HOLD_SWAP_AFTER_WARMUP "
             "is on -- default 'webshare' (long, ~24h session lifetime) vs phase-1's 'soax' default "
             "(~1h session lifetime): a long hold needs to outlive soax's own session cap, which a "
             "same-provider swap can't fix -- see libs.domain.settings.catalog's hold_swap group"),
-    _s("HOLD_PROXY_KIND", L.BOOKING, str, group="mode",
+    _s("HOLD_PROXY_KIND", L.BOOKING, str, override=_WRK, group="mode",
        note="optional phase-2 proxy kind filter ('rotating' | 'mobile'); blank = no filter"),
     # Timing (warmup_start_at / slot_open_at are booking timestamp columns)
     _s("WARMUP_START_JITTER", L.BOOKING, float, 0.0, group="timing",
@@ -402,26 +408,25 @@ _TEMPLATE = [
        note="anti-herd: stagger checkpoint-restore attempts after a mass relaunch"),
     _s("SESSION_REFRESH_STAGGER", L.TEMPLATE, float, 120.0, _WRK, "keepalive"),
     # Hold / ISP swap
-    # Fires right after WARMUP completes (phases.py, between WARMED and HOLDING) -- the old name
-    # HOLD_SWAP_AFTER_FOUND described a trigger point the code never had. When OFF the swap step is
-    # skipped entirely and the worker stays on its phase-1 proxy for the whole run.
+    # Fires right after WARMUP completes (phases.py, between WARMED and HOLDING), NOT after a slot is
+    # actually found (PhaseMachine._warmup() calls do_swap() before await_slot_open() even begins).
+    # When OFF the swap step is skipped entirely and the worker stays on its phase-1 proxy for the
+    # whole run. Removed 2026-08-26 (Phase 6, DECISIONS.md D35): a deprecated alias,
+    # HOLD_SWAP_AFTER_FOUND, existed alongside this key and was found to be READ (not just carried for
+    # compatibility) by some Hub-side call sites while others read only this canonical name -- an
+    # inconsistency, not a supported dual-spelling design. The alias is gone; this is the only
+    # supported key.
     _s("HOLD_SWAP_AFTER_WARMUP", L.TEMPLATE, bool, False, _TPL_BK, "hold_swap",
-       note="swap to the hold proxy pool once warmup is done; off = never swap"),
-    # DEPRECATED spelling of HOLD_SWAP_AFTER_WARMUP, kept ONLY so stored booking/template settings
-    # still resolve -- removing a key an operator already saved makes the resolver reject the whole
-    # layer and breaks every launch. HOLD_SWAP_AFTER_WARMUP wins when both are present.
-    _s("HOLD_SWAP_AFTER_FOUND", L.TEMPLATE, bool, False, _TPL_BK, "hold_swap",
        note="on/off switch for the phase-1->phase-2 proxy swap (LiveEngineOps.do_swap); off by "
             "default -- a worker just keeps its phase-1 (PROXY_PROVIDER) proxy for the whole run. "
-            "NAME IS HISTORICAL, NOT LITERAL: despite the name, the swap fires right after warmup "
-            "finishes -- i.e. the instant a worker is about to start its (potentially many-hour) "
-            "hold -- NOT after a slot is actually found (PhaseMachine._warmup() calls do_swap() "
-            "before await_slot_open() even begins). This is intentional: the operator's design is "
-            "soax (short, ~1h session) for the brief login/warmup, then a swap to webshare (long, "
-            "~24h session) BEFORE the long hold starts, so the hold never outlives its proxy's own "
-            "session cap. When on, a second proxy is leased per HOLD_PROXY_PROVIDER/HOLD_PROXY_KIND. "
-            "Booking-layer override added as the dashboard's booking-settings shortcut checkbox -- a "
-            "per-booking operator choice, not something that should require editing a worker template"),
+            "NAME IS LITERAL: the swap fires right after warmup finishes -- i.e. the instant a worker "
+            "is about to start its (potentially many-hour) hold. This is intentional: the operator's "
+            "design is soax (short, ~1h session) for the brief login/warmup, then a swap to webshare "
+            "(long, ~24h session) BEFORE the long hold starts, so the hold never outlives its proxy's "
+            "own session cap. When on, a second proxy is leased per HOLD_PROXY_PROVIDER/"
+            "HOLD_PROXY_KIND. Booking-layer override is the dashboard's booking-settings shortcut "
+            "checkbox -- a per-booking operator choice, not something that should require editing a "
+            "worker template"),
     _s("HOLD_SWAP_RETRIES", L.TEMPLATE, int, 3, _WRK, "hold_swap",
        note="swap retry protocol (operator spec 2026-08-14): if the FIRST swap attempt fails (new "
             "session doesn't pass its post-swap health check, or launch itself fails), do_swap() "

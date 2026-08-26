@@ -391,6 +391,149 @@ def test_handle_proxy_request_sends_unavailable_when_pool_exhausted(client):
     assert "no webshare proxy leased" in bus.sent[0][2]["reason"]
 
 
+# ── Phase 5: mid-hold rotation must resolve the SAME effective config as launch, and must enforce
+# resource_type='static' whenever the resolved hold configuration requires it -- Phase 4 found both
+# guarantees held only at launch, never at a subsequent rotation. ────────────────────────────────────
+def _seed_and_call_proxy_request(client, *, booking_settings, worker_settings=None, phase="warmup",
+                                 proxies):
+    """Shared plumbing for the tests below: create an identity/booking/worker (optionally with a
+    WORKER-layer override), seed proxy rows, and invoke _handle_proxy_request exactly as the P3 tests
+    above do. Returns (bus.sent, TestSession) for the caller to assert against."""
+    from libs.db import models as M
+
+    c, TestSession = client
+    h = _op_headers(c)
+    iid = c.post("/identities", json={"full_name": "X", "type": "test"}, headers=h).json()["id"]
+    bid = c.post("/bookings", json={"name": "b", "type": "test", "posto_id": "2032"}, headers=h).json()["id"]
+    attach_body = {"identity_id": iid, "assigned_role": "apply"}
+    if worker_settings:
+        attach_body["worker_settings"] = worker_settings
+    wid = c.post(f"/bookings/{bid}/identities", json=attach_body, headers=h).json()["id"]
+
+    db = TestSession()
+    try:
+        bk = db.get(M.Booking, bid)
+        bk.settings_json = {**bk.settings_json, **booking_settings}
+        for kwargs in proxies:
+            db.add(M.Proxy(**kwargs))
+        db.commit()
+    finally:
+        db.close()
+
+    class _FakeBus:
+        def __init__(self):
+            self.sent = []
+
+        def send_command(self, worker_id, type, **payload):
+            self.sent.append((worker_id, type, payload))
+
+    import apps.hub.db as hub_db
+    import apps.hub.events as events_mod
+    orig = hub_db.SessionLocal
+    hub_db.SessionLocal = TestSession
+    events_mod.SessionLocal = TestSession
+    bus = _FakeBus()
+    try:
+        hub = events_mod.EventHub.__new__(events_mod.EventHub)
+        hub._handle_proxy_request(wid, phase, bus, health_check=lambda url: (True, "ok"))
+    finally:
+        hub_db.SessionLocal = orig
+        events_mod.SessionLocal = orig
+    return bus.sent, TestSession, wid
+
+
+def test_handle_proxy_request_uses_worker_layer_override_same_as_launch(client):
+    """Regression: booking-level PROXY_PROVIDER='soax' (A), worker-level override 'webshare' (B).
+    _do_launch_worker already resolves B (tested in tests/hub/test_live_launch.py); this proves
+    mid-hold rotation now resolves the SAME B, not the booking's A -- the exact inconsistency Phase 4
+    found (events.py's layers dict never included L.WORKER)."""
+    sent, _, wid = _seed_and_call_proxy_request(
+        client,
+        booking_settings={"PROXY_PROVIDER": "soax"},
+        worker_settings={"PROXY_PROVIDER": "webshare"},
+        phase="warmup",
+        proxies=[
+            dict(id="px-soax", provider="soax", kind="rotating", endpoint="soax:1",
+                credentials_ref="u:p", max_sessions=5),
+            dict(id="px-webshare", provider="webshare", kind="rotating", endpoint="webshare:1",
+                credentials_ref="u:p", max_sessions=5),
+        ],
+    )
+    assert len(sent) == 1
+    worker_id, typ, payload = sent[0]
+    assert typ == "proxy_assigned"
+    assert payload["proxy"].endswith("webshare:1"), (
+        "rotation resolved the booking-level provider ('soax'), not the worker override -- "
+        "launch and rotation are resolving different effective configs")
+
+
+def test_handle_proxy_request_hold_rejects_rotating_when_static_required(client):
+    """Invariant B / F: HOLD_SWAP_AFTER_WARMUP is on, so the resolved hold configuration requires
+    resource_type='static' -- and no static row exists, only a rotating one. The rotation must fail
+    cleanly (proxy_unavailable), and must NEVER return the rotating candidate as a fallback."""
+    sent, TestSession, wid = _seed_and_call_proxy_request(
+        client,
+        booking_settings={"HOLD_PROXY_PROVIDER": "soax", "HOLD_SWAP_AFTER_WARMUP": True},
+        phase="hold",
+        proxies=[
+            dict(id="px-rotating", provider="soax", kind="rotating", endpoint="soax:1",
+                credentials_ref="u:p", max_sessions=5, resource_type="rotating"),
+        ],
+    )
+    assert len(sent) == 1
+    worker_id, typ, payload = sent[0]
+    assert typ == "proxy_unavailable", "a rotating candidate must never be returned for a static-required hold request"
+    assert "static" in payload["reason"].lower()
+
+    db = TestSession()
+    try:
+        from libs.db import models as M
+        assert db.query(M.ProxyLease).filter(M.ProxyLease.worker_id == wid).count() == 0, (
+            "the rotating candidate must not have been leased at all")
+    finally:
+        db.close()
+
+
+def test_handle_proxy_request_hold_succeeds_and_returns_static_when_available(client):
+    """Positive case: same static-required configuration, but a static candidate exists alongside a
+    rotating one for the same provider -- the rotation must succeed and return the STATIC row, never
+    the rotating one, even though nothing about score/LRU ordering favors either."""
+    sent, _, wid = _seed_and_call_proxy_request(
+        client,
+        booking_settings={"HOLD_PROXY_PROVIDER": "soax", "HOLD_SWAP_AFTER_WARMUP": True},
+        phase="hold",
+        proxies=[
+            dict(id="px-rotating", provider="soax", kind="rotating", endpoint="rot:1",
+                credentials_ref="u:p", max_sessions=5, resource_type="rotating"),
+            dict(id="px-static", provider="soax", kind="rotating", endpoint="stat:1",
+                credentials_ref="u:p", max_sessions=5, resource_type="static"),
+        ],
+    )
+    assert len(sent) == 1
+    worker_id, typ, payload = sent[0]
+    assert typ == "proxy_assigned"
+    assert payload["proxy"].endswith("stat:1")
+    assert payload["resource_type"] == "static"
+
+
+def test_handle_proxy_request_warmup_never_requires_static(client):
+    """Sanity boundary: HOLD_SWAP_AFTER_WARMUP being on must not leak a static requirement into the
+    UNRELATED warmup-phase (PROXY_PROVIDER) pool -- only "hold" is ever static-constrained."""
+    sent, _, wid = _seed_and_call_proxy_request(
+        client,
+        booking_settings={"PROXY_PROVIDER": "soax", "HOLD_SWAP_AFTER_WARMUP": True},
+        phase="warmup",
+        proxies=[
+            dict(id="px-rotating", provider="soax", kind="rotating", endpoint="rot:1",
+                credentials_ref="u:p", max_sessions=5, resource_type="rotating"),
+        ],
+    )
+    assert len(sent) == 1
+    worker_id, typ, payload = sent[0]
+    assert typ == "proxy_assigned"
+    assert payload["proxy"].endswith("rot:1")
+
+
 def test_persist_booked_pdf_creates_artifact_and_appointment(client, tmp_path):
     c, TestSession = client
     h = _op_headers(c)

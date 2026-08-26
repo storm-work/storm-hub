@@ -476,12 +476,12 @@ def test_patch_settings_merges_instead_of_replacing(client):
     }, headers=h).json()["id"]
 
     r = client.patch(f"/bookings/{bid}/settings",
-                     json={"PROXY_PROVIDER": "soax", "HOLD_SWAP_AFTER_FOUND": True}, headers=h)
+                     json={"PROXY_PROVIDER": "soax", "HOLD_SWAP_AFTER_WARMUP": True}, headers=h)
     assert r.status_code == 200
     got = r.json()["settings_json"]
     assert got["CAL_START_DATE"] == "2026-09-01"     # untouched by an unrelated panel
     assert got["CAL_END_DATE"] == "2026-09-20"
-    assert got["PROXY_PROVIDER"] == "soax" and got["HOLD_SWAP_AFTER_FOUND"] is True
+    assert got["PROXY_PROVIDER"] == "soax" and got["HOLD_SWAP_AFTER_WARMUP"] is True
 
 
 def test_put_settings_still_replaces_wholesale(client):

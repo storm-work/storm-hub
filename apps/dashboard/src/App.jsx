@@ -772,7 +772,7 @@ function BookingShortcutSettings({ me, booking, onSaved }) {
   const poolValue = (provider, kind) => `${provider}|${kind}`;
   const warmupValue = poolValue(settings.PROXY_PROVIDER ?? "soax", settings.PROXY_KIND ?? "");
   const holdValue = poolValue(settings.HOLD_PROXY_PROVIDER ?? "soax", settings.HOLD_PROXY_KIND ?? "");
-  const swapOn = !!settings.HOLD_SWAP_AFTER_FOUND;
+  const swapOn = !!settings.HOLD_SWAP_AFTER_WARMUP;
 
   // PATCH, not PUT. This panel owns a handful of proxy/swap fields; it used to write back its own
   // snapshot of the WHOLE settings object, taken when the page loaded -- so toggling a proxy pool
@@ -804,7 +804,7 @@ function BookingShortcutSettings({ me, booking, onSaved }) {
       </div>
       <div className="field" style={{ margin: 0, display: "flex", alignItems: "center", gap: 8 }}>
         <input type="checkbox" id="hold-swap-toggle" checked={swapOn} disabled={!op}
-          onChange={(e) => saveFields({ HOLD_SWAP_AFTER_FOUND: e.target.checked })} />
+          onChange={(e) => saveFields({ HOLD_SWAP_AFTER_WARMUP: e.target.checked })} />
         <label htmlFor="hold-swap-toggle" style={{ margin: 0 }}>Swap after warmup</label>
       </div>
       <div className="field" style={{ margin: 0, minWidth: 220 }}>

@@ -143,7 +143,7 @@ def _resolve_booking_setting(db: Session, bk: M.Booking, key: str, default):
 
 # Bookings with a fleet launch currently in flight. A live-mode launch is SLOW -- each worker's
 # proxy lease runs real browser health probes against the portal (libs/proxies/health.py), up to
-# max_probes candidates, twice over when HOLD_SWAP_AFTER_FOUND is on -- so a six-worker fleet takes
+# max_probes candidates, twice over when HOLD_SWAP_AFTER_WARMUP is on -- so a six-worker fleet takes
 # minutes of wall clock, not milliseconds.
 #
 # Confirmed live 2026-08-14 ("start button doesn't work"): /bookings/{id}/start ran that fleet
@@ -720,7 +720,7 @@ def settings_catalog(_v: Principal = Depends(require_viewer)) -> dict:
 
     The "booking" list is the one exception to "home layer only": it also includes settings whose
     home is elsewhere but that declare BOOKING as an override layer (currently just
-    HOLD_SWAP_AFTER_FOUND, home=TEMPLATE) -- the Booking Settings tab needs the full set of what's
+    HOLD_SWAP_AFTER_WARMUP, home=TEMPLATE) -- the Booking Settings tab needs the full set of what's
     actually legal to set at BOOKING, not just what's homed there."""
     out: dict[str, list[dict]] = {}
     for layer in (L.GLOBAL, L.BOOKING, L.TEMPLATE):
@@ -1274,9 +1274,9 @@ def list_proxies(db: Session = Depends(get_db),
 @app.post("/proxies", response_model=ProxyOut, status_code=201)
 def create_proxy(body: ProxyCreate, db: Session = Depends(get_db),
                  _op: Principal = Depends(require_operator)) -> M.Proxy:
-    p = M.Proxy(provider=body.provider, kind=body.kind, endpoint=body.endpoint,
-                credentials_ref=body.credentials_ref, geo=parse_geo(body.credentials_ref),
-                max_sessions=body.max_sessions, active=True)
+    p = M.Proxy(provider=body.provider, kind=body.kind, resource_type=body.resource_type,
+                endpoint=body.endpoint, credentials_ref=body.credentials_ref,
+                geo=parse_geo(body.credentials_ref), max_sessions=body.max_sessions, active=True)
     db.add(p)
     db.commit()
     db.refresh(p)
@@ -1297,9 +1297,10 @@ def import_proxies(body: ProxyImport, db: Session = Depends(get_db),
         if key in existing:
             errors.append(f"skip duplicate {pp.endpoint}")
             continue
-        db.add(M.Proxy(provider=body.provider, kind=body.kind, endpoint=pp.endpoint,
-                       credentials_ref=pp.credentials_ref, geo=parse_geo(pp.credentials_ref),
-                       max_sessions=body.max_sessions, active=True))
+        db.add(M.Proxy(provider=body.provider, kind=body.kind, resource_type=body.resource_type,
+                       endpoint=pp.endpoint, credentials_ref=pp.credentials_ref,
+                       geo=parse_geo(pp.credentials_ref), max_sessions=body.max_sessions,
+                       active=True))
         existing.add(key)
         created += 1
     db.commit()
@@ -1993,7 +1994,15 @@ def attach_identity(
     alloc = M.IdentityAllocation(identity_id=ident.id, booking_id=bk.id, allocated_at=_now())
     db.add(alloc)
     db.add(M.BookingIdentity(booking_id=bk.id, identity_id=ident.id, assigned_role=body.assigned_role))
-    worker = M.Worker(booking_id=bk.id, identity_id=ident.id, role=role, template_id=template_id)
+    # Phase 3 (D32): the WORKER settings layer's input. Validated the same way Booking/WorkerTemplate
+    # settings already are at write time -- an unknown key or a key not settable at L.WORKER fails
+    # here, not silently at launch.
+    try:
+        worker_settings = validate_layer(L.WORKER, body.worker_settings or {})
+    except Exception as e:
+        raise HTTPException(400, f"invalid worker settings: {e}")
+    worker = M.Worker(booking_id=bk.id, identity_id=ident.id, role=role, template_id=template_id,
+                      settings_json=worker_settings)
     db.add(worker)
     try:
         db.commit()
@@ -2177,6 +2186,12 @@ def _do_launch_worker(db: Session, w: M.Worker) -> None:
     layers = {L.GLOBAL: get_global(db), L.BOOKING: (bk.settings_json or {})}
     if tpl:
         layers[L.TEMPLATE] = (tpl.settings_json or {})
+    # Phase 3 (D32): the WORKER layer's one and only input source. Already validated at attach time
+    # (attach_identity), so this is a straight pass-through -- an empty dict (every worker attached
+    # before this column existed, and every worker attached without an override since) resolves
+    # identically to today's behaviour.
+    if w.settings_json:
+        layers[L.WORKER] = w.settings_json
     eff = resolve(layers)
     eff["ROLE"] = str(w.role)                     # role comes from the worker row, not settings
 
@@ -2204,15 +2219,48 @@ def _do_launch_worker(db: Session, w: M.Worker) -> None:
             raise HTTPException(409, f"worker {w.id}: {e}")
 
         # Phase-2 (hold/apply/discovery) proxy, only leased when the swap is actually switched on
-        # (HOLD_SWAP_AFTER_FOUND) -- a worker with swap off keeps its phase-1 proxy for the whole
+        # (HOLD_SWAP_AFTER_WARMUP) -- a worker with swap off keeps its phase-1 proxy for the whole
         # run, matching do_swap()'s off-by-default behavior in ops_live.py.
         hold_proxy = None
-        if bool(eff.get("HOLD_SWAP_AFTER_FOUND", False)):
+        if bool(eff.get("HOLD_SWAP_AFTER_WARMUP", False)):
+            # Phase 3 (D32): the post-swap pool must be static -- a rotating template's exit can
+            # move underneath the swap for no reason related to holding, which is exactly the
+            # instability the swap exists to move AWAY from. Reject before ever leasing anything
+            # (not after a lease attempt fails, not silently falling back to rotating): there is no
+            # static/ISP inventory in this system today, so this branch always rejects right now --
+            # that is the correct, honest answer, not a bug. The phase-1 lease already succeeded by
+            # this point, so it must be released before raising, same as the lease-failure path
+            # right below.
+            hold_provider = str(eff.get("HOLD_PROXY_PROVIDER", "soax"))
+            hold_kind = eff.get("HOLD_PROXY_KIND") or None
+            static_available = db.scalar(
+                select(func.count()).select_from(M.Proxy).where(
+                    M.Proxy.provider == hold_provider, M.Proxy.active.is_(True),
+                    M.Proxy.resource_type == "static",
+                    *([M.Proxy.kind == hold_kind] if hold_kind else []),
+                )
+            ) or 0
+            if static_available == 0:
+                release_proxy(db, w.id)
+                raise HTTPException(
+                    409,
+                    f"worker {w.id}: HOLD_SWAP_AFTER_WARMUP is on but the resolved post-swap pool "
+                    f"(provider={hold_provider!r}"
+                    f"{f', kind={hold_kind!r}' if hold_kind else ''}) has no active static "
+                    f"resource -- the post-swap proxy must be a static/ISP resource, and none is "
+                    f"configured. This is not a lease failure: no rotating fallback is used."
+                )
             try:
+                # Phase 5: resource_type="static" makes this an ACTUAL requirement on the leased row,
+                # not just the count-based pre-check above. Without it, the pre-check only proves a
+                # static row exists SOMEWHERE in the pool -- lease_proxy's own query (unconstrained by
+                # resource_type) is still free to return a rotating row that happens to sort first.
+                # That was masked in this repo's own tests only by incidental capacity exhaustion (the
+                # phase-1 lease consuming the sole matching rotating row) -- not a real guarantee.
                 _hold_proxy_row, hold_proxy = lease_proxy(
                     db, w.id, provider=str(eff.get("HOLD_PROXY_PROVIDER", "soax")),
                     kind=eff.get("HOLD_PROXY_KIND") or None, health_check=check_proxy, quick_screen=_screen_tier1(),
-                    geos=_geos(eff.get("HOLD_PROXY_GEOS")),
+                    geos=_geos(eff.get("HOLD_PROXY_GEOS")), resource_type="static",
                 )
             except ProxyLeaseError as e:
                 # The phase-1 lease already succeeded -- release it, otherwise it's stranded (this
@@ -2220,7 +2268,7 @@ def _do_launch_worker(db: Session, w: M.Worker) -> None:
                 # workers -- would never release it either).
                 release_proxy(db, w.id)
                 raise HTTPException(
-                    409, f"worker {w.id}: HOLD_SWAP_AFTER_FOUND is on but no hold proxy available: {e}"
+                    409, f"worker {w.id}: HOLD_SWAP_AFTER_WARMUP is on but no hold proxy available: {e}"
                 )
 
         quest_steps = get_config(db, "quest_steps", {}) or {}
@@ -2243,6 +2291,12 @@ def _do_launch_worker(db: Session, w: M.Worker) -> None:
             capsolver_keys=capsolver_keys,
             warm_proxy=warm_proxy,
             hold_proxy=hold_proxy,
+            # Phase 5: a hold_proxy is only ever leased inside the HOLD_SWAP_AFTER_WARMUP branch above,
+            # and (as of this phase) is now always resource_type='static' when it is. Carrying this
+            # one boolean fact -- not a Proxy row, not the DB's own vocabulary -- lets the worker
+            # refuse to locally roll/transform it (D1: no DB access, no DB-shaped state; this is a
+            # plain runtime fact, same shape as warm_proxy/hold_proxy themselves).
+            hold_proxy_static=bool(hold_proxy),
             sub_account_id=sub_account.id,
             identity_id=identity.id,
             booking_id=bk.id,

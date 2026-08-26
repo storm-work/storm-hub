@@ -37,7 +37,7 @@ libs/engine/     phases.py (PhaseMachine + EngineOps Protocol), payload, discove
                  pool_manager, checkpoint, orchestration, portal_health
 libs/engine/vendor/  storm-auto's Playwright engine, vendored, ~2742 lines — NOT modified
 libs/bus/        Redis streams (cmd/evt), pub/sub signals, semaphore, breaker
-libs/proxies/    lease.py (pool selection + leasing), health, exit_ip
+libs/proxies/    lease.py (pool selection + leasing), health, exit_ip, credentials (Phase 3)
 libs/db/         SQLAlchemy models (24) + Alembic migrations
 ```
 
@@ -246,15 +246,21 @@ Workers are spawned by the Hub with `start_new_session=True`, so they survive a 
 - `checkpoint.cleanup_stale` has **no production caller** — tested and probed only.
 - `apps/hub/main.py` is 2773 lines and `App.jsx` is 2856; both mix concerns.
 - `libs/engine/orchestration.py` (134 lines) overlaps `scheduler.py`'s inline logic.
-- `HOLD_SWAP_AFTER_FOUND` is retained as a deprecated alias — the name described a trigger
-  point that was never the code's.
+- ~~`HOLD_SWAP_AFTER_FOUND` is retained as a deprecated alias~~ — **removed 2026-08-26 (Phase 6,
+  `DECISIONS.md` D35)**, not merely renamed. It was never a legitimate second spelling; it named a
+  trigger point the code never had, and its continued existence let the Hub-side launch/rotation
+  gates drift onto reading it specifically while the worker's own `EngineConfig` read both spellings
+  OR'd. `HOLD_SWAP_AFTER_WARMUP` is now the sole recognized key.
 - The dashboard duplicates the worker action-legality table (`WORKER_ACTIONS` in `App.jsx`)
   that `state_machines.py:WORKER_ACTION_STATUSES` owns — two copies that can drift.
 
-## 11. Session-state model and recovery — DESIGN ONLY, not implemented
+## 11. Session-state model and recovery — DESIGN, PARTIALLY IMPLEMENTED (Phase 1, 2026-08-26)
 
-Written 2026-08-26 after Q22. **Nothing in this section is built.** It is the target the current
-implementation is measured against in `FAILURE_MODES.md` F23-F25.
+Written 2026-08-26 after Q22, as the target the (then-unbuilt) implementation would be measured
+against in `FAILURE_MODES.md` F23-F25. **§11.1's classifier and most of §11.2's recovery machine
+are now implemented** (`apps/worker/ops_live.py`'s `SessionState`/`classify_session_state`,
+Phase 1, same day) — see §11.3 for exactly what matches this design, what diverges, and what
+remains undone. The design below is preserved as originally written; §11.3 is the reconciliation.
 
 ### 11.1 The five states
 
@@ -313,3 +319,46 @@ them**. Today the hold loop branches on symptom counters (`_keepalive_dead_strea
 
 **The single highest-value change** this implies is not a new state machine — it is making
 `_do_keepalive` classify its own response instead of treating "the navigation returned" as health.
+
+### 11.3 Implementation status (added 2026-08-26, after Phase 1)
+
+**Matches this design:**
+- `SessionState(str, Enum)` with `AUTHENTICATED` / `SESSION_EXPIRED` / `PORTAL_ERROR` / `UNKNOWN`,
+  and `classify_session_state(page, final_url, *, warmed)`, both in `apps/worker/ops_live.py`.
+- `SESSION_EXPIRED` via `sessionLost.jsp`/`Authentication.jsp` in the final URL, checked before any
+  page-content marker — closes F22.
+- `PORTAL_ERROR` via the existing `_is_portal_busy`, now also consulted inside the keepalive loop —
+  closes F25.
+- `UNKNOWN` as an explicit, first-class outcome on both the pre-warm and warmed paths, never
+  silently promoted to a specific verdict — closes F26 for the keepalive loop specifically (the
+  `events.py` `_TERMINAL_STATUS.get()` instance of the same defect class is untouched, tracked
+  separately in `FAILURE_MODES.md` F26).
+- `EXIT_CHANGED` stays informational-only, exactly as D31 prescribes — `classify_session_state`
+  never consults `_note_exit_ip`'s result.
+- Recovery actions for `AUTHENTICATED`/`SESSION_EXPIRED`/`PORTAL_ERROR`/`UNKNOWN` match §11.2's
+  transitions (stay / reauthenticate via the existing `_attempt_keepalive_restore` chain / back off
+  / back off and re-probe, escalating only via the existing bounded `_maybe_escalate_stuck_rewarm`
+  streak) — closes F23/F24.
+
+**Diverges from this design, deliberately, as smaller-scope choices:**
+- The validated marker table (§11.1) lists **two** usable authenticated-home signals,
+  `consultar pedidos` and the `Terminar Sessão` logout link. The implementation wires only
+  `consultar pedidos` (via the pre-existing `_HOME_MARKERS` constant). Both are independently
+  validated in `CONFIRMED_FACTS.md` §27 and agreed on every probed row there — using one is not
+  currently known to be wrong, but the design's redundancy (either marker independently proves the
+  state) is not yet built. Low risk, cheap to add later.
+- §11.2's `PROXY_TRANSPORT_FAILURE` transition ("roll session id, retry" before escalating) was
+  **not implemented**. Phase 1 deliberately left the pre-existing exception-catching branch around
+  `browser_nav` untouched (still `_keepalive_dead_streak` → `_attempt_keepalive_restore` — a full
+  re-authentication after `KEEPALIVE_DEAD_TRIP` failures, not a cheap in-band session-id roll
+  first), per Phase 1's own "smallest clean change" scope boundary. `PROXY_TRANSPORT_FAILURE` is
+  therefore not a `SessionState` enum member in the implementation — it remains the pre-existing
+  branch, functionally in the same place in the control flow but not a named classifier output.
+
+**Remaining limitation this design already names, still true:** the model assumes detect-and-recover
+per the D29/Q22 finding, not a duration budget — consistent, not a gap.
+
+**Future evolution, not scoped to any authorized phase:** wiring the `Terminar Sessão` marker as a
+second signal; building the cheaper roll-then-retry ladder for `PROXY_TRANSPORT_FAILURE`; extending
+the same classifier/`UNKNOWN` discipline to `events.py`'s `_TERMINAL_STATUS.get()` (F26's other
+half).

@@ -25,12 +25,16 @@ from __future__ import annotations
 
 import argparse
 import os
-import random
-import string
 import sys
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_ROOT))          # Phase 3: needed to import libs.proxies.credentials below
+
+from libs.proxies.credentials import (  # noqa: E402
+    build_soax_credential, build_webshare_credential, soax_session_id,
+)
+
 _DATA_DIR = _ROOT / "data"
 
 # Non-secret defaults confirmed working as of 2026-08-13 -- update these (or pass
@@ -78,15 +82,9 @@ def _split_counts(total: int, n: int) -> list[int]:
 
 def _gen_soax(countries: list[str], counts: list[int], package: str, password: str,
              sessionlength: int, bindttl: int, idlettl: int, no_geo: bool = False) -> list[str]:
+    # Credential construction itself moved to libs.proxies.credentials (Phase 3, D32) -- this
+    # function is now only the bulk/country-splitting orchestration around it.
     seen: set[str] = set()
-
-    def sessionid() -> str:
-        while True:
-            sid = "".join(random.choices(string.ascii_letters + string.digits, k=16))
-            if sid not in seen:
-                seen.add(sid)
-                return sid
-
     lines = []
     for cc, n in zip(countries, counts):
         for _ in range(n):
@@ -94,28 +92,29 @@ def _gen_soax(countries: list[str], counts: list[int], package: str, password: s
             # geo restriction (when one is wanted) is applied at LEASE time instead of being frozen
             # into the credential. A pool baked to fixed countries can only ever be re-pointed by
             # regenerating it.
-            geo = "" if no_geo else f"-country-{cc.lower()}"
-            lines.append(
-                f"package-{package}{geo}-sessionid-{sessionid()}-"
-                f"sessionlength-{sessionlength}-bindttl-{bindttl}-idlettl-{idlettl}"
-                f"-opt-wb:{password}@proxy.soax.com:5000"
-            )
+            lines.append(build_soax_credential(
+                package=package, password=password, session_id=soax_session_id(seen),
+                sessionlength=sessionlength, bindttl=bindttl, idlettl=idlettl,
+                country=None if no_geo else cc,
+            ))
     return lines
 
 
 def _gen_webshare(countries: list[str], counts: list[int], prefix: str, password: str,
                   no_geo: bool = False) -> list[str]:
-    lines = []
     if no_geo:
         # Webshare puts the country in the USERNAME, so "no geo" means dropping the -{CC} segment
         # rather than omitting a parameter. VERIFIED 2026-08-21 against the live account:
         # sodade2026-{n}, sodade2026-rotate and the bare username all authenticate and each returns
         # a different exit; the -{n} suffix is what makes each row a distinct session.
         total = sum(counts)
-        return [f"p.webshare.io:80:{prefix}-{i}:{password}" for i in range(1, total + 1)]
+        return [build_webshare_credential(prefix=prefix, password=password, session_id=i)
+                for i in range(1, total + 1)]
+    lines = []
     for cc, n in zip(countries, counts):
         for i in range(1, n + 1):
-            lines.append(f"p.webshare.io:80:{prefix}-{cc.upper()}-{i}:{password}")
+            lines.append(build_webshare_credential(prefix=prefix, password=password,
+                                                    session_id=i, country=cc))
     return lines
 
 

@@ -210,6 +210,8 @@ class Scheduler:
             self._reap_stalled_workers(db, now)
             self._reap_runaway_workers(db, now)
             self._sweep_orphan_streams(db, now)
+            self._reprobe_static_proxies(db, now)
+            self._reconcile_orphaned_leases(db, now)
         finally:
             db.close()
 
@@ -255,6 +257,90 @@ class Scheduler:
             # Never let housekeeping kill the tick -- that is the failure mode this file's own
             # catch-all comments are about.
             logger.warning("orphan stream sweep failed; continuing", exc_info=True)
+
+    # ── Phase 8 (D-NEW-1): static resource health reactivation ────────────────
+    # Operator decision (Phase 8): re-probe every 600s. Deliberately NOT derived from
+    # _STREAM_SWEEP_EVERY or _DEAD_GRACE above -- those govern different, unrelated mechanisms.
+    _STATIC_REPROBE_EVERY = 600.0
+
+    def _reprobe_static_proxies(self, db, now: datetime, health_check=None) -> None:
+        """Re-probe resource_type='static' rows _candidate_query currently excludes outright
+        (D33's health scoping) -- the only way, before this, that such a row ever became leasable
+        again was the operator's manual, whole-pool POST /proxies/reset-health.
+
+        `health_check` is injectable (defaults to the real libs.proxies.health.check_proxy),
+        mirroring apps/hub/events.py's _handle_proxy_request's own health_check parameter -- same
+        reasoning: a caller injecting a fake probe is describing a fake environment and must not get
+        a real browser/network call underneath it.
+
+        Candidates are read with NO row lock (find_reactivation_candidates is a plain SELECT), and
+        the probe itself runs completely outside any transaction -- identical discipline to
+        lease_proxy's own probe loop, which never holds FOR UPDATE across a multi-second browser nav.
+        A row this sweep flips healthy becomes an ordinary candidate on the very next lease attempt,
+        going through the existing, unmodified _claim_locked / FOR UPDATE SKIP LOCKED path -- this
+        sweep never claims or leases anything itself."""
+        last = getattr(self, "_last_static_reprobe", 0.0)
+        if time.time() - last < self._STATIC_REPROBE_EVERY:
+            return
+        self._last_static_reprobe = time.time()
+        try:
+            from libs.proxies import apply_result, check_proxy, conn_url, find_reactivation_candidates
+
+            hc = health_check if health_check is not None else check_proxy
+            candidates = find_reactivation_candidates(db)
+            if not candidates:
+                return
+            recovered, still_down = 0, 0
+            for proxy in candidates:
+                ok, detail = hc(conn_url(proxy))
+                apply_result(proxy, ok, detail)
+                db.commit()
+                if ok:
+                    recovered += 1
+                else:
+                    still_down += 1
+            logger.info("static reactivation sweep: %d checked, %d recovered, %d still down",
+                       len(candidates), recovered, still_down)
+        except Exception:
+            logger.warning("static reactivation sweep failed; continuing", exc_info=True)
+
+    # ── Phase 8 (D-NEW-2): F5 orphaned proxy-lease reconciliation ──────────────
+    # Operator decision (Phase 8): reconcile leases whose worker is non-RUNNING and whose lease is
+    # older than 300s; the sweep itself runs no more often than that same 300s -- one operator-
+    # supplied number used for both the sweep's own cadence and the query's age threshold, not two
+    # independently invented values (see Phase 8 report for the reasoning).
+    _LEASE_RECONCILE_GRACE = 300.0
+    _LEASE_RECONCILE_EVERY = 300.0
+
+    def _reconcile_orphaned_leases(self, db, now: datetime) -> None:
+        """F5 (FAILURE_MODES.md): every existing release path is edge-triggered -- a worker's own
+        terminal event, or one of the three RUNNING-only reap paths above. Two confirmed paths leak a
+        lease past all of them: `events.py`'s `_release_on_terminal` swallows any exception from
+        `release_worker_resources` with no retry, and `_do_launch_worker`'s launch-failure handler
+        (apps/hub/main.py) sets a worker FAILED directly after a successful lease WITHOUT releasing
+        it -- that worker never touches RUNNING at all, so the reap paths above never see it.
+
+        Reuses `release_worker_resources` (via the existing `_release_worker_resources` wrapper the
+        three reap paths already call) -- no second, lease-only release path. Idempotent by
+        construction: `release_proxy`'s own `WHERE released_at IS NULL` makes a repeat call on an
+        already-released lease a no-op, so a lease released by the worker's own terminal event
+        between this sweep's query and its release call is simply not re-released, not double
+        counted as an error."""
+        last = getattr(self, "_last_lease_reconcile", 0.0)
+        if time.time() - last < self._LEASE_RECONCILE_EVERY:
+            return
+        self._last_lease_reconcile = time.time()
+        try:
+            from libs.proxies import find_orphaned_worker_ids
+
+            worker_ids = find_orphaned_worker_ids(db, self._LEASE_RECONCILE_GRACE, now=now)
+            for worker_id in worker_ids:
+                self._release_worker_resources(db, worker_id)
+            if worker_ids:
+                logger.info("lease reconciliation: released %d orphaned worker(s): %s",
+                           len(worker_ids), ", ".join(worker_ids))
+        except Exception:
+            logger.warning("lease reconciliation sweep failed; continuing", exc_info=True)
 
     # ── settings helpers ──────────────────────────────────────────────────────
     def _effective_booking_setting(self, db, bk: M.Booking, key: str, default):

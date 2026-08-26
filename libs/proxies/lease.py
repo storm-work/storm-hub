@@ -12,9 +12,9 @@ import re as _re
 
 import random
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import and_, case, func, select
+from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.orm import Session
 
 from libs.db import models as M
@@ -229,7 +229,7 @@ def _active_lease_counts(db: Session) -> dict[str, int]:
 
 
 def _candidate_query(provider: str, kind: str | None, exclude_ids: set[str] | None,
-                     geos: set[str] | None = None):
+                     geos: set[str] | None = None, resource_type: str | None = None):
     """Least-recently-used first -- this ordering IS the pool cursor.
 
     It used to be (score DESC, created_at ASC): fully deterministic, so every lease walked the pool
@@ -291,11 +291,30 @@ def _candidate_query(provider: str, kind: str | None, exclude_ids: set[str] | No
     )
     q = (
         select(M.Proxy)
-        .where(M.Proxy.provider == provider, M.Proxy.active.is_(True))
+        .where(
+            M.Proxy.provider == provider, M.Proxy.active.is_(True),
+            # Phase 3 (D32): everything above this line is correct ONLY for a rotating session
+            # template (D19) -- a static/ISP row is a genuinely finite resource, where a failed
+            # probe means THIS resource is bad, not "an exit behind it moved." Scope the
+            # never-filter-on-health rule to resource_type='rotating' explicitly; a static row with
+            # is_healthy=False is excluded. Every row in the pool is 'rotating' as of this change
+            # (no static inventory exists), so this is a no-op today and only takes effect once a
+            # static row is actually imported.
+            or_(M.Proxy.resource_type != "static", M.Proxy.is_healthy.is_(True)),
+        )
         .order_by(_tier.asc(),
                   M.Proxy.last_used_at.asc().nullsfirst(),
                   M.Proxy.score.desc(), M.Proxy.created_at.asc())
     )
+    if resource_type:
+        # Phase 5 (D33 follow-up): an explicit, exact-match requirement -- not the D19 "health is
+        # never a filter" scoping already applied above. That scoping only EXCLUDES an unhealthy
+        # static row from an otherwise-mixed pool; it never REQUIRES resource_type='static'. Without
+        # this, a caller asking for the static hold pool could still be handed a rotating row simply
+        # because one sorted first (proven-good/LRU), silently defeating the whole point of the
+        # static-only guarantee. Optional and unused by every pre-Phase-5 caller, so this changes no
+        # existing behavior for any rotating-only query.
+        q = q.where(M.Proxy.resource_type == resource_type)
     if kind:
         q = q.where(M.Proxy.kind == kind)
     if geos:
@@ -331,12 +350,19 @@ def _claim_locked(db: Session, proxy_id: str, worker_id: str, is_pg: bool,
 def lease_proxy(db: Session, worker_id: str, provider: str, *, kind: str | None = None,
                 exclude_ids: set[str] | None = None, health_check=None,
                 max_probes: int = 5, geos: set[str] | None = None,
-                quick_screen=None) -> tuple[M.Proxy, str]:
+                quick_screen=None, resource_type: str | None = None) -> tuple[M.Proxy, str]:
     """Lease a healthy proxy of `provider` (e.g. 'soax' or 'webshare') with free capacity. Returns
     (proxy, conn_url). Raises ProxyLeaseError if the pool is exhausted. `exclude_ids` (P3, proxy
     rotation): a worker asking the Hub to ROTATE off a proxy must not just get handed the same one
     back -- without this, a still-has-capacity proxy sorted first by score/created_at is exactly what
     a rotation request would otherwise re-lease, defeating the point of asking for a fresh one.
+
+    `resource_type` (Phase 5): an optional exact-match requirement, e.g. `"static"` for the hold pool
+    when the resolved configuration requires it. `None` (the default, every pre-Phase-5 caller) means
+    no constraint -- identical to today's behavior. This is NOT the same thing as D19's health-filter
+    scoping in `_candidate_query`, which only ever EXCLUDES an unhealthy static row from an otherwise
+    mixed pool; without this explicit requirement, a mixed pool could still hand back a perfectly
+    healthy ROTATING row for a request that specifically needed a static one.
 
     `geos` restricts selection to those exit countries (PROXY_GEOS). Login success against this
     portal varies ~8x by geo -- DE 23.7% / IT 23.4% / PT 10.8% / NL 10.6% / ES 8.1% / LU 4.9% /
@@ -372,7 +398,7 @@ def lease_proxy(db: Session, worker_id: str, provider: str, *, kind: str | None 
 
     if health_check is None:
         counts = _active_lease_counts(db)
-        q = _candidate_query(provider, kind, exclude_ids, geos)
+        q = _candidate_query(provider, kind, exclude_ids, geos, resource_type)
         if is_pg:
             q = q.with_for_update(skip_locked=True)
         for proxy in db.scalars(q):
@@ -387,7 +413,7 @@ def lease_proxy(db: Session, worker_id: str, provider: str, *, kind: str | None 
     from .health import apply_result
 
     counts = _active_lease_counts(db)
-    q = _candidate_query(provider, kind, exclude_ids, geos)   # no lock -- see docstring
+    q = _candidate_query(provider, kind, exclude_ids, geos, resource_type)   # no lock -- see docstring
     unhealthy = 0     # candidates that FAILED their probe -- the pool-badness signal max_probes bounds
     lost_races = 0    # healthy candidates a concurrent leaser claimed first -- NOT pool badness
     probes = 0        # browser probes actually run -- the real cost ceiling
@@ -504,3 +530,76 @@ def release_worker_resources(db: Session, worker_id: str, bus=None) -> None:
     db.commit()
     if bus is not None:
         bus.delete_worker_stream(worker_id)
+
+
+# ── Phase 8 (D-NEW-1): static resource reactivation candidates ────────────────────────────────
+def find_reactivation_candidates(db: Session) -> list[M.Proxy]:
+    """`resource_type='static'` rows `_candidate_query` currently excludes outright (D33's health
+    scoping, `lease.py:_candidate_query`'s `or_(resource_type != 'static', is_healthy)` clause) --
+    the set that will never be leased again until something clears `is_healthy`.
+
+    Ordered oldest-failed-first via `last_used_at` with NO new persisted state: `last_used_at` is
+    stamped on every lease AND every probe attempt (see `_candidate_query`'s own docstring), and
+    once a static row is excluded, NOTHING ever selects it again to touch that column -- the
+    exclusion itself freezes `last_used_at` at exactly the last failed-probe timestamp. So
+    `ORDER BY last_used_at ASC NULLS FIRST` is already "longest still down first" for a row that has
+    never been probed at all (NULL) or has been down since its most recent failure -- no
+    `unhealthy_since` column, no retry counter, nothing new (Phase 7, D-NEW-1)."""
+    q = (
+        select(M.Proxy)
+        .where(M.Proxy.resource_type == "static", M.Proxy.active.is_(True),
+               M.Proxy.is_healthy.is_(False))
+        .order_by(M.Proxy.last_used_at.asc().nullsfirst())
+    )
+    return list(db.scalars(q).all())
+
+
+# ── Phase 8 (D-NEW-2): F5 orphaned-lease reconciliation ────────────────────────────────────────
+def find_orphaned_worker_ids(db: Session, grace_seconds: float, *,
+                              now: datetime | None = None) -> list[str]:
+    """Worker ids holding at least one active (`released_at IS NULL`) proxy lease whose OWNING
+    worker is not RUNNING, aged past `grace_seconds` since the lease was claimed (`leased_at`).
+
+    `now` is injectable and defaults to the real current time -- matching every other time-driven
+    method in `apps/hub/scheduler.py` (`_reap_dead_workers(self, db, now)` etc.), which compute `now`
+    ONCE per tick and thread it through explicitly rather than letting each mechanism call
+    `datetime.now()` independently. Needed for deterministic grace-boundary tests, not just style.
+
+    `Worker.status == RUNNING` is this codebase's own, only definition of "live" -- it is exactly
+    the predicate the scheduler's three existing reap paths (`_reap_dead_workers` etc.) already scan
+    against, not a new interpretation.
+
+    Two confirmed, distinct leak paths produce exactly this signature (`FAILURE_MODES.md` F5, "0
+    running workers"), traced in Phase 7:
+      1. `events.py`'s `_release_on_terminal` runs inside a try/except that logs and discards any
+         exception from `release_worker_resources`, with no retry -- a transient failure there
+         orphans the lease even though the worker reached its correct terminal status.
+      2. `apps/hub/main.py:_do_launch_worker`'s launch-failure handler sets `status=FAILED` directly
+         after a successful lease, WITHOUT releasing it, and the worker never touches RUNNING at all
+         -- invisible to every one of the three RUNNING-only reap paths, forever, with no existing
+         safety net.
+
+    `grace_seconds` guards two legitimate in-flight cases neither of which is a leak: a worker mid
+    launch (leased, `status` still READY, about to flip to RUNNING) and a worker whose own
+    terminal-event release is still in flight on the event-consumer thread. `leased_at` (not a new
+    column -- stamped at claim time by every `lease_proxy` code path already) is the age reference,
+    not a worker-side timestamp: `TimestampMixin` gives `Worker` no `updated_at`, and `leased_at`
+    is what's actually being asked "is this old enough to no longer be in-flight."
+
+    Returns worker ids, not lease rows -- the caller reuses `release_worker_resources` per worker
+    (releases every resource that worker holds, proxy AND slot, in one already-tested call), not a
+    new lease-only release path."""
+    from libs.domain.enums import WorkerStatus
+
+    cutoff = (now or datetime.now(timezone.utc)) - timedelta(seconds=grace_seconds)
+    q = (
+        select(M.ProxyLease.worker_id)
+        .join(M.Worker, M.Worker.id == M.ProxyLease.worker_id)
+        .where(
+            M.ProxyLease.released_at.is_(None),
+            M.Worker.status != WorkerStatus.RUNNING,
+            M.ProxyLease.leased_at < cutoff,
+        )
+        .distinct()
+    )
+    return list(db.scalars(q).all())

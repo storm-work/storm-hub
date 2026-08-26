@@ -217,13 +217,23 @@ class EventHub:
         provider") for a rotation and gets back a proxy drawn from the pool matching its CURRENT
         phase -- PROXY_PROVIDER/PROXY_KIND (the same settings _do_launch_worker's phase-1 lease
         uses) during "warmup", HOLD_PROXY_PROVIDER/HOLD_PROXY_KIND (its phase-2 lease settings)
-        during "hold" -- with identical pool selection whether or not HOLD_SWAP_AFTER_FOUND is
-        actually on (LiveEngineOps.do_swap() flips the worker's tracked phase to "hold"
-        unconditionally, per the operator's explicit requirement: "it will not be different when
-        swap is off"). The worker process is deliberately DB-less (apps/worker/__main__.py's own
-        constraint), so it can't lease a row itself -- this round-trips through the same event/
-        command bus slot assignment already uses. Called off the event-consumer's own thread (see
-        __init__'s _proxy_executor) since the live health probe below can take several seconds.
+        during "hold" -- with identical provider/kind/geo selection whether or not
+        HOLD_SWAP_AFTER_WARMUP is actually on (LiveEngineOps.do_swap() flips the worker's tracked
+        phase to "hold" unconditionally, per the operator's explicit requirement: "it will not be
+        different when swap is off"). The worker process is deliberately DB-less (apps/worker/
+        __main__.py's own constraint), so it can't lease a row itself -- this round-trips through the
+        same event/command bus slot assignment already uses. Called off the event-consumer's own
+        thread (see __init__'s _proxy_executor) since the live health probe below can take several
+        seconds.
+
+        Phase 5: settings resolution now includes the WORKER layer (matching _do_launch_worker), and
+        a "hold" request additionally requires `resource_type='static'` on the lease whenever the
+        resolved HOLD_SWAP_AFTER_WARMUP is on -- mirroring _do_launch_worker's own launch-time
+        requirement exactly, so the guarantee "the post-swap pool is static" survives every
+        subsequent rotation, not just the worker's first hold-proxy assignment. No rotating fallback:
+        if no static candidate exists, the request fails cleanly via `proxy_unavailable` (below) --
+        the SAME failure shape as any other pool exhaustion, just with the constraint named in the
+        reason string.
 
         P4 -- live pre-lease screening (operator-specified, 2026-08-13): before handing back a
         candidate, check it against the real portal (libs/proxies/health.check_proxy by default,
@@ -266,16 +276,29 @@ class EventHub:
                 tpl = db.get(M.WorkerTemplate, w.template_id)
                 if tpl:
                     layers[L.TEMPLATE] = (tpl.settings_json or {})
+            # Phase 5: the WORKER layer's one input source (same as _do_launch_worker) -- without
+            # this, a worker's proxy-setting override applied at launch silently stopped applying the
+            # instant a mid-hold rotation ran, resolving BOOKING/TEMPLATE/GLOBAL only.
+            if w.settings_json:
+                layers[L.WORKER] = w.settings_json
             eff = resolve(layers)
 
+            # Phase 5 (D33 follow-up): a hold-phase request whose resolved configuration requires the
+            # swap must also require resource_type='static' on the lease -- otherwise a mid-hold
+            # rotation can silently hand back a rotating proxy for a pool that was static-only at
+            # launch, defeating the guarantee _do_launch_worker enforces at the very first lease.
+            # Matches _do_launch_worker's own gate (main.py) exactly.
+            hold_required = bool(eff.get("HOLD_SWAP_AFTER_WARMUP", False))
             if phase == "hold":
                 provider = str(eff.get("HOLD_PROXY_PROVIDER", "soax"))
                 kind = eff.get("HOLD_PROXY_KIND") or None
                 geo_setting = eff.get("HOLD_PROXY_GEOS")
+                resource_type = "static" if hold_required else None
             else:
                 provider = str(eff.get("PROXY_PROVIDER", "soax"))
                 kind = eff.get("PROXY_KIND") or None
                 geo_setting = eff.get("PROXY_GEOS")
+                resource_type = None
             # A rotation must honour the same geo restriction as the original lease -- otherwise the
             # first proxy failure quietly drops the worker back into the full pool, and the geos
             # that clear the login wall stop being the ones it uses.
@@ -293,13 +316,18 @@ class EventHub:
 
             try:
                 proxy, url = lease_proxy(db, worker_id, provider=provider, kind=kind,
-                                         exclude_ids=old_proxy_ids, health_check=hc, quick_screen=_quick_screen, geos=geos)
+                                         exclude_ids=old_proxy_ids, health_check=hc, quick_screen=_quick_screen,
+                                         geos=geos, resource_type=resource_type)
             except ProxyLeaseError:
                 try:
                     proxy, url = lease_proxy(db, worker_id, provider=provider, kind=kind,
-                                             health_check=hc, quick_screen=_quick_screen, geos=geos)
+                                             health_check=hc, quick_screen=_quick_screen, geos=geos,
+                                             resource_type=resource_type)
                 except ProxyLeaseError as e:
-                    bus.send_command(worker_id, "proxy_unavailable", reason=str(e))
+                    detail = str(e)
+                    if resource_type:
+                        detail = f"{detail} (resource_type={resource_type!r} required, no rotating fallback)"
+                    bus.send_command(worker_id, "proxy_unavailable", reason=detail)
                     return
 
             from datetime import datetime, timezone
@@ -313,7 +341,9 @@ class EventHub:
             if released_any:
                 db.commit()
 
-            bus.send_command(worker_id, "proxy_assigned", proxy=url)
+            # Phase 5: carries the fact, not the row -- lets the worker refuse to locally roll a
+            # static hold identity (D1: no DB access) without giving it any DB-shaped state.
+            bus.send_command(worker_id, "proxy_assigned", proxy=url, resource_type=proxy.resource_type)
         finally:
             db.close()
 

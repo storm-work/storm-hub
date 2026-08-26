@@ -1,6 +1,8 @@
 """LiveEngineOps -- construction, protocol conformance, and pure-logic unit tests. No real browser or
 network calls (that's Phase E's live-gated tier); this covers what's testable offline: the response
 classification, the discovery outcome shaping, and that the class actually satisfies EngineOps."""
+import pytest
+
 from libs.domain.enums import SettingsLayer as L
 from libs.domain.settings import resolve
 from libs.engine.config import EngineConfig
@@ -159,6 +161,71 @@ def test_do_swap_retries_with_fresh_proxy_and_succeeds_on_final_attempt(monkeypa
     assert ops.hold_proxy == "http://u:p@freshhold:8888"
 
 
+# ── Phase 5 (D33 follow-up): a static hold identity must never be locally transformed by
+# roll_sticky_session -- only a rotating one may be. ────────────────────────────────────────────────
+def test_do_swap_retry_still_rolls_a_rotating_hold_proxy(monkeypatch):
+    """Invariant D: rotating hold resources keep their previous local-rolling behavior exactly.
+    Webshare-grammar credential (trailing numeric session id) so roll_sticky_session actually
+    changes it -- the FIRST retry must use a locally-rolled credential, never touch the Hub at all."""
+    import apps.worker.ops_live as ops_live_mod
+
+    sessions = [_FakeSession(alive=False), _FakeSession(alive=True)]
+    calls = []
+
+    def _spy(**kw):
+        calls.append(kw["proxy"])
+        return sessions[len(calls) - 1]
+
+    monkeypatch.setattr(ops_live_mod, "get_session", _spy)
+    signals = _RotationSignals(proxy="http://sodade2026-99:pw@hold.example:80", resource_type="static")
+    ops = _make_ops(cfg=_cfg(HOLD_SWAP_AFTER_WARMUP=True, HOLD_SWAP_RETRIES=1,
+                             HOLD_SWAP_RETRY_HOLD_SECS=0.0),
+                    hold_proxy="http://sodade2026-51:pw@hold.example:80",
+                    hold_proxy_static=False, emit=lambda t, **p: None, signals=signals)
+    ops.session = _FakeSession()
+
+    result = ops.do_swap()
+
+    assert result is not None and result.startswith("hold.example:80#")   # rolled -- carries a sid
+    assert calls[0] == "http://sodade2026-51:pw@hold.example:80"        # attempt 1: original
+    assert calls[1].startswith("http://sodade2026-") and calls[1] != calls[0]  # attempt 2: ROLLED
+    assert calls[1].endswith("@hold.example:80")   # same endpoint -- a local transform, not a lease
+    assert signals.calls == 0   # the Hub was never asked -- rolling succeeded first, as before
+    assert ops.hold_proxy == calls[1]
+
+
+def test_do_swap_retry_never_rolls_a_static_hold_proxy(monkeypatch):
+    """Invariant C: a static hold identity is never passed through roll_sticky_session. Same
+    webshare-grammar credential as the rotating test above -- roll_sticky_session WOULD succeed on
+    it syntactically, which is exactly why hold_proxy_static must gate the call, not rely on the
+    roller declining. With the flag set, the retry must skip straight to the Hub."""
+    import apps.worker.ops_live as ops_live_mod
+
+    sessions = [_FakeSession(alive=False), _FakeSession(alive=True)]
+    calls = []
+
+    def _spy(**kw):
+        calls.append(kw["proxy"])
+        return sessions[len(calls) - 1]
+
+    monkeypatch.setattr(ops_live_mod, "get_session", _spy)
+    signals = _RotationSignals(proxy="http://freshstatic:pw@static.example:80", resource_type="static")
+    ops = _make_ops(cfg=_cfg(HOLD_SWAP_AFTER_WARMUP=True, HOLD_SWAP_RETRIES=1,
+                             HOLD_SWAP_RETRY_HOLD_SECS=0.0),
+                    hold_proxy="http://sodade2026-51:pw@hold.example:80",
+                    hold_proxy_static=True, emit=lambda t, **p: None, signals=signals)
+    ops.session = _FakeSession()
+
+    result = ops.do_swap()
+
+    assert result == "static.example:80"
+    assert calls[0] == "http://sodade2026-51:pw@hold.example:80"                # attempt 1: original
+    assert calls[1] == "http://freshstatic:pw@static.example:80"                # attempt 2: from the HUB
+    assert signals.calls == 1   # the Hub WAS asked -- no local roll was ever attempted
+    assert ops.hold_proxy == "http://freshstatic:pw@static.example:80"
+    assert ops.hold_proxy_static is True   # still marked static after the fresh lease
+
+
 def test_do_swap_gives_up_after_exhausting_retries_never_stops_worker(monkeypatch):
     import apps.worker.ops_live as ops_live_mod
 
@@ -236,17 +303,18 @@ def test_do_swap_passes_stable_fp_seed(monkeypatch):
 # proxy row itself ────────────────────────────────────────────────────────────────────────────────
 class _RotationSignals:
     """Fake BusSignals exposing only wait_proxy -- the round-trip _request_proxy_rotation blocks on."""
-    def __init__(self, ok=True, proxy=None, reason="pool exhausted"):
+    def __init__(self, ok=True, proxy=None, reason="pool exhausted", resource_type=None):
         self._ok = ok
         self._proxy = proxy
         self._reason = reason
+        self._resource_type = resource_type
         self.calls = 0
         self.stopped = False   # matches real BusSignals' contract; is_stopped() reads this
 
     def wait_proxy(self, timeout=30):
         self.calls += 1
         if self._ok:
-            return {"ok": True, "proxy": self._proxy}
+            return {"ok": True, "proxy": self._proxy, "resource_type": self._resource_type}
         return {"ok": False, "reason": self._reason}
 
 
@@ -275,6 +343,52 @@ def test_request_proxy_rotation_defaults_phase_to_current_phase():
 def test_request_proxy_rotation_returns_none_when_pool_exhausted():
     ops = _make_ops(emit=lambda t, **p: None, signals=_RotationSignals(ok=False))
     assert ops._request_proxy_rotation("warmup") is None
+
+
+# ── Phase 5: the failure reason used to be generated by the Hub and then silently discarded here --
+# the single biggest "why did this fail" gap in the proxy subsystem (Phase 4 finding). ──────────────
+def test_request_proxy_rotation_logs_the_discarded_reason_on_failure():
+    logged = []
+    ops = _make_ops(emit=lambda t, **p: None,
+                    signals=_RotationSignals(ok=False, reason="no static resource available"))
+    ops._log = lambda t: logged.append(t)
+    assert ops._request_proxy_rotation("hold") is None
+    assert any("no static resource available" in line for line in logged)
+
+
+def test_request_proxy_rotation_logs_nothing_extra_when_bus_not_wired():
+    """No signals wired -> returns None immediately, before any reason could exist. Must not log a
+    spurious/blank failure line."""
+    logged = []
+    ops = _make_ops()
+    ops._log = lambda t: logged.append(t)
+    assert ops._request_proxy_rotation("hold") is None
+    assert logged == []
+
+
+# ── Phase 5: resource_type rides the Hub's proxy_assigned reply so the worker can tell a static hold
+# assignment apart from a rotating one without any DB access (D1) -- used only to decide whether
+# do_swap()'s retry ladder may locally roll the credential. ──────────────────────────────────────────
+def test_request_proxy_rotation_sets_hold_proxy_static_true_from_hub_reply():
+    ops = _make_ops(emit=lambda t, **p: None,
+                    signals=_RotationSignals(proxy="http://u:p@fresh:80", resource_type="static"))
+    assert ops.hold_proxy_static is False   # default
+    assert ops._request_proxy_rotation("hold") == "http://u:p@fresh:80"
+    assert ops.hold_proxy_static is True
+
+
+def test_request_proxy_rotation_sets_hold_proxy_static_false_when_hub_says_rotating():
+    ops = _make_ops(emit=lambda t, **p: None, hold_proxy_static=True,
+                    signals=_RotationSignals(proxy="http://u:p@fresh:80", resource_type="rotating"))
+    assert ops._request_proxy_rotation("hold") == "http://u:p@fresh:80"
+    assert ops.hold_proxy_static is False   # follows the Hub's answer, not left stale from before
+
+
+def test_request_proxy_rotation_warmup_phase_never_touches_hold_proxy_static():
+    ops = _make_ops(emit=lambda t, **p: None, hold_proxy_static=True,
+                    signals=_RotationSignals(proxy="http://u:p@fresh:80", resource_type=None))
+    assert ops._request_proxy_rotation("warmup") == "http://u:p@fresh:80"
+    assert ops.hold_proxy_static is True   # unrelated pool -- untouched
 
 
 def test_do_swap_does_not_touch_the_pool_phase_when_swap_is_off():
@@ -1470,11 +1584,19 @@ def test_swap_on_moves_the_worker_to_the_hold_pool(monkeypatch):
     assert ops._current_phase == "hold"
 
 
-def test_the_deprecated_setting_name_still_enables_the_swap():
-    """HOLD_SWAP_AFTER_FOUND named a trigger point the code never had -- the swap has always fired
-    right after warmup. The key is kept working because removing one an operator already stored
-    makes the resolver reject the whole layer and breaks every launch."""
-    cfg = _cfg(HOLD_SWAP_AFTER_FOUND=True)
+def test_the_old_setting_name_is_no_longer_accepted():
+    """Phase 6: HOLD_SWAP_AFTER_FOUND named a trigger point the code never had, and was never a
+    supported alias/compatibility mechanism -- it was removed outright, not reconciled with
+    HOLD_SWAP_AFTER_WARMUP. A template that still names it must fail to resolve at all (the same
+    UnknownSetting every other unrecognised key produces), not silently enable the swap."""
+    from libs.domain.settings.resolver import SettingsError
+
+    with pytest.raises(SettingsError):
+        _cfg(HOLD_SWAP_AFTER_FOUND=True)
+
+
+def test_hold_swap_after_warmup_is_the_sole_setting_that_enables_the_swap():
+    cfg = _cfg(HOLD_SWAP_AFTER_WARMUP=True)
     assert cfg.hold_swap.swap_after_warmup is True
 
 
@@ -1537,6 +1659,170 @@ def test_an_unwarmed_worker_still_probes_home():
     ops = _keepalive_ops(_SCHED_OK, warmed=False)
     ops._do_keepalive("test")
     assert ops.session.navs and "Schedule.jsp" not in ops.session.navs[0]
+
+
+# ── explicit session-state classifier (F21-F26) ────────────────────────────────────────────────
+# The keepalive loop used to discard the very evidence it fetched: a logged-out home page returned
+# HTTP 200 and was read as healthy (F23), a lapsed Schedule.jsp was always treated as a lapsed FORM
+# even when the real cause was a dead SESSION (F24), a portal-busy page fell into that same bucket
+# (F25), and no response had a name for "we don't actually know" (F26). classify_session_state is
+# the fix: a pure function, tested here directly, with no session/browser fixture needed.
+from apps.worker.ops_live import SessionState, classify_session_state  # noqa: E402
+
+_HOME_AUTHENTICATED = ("<html><body>solicitar pedido de visto ... consultar pedidos ... "
+                       "terminar sessão</body></html>")
+_HOME_LOGGED_OUT = "<html><body>solicitar pedido de visto ... iniciar sessão</body></html>"
+_SCHED_BUSY = ("<html><body>Não foi possível de momento concretizar o seu pedido, "
+               "por favor tente mais tarde.</body></html>")
+
+
+def test_classify_authenticated_home_page():
+    assert classify_session_state(_HOME_AUTHENTICATED, "https://x/VistosOnline/",
+                                  warmed=False) == SessionState.AUTHENTICATED
+
+
+def test_classify_authenticated_schedule_page():
+    assert classify_session_state(_SCHED_OK, "https://x/VistosOnline/Schedule.jsp",
+                                  warmed=True) == SessionState.AUTHENTICATED
+
+
+def test_classify_sessionlost_redirect_is_session_expired():
+    """F22: sessionLost.jsp is recognised nowhere in production today -- this is the fix."""
+    assert classify_session_state("<html>anything</html>",
+                                  "https://x/VistosOnline/sessionLost.jsp",
+                                  warmed=True) == SessionState.SESSION_EXPIRED
+    assert classify_session_state("<html>anything</html>",
+                                  "https://x/VistosOnline/sessionLost.jsp",
+                                  warmed=False) == SessionState.SESSION_EXPIRED
+
+
+def test_classify_authentication_jsp_redirect_is_session_expired():
+    assert classify_session_state("<html>login form</html>",
+                                  "https://x/VistosOnline/Authentication.jsp",
+                                  warmed=True) == SessionState.SESSION_EXPIRED
+
+
+def test_classify_portal_busy_page_is_portal_error_not_form_lapse():
+    """F25: a busy portal must not be misread as a lapsed form."""
+    assert classify_session_state(_SCHED_BUSY, "https://x/VistosOnline/Schedule.jsp",
+                                  warmed=True) == SessionState.PORTAL_ERROR
+
+
+def test_classify_unrecognised_warmed_page_is_unknown_not_expired():
+    """F26: absence of the schedule markers is UNKNOWN, never silently promoted to SESSION_EXPIRED
+    -- that verdict is reserved for actual expiry evidence (sessionLost/Authentication.jsp
+    redirect, or the home page's own measured discriminator)."""
+    assert classify_session_state("<html>no markers here</html>",
+                                  "https://x/VistosOnline/Schedule.jsp",
+                                  warmed=True) == SessionState.UNKNOWN
+
+
+def test_classify_unrecognised_home_page_is_unknown():
+    assert classify_session_state("<html>completely unrelated content</html>",
+                                  "https://x/VistosOnline/",
+                                  warmed=False) == SessionState.UNKNOWN
+
+
+def test_classify_public_marker_alone_is_session_expired_not_authenticated():
+    """The F23 regression test: this is the EXACT logged-out home signature (58,266B in
+    production -- only the public menu item, never the auth-gated one). It must never classify
+    AUTHENTICATED just because the navigation succeeded and returned a non-empty page."""
+    assert classify_session_state(_HOME_LOGGED_OUT, "https://x/VistosOnline/",
+                                  warmed=False) == SessionState.SESSION_EXPIRED
+
+
+def test_classify_non_empty_body_alone_is_not_authenticated():
+    """A non-empty, unrecognised body must not be read as 'logged in' -- only the specific
+    positive markers do that."""
+    assert classify_session_state("<html>some perfectly normal-looking but irrelevant page</html>",
+                                  "https://x/VistosOnline/",
+                                  warmed=False) != SessionState.AUTHENTICATED
+
+
+# ── _do_keepalive wired to the classifier -- integration-level, exercises the real branches ────
+class _RedirectingKeepaliveSession(_KeepaliveSession):
+    """Like _KeepaliveSession, but browser_nav can report a DIFFERENT final URL than the one
+    requested -- simulating a server-side redirect (sessionLost.jsp, Authentication.jsp)."""
+    def __init__(self, page, final_url=None):
+        super().__init__(page)
+        self._final_url = final_url
+
+    def browser_nav(self, url, timeout=30, **kw):
+        self.navs.append(url)
+        return self._final_url or url
+
+
+def test_session_expired_triggers_reauth_not_rewarm():
+    """F24's fix, exercised end to end: a Schedule.jsp probe that redirected to sessionLost.jsp
+    must re-authenticate, and must NEVER call _run_warmup_steps (there is no session left to warm
+    against)."""
+    ops = _keepalive_ops("<html>session gone</html>")
+    ops.session = _RedirectingKeepaliveSession(
+        "<html>session gone</html>", final_url="https://x/VistosOnline/sessionLost.jsp")
+    ops._run_warmup_steps = lambda: pytest.fail("must not re-warm a dead session")
+    restore_calls = []
+    ops._attempt_keepalive_restore = lambda context="": restore_calls.append(context)
+    ops._do_keepalive("test")
+    assert restore_calls == ["test"]
+
+
+def test_portal_busy_backs_off_without_rewarm_or_relogin():
+    """F25's fix: a busy portal must not re-warm (cannot succeed) and must not re-login (would
+    burn a CAPTCHA solve on a condition unrelated to our credentials)."""
+    ops = _keepalive_ops(_SCHED_BUSY)
+    ops._run_warmup_steps = lambda: pytest.fail("must not re-warm against a busy portal")
+    ops._attempt_keepalive_restore = lambda context="": pytest.fail("must not re-login on a busy portal")
+    ops._do_keepalive("test")   # must return cleanly, doing neither
+
+
+def test_prewarm_logged_out_home_is_no_longer_read_as_healthy():
+    """THE F23 regression test. Before this fix, _do_keepalive never read the pre-warm home page's
+    body at all -- a successful nav alone reset the dead-streak and logged 'probe OK', so a worker
+    that lost its session before ever warming held indefinitely, reporting healthy, and was counted
+    by the Hub as ready capacity."""
+    ops = _keepalive_ops(_HOME_LOGGED_OUT, warmed=False)
+    restore_calls = []
+    ops._attempt_keepalive_restore = lambda context="": restore_calls.append(context)
+    logged = []
+    ops._log = logged.append
+    ops._do_keepalive("test")
+    assert restore_calls == ["test"], "a logged-out pre-warm home must trigger re-authentication"
+    assert not any("probe OK" in m for m in logged), "must never report healthy on a dead session"
+
+
+def test_prewarm_authenticated_home_still_reports_healthy():
+    """The positive case, so the fix above isn't just inverting the polarity: a genuinely
+    authenticated pre-warm home page must still be treated as healthy."""
+    ops = _keepalive_ops(_HOME_AUTHENTICATED, warmed=False)
+    ops._attempt_keepalive_restore = lambda context="": pytest.fail("must not re-auth a healthy session")
+    events = []
+    ops._emit = lambda t, **p: events.append((t, p))
+    ops._do_keepalive("test")
+    assert any(t == "log_line" and "probe OK" in p.get("text", "") for t, p in events)
+
+
+def test_unrecognised_prewarm_response_is_inconclusive_not_healthy_not_dead():
+    """F26: UNKNOWN must not be silently absorbed into either healthy or dead -- it does nothing
+    and waits for the next cycle, which is the bounded 'don't guess' behaviour the spec calls for."""
+    ops = _keepalive_ops("<html>a page that matches none of the known markers</html>", warmed=False)
+    ops._attempt_keepalive_restore = lambda context="": pytest.fail("UNKNOWN must not trigger re-auth")
+    events = []
+    ops._emit = lambda t, **p: events.append((t, p))
+    ops._do_keepalive("test")
+    assert not any(t == "log_line" and "probe OK" in p.get("text", "") for t, p in events), \
+        "UNKNOWN must not be reported as healthy"
+
+
+def test_exit_ip_change_is_informational_and_does_not_override_a_healthy_classification():
+    """Q16 (confirmed): an exit change does not by itself invalidate the portal session. The
+    classifier must never consult _note_exit_ip's result -- an authenticated page stays
+    AUTHENTICATED even when the exit moved this same cycle."""
+    ops = _keepalive_ops(_SCHED_OK)
+    ops._note_exit_ip = lambda when: True   # exit "moved" this cycle
+    ops._run_warmup_steps = lambda: pytest.fail("must not re-warm a healthy schedule page")
+    ops._attempt_keepalive_restore = lambda context="": pytest.fail(
+        "an exit change must never by itself trigger re-authentication")
+    ops._do_keepalive("test")   # must return cleanly: healthy page, exit-change is informational only
 
 
 # ── escalating a re-warm that keeps failing (2026-08-22) ─────────────────────
