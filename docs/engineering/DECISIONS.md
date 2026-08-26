@@ -165,3 +165,17 @@ wherever it appeared.
 challenge* — three things F21 says the worker must tell apart. The Q16 probe classifies it; the
 production classifier in `ops_live.py` does **not** yet. Recorded, not implemented, per the
 analysis-only boundary.
+
+### D26. Persist raw evidence, never conclusions
+Every probe in this project writes its own byte counts, marker lists, URLs and errors, and reports
+re-derive verdicts from those offline (`reclassify()`).
+**Why:** on 2026-08-26 the live classifier accepted any home marker as proof of authentication and
+labelled logged-out pages AUTHENTICATED for 25+ minutes on two arms — a wrong result that was
+reported to the operator before being caught. Because the raw evidence was persisted, the fix cost
+one function and zero re-spent logins. Had the probe stored only its verdicts, the night's data
+would have been unrecoverable.
+
+### D27. A measurement whose vehicle is invalidated is reported as NOT ANSWERED
+Q19's soax transition fired exactly on schedule and still answered nothing, because the session had
+already expired. The result recorded is "not answered, here is why, here is the corrected design" —
+not a verdict extracted from an invalid observation (`CONFIRMED_FACTS.md` §25).

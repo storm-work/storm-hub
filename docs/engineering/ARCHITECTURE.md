@@ -113,14 +113,22 @@ the general fix for a worker that once accrued 56 unconsumed `assign` commands.
 **Corrected 2026-08-25.** These were previously treated as one thing. They are five, and none
 guarantees another. See `CONFIRMED_FACTS.md` §18.
 
-| # | Lifetime | Created by | Bound to | Refreshed by | TTL |
+| # | Lifetime | Known value / range | Evidence | What refreshes it | What ends it |
 |---|---|---|---|---|---|
-| 1 | Portal auth session | `browser_login` | `Vistos_sid` cookie | any authed GET | **UNKNOWN** |
-| 2 | Server-side form state | warmup chain | `Vistos_sid`, server-side | any authed GET on that sid | ~90–120 s, **HYPOTHESIS** |
-| 3 | Proxy session | credential/session id | the credential string | nothing | soax **60 min CONFIRMED**; webshare none observed |
-| 4 | **Proxy exit / IP** | provider binding | provider policy | **nothing — traffic does not hold it** | **unstable, CONFIRMED** |
-| 5 | Browser session | `get_session` | worker process | — | process lifetime |
-| — | Checkpoint file | `save_checkpoint_now` | `identity_id` | overwritten at HOLDING/POLLING | `cleanup_stale` never called |
+| 1 | **Portal auth session** (`Vistos_sid`) | **33-45 min** | MEASURED 2026-08-26, 2 independent sessions (§24) | **nothing we have found** — a 5-min authenticated GET did not extend it | elapsed time; survives a browser change and an IP change |
+| 2 | **Server-side form/draft state** | ~90-120 s | **HYPOTHESIS** — storm-auto's figure, never measured here | any authed GET on that `Vistos_sid` (storm-auto's claim) | idle time; **not** an IP change (§22) |
+| 3 | **Proxy session** (session id) | soax **60.2-63.4 min** (20/20); webshare no ceiling observed | MEASURED, Q1 (§17) | nothing — a hard ceiling on soax | provider policy (`sessionlength`) |
+| 4 | **Proxy exit / IP** | webshare **0.278 changes/session-h** (CI 0.159-0.451); soax bounded by #3 | MEASURED, Q1 (§17) | **nothing — traffic has no effect** | provider-side, independent of our activity |
+| 5 | **Browser session** | process lifetime | CONFIRMED by construction | — | process exit, crash, `close_browser` |
+| — | Checkpoint file | until swept | code | overwritten at HOLDING/POLLING | `cleanup_stale` — which has no production caller |
+
+**These are five independent lifetimes. None guarantees another.** The two that now dominate the
+architecture are #1 (shortest, and nothing we know refreshes it) and #4 (uncontrollable, but
+**harmless to the session** per §22).
+
+**Ordering matters:** #1 (33-45 min) is SHORTER than #3 on soax (60 min). A soax exit can therefore
+never rotate under a live portal session — the session always dies first. That ordering is what
+invalidated Q19's experimental vehicle (§25).
 
 **The invalidated assumption:** *"keeping the session alive also keeps the proxy exit stable."*
 Measured false (§17). Keepalive acts on lifetimes 1 and 2; it has no measurable effect on 4 and

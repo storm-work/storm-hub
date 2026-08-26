@@ -493,3 +493,92 @@ sample generalised too far.
 Because many distinct exits were refused identically, this is **not** exit-reputation and must not
 be diagnosed as one. Successful logins did still occur (3 of 8, in 50.8 s, 63.1 s and 214.1 s), so
 the wall is probabilistic, not closed.
+
+---
+
+## 24. The portal authentication session lives ~33-45 minutes, and traffic does not extend it — Q20, 2026-08-26
+
+**CONFIRMED, two independent sessions.** Raw: `var/session_lifetime.jsonl`; probe:
+`probes/session_lifetime_probe.py --report` (verdicts are re-derived from raw evidence, never
+trusted from the live run — see the classifier bug below).
+
+| arm | provider | probe cadence | last AUTHENTICATED | first LOGGED_OUT | lifetime |
+|---|---|---|---|---|---|
+| `q19_soax_involuntary` | soax | every 5 min | t = 34.2 min | t = 45.0 min | **33-45 min** |
+| `q20_active_ws` | webshare | every 5 min | t = 32.9 min | t = 43.5 min | **33-44 min** |
+| `q20_idle_ws` | webshare | gaps 10/20/30 min | t = 30.8 min | not observed | > 30.8 min |
+
+**Both active sessions died at essentially the same elapsed time despite an authenticated GET every
+five minutes.** Traffic at that cadence does not keep the session alive. Each arm also showed a
+partial page (20,972 B / 9,651 B) at t≈38-40 min, right at the transition.
+
+**The discriminator (measured):** the portal home renders at **59,690 B carrying BOTH**
+`solicitar pedido de visto` and `consultar pedidos` while authenticated, and at **58,266 B carrying
+only** `solicitar pedido de visto` once the session is gone. `solicitar pedido de visto` is a
+PUBLIC menu item; only `consultar pedidos` is auth-gated. There is no inline password field on the
+logged-out home — the login form lives on `Authentication.jsp` — so a password field is useless as
+a negative signal on this page.
+
+### The unresolved confound — state it before using this number
+
+This measurement **cannot yet distinguish**:
+  (a) an **absolute** session lifetime of ~35-40 min that no activity extends, from
+  (b) an **idle** timeout of ~35-40 min where our probe *does not count as activity* — the home
+      page may be served without touching the server-side session.
+Both fit the data exactly. Settling it needs a probe against an **auth-gated** page (the
+`consultar pedidos` target) rather than the home page — see `OPEN_QUESTIONS.md` Q21.
+
+Note what is already true either way: **the keepalive as production runs it navigates `HOME_URL`
+before a worker has warmed**, which is precisely the request whose session-refreshing power is now
+in doubt.
+
+### Limitations
+n=2 for the lifetime figure; one night; both sessions unwarmed (no `ScheduleController` POST, which
+this phase forbids), so this is the **auth** session only. Form-state TTL is untouched and remains a
+HYPOTHESIS. The idle arm produced no expiry observation: its 61.4 min probe was a transport failure
+(its proxy exit had died), so the idle-vs-active question is not settled by it.
+
+---
+
+## 25. Q19 could not be answered — the vehicle was invalidated by fact #24
+
+**NOT ANSWERED. Reported as such rather than forced.**
+
+The plan was sound on the evidence available: Q1 measured that every soax credential loses its exit
+at its `sessionlength` ceiling (20/20, 60.2-63.4 min), so holding an authenticated browser on soax
+past 60 min should produce a genuine involuntary exit transition under a live session.
+
+The transition happened exactly as predicted — **t = 60.9 min, 151.59.4.106 -> 93.44.90.203** — but
+by then the portal session had been dead for ~16 minutes (last authenticated probe t = 34.2 min).
+The observation says nothing about Q19.
+
+**The reason is the finding:** the portal session (~35-45 min) is **shorter than the soax exit
+lifetime (~60 min)**. On soax, an involuntary exit change can therefore *never* occur under a live
+session — the session always dies of old age first. That is a structural fact about the two
+lifetimes, not a failed experiment.
+
+**Corrected design for Q19** (see `OPEN_QUESTIONS.md` Q19): webshare has no fixed ceiling and loses
+an exit at 0.278/session-hour, so from Q1's survival curve roughly 8-17% of sessions move within
+their first 30 minutes — inside the portal session's lifetime. Run N webshare sessions concurrently,
+probe every ~2 min for ~35 min, and catch the sessions whose exit moves while still authenticated.
+At n=6 that is a ~40-65% chance of at least one event, so it is a real experiment with a real chance
+of yielding nothing.
+
+---
+
+## 26. A classifier bug, and why the raw data survived it
+
+**Recorded as a method note, because the recovery is the point.**
+
+The live classifier accepted **any** home marker as proof of authentication. Because
+`solicitar pedido de visto` is public, it reported logged-out pages as AUTHENTICATED for 25+ minutes
+on two arms, and I reported that to the operator before catching it. `ops_live.py`'s own
+`_classify_submit_response` already had the correct rule — `all(m in low for m in _HOME_MARKERS)`.
+
+It was caught by noticing that a "successful" probe was 58,266 B — the exact byte count measured for
+the *logged-out* home page during Q16 — and carried one marker where earlier probes carried two.
+
+**No re-run and no re-spent logins were needed**, because every probe persists its own raw evidence
+(byte count, marker list, password field, final URL). Verdicts are now re-derived offline by
+`reclassify()` and the report never trusts the recorded verdict. **Persisting raw evidence rather
+than conclusions is what made a bad classifier a recoverable error instead of a lost night.**

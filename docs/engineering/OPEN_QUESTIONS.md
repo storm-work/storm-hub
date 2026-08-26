@@ -133,18 +133,40 @@ hold straight through — may be self-inflicted rather than a constraint.
 **Settled by:** provider documentation or a single generated credential at a higher value, probed
 with the existing `proxy_exit_stability_probe.py`. **Do not change the pool to find out.**
 
-### Q19. Does an INVOLUNTARY exit change behave like a deliberate migration?
-Q16 tested a controlled migration: a new browser dialling out from a new address. A live connection
-whose exit moves underneath it is a different event — existing sockets break mid-flight, and the
-page may be left on an error origin (`FAILURE_MODES.md` F3).
-**Why it matters:** Q16 makes Option F look safe. Option F is only actually safe if this is true too.
-**Settled by:** hold a warmed session, force an exit change under it (roll the session id on a live
-worker, or wait out a soax `sessionlength`), then probe — no submit needed, same classifier.
+### Q19. Does an INVOLUNTARY exit change behave like a deliberate migration? — **STILL OPEN**
+Attempted 2026-08-26 and **not answered**; the vehicle was invalidated (`CONFIRMED_FACTS.md` §25).
+The soax exit transition fired exactly as predicted (t=60.9 min) but the portal session had already
+been dead ~16 min, because the session (33-45 min) is shorter than the soax exit (60 min).
 
-### Q20. How long does a portal session live, independent of IP?
-Q16's positive runs all completed within ~70 s. The four archived checkpoints (4.7 h+) all returned
-`sessionLost.jsp`. So the session dies somewhere between ~70 s and 4.7 h — a range spanning two
-orders of magnitude, and it is now the binding constraint on hold duration rather than the exit.
-**Settled by:** hold one authenticated session with keepalive ON, probe on a schedule until
-`sessionLost.jsp` appears. No login beyond the first, no submit. This is the natural successor
-experiment and it subsumes the old Q4.
+**Corrected design:** webshare has no ceiling and loses an exit at 0.278/session-hour, so ~8-17% of
+sessions move within their first 30 min — inside the session's own lifetime. Run ~6 webshare
+sessions concurrently, probe every 2 min for ~35 min, catch any whose exit moves while still
+authenticated. ~40-65% chance of at least one event, so it may legitimately yield nothing.
+
+**Priority note:** this is now a second-order question. It matters for the minority of holds where
+the exit moves inside a 35-minute window; it no longer gates the holding architecture, because #1
+below does.
+
+### Q20. Portal authentication TTL — **ANSWERED 2026-08-26: 33-45 minutes**
+Two independent sessions, different providers, both lost authentication between t=33 and t=45 min
+**despite an authenticated GET every 5 minutes** (`CONFIRMED_FACTS.md` §24).
+
+**This is now the binding constraint on hold duration** — shorter than the soax exit lifetime,
+shorter than every planned hold in §20 except one.
+
+**Unresolved and important:** this cannot yet distinguish an *absolute* ~35-40 min lifetime from an
+*idle* timeout where our home-page GET does not count as activity. See Q21 — and note production's
+pre-warm keepalive navigates exactly that URL.
+
+### Q21. Does an authenticated GET actually refresh the portal session?
+The blocking follow-up to Q20, and cheap. Q20's probe used the portal **home** page, which may be
+served without touching the server-side session — in which case Q20 measured an idle timeout, not an
+absolute lifetime, and a *genuinely* session-touching request might hold a session open indefinitely.
+
+**Why it matters most:** if an auth-gated GET does refresh the session, long holds become possible
+and the keepalive simply needs to request the right URL. If it does not, ~40 minutes is a hard
+ceiling on any held session and the architecture must re-login instead of hold.
+
+**Settled by:** one login, then probe the `consultar pedidos` target (auth-gated) every 5 min past
+the 45-minute mark. If it survives well past 45 min, Q20 measured our probe's inadequacy rather than
+the portal's TTL. No warm, no submit; the same classifier applies.
