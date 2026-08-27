@@ -716,3 +716,44 @@ warning.** That is a worse world than a known TTL — you cannot schedule around
 single fact the holding design must absorb. It is also good news in one respect: sessions are
 capable of lasting 3+ hours (§27), so nothing forces short holds; what is required is *detection and
 recovery*, not a duration budget.
+
+---
+
+## 30. getPeriodosOcupados does NOT renew the form state — 2026-08-27
+
+**CONFIRMED, and it disproves a belief recorded in this project's own settings catalog.**
+
+Two arms, same warm session shape, same 2-minute cadence, different request type. Raw:
+`var/formstate_ttl_discover.jsonl`.
+
+| arm | request polled | last ALIVE | first DEAD |
+|---|---|---|---|
+| `schedule_poll` | `Schedule.jsp` | 4.17 min | **6.12 min** |
+| `discover_poll` | `getPeriodosOcupados` | 4.08 min | **6.08 min** |
+
+**They expire at the same instant** (6.12 vs 6.08 min). Polling the discovery endpoint every two
+minutes preserves the server-side form state no better than polling Schedule.jsp — which
+`CONFIRMED_FACTS.md` §17-adjacent work already showed preserves it not at all.
+
+**What this disproves.** `MONO_BOOKING`'s catalog note claims it is "the practical fix for anchor
+lapse during hold: a worker running its own getPeriodosOcupados rounds keeps the server-side
+booking anchor alive, which a bare keepalive nav does not (147 lapses vs 42 restores, measured
+2026-08-21)." The 147:42 figure is real but **correlational**; this is the controlled test, and the
+causal claim does not survive it.
+
+The likely real mechanism: scouts do not lapse *less* — their discovery **fails fast** once the
+anchor dies (the response degrades in one poll), which trips the keepalive's re-warm sooner. They
+are re-warmed more often, not held alive.
+
+**Post-mortem detail worth keeping.** After the form died the discovery endpoint's response
+degraded in two stages: `192B` (valid, marker present) -> `168B` (marker absent) -> `28,513B` from
+8.1 min onward. That last size matches the portal's "try again later" refusal page measured at
+28,506-28,529B, so a long-dead context eventually gets refused outright rather than merely
+answered emptily.
+
+**`Vistos_sid` was present in every row of both arms, alive and dead** — further confirmation that
+cookie presence is not evidence of a usable form state.
+
+**Architectural consequence.** "Discovery-as-keepalive" is not available. The existing design --
+`discover -> detect expiry -> re-warm` -- is the correct one, and the only mechanism shown to
+restore a lapsed anchor remains a real `_run_warmup_steps()`.

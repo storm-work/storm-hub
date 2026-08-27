@@ -38,6 +38,10 @@ from __future__ import annotations
 import argparse, json, pathlib, sys, threading, time
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
+# One fixed weekday, reused every round by the discovery arm: a changing date must never be
+# mistakable for a changing form state. Format matches do_discover: YYYY/MM/DD.
+_DISCOVER_DATE = "2026/09/08"
+
 
 def observe(ops, tag: str) -> dict:
     """One Schedule.jsp GET + classification. Never raises."""
@@ -74,7 +78,7 @@ def observe(ops, tag: str) -> dict:
     return d
 
 
-def warm_one(arm: str, geo: str, log) -> object | None:
+def warm_one(arm: str, geo: str, log, booking_name: str = "Test2") -> object | None:
     """Real login + warm-up through the production code path. Returns LiveEngineOps or None."""
     from sqlalchemy import select
     from apps.hub.db import SessionLocal
@@ -89,7 +93,11 @@ def warm_one(arm: str, geo: str, log) -> object | None:
     import random as _r
 
     db = SessionLocal()
-    bk = db.scalar(select(M.Booking).where(M.Booking.name == "Test 2032"))
+    bk = db.scalar(select(M.Booking).where(M.Booking.name == booking_name))
+    if bk is None:
+        db.close()
+        log(f"[{arm}] no booking named {booking_name!r} -- cannot source posto/nationality")
+        return None
     eff = resolve({L.GLOBAL: get_global(db), L.BOOKING: (bk.settings_json or {})})
     eff["ROLE"] = "apply"; eff["WARMUP_ONLY"] = True; eff["CAPTURE_ONLY"] = True
     eff["LOGIN_TRANSIENT_RETRY_MAX"] = 10
@@ -146,8 +154,53 @@ def warm_one(arm: str, geo: str, log) -> object | None:
     return None
 
 
-def run_arm(arm, mode, geo, minutes, interval, silent_at, sink, lock, log):
-    ops = warm_one(arm, geo, log)
+def observe_discover(ops, tag: str) -> dict:
+    """One getPeriodosOcupados round -- the candidate keepalive AND its own liveness indicator.
+
+    Symmetric with observe() by design: in the Schedule.jsp arm the polling request and the
+    liveness test are the same request, so the discovery arm must work the same way or the
+    comparison is not like-for-like. The response tells us both things at once, because
+    getPeriodosOcupados depends on the warmed context (MEASURED 2026-08-26):
+
+        warm context : ~192B, `periodos_ocupados='...'` marker present
+        expired      : ~168B, marker ABSENT
+
+    Uses the SAME date every round so a changing date can never be mistaken for a changing state.
+    """
+    from apps.worker.ops_live import GETPERIODOS_URL
+    import re
+    d = {"tag": tag, "ts": time.time()}
+    url = f"{GETPERIODOS_URL}?id_posto={ops.posto_pdf or ops.posto_id}&data_agendamento={_DISCOVER_DATE}"
+    try:
+        final = ops.session.browser_nav(url, timeout=45)
+    except Exception as e:
+        d.update(ok=False, error=f"{type(e).__name__}: {e}"[:140])
+        return d
+    try:
+        html = ops.session.browser_eval("document.documentElement.outerHTML") or ""
+    except Exception as e:
+        d.update(ok=False, error=f"{type(e).__name__}: {e}"[:140])
+        return d
+    m = re.search(r"periodos_ocupados='([0-9]*)", html)
+    d["ok"] = True
+    d["final_url"] = final
+    d["bytes"] = len(html)
+    d["markers"] = ["periodos_ocupados"] if m else []
+    d["token"] = m.group(1) if m else None      # digits only -- no PII
+    d["form_state_alive"] = bool(m)
+    d["redirected_off_schedule"] = False
+    d["session_lost"] = "sessionlost" in (final or "").lower()
+    d["auth_redirect"] = "authentication.jsp" in (final or "").lower()
+    try:
+        d["vistos_sid"] = any(c.get("name") == "Vistos_sid" for c in ops.session.get_all_cookies())
+    except Exception:
+        d["vistos_sid"] = None
+    d["authenticated"] = None                   # not readable from this endpoint -- do not guess
+    return d
+
+
+def run_arm(arm, mode, geo, minutes, interval, silent_at, sink, lock, log, booking="Test2"):
+    ops = warm_one(arm, geo, log, booking)
     if ops is None:
         with lock:
             sink.write(json.dumps({"arm": arm, "mode": mode, "fatal": "could not warm"}) + "\n"); sink.flush()
@@ -156,7 +209,8 @@ def run_arm(arm, mode, geo, minutes, interval, silent_at, sink, lock, log):
     deadline = t0 + minutes * 60
     try:
         # Baseline immediately after warm-up -- both arms take this, it is the reference point.
-        d = observe(ops, "baseline"); d.update(arm=arm, mode=mode, elapsed_s=round(time.time()-t0, 1))
+        _obs = observe_discover if mode == "discover" else observe
+        d = _obs(ops, "baseline"); d.update(arm=arm, mode=mode, elapsed_s=round(time.time()-t0, 1))
         with lock: sink.write(json.dumps(d)+"\n"); sink.flush()
         log(f"[{arm}] t=0.0m form_state={d.get('form_state_alive')} markers={len(d.get('markers') or [])}")
         if mode == "silent":
@@ -164,7 +218,7 @@ def run_arm(arm, mode, geo, minutes, interval, silent_at, sink, lock, log):
             end = min(deadline, t0 + silent_at)
             while time.time() < end:
                 time.sleep(min(10, end - time.time()))
-            d = observe(ops, "after-silence"); d.update(arm=arm, mode=mode, elapsed_s=round(time.time()-t0,1))
+            d = _obs(ops, "after-silence"); d.update(arm=arm, mode=mode, elapsed_s=round(time.time()-t0,1))
             with lock: sink.write(json.dumps(d)+"\n"); sink.flush()
             log(f"[{arm}] t={d['elapsed_s']/60:.1f}m AFTER SILENCE form_state={d.get('form_state_alive')} "
                 f"auth={d.get('authenticated')} url={str(d.get('final_url'))[-40:]}")
@@ -174,7 +228,7 @@ def run_arm(arm, mode, geo, minutes, interval, silent_at, sink, lock, log):
                 while time.time() < min(nxt, deadline):
                     time.sleep(min(5, max(0.1, min(nxt, deadline) - time.time())))
                 if time.time() >= deadline: break
-                d = observe(ops, "poll"); d.update(arm=arm, mode=mode, elapsed_s=round(time.time()-t0,1))
+                d = _obs(ops, "poll"); d.update(arm=arm, mode=mode, elapsed_s=round(time.time()-t0,1))
                 with lock: sink.write(json.dumps(d)+"\n"); sink.flush()
                 log(f"[{arm}] t={d['elapsed_s']/60:5.1f}m form_state={d.get('form_state_alive')} "
                     f"auth={d.get('authenticated')} bytes={d.get('bytes')}")
@@ -214,6 +268,8 @@ def main():
     ap.add_argument("--interval", type=float, default=120.0, help="poll arm: seconds between GETs")
     ap.add_argument("--silent-at", type=float, default=480.0, help="silent arm: seconds before its ONE GET")
     ap.add_argument("--geo", default="it")
+    ap.add_argument("--booking", default="Test2",
+                    help="booking to source posto/nationality/residence from")
     ap.add_argument("--out", default="var/formstate_ttl.jsonl")
     ap.add_argument("--report")
     a = ap.parse_args()
@@ -222,8 +278,9 @@ def main():
     out = pathlib.Path(a.out); out.parent.mkdir(parents=True, exist_ok=True)
     lock = threading.Lock()
     with out.open("w") as sink:
-        ths = [threading.Thread(target=run_arm, args=("poll","poll",a.geo,a.minutes,a.interval,a.silent_at,sink,lock,log)),
-               threading.Thread(target=run_arm, args=("silent","silent",a.geo,a.minutes,a.interval,a.silent_at,sink,lock,log))]
+        ths = [threading.Thread(target=run_arm, args=("schedule_poll","poll",a.geo,a.minutes,a.interval,a.silent_at,sink,lock,log,a.booking)),
+               threading.Thread(target=run_arm, args=("discover_poll","discover",a.geo,a.minutes,a.interval,a.silent_at,sink,lock,log,a.booking)),
+               threading.Thread(target=run_arm, args=("silent","silent",a.geo,a.minutes,a.interval,a.silent_at,sink,lock,log,a.booking))]
         for t in ths: t.start()
         for t in ths: t.join()
     return report(str(out))
