@@ -265,3 +265,4 @@ def test_rewarm_cadence_is_configurable():
                                       "APPLY_REWARM_AFTER_BOUNCES": 3})
     PhaseMachine(cfg, ops).run()
     assert ops.warmups > 1, "a cadence of 3 must still produce re-warms"
+

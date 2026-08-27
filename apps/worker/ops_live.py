@@ -2167,33 +2167,32 @@ class LiveEngineOps(EngineOps):
                 self._log("do_apply: re-warm at round start failed -- session problem, not the slot")
                 return "session"
 
-            # DIAGNOSTIC ONLY (2026-08-27) -- observational, changes no control flow.
+            # THE /slots PRIMER IS GONE. It destroyed the server-side booking cursor every round.
             #
-            # The primer's return value was DISCARDED, and a chrome-error page is a successful
-            # return, not an exception -- so a primer that died was completely invisible. That
-            # matters because browser_form_post builds its form in the CURRENT document
-            # (`document.createElement('form') ... f.submit()`), so a primer that parks the page on
-            # chrome-error://chromewebdata/ makes the SUBMIT unsendable however healthy the network
-            # is. Measured 2026-08-27: ScheduleController (an IN-PAGE fetch, so the origin was
-            # provably live) returned 200 at t=10.40m and the submit was dead 25s later, with only
-            # the primer in between. Record what the primer returned and what origin we are on when
-            # we submit; decide nothing on it yet.
-            _t0 = time.time()
-            try:
-                _pr_url, _pr_html = self.session.browser_form_post(
-                    SLOTS_URL + "?posto_id=" + str(self.posto_pdf),
-                    {"posto_id": self.posto_pdf, "captcha": ""},
-                    timeout=45,
-                )
-                self._log(f"do_apply: /slots primer -> {time.time() - _t0:.1f}s "
-                          f"{len(_pr_html or '')}B final_url={_pr_url}")
-            except Exception as e:
-                self._log(f"do_apply: /slots primer raised after {time.time() - _t0:.1f}s "
-                          f"(non-fatal): {e}")
-
-            # One in-page eval, no navigation. False here means the submit below is being issued
-            # from a dead document, which is the whole hypothesis under test.
-            self._log(f"do_apply: pre-submit origin_ok={self._on_portal_origin()}")
+            # It POSTed `{"posto_id": ..., "captcha": ""}` -- a CAPTCHA-less request the portal
+            # rejects -- as a real navigation, and discarded the response. MEASURED 2026-08-27,
+            # controlled, fresh session per arm, only the primer differing:
+            #
+            #     control (wait 6s, no primer)  Schedule.jsp 55,194B -> 55,196B, all 5 markers
+            #     primer                        Schedule.jsp 55,196B -> 39B, ZERO markers
+            #
+            # `_SCHED_PAGE_MARKERS` on Schedule.jsp IS this codebase's definition of a live booking
+            # cursor -- it is the exact check _run_warmup_steps uses to decide it is warmed. So the
+            # chain was: warm-up establishes the cursor and its guard passes; the primer destroys it;
+            # SubmeterVistoCriaPDF then has no cursor and the portal answers with the questionnaire
+            # start page (captured at var/submits/, 72,211B, title 'Questionnaire to apply for a
+            # visa', carrying the authenticated Logout/Change-Password nav -- so the SESSION was
+            # never the problem). That was classified form_stale, which sent the ladder off to
+            # re-warm and re-login -- rebuilding the very cursor the next round's primer would
+            # destroy again.
+            #
+            # Not replaced with a CAPTCHA-solving variant: measured the same day, even a genuinely
+            # solved SCHEDULE_EVISA token (2,617 chars) came back `{"error": ReCaptchaError"}`, so
+            # sending it properly would still be a rejected POST. storm-auto's /slots is real
+            # secondary discovery with a solved token whose response it INSPECTS -- not a fire-and-
+            # forget primer -- and this project already treats /slots as under-reporting and never
+            # trusts it for availability. The HAR precedent that motivated it does not outrank a
+            # controlled measurement.
 
             body = booking_payload(self.quest_steps, slot, residence=self.residence)
             submit_url = SUBMIT_URL + "?posto_id=" + str(self.posto_pdf)
@@ -2272,8 +2271,10 @@ class LiveEngineOps(EngineOps):
                 # log line in between, so there was no way to tell a rejected slot from a bounced
                 # session from a WAF page. The submit response is the single most important thing
                 # this worker does; its rejection must always say why.
+                _saved = self._save_submit_body(html, outcome)
                 self._log(f"do_apply: submit NOT confirmed [{outcome}] -- "
-                          f"{_submit_bounce_reason(html)} | slot={slot} | final_url={_final_url}")
+                          f"{_submit_bounce_reason(html)} | slot={slot} | final_url={_final_url}"
+                          + (f" | body={_saved}" if _saved else ""))
                 return outcome
 
             self._log(f"do_apply: BOOKED slot={slot} | final_url={_final_url}")
@@ -2377,6 +2378,30 @@ class LiveEngineOps(EngineOps):
             return "no_slot"
         # No confirmation marker and no bounce marker at all: genuinely unexpected, not a bounce.
         return "error"
+
+    def _save_submit_body(self, html: str, outcome: str) -> str:
+        """Persist the portal's answer to SubmeterVistoCriaPDF. DIAGNOSTIC, not part of any verdict.
+
+        storm-auto captures this on every submit (`_evidence(..., "pdf_submission", always=True)`).
+        storm-hub captured nothing, so the one document that explains a rejected booking was
+        discarded every time -- five separate hypotheses were argued from a keyword match and a byte
+        count because the body itself no longer existed. Measured 2026-08-27: a 72,133B response
+        titled 'questionnaire to apply for a visa' classified `form_stale`, and we could not tell
+        whether that meant our form state had lapsed or the slot was simply taken.
+
+        Best-effort and never raises: a failed write must not change an apply outcome.
+        """
+        from pathlib import Path as _Path
+        import time as _time
+        try:
+            d = _Path(__file__).resolve().parents[2] / "var" / "submits"
+            d.mkdir(parents=True, exist_ok=True)
+            p = d / f"{self.identity_id}_{outcome}_{int(_time.time())}.html"
+            p.write_text(html or "", encoding="utf-8", errors="replace")
+            return str(p)
+        except Exception as e:      # pragma: no cover - diagnostics must never break the round
+            self._log(f"do_apply: could not save the submit body ({e})")
+            return ""
 
     def _save_pdf(self, body: bytes) -> str:
         """Persist a confirmed booking's PDF to local disk (same var/ convention as checkpoints --

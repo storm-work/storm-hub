@@ -1,3 +1,4 @@
+import pathlib
 """LiveEngineOps -- construction, protocol conformance, and pure-logic unit tests. No real browser or
 network calls (that's Phase E's live-gated tier); this covers what's testable offline: the response
 classification, the discovery outcome shaping, and that the class actually satisfies EngineOps."""
@@ -27,6 +28,30 @@ def _origin_reply(js, otherwise=""):
 
 def _cfg(**template):
     return EngineConfig.from_settings(resolve({L.TEMPLATE: {"ROLE": "apply", **template}}))
+
+
+_REAL_SAVE_SUBMIT_BODY = LiveEngineOps._save_submit_body
+
+
+@pytest.fixture(autouse=True)
+def _isolate_submit_bodies(tmp_path, monkeypatch):
+    """Keep _save_submit_body out of the real var/submits/ tree.
+
+    Same isolation class as the cleanup_checkpoints leak (F26): a test that drives do_apply through
+    a rejection calls the REAL _save_submit_body, which resolves a path relative to the repo and
+    wrote sub-1_*.html into production evidence. Point it at pytest's tmp_path instead.
+    """
+    real = LiveEngineOps._save_submit_body
+
+    def _scoped(self, html, outcome):
+        d = tmp_path / "submits"
+        d.mkdir(parents=True, exist_ok=True)
+        p = d / f"{self.identity_id}_{outcome}.html"
+        p.write_text(html or "", encoding="utf-8", errors="replace")
+        return str(p)
+
+    monkeypatch.setattr(LiveEngineOps, "_save_submit_body", _scoped)
+    yield
 
 
 def _make_ops(**overrides):
@@ -2433,18 +2458,6 @@ class _PrimerSession(_SubmitSession):
         return super().browser_form_post(url, data, timeout)
 
 
-def test_the_primer_result_and_pre_submit_origin_are_recorded():
-    logs = []
-    ops = _apply_ops(b"%PDF-1.4 real", [])
-    ops.session = _PrimerSession(b"%PDF-1.4 real",
-                                 ("chrome-error://chromewebdata/", "<html>" + "x" * 1000 + "</html>"))
-    ops._log = lambda m, *a, **k: logs.append(m)
-    ops.do_apply({"date": "2026-09-01", "period": 4})
-    joined = " | ".join(logs)
-    assert "/slots primer ->" in joined, "the primer's own result is still not recorded"
-    assert "chrome-error://chromewebdata/" in joined, "the primer's final_url was not logged"
-    assert "pre-submit origin_ok=" in joined, "the pre-submit origin was not recorded"
-
 
 def test_the_diagnostic_does_not_change_the_apply_outcome():
     """Same stub, with and without a dead primer: the outcome must be identical. The diagnostic
@@ -2462,17 +2475,93 @@ def test_the_diagnostic_does_not_change_the_apply_outcome():
     assert ops_ok.do_apply(slot) == ops_dead.do_apply(slot)
 
 
-def test_a_primer_that_raises_is_still_non_fatal():
-    """The primer is best-effort by design. An exception must not abort the round -- the submit
-    still gets its attempt, exactly as before."""
-    class _Raises(_PrimerSession):
-        def browser_form_post(self, url, data, timeout=100):
-            if "lots" in url:
-                raise RuntimeError("tunnel gone")
-            return _SubmitSession.browser_form_post(self, url, data, timeout)
-    ops = _apply_ops(b"%PDF-1.4 real", [])
-    ops.session = _Raises(b"%PDF-1.4 real", None)
+
+def test_a_rejected_submit_body_is_written_to_disk(tmp_path, monkeypatch):
+    # _save_submit_body is stubbed below, so nothing reaches disk; this test never wrote a file.
+    events = []
+    ops = _apply_ops(b"", events)          # MostrarPdf shell, no PDF -> not booked
+    written = {}
+    monkeypatch.setattr(ops, "_save_submit_body",
+                        lambda html, outcome: written.setdefault(outcome, html) or "/x.html")
     logs = []
     ops._log = lambda m, *a, **k: logs.append(m)
+
+    out = ops.do_apply({"date": "2026-09-01", "period": 4})
+
+    assert out != "booked"
+    assert written, "the rejected submit response was discarded -- again"
+    assert any("body=" in m for m in logs), "the saved path was not logged"
+
+
+def test_saving_the_submit_body_never_breaks_the_round(tmp_path, monkeypatch):
+    """Diagnostics must not be able to change an apply outcome. A write that blows up is logged
+    and swallowed; the classification is whatever the portal actually said."""
+    events = []
+    ops = _apply_ops(b"", events)
+    logs = []
+    ops._log = lambda m, *a, **k: logs.append(m)
+    # This one must run the REAL _save_submit_body -- the autouse isolation fixture replaces it,
+    # so put the original back for this test before making the write fail.
+    monkeypatch.setattr(LiveEngineOps, "_save_submit_body", _REAL_SAVE_SUBMIT_BODY)
+    monkeypatch.setattr(pathlib.Path, "write_text",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+
+    out = ops.do_apply({"date": "2026-09-01", "period": 4})
+
+    assert out != "booked"          # unchanged by the failed write
+    assert any("could not save the submit body" in m for m in logs)
+
+
+def test_a_booked_submit_does_not_write_a_rejection_body(tmp_path):
+    """Only rejections are captured; a real booking already persists its PDF artifact."""
+    events = []
+    ops = _apply_ops(b"%PDF-1.4 real booking", events)
+    calls = []
+    ops._save_submit_body = lambda html, outcome: calls.append(outcome) or "/x.html"
+    ops._save_pdf = lambda b: "/tmp/x.pdf"
+
     assert ops.do_apply({"date": "2026-09-01", "period": 4}) == "booked"
-    assert any("primer raised" in m for m in logs)
+    assert calls == [], "a successful booking wrote a rejection body"
+
+
+# ── the apply round must not POST /slots before the submit (2026-08-27) ──────────────────────
+# MEASURED, controlled, fresh session per arm, only the primer differing:
+#   control (wait 6s, no primer)  Schedule.jsp 55,194B -> 55,196B, all 5 scheduling markers
+#   primer                        Schedule.jsp 55,196B -> 39B, ZERO markers
+# _SCHED_PAGE_MARKERS on Schedule.jsp is this codebase's own definition of a live booking cursor
+# (it is what _run_warmup_steps checks). The CAPTCHA-less /slots POST destroyed it every round, so
+# the submit that followed had no cursor and the portal answered with the questionnaire page.
+
+class _UrlRecordingSession(_SubmitSession):
+    """Records every URL the apply round navigates, so a re-introduced primer is visible."""
+    def __init__(self, pdf_bytes: bytes):
+        super().__init__(pdf_bytes)
+        self.posted_urls = []
+
+    def browser_form_post(self, url, data, timeout=100):
+        self.posted_urls.append(url)
+        return super().browser_form_post(url, data, timeout)
+
+
+def test_the_apply_round_never_posts_slots_before_the_submit():
+    ops = _apply_ops(b"%PDF-1.4 real", [])
+    ops.session = _UrlRecordingSession(b"%PDF-1.4 real")
+    ops._save_pdf = lambda b: "/tmp/x.pdf"
+
+    ops.do_apply({"date": "2026-09-01", "period": 4})
+
+    slots_posts = [u for u in ops.session.posted_urls if "/slots" in u]
+    assert slots_posts == [], (
+        "the /slots primer is back -- it destroys the server-side booking cursor "
+        f"(Schedule.jsp 55KB+5 markers -> 39B+0 markers): {slots_posts}")
+
+
+def test_the_apply_round_still_submits_exactly_once():
+    """Removing the primer must not disturb the submit itself: one POST, to SubmeterVistoCriaPDF."""
+    ops = _apply_ops(b"%PDF-1.4 real", [])
+    ops.session = _UrlRecordingSession(b"%PDF-1.4 real")
+    ops._save_pdf = lambda b: "/tmp/x.pdf"
+
+    assert ops.do_apply({"date": "2026-09-01", "period": 4}) == "booked"
+    submits = [u for u in ops.session.posted_urls if "SubmeterVistoCriaPDF" in u]
+    assert len(submits) == 1, f"expected exactly one submit, got {ops.session.posted_urls}"

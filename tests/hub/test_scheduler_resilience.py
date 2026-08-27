@@ -21,6 +21,7 @@ from libs.db import models as M
 from libs.engine import orchestration as orch
 from libs.domain.enums import (
     BookingStatus,
+    SlotLeaseOutcome,
     SlotStatus,
     WorkerRole,
     WorkerStatus,
@@ -2081,3 +2082,78 @@ def test_reconcile_orphaned_leases_failure_never_kills_the_tick(db, monkeypatch)
     import libs.proxies as proxies_pkg
     monkeypatch.setattr(proxies_pkg, "find_orphaned_worker_ids", boom)
     sched._reconcile_orphaned_leases(db, NOW)   # must not raise
+
+
+# ── form_stale must not send the same slot straight back (2026-08-27) ────────────────────────
+# Measured live on booking "E2E VALIDATION 0827": 14 leases over ONE slot (2026-08-28/period 3)
+# while 31 others sat AVAILABLE and freshly seen. _assign_slots ordered date.asc(),period.asc() and
+# form_stale releases WITHOUT penalty, so the first candidate came back on every tick, forever.
+
+def _stale_lease(db, slot, worker, when):
+    db.add(M.SlotLease(slot_id=slot.id, worker_id=worker.id, leased_at=when,
+                       released_at=when, outcome=SlotLeaseOutcome.FORM_STALE))
+    db.commit()
+
+
+def test_a_slot_that_just_went_form_stale_is_offered_last(db):
+    bus = _FakeBus()
+    sched = _scheduler(bus=bus)
+    bk = _make_booking(db)
+    ident = _make_identity(db)
+    w = _make_worker(db, bk, ident, role=WorkerRole.APPLY, substate=WorkerSubstate.HOLDING)
+    # first by date/period -- the one the old ordering handed back every single time
+    first = M.Slot(booking_id=bk.id, posto_id="5084", date="2026-08-28", period=3,
+                   status=SlotStatus.AVAILABLE)
+    later = M.Slot(booking_id=bk.id, posto_id="5084", date="2026-08-28", period=4,
+                   status=SlotStatus.AVAILABLE)
+    db.add_all([first, later]); db.commit()
+    _stale_lease(db, first, w, NOW - timedelta(seconds=5))
+
+    sched._assign_slots(db, bk)
+
+    lease = db.scalars(select(M.SlotLease).where(
+        M.SlotLease.worker_id == w.id, M.SlotLease.released_at.is_(None))).first()
+    assert lease is not None, "no assignment was made at all"
+    assert lease.slot_id == later.id, (
+        "the just-form_stale'd slot was handed straight back -- this is the live "
+        "14-leases-on-one-slot loop")
+
+
+def test_form_stale_ordering_does_not_retire_or_penalise_the_slot(db):
+    """Order only. A slot we could not use is not a slot that is gone -- charging it is what
+    produced 5082 bounced leases against a pool that was never phantom."""
+    bus = _FakeBus()
+    sched = _scheduler(bus=bus)
+    bk = _make_booking(db)
+    ident = _make_identity(db)
+    w = _make_worker(db, bk, ident, role=WorkerRole.APPLY, substate=WorkerSubstate.HOLDING)
+    s = M.Slot(booking_id=bk.id, posto_id="5084", date="2026-08-28", period=3,
+               status=SlotStatus.AVAILABLE, miss_count=0)
+    db.add(s); db.commit()
+    _stale_lease(db, s, w, NOW - timedelta(seconds=5))
+
+    sched._assign_slots(db, bk)
+
+    db.refresh(s)
+    assert s.miss_count == 0, "form_stale charged the slot a miss"
+    assert s.status != SlotStatus.CLOSED, "form_stale retired the slot"
+
+
+def test_a_single_stale_slot_is_still_offered(db):
+    """With only one slot in the pool, it must still be assigned -- back of the queue is still
+    in the queue. Otherwise a one-slot pool would deadlock."""
+    bus = _FakeBus()
+    sched = _scheduler(bus=bus)
+    bk = _make_booking(db)
+    ident = _make_identity(db)
+    w = _make_worker(db, bk, ident, role=WorkerRole.APPLY, substate=WorkerSubstate.HOLDING)
+    only = M.Slot(booking_id=bk.id, posto_id="5084", date="2026-08-28", period=3,
+                  status=SlotStatus.AVAILABLE)
+    db.add(only); db.commit()
+    _stale_lease(db, only, w, NOW - timedelta(seconds=5))
+
+    sched._assign_slots(db, bk)
+
+    lease = db.scalars(select(M.SlotLease).where(
+        M.SlotLease.worker_id == w.id, M.SlotLease.released_at.is_(None))).first()
+    assert lease is not None and lease.slot_id == only.id, "a one-slot pool was never assigned"

@@ -78,7 +78,8 @@ def observe(ops, tag: str) -> dict:
     return d
 
 
-def warm_one(arm: str, geo: str, log, booking_name: str = "Test2") -> object | None:
+def warm_one(arm: str, geo: str, log, booking_name: str = "Test2",
+             provider: str = "webshare") -> object | None:
     """Real login + warm-up through the production code path. Returns LiveEngineOps or None."""
     from sqlalchemy import select
     from apps.hub.db import SessionLocal
@@ -108,7 +109,7 @@ def warm_one(arm: str, geo: str, log, booking_name: str = "Test2") -> object | N
     appt = {r[0] for r in db.execute(select(M.BookedAppointment.identity_id)).all() if r[0]}
     cands = db.scalars(select(M.Identity).where(M.Identity.status == "ACTIVE").limit(300)).all()
     _r.shuffle(cands)
-    pool = db.scalars(select(M.Proxy).where(M.Proxy.provider == "webshare",
+    pool = db.scalars(select(M.Proxy).where(M.Proxy.provider == provider,
                                             M.Proxy.active.is_(True)).limit(1500)).all()
     _r.shuffle(pool)
     caps = [k.strip() for k in (get_global(db).get("CAPSOLVER_KEYS", "") or "").split(",") if k.strip()]
@@ -127,7 +128,7 @@ def warm_one(arm: str, geo: str, log, booking_name: str = "Test2") -> object | N
             continue
         tried += 1
         url = conn_url(pool[tried], geo=geo)
-        log(f"[{arm}] login try {tried} {ident.full_name[:22]!r} webshare#{session_id(url)}")
+        log(f"[{arm}] login try {tried} {ident.full_name[:22]!r} {provider}#{session_id(url)}")
         ops = LiveEngineOps(
             cfg, account=_live_account(ident, subs[0]), posto_id=str(bk.posto_id),
             nationality=bk.nationality, residence=bk.residence,

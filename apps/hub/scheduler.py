@@ -1086,6 +1086,40 @@ class Scheduler:
             .order_by(M.Slot.date.asc(), M.Slot.period.asc())).all()
         if not avail:
             return
+        # A slot that just answered form_stale goes to the BACK of the queue.
+        #
+        # This ordering was strictly `date.asc(), period.asc()`, and form_stale releases WITHOUT a
+        # penalty by design (miss_count untouched, status straight back to AVAILABLE) -- so the
+        # first candidate came back to the same worker on the very next tick, forever. Measured
+        # live 2026-08-27 on booking "E2E VALIDATION 0827": 14 leases over ONE slot
+        # (2026-08-28/period 3) while 31 others sat AVAILABLE and freshly seen. `bounced` retires a
+        # slot after N misses and `session` parks the worker after N; form_stale had NEITHER escape,
+        # so the worker re-warmed and re-logged in four times without ever trying a different slot.
+        # storm-auto's own reading of that response (quoted at ops_live.py's _BOUNCE_KEYWORDS) is
+        # "the slot was taken", which makes retrying the same one exactly wrong.
+        #
+        # Deliberately ORDER ONLY: no miss_count, no status change, no retirement. A slot we could
+        # not use is not a slot that is gone -- charging it would reintroduce the false-slot revert
+        # that condemned a real pool over 5082 "bounces". It simply goes last until something else
+        # has had a turn.
+        recent_stale = dict(db.execute(
+            select(M.SlotLease.slot_id, func.max(M.SlotLease.released_at)).where(
+                M.SlotLease.slot_id.in_([s.id for s in avail]),
+                M.SlotLease.outcome == SlotLeaseOutcome.FORM_STALE,
+                M.SlotLease.released_at.isnot(None),
+            ).group_by(M.SlotLease.slot_id)
+        ).all())
+        if recent_stale:
+            def _staleness(slot) -> float:
+                # Postgres hands back tz-aware datetimes and SQLite (tests) naive ones, and the two
+                # cannot be compared. Normalise to a float so the key is always orderable.
+                ts = recent_stale.get(slot.id)
+                if ts is None:
+                    return 0.0
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                return ts.timestamp()
+            avail.sort(key=lambda s: (_staleness(s), s.date, s.period))
         active_counts = dict(db.execute(
             select(M.SlotLease.slot_id, func.count()).where(
                 M.SlotLease.slot_id.in_([s.id for s in avail]), M.SlotLease.released_at.is_(None),
