@@ -600,3 +600,60 @@ def test_a_booking_that_never_started_shows_everything(client):
     r = client.get(f"/workers/{wid}/logs", headers=h).json()
     assert [l["text"] for l in r["lines"]] == ["before any run"]
     assert r["run_started_at"] is None
+
+
+def test_a_launch_failure_reason_survives_the_requeue_to_ready():
+    """READY + `launch failed:` is the dead-end state this marker exists for, so it must not be
+    wiped by the very relaunch that is about to re-establish it.
+
+    Every relaunch path calls _set_worker_status(w, READY) on the way in, and that helper nulls
+    substate_detail by design. Confirmed live 2026-08-27 on "Test 2032": worker 645b41e9 sat READY
+    with substate_detail NULL while the Hub log held the real cause ("no webshare proxy leased
+    after 5 probe(s): 5 failed health"). The operator had no way to see why a worker never ran.
+    """
+    from apps.hub.main import _set_worker_status
+    from apps.hub.scheduler import LAUNCH_FAILED_PREFIX
+    from libs.db import models as M
+    from libs.domain.enums import WorkerStatus
+
+    w = M.Worker(booking_id="b", identity_id="i", role="apply", status=WorkerStatus.READY)
+    w.substate_detail = f"{LAUNCH_FAILED_PREFIX} no webshare proxy leased after 5 probe(s)"
+    _set_worker_status(w, WorkerStatus.READY)
+    assert (w.substate_detail or "").startswith(LAUNCH_FAILED_PREFIX), \
+        "the launch-failure reason was wiped by the requeue"
+    assert w.substate is None
+
+
+def test_an_explicit_new_detail_still_replaces_a_launch_failure_reason():
+    from apps.hub.main import _set_worker_status
+    from apps.hub.scheduler import LAUNCH_FAILED_PREFIX
+    from libs.db import models as M
+    from libs.domain.enums import WorkerStatus
+    w = M.Worker(booking_id="b", identity_id="i", role="apply", status=WorkerStatus.READY)
+    w.substate_detail = f"{LAUNCH_FAILED_PREFIX} old reason"
+    _set_worker_status(w, WorkerStatus.READY, detail="operator stop")
+    assert w.substate_detail == "operator stop"
+
+
+def test_other_stale_details_are_still_cleared():
+    """The narrow exception must not resurrect the 2026-08-14 behaviour it is carved out of: a
+    relaunched worker must not keep reading 'no live process (dead-worker reap)'."""
+    from apps.hub.main import _set_worker_status
+    from libs.db import models as M
+    from libs.domain.enums import WorkerStatus
+    w = M.Worker(booking_id="b", identity_id="i", role="apply", status=WorkerStatus.FAILED)
+    w.substate_detail = "no live process (dead-worker reap)"
+    _set_worker_status(w, WorkerStatus.READY)
+    assert w.substate_detail is None
+
+
+def test_a_launch_failure_reason_is_not_carried_into_running():
+    """Only READY keeps it. A worker that actually started must never display a stale failure."""
+    from apps.hub.main import _set_worker_status
+    from apps.hub.scheduler import LAUNCH_FAILED_PREFIX
+    from libs.db import models as M
+    from libs.domain.enums import WorkerStatus
+    w = M.Worker(booking_id="b", identity_id="i", role="apply", status=WorkerStatus.READY)
+    w.substate_detail = f"{LAUNCH_FAILED_PREFIX} lease exhausted"
+    _set_worker_status(w, WorkerStatus.RUNNING)
+    assert w.substate_detail is None

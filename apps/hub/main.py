@@ -374,7 +374,25 @@ def _set_worker_status(w: M.Worker, status: WorkerStatus, *, detail: str | None 
     # LAST state; carrying it forward means a relaunched worker still reads "no live process
     # (dead-worker reap)" while it is demonstrably alive and running -- observed 2026-08-14, and
     # doubly misleading now that the dashboard surfaces this as the status tooltip.
+    previous = w.substate_detail or ""
     w.substate_detail = detail
+    # ONE EXCEPTION: a `launch failed:` reason on a worker going (back) to READY.
+    #
+    # That combination is the dead end this marker exists for -- the launch raised BEFORE spawn (a
+    # proxy lease exhausting its health-probe budget, say), so the row is correctly READY and
+    # relaunchable, and READY is a status no watchdog looks at. Every relaunch path calls this
+    # helper on the way in, so the reason was being wiped a moment before the retry that would
+    # re-establish it, and a worker failing repeatedly ended up displaying nothing at all.
+    #
+    # Confirmed live 2026-08-27 on "Test 2032": worker 645b41e9 sat READY with substate_detail
+    # NULL while the Hub log carried the actual cause ("no webshare proxy leased after 5 probe(s):
+    # 5 failed health"). The operator had to ask why a worker never ran.
+    #
+    # Narrow on purpose: only this prefix, only into READY, and only when no new detail is given.
+    # A SUCCESSFUL launch still clears it (see _do_launch_worker), so a running worker never shows
+    # a stale failure -- which is the concern the paragraph above is protecting.
+    if detail is None and status == WorkerStatus.READY and previous.startswith(LAUNCH_FAILED_PREFIX):
+        w.substate_detail = previous
 
 
 def _sched_on_relaunch(db: Session, workers: list[M.Worker]) -> None:

@@ -122,6 +122,17 @@ _PORTAL_BUSY_MARKERS = (
     "não foi possível de momento concretizar o seu pedido",
     "nao foi possivel de momento concretizar o seu pedido",
     "we were unable to complete your request at this time",
+    # The portal's MAINTENANCE page, added 2026-08-27. Same class as the refusals above -- the
+    # portal declining to serve, saying nothing about our session, our proxy or the account -- but
+    # it was not recognised, and the cost was concrete on booking "Test 2032": 154 refusals across
+    # 13 sub-accounts and 99 sub-account rotations, with the booking's RedisBreaker hash still
+    # EMPTY because record_portal_down() is gated on _is_portal_busy(). So nothing backed off, and
+    # every worker kept cycling accounts against a portal that was explicitly saying "come back
+    # later". Accent-stripped variants included for the same reason as the two above: the portal
+    # serves both forms.
+    "serviço em manutenção",
+    "servico em manutencao",
+    "service under maintenance",
 )
 
 

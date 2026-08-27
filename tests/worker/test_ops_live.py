@@ -2321,3 +2321,27 @@ def test_push_slots_with_nothing_found_emits_nothing_worth_persisting():
     ops = _make_ops(emit=lambda t, **p: emitted.append((t, p)))
     ops.push_slots([])
     assert emitted == [] or emitted[0][1]["slots"] == []
+
+
+def test_the_maintenance_page_is_recognised_as_a_portal_refusal():
+    """The portal's maintenance page is the portal declining to serve -- not a bad session, not a
+    bad proxy, not the account.
+
+    It went unrecognised until 2026-08-27, and the cost was measured on booking "Test 2032": 154
+    refusals across 13 sub-accounts and 99 rotations, with the booking's RedisBreaker hash still
+    EMPTY -- record_portal_down() is gated on _is_portal_busy(), so nothing ever backed off and the
+    fleet kept cycling accounts against a portal explicitly saying "come back later".
+    """
+    from apps.worker.ops_live import _is_portal_busy
+    assert _is_portal_busy("Serviço em manutenção. Tente novamente mais tarde.")
+    assert _is_portal_busy("SERVICO EM MANUTENCAO")            # accent-stripped form
+    assert _is_portal_busy("<html>Service under maintenance</html>")
+    # and it must not fire on an ordinary page
+    assert not _is_portal_busy("<html>Solicitar pedido de Visto</html>")
+
+
+def test_the_existing_busy_refusals_still_match():
+    """Guard against the maintenance addition narrowing what was already recognised."""
+    from apps.worker.ops_live import _is_portal_busy
+    assert _is_portal_busy("Não foi possível de momento concretizar o seu pedido")
+    assert _is_portal_busy("We were unable to complete your request at this time")
