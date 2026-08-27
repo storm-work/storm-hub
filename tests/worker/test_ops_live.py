@@ -2601,3 +2601,79 @@ def test_an_unreadable_pre_submit_document_does_not_change_the_outcome():
 
     assert ops.do_apply({"date": "2026-09-01", "period": 4}) == "booked"
     assert any("PRE-SUBMIT doc unreadable" in m for m in logs)
+
+
+# ── discovery backs off when the portal says "try again later" (2026-08-27) ──────────────────
+# MEASURED live on "Test 2032": one worker went `-> discovering` twenty times in ~10 minutes, every
+# one answered portal_try_again_later (28,499B), five workers wide, for hours. We were asking again
+# 30s after the portal explicitly said to try later. storm-auto carries this fix and the scar behind
+# it: "~2.5h of empty polling drew 77 DataDome pages -> fixed by bounded backoff."
+
+_BLOCKED_BODY = "<html><body>Não foi possível de momento concretizar o seu pedido, " \
+                "por favor tente mais tarde" + "x" * 28000 + "</body></html>"
+_OK_GETTIME = "<html>special_days = {'2026': {'8': [28]}};</html>"
+
+
+class _GettimeSession(_FakeSession):
+    def __init__(self, body):
+        super().__init__()
+        self.body = body
+
+    def browser_nav(self, url, timeout=30, **kw):
+        return url
+
+    def browser_eval(self, js, timeout=30):
+        if "location.origin" in (js or ""):
+            return _origin_reply(js)
+        return self.body
+
+
+def _discover_ops(body, monkeypatch, **raw):
+    slept = []
+    import apps.worker.ops_live as _ol
+    monkeypatch.setattr(_ol.time, "sleep", lambda s: slept.append(s))
+    ops = _make_ops(emit=lambda t, **p: None)
+    ops.session = _GettimeSession(body)
+    ops._log = lambda *a, **k: None
+    ops.posto_pdf = "2032"
+    ops.cfg.raw.update(raw)
+    return ops, slept
+
+
+def test_a_blocked_gettime_backs_off_and_escalates(monkeypatch):
+    ops, slept = _discover_ops(_BLOCKED_BODY, monkeypatch,
+                               DISCOVERY_BLOCKED_BACKOFF=30.0, DISCOVERY_BLOCKED_BACKOFF_CAP=300.0)
+    for _ in range(3):
+        out = ops.do_discover(["2026-08-28"])
+        assert all(r["outcome"] == "failed" for r in out), "a block must be failed, never empty"
+    assert len(slept) == 3, f"no back-off on a blocked gettime: {slept}"
+    assert slept[1] > slept[0] and slept[2] > slept[1], \
+        f"back-off did not escalate across consecutive blocks: {slept}"
+
+
+def test_the_backoff_is_capped(monkeypatch):
+    ops, slept = _discover_ops(_BLOCKED_BODY, monkeypatch,
+                               DISCOVERY_BLOCKED_BACKOFF=30.0, DISCOVERY_BLOCKED_BACKOFF_CAP=90.0)
+    for _ in range(6):
+        ops.do_discover(["2026-08-28"])
+    assert max(slept) <= 90.0 * 1.16, f"back-off exceeded its cap: {slept}"
+
+
+def test_the_backoff_can_be_disabled(monkeypatch):
+    ops, slept = _discover_ops(_BLOCKED_BODY, monkeypatch, DISCOVERY_BLOCKED_BACKOFF=0.0)
+    ops.do_discover(["2026-08-28"])
+    assert slept == [], f"back-off ran despite being disabled: {slept}"
+
+
+def test_a_healthy_gettime_resets_the_streak(monkeypatch):
+    """A transient block must cost one short pause, not permanently raise the floor."""
+    ops, slept = _discover_ops(_BLOCKED_BODY, monkeypatch, DISCOVERY_BLOCKED_BACKOFF=30.0)
+    ops.do_discover(["2026-08-28"])
+    ops.do_discover(["2026-08-28"])
+    first_two = list(slept)
+    ops.session.body = _OK_GETTIME          # portal answers properly
+    ops.do_discover(["2026-08-28"])
+    ops.session.body = _BLOCKED_BODY        # and blocks again later
+    ops.do_discover(["2026-08-28"])
+    assert slept[-1] <= first_two[0] * 1.2, \
+        f"the streak did not reset after a healthy gettime: {slept}"

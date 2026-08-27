@@ -2008,7 +2008,31 @@ class LiveEngineOps(EngineOps):
                 if self._emit is not None:
                     self._emit("portal_health", phase="discover", kind=why,
                                seconds=0.0, **self._health.snapshot())
+                # BACK OFF. The caller loops on poll_gap(), so a blocked gettime was retried every
+                # ~30s forever. Measured live 2026-08-27 on "Test 2032": one worker went
+                # `-> discovering` TWENTY times in ~10 minutes, every one answered
+                # portal_try_again_later (28,499B) -- the portal literally saying "try again later"
+                # while we asked again 30 seconds later, five workers wide, for hours.
+                #
+                # storm-auto carries this fix and the scar behind it: "~2.5h of empty polling drew
+                # 77 DataDome pages -> fixed by bounded backoff after this tag." Hammering a portal
+                # that is throttling us is the one thing here that plausibly makes the throttling
+                # worse, and it is entirely under our control.
+                #
+                # Escalates per CONSECUTIVE block and resets the moment gettime answers properly, so
+                # a transient block costs one short pause and a sustained one stops the hammering.
+                self._gettime_block_streak = getattr(self, "_gettime_block_streak", 0) + 1
+                base = float(self.cfg.raw.get("DISCOVERY_BLOCKED_BACKOFF", 30.0))
+                cap = float(self.cfg.raw.get("DISCOVERY_BLOCKED_BACKOFF_CAP", 300.0))
+                if base > 0:
+                    nap = min(cap, base * (2 ** (self._gettime_block_streak - 1)))
+                    nap *= random.uniform(0.85, 1.15)   # de-sync the fleet; they all block together
+                    self._log(f"do_discover: backing off {nap:.0f}s "
+                              f"(consecutive blocks: {self._gettime_block_streak})")
+                    time.sleep(nap)
                 return [{"date": d, "outcome": "failed"} for d in dates]
+            # gettime answered properly -- the block is over, so the ladder starts from zero again.
+            self._gettime_block_streak = 0
             special_days = parse_special_days(gettime_body)
             if self._emit is not None:
                 self._emit("gettime_result", special_days=special_days_to_json(special_days))

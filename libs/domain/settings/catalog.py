@@ -382,6 +382,15 @@ _TEMPLATE = [
     # to be fresh booked in 47 seconds. 600s leaves ~6 minutes of headroom and costs one extra
     # lightweight probe per worker per hour.
     _s("KEEPALIVE_INTERVAL", L.TEMPLATE, float, 600.0, _WRK, "keepalive", min_value=1.0),
+    # Discovery back-off on a BLOCKED gettime (the portal's "try again later" / WAF page, not an
+    # empty calendar). MEASURED live 2026-08-27 on "Test 2032": one worker went `-> discovering`
+    # twenty times in ~10 minutes, every one answered portal_try_again_later (28,499B), five workers
+    # wide, for hours -- asking again 30s after the portal said "try again later". storm-auto
+    # carries this fix and the scar: "~2.5h of empty polling drew 77 DataDome pages -> fixed by
+    # bounded backoff." Doubles per CONSECUTIVE block, resets the moment gettime answers properly.
+    # Set 0 to disable.
+    _s("DISCOVERY_BLOCKED_BACKOFF", L.TEMPLATE, float, 30.0, _WRK, "discovery", min_value=0.0),
+    _s("DISCOVERY_BLOCKED_BACKOFF_CAP", L.TEMPLATE, float, 300.0, _WRK, "discovery", min_value=0.0),
     _s("KEEPALIVE_DECAY_MIN", L.TEMPLATE, float, 30.0, _WRK, "keepalive"),
     _s("KEEPALIVE_DECAY_MAX", L.TEMPLATE, float, 60.0, _WRK, "keepalive"),
     _s("REWARM_ESCALATE_AFTER", L.TEMPLATE, int, 3, _WRK, "keepalive", min_value=1.0,
