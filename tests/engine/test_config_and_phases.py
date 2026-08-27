@@ -497,3 +497,90 @@ def test_mono_shares_what_it_finds_with_the_pool():
     }))
     PhaseMachine(cfg, ops).run()
     assert ops.pushed, "a mono worker must push its finds so slot_found fires and others benefit"
+
+
+# ── Test2 regression: the apply loop must not churn slot leases ───────────────
+def test_portal_unreachable_is_bounded_and_parks_instead_of_churning_leases():
+    """LIVE REGRESSION (booking "Test2", 2026-08-27).
+
+    `portal_unreachable` had no counter and no cap, AND it reset the session cap, so nothing
+    anywhere could stop it. Worker 9fd63b7f took 64 of them in a SINGLE process -- lease, fail,
+    release, immediately re-lease -- producing 70 slot leases alone and 102 across the booking in
+    45 minutes, with zero bookings.
+
+    The worker must now back off (park) instead of consuming pooled slots forever.
+    """
+    ops = SimEngineOps(assignment={"date": "2026-09-01", "period": 4},
+                       apply_outcome="portal_unreachable", stop_after_polls=12)
+    details: list[str] = []
+    PhaseMachine(_cfg(ROLE="apply", booking={"APPLY_MAX_ATTEMPTS": 2}), ops,
+                 on_transition=lambda sub, detail: details.append(detail)).run()
+
+    # It must PARK -- the session is fine, so this backs off instead of rebuilding or failing.
+    assert [d for d in details if d.startswith("parked:")], f"never parked; details={details}"
+    # Parking must cost poll gaps, not slots. Before the fix this branch had no counter at all and
+    # ran 1:1 with the poll budget (live: 64 in one process). Parking inserts _PARK_POLL_GAPS of
+    # back-off, so the same budget must now buy materially fewer lease attempts.
+    assert ops.applied < 12, f"unbounded portal_unreachable churn: {ops.applied} applies in 12 polls"
+    assert ops.release_reasons, "the slot must be handed back, not hoarded"
+    assert set(ops.release_reasons) == {"session"}, \
+        "portal_unreachable must release WITHOUT a slot penalty"
+
+
+def test_portal_unreachable_does_not_clear_the_session_cap():
+    """The old code reset session_streak on any outcome != "session", justified as "any other
+    answer means the session reached the portal". That is exactly inverted for
+    portal_unreachable -- the request never reached the portal -- so it was clearing the very cap
+    meant to stop the churn. Alternating the two outcomes must still terminate.
+    """
+    ops = SimEngineOps(assignment={"date": "2026-09-01", "period": 4},
+                       apply_outcome=["session", "portal_unreachable"] * 40, stop_after_polls=400)
+    res = PhaseMachine(_cfg(ROLE="apply", booking={"APPLY_MAX_ATTEMPTS": 2}), ops).run()
+    assert ops.applied <= 20, (
+        f"alternating session/portal_unreachable never hit a cap: {ops.applied} attempts")
+
+
+def test_a_reachable_portal_still_clears_the_session_cap():
+    """Guard the other direction: a real portal answer (a bounce) still proves the session is
+    healthy and must keep resetting the session cap, or a worker would fail for the wrong reason."""
+    ops = SimEngineOps(assignment={"date": "2026-09-01", "period": 4},
+                       apply_outcome=["session", "no_slot"] * 30, stop_after_polls=200)
+    PhaseMachine(_cfg(ROLE="apply", booking={"APPLY_MAX_ATTEMPTS": 5}), ops).run()
+    # bounced resets session_streak, so the run ends on the BOUNCE budget (park), not on
+    # "session unrecoverable" -- i.e. the reset still works where it is correct.
+    assert ops.applied > 2
+
+
+def test_the_exact_test2_recovery_loop_terminates_instead_of_churning():
+    """INTEGRATION REGRESSION -- the full sequence observed live on booking "Test2", 2026-08-27.
+
+    Observed: WARMED -> HOLDING -> APPLYING -> portal origin dies -> re-anchor fails -> apply
+    re-warm fails -> roll exit -> re-login/checkpoint restore -> APPLYING again -> identical
+    failure, forever. Worker 9fd63b7f ran 64 `portal_unreachable` cycles in a SINGLE process and
+    took 70 slot leases on its own; the booking took 102 in 45 minutes and booked nothing.
+
+    Nothing could stop it: `portal_unreachable` had no cap of its own AND reset the session cap.
+    This drives the same alternating sequence and requires that the worker reaches a bounded end
+    state -- parking and/or the session cap -- rather than leasing indefinitely.
+    """
+    # Alternate the two outcomes exactly as the live run did (64 unreachable : 7 session).
+    script = (["portal_unreachable"] * 9 + ["session"]) * 20
+    ops = SimEngineOps(assignment={"date": "2026-09-01", "period": 4},
+                       apply_outcome=script, stop_after_polls=60)
+    details: list[str] = []
+    res = PhaseMachine(_cfg(ROLE="apply", booking={"APPLY_MAX_ATTEMPTS": 3}), ops,
+                       on_transition=lambda sub, detail: details.append(detail)).run()
+
+    # It must have applied a brake -- parked, or ended on the session cap. Not neither.
+    parked = [d for d in details if d.startswith("parked:")]
+    ended_on_cap = "unrecoverable" in (res.detail or "")
+    assert parked or ended_on_cap, (
+        f"no brake was applied: outcome={res.outcome} detail={res.detail!r} applies={ops.applied}")
+
+    # And the churn must be paced: before the fix this ran 1:1 with the poll budget.
+    assert ops.applied < 60, f"still churning: {ops.applied} applies against a 60-poll budget"
+
+    # Every release must be blameless -- neither failure is the slot's fault, so nothing here may
+    # feed the Hub's false-slot revert.
+    assert set(ops.release_reasons) <= {"session"}, \
+        f"a non-slot failure was charged to the slot: {set(ops.release_reasons)}"

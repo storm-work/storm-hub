@@ -1,6 +1,7 @@
 """LiveEngineOps -- construction, protocol conformance, and pure-logic unit tests. No real browser or
 network calls (that's Phase E's live-gated tier); this covers what's testable offline: the response
 classification, the discovery outcome shaping, and that the class actually satisfies EngineOps."""
+import json
 import pytest
 
 from libs.domain.enums import SettingsLayer as L
@@ -2345,3 +2346,68 @@ def test_the_existing_busy_refusals_still_match():
     from apps.worker.ops_live import _is_portal_busy
     assert _is_portal_busy("Não foi possível de momento concretizar o seu pedido")
     assert _is_portal_busy("We were unable to complete your request at this time")
+
+
+# ── Test2 regression: a failed origin re-anchor must abort the warm-up chain ──
+class _DeadOriginSession(_FakeSession):
+    """Off-origin page whose re-anchor navigation also fails -- the exact live state: the guard
+    reports "the tunnel is genuinely down" and cannot restore a portal origin."""
+    def __init__(self):
+        super().__init__()
+        self.fetches = 0
+        self.navs = 0
+
+    def browser_nav(self, url, timeout=30, **kw):
+        self.navs += 1
+        raise RuntimeError("net::ERR_TUNNEL_CONNECTION_FAILED")
+
+    def browser_eval(self, js, timeout=30):
+        if "location.origin" in (js or ""):
+            return json.dumps({"o": "chrome-error://chromewebdata", "h": "chrome-error://chromewebdata/"})
+        self.fetches += 1                       # any in-page fetch attempted after the guard
+        raise RuntimeError("Page.evaluate: TypeError: Failed to fetch")
+
+
+def test_warmup_aborts_when_the_portal_origin_cannot_be_restored():
+    """LIVE REGRESSION (booking "Test2", 2026-08-27).
+
+    _run_warmup_steps called _ensure_portal_origin and DISCARDED its return, so a re-anchor that
+    had just reported "the tunnel is genuinely down" was followed by the very fetch loop the code
+    calls guaranteed-to-fail. Measured: 24 off-origin detections -> 24 failed re-anchors -> 24
+    warmup failures -> 96 "Failed to fetch" (4 attempts each), burning 30-43s per cycle and
+    reporting the symptom instead of the known cause.
+
+    The chain must now stop at the guard.
+    """
+    ops = _make_ops(emit=lambda t, **p: None)
+    logs = []
+    ops._log = logs.append
+    ops.session = _DeadOriginSession()
+
+    assert ops._run_warmup_steps() is False
+    # THE POINT: not one in-page fetch was attempted after the guard said the origin was dead.
+    assert ops.session.fetches == 0, (
+        f"ran {ops.session.fetches} doomed in-page fetch(es) after a failed re-anchor")
+    # and the reported cause is the real one, not the downstream symptom
+    joined = " | ".join(logs)
+    assert "re-anchor" in joined
+    assert "Failed to fetch" not in joined, f"reported the symptom instead of the cause: {joined}"
+
+
+def test_warmup_still_proceeds_when_the_origin_is_healthy():
+    """Guard the successful path: an on-origin page must run the chain exactly as before, so the
+    fix cannot turn a healthy warm-up into a refusal."""
+    ops = _make_ops(emit=lambda t, **p: None)
+    ops._log = lambda t: None
+    reached = {"n": 0}
+
+    class _OnOrigin(_FakeSession):
+        def browser_eval(self, js, timeout=30):
+            if "location.origin" in (js or ""):
+                return _origin_reply(js)
+            reached["n"] += 1
+            raise RuntimeError("stop here -- we only need to prove the chain was entered")
+
+    ops.session = _OnOrigin()
+    ops._run_warmup_steps()
+    assert reached["n"] > 0, "a healthy origin must still enter the in-page fetch chain"

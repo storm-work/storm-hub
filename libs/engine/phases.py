@@ -394,10 +394,14 @@ class PhaseMachine:
         # Generous on purpose -- 3x the bounce budget -- so a genuinely transient dead proxy still
         # gets many chances; failing here is terminal and hold-respawn relaunches with backoff.
         max_session_failures = max_bounces * 3
+        # Same budget as the bounce storm: both are "this keeps failing for a reason that is not
+        # the slot's fault", and both are answered by parking rather than by burning a re-login.
+        max_unreachable = max_bounces
         attempts = 0
         stale_streak = 0
         bounce_streak = 0
         session_streak = 0
+        unreachable_streak = 0
         slot = None                      # a form_stale retry KEEPS its slot across iterations
         while True:
             if self.ops.is_stopped():
@@ -454,8 +458,14 @@ class PhaseMachine:
                 return PhaseResult("dry_run", self._sub, "no_book: not submitted", self.visited)
             attempts += 1
             outcome = self.ops.do_apply(slot)
-            if outcome != "session":
-                session_streak = 0      # any other answer means the session reached the portal
+            # `portal_unreachable` is EXCLUDED from this reset on purpose. The comment this replaces
+            # read "any other answer means the session reached the portal" -- which is exactly
+            # inverted for that one outcome: it means the request never reached the portal at all,
+            # so it is not evidence the session is healthy and must not clear the session cap.
+            if outcome not in ("session", "portal_unreachable"):
+                session_streak = 0      # the portal actually answered -- the session is healthy
+            if outcome != "portal_unreachable":
+                unreachable_streak = 0
             if outcome == "booked":
                 self._to(WorkerSubstate.BOOKED)
                 return PhaseResult("booked", self._sub, str(slot), self.visited)
@@ -465,9 +475,26 @@ class PhaseMachine:
                 # The SESSION is fine -- do_apply re-warms at the top of every attempt, so simply
                 # taking the next assignment is the whole recovery. Rebuilding here threw away a
                 # healthy login and ~10 minutes of warmup for a transient dropped POST.
+                #
+                # BUT IT MUST BE BOUNDED. This branch had no counter and no cap, and it also reset
+                # the session cap above, so nothing anywhere could stop it: measured live
+                # 2026-08-27 on booking "Test2", worker 9fd63b7f took 64 of these in a SINGLE
+                # process -- leasing a slot, failing, releasing it and immediately re-leasing --
+                # producing 70 slot leases on its own and 102 across the booking in 45 minutes,
+                # with zero bookings. That is the churn shape this file's own PACING note warns
+                # about, reached through the one outcome that had no brake.
+                #
+                # _park is the right brake rather than a rebuild or a failure: the session really
+                # is fine, so this keeps it and simply stops consuming pooled slots for a few poll
+                # gaps -- the same session-preserving back-off the bounce storm already uses.
                 self.ops.release_slot(slot, "session")
                 slot = None
-                self._to(WorkerSubstate.HOLDING, detail="portal unreachable; retrying")
+                unreachable_streak += 1
+                if unreachable_streak >= max_unreachable:
+                    self._park(f"portal unreachable x{unreachable_streak}")
+                    unreachable_streak = 0
+                else:
+                    self._to(WorkerSubstate.HOLDING, detail="portal unreachable; retrying")
                 self.ops.poll_gap()
                 continue
 

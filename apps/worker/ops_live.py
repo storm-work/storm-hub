@@ -1196,12 +1196,25 @@ class LiveEngineOps(EngineOps):
         """Questionnaire -> Formulario -> ScheduleController -> Schedule.jsp (confirmed URLs/flow,
         ported from storm-auto batch_apply._run_steps_2_to_6)."""
         _t0 = time.time()
-        # Every step below is an in-page fetch. If a prior failed navigation left the page on
-        # chrome-error, all three retries of the home-lang POST are guaranteed to raise
-        # "TypeError: Failed to fetch" -- that is an opaque origin, not the transient network blip
-        # the retry loop was written for. Re-anchor first so the retries mean something.
-        self._ensure_portal_origin("the warm-up chain")
         try:
+            # Every step below is an in-page fetch. If a prior failed navigation left the page on
+            # chrome-error, all three retries of the home-lang POST are guaranteed to raise
+            # "TypeError: Failed to fetch" -- that is an opaque origin, not the transient network
+            # blip the retry loop was written for. Re-anchor first so the retries mean something.
+            #
+            # ACT ON THE VERDICT. This called _ensure_portal_origin and DISCARDED its return, so a
+            # re-anchor that had just reported "the tunnel is genuinely down" was followed by the
+            # very fetch loop this comment calls guaranteed-to-fail. Measured live 2026-08-27 on
+            # booking "Test2": 24 off-origin detections, 24 failed re-anchors, 24 warmup failures,
+            # 96 "Failed to fetch" (4 attempts each) -- a perfect 1:1 chain, burning 30-43s per
+            # cycle and reporting the symptom ("Failed to fetch") instead of the known cause.
+            #
+            # Raised INSIDE the try on purpose: the existing except below already records the
+            # failure through _note_portal and returns False, so this reuses the established
+            # taxonomy (warmup_failure_kind -> "unreachable") rather than adding a second one.
+            if not self._ensure_portal_origin("the warm-up chain"):
+                raise RuntimeError(
+                    "portal origin could not be restored -- the in-page fetch chain cannot run")
             # Retried like every other in-page fetch in this chain. When the labelling went in I
             # made this one raise on the FIRST failure while giving the quest steps below three
             # attempts -- and it is by far the most common failure point: 377 aborted warmups in one
