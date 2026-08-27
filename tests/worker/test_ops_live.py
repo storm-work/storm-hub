@@ -2411,3 +2411,68 @@ def test_warmup_still_proceeds_when_the_origin_is_healthy():
     ops.session = _OnOrigin()
     ops._run_warmup_steps()
     assert reached["n"] > 0, "a healthy origin must still enter the in-page fetch chain"
+
+
+# ── primer/origin diagnostic (2026-08-27) ────────────────────────────────────────────────────
+# The /slots primer's result was discarded and a chrome-error page returns normally rather than
+# raising, so a primer that parked the page on an opaque origin was invisible -- and since
+# browser_form_post builds its form in the CURRENT document, that makes the SUBMIT unsendable.
+# These pin the diagnostic as OBSERVATIONAL: it must record the primer + origin and change nothing.
+
+class _PrimerSession(_SubmitSession):
+    """Primer lands on chrome-error; the submit still behaves exactly as the stub dictates."""
+    def __init__(self, pdf_bytes: bytes, primer_result):
+        super().__init__(pdf_bytes)
+        self._primer_result = primer_result
+        self.calls = []
+
+    def browser_form_post(self, url, data, timeout=100):
+        self.calls.append(url)
+        if "Slots" in url or "slots" in url:
+            return self._primer_result
+        return super().browser_form_post(url, data, timeout)
+
+
+def test_the_primer_result_and_pre_submit_origin_are_recorded():
+    logs = []
+    ops = _apply_ops(b"%PDF-1.4 real", [])
+    ops.session = _PrimerSession(b"%PDF-1.4 real",
+                                 ("chrome-error://chromewebdata/", "<html>" + "x" * 1000 + "</html>"))
+    ops._log = lambda m, *a, **k: logs.append(m)
+    ops.do_apply({"date": "2026-09-01", "period": 4})
+    joined = " | ".join(logs)
+    assert "/slots primer ->" in joined, "the primer's own result is still not recorded"
+    assert "chrome-error://chromewebdata/" in joined, "the primer's final_url was not logged"
+    assert "pre-submit origin_ok=" in joined, "the pre-submit origin was not recorded"
+
+
+def test_the_diagnostic_does_not_change_the_apply_outcome():
+    """Same stub, with and without a dead primer: the outcome must be identical. The diagnostic
+    observes; it must not gate, guard or re-anchor anything (that decision comes after the data)."""
+    ops_ok = _apply_ops(b"%PDF-1.4 real", [])
+    ops_ok.session = _PrimerSession(b"%PDF-1.4 real", ("https://portal/slots", "<html>ok</html>"))
+    ops_ok._log = lambda *a, **k: None
+
+    ops_dead = _apply_ops(b"%PDF-1.4 real", [])
+    ops_dead.session = _PrimerSession(b"%PDF-1.4 real",
+                                      ("chrome-error://chromewebdata/", "<html>dead</html>"))
+    ops_dead._log = lambda *a, **k: None
+
+    slot = {"date": "2026-09-01", "period": 4}
+    assert ops_ok.do_apply(slot) == ops_dead.do_apply(slot)
+
+
+def test_a_primer_that_raises_is_still_non_fatal():
+    """The primer is best-effort by design. An exception must not abort the round -- the submit
+    still gets its attempt, exactly as before."""
+    class _Raises(_PrimerSession):
+        def browser_form_post(self, url, data, timeout=100):
+            if "lots" in url:
+                raise RuntimeError("tunnel gone")
+            return _SubmitSession.browser_form_post(self, url, data, timeout)
+    ops = _apply_ops(b"%PDF-1.4 real", [])
+    ops.session = _Raises(b"%PDF-1.4 real", None)
+    logs = []
+    ops._log = lambda m, *a, **k: logs.append(m)
+    assert ops.do_apply({"date": "2026-09-01", "period": 4}) == "booked"
+    assert any("primer raised" in m for m in logs)

@@ -2167,14 +2167,33 @@ class LiveEngineOps(EngineOps):
                 self._log("do_apply: re-warm at round start failed -- session problem, not the slot")
                 return "session"
 
+            # DIAGNOSTIC ONLY (2026-08-27) -- observational, changes no control flow.
+            #
+            # The primer's return value was DISCARDED, and a chrome-error page is a successful
+            # return, not an exception -- so a primer that died was completely invisible. That
+            # matters because browser_form_post builds its form in the CURRENT document
+            # (`document.createElement('form') ... f.submit()`), so a primer that parks the page on
+            # chrome-error://chromewebdata/ makes the SUBMIT unsendable however healthy the network
+            # is. Measured 2026-08-27: ScheduleController (an IN-PAGE fetch, so the origin was
+            # provably live) returned 200 at t=10.40m and the submit was dead 25s later, with only
+            # the primer in between. Record what the primer returned and what origin we are on when
+            # we submit; decide nothing on it yet.
+            _t0 = time.time()
             try:
-                self.session.browser_form_post(
+                _pr_url, _pr_html = self.session.browser_form_post(
                     SLOTS_URL + "?posto_id=" + str(self.posto_pdf),
                     {"posto_id": self.posto_pdf, "captcha": ""},
                     timeout=45,
                 )
+                self._log(f"do_apply: /slots primer -> {time.time() - _t0:.1f}s "
+                          f"{len(_pr_html or '')}B final_url={_pr_url}")
             except Exception as e:
-                self._log(f"do_apply: /slots primer failed (non-fatal): {e}")
+                self._log(f"do_apply: /slots primer raised after {time.time() - _t0:.1f}s "
+                          f"(non-fatal): {e}")
+
+            # One in-page eval, no navigation. False here means the submit below is being issued
+            # from a dead document, which is the whole hypothesis under test.
+            self._log(f"do_apply: pre-submit origin_ok={self._on_portal_origin()}")
 
             body = booking_payload(self.quest_steps, slot, residence=self.residence)
             submit_url = SUBMIT_URL + "?posto_id=" + str(self.posto_pdf)

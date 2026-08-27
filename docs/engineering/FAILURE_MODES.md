@@ -361,3 +361,34 @@ APP (our logic/state) · OPS (configuration, deployment, human action).
   3 remote branches, 43-60 commits each). `origin/main` is unaffected.
 - **Improvement:** a pre-commit secret scan, and stop reusing one password across Postgres and the
   admin login.
+
+## F28 — The apply-recovery ladder poisons its own checkpoint, then restores it
+- **Class:** APP
+- **What:** on the `do_apply` → `"session"` recovery path, the worker writes the *broken* session's
+  cookie jar to `var/checkpoints/` three times and then reloads that file ~22s later, before it is
+  allowed to attempt a fresh login. Full evidence, trace and options:
+  `REPORT_2026-08-27_checkpoint_self_poisoning.md`.
+- **Mechanism:** `WorkerRuntime.on_transition` calls `ops.save_checkpoint_now()` on **every**
+  `HOLDING` transition (`runtime.py:36`), and three of `_rebuild_session`'s transitions are
+  *failure* transitions (`phases.py:299, 307, 511`). `do_login` then tries
+  `_try_restore_from_checkpoint()` before `_fresh_login()` (`ops_live.py:543`).
+- **Why the save succeeds on a dead session:** `get_all_cookies()` is a local CDP call; a dead proxy
+  tunnel does not make it fail. A broken session always produces a clean-looking save.
+- **Detection:** `restoring checkpoint for identity …` immediately following
+  `-> holding (re-warm failed; …)` in the worker log. CONFIRMED live on booking `Test2`,
+  2026-08-27: 20 restores in 32.5 min, 1 success (14 transport failures, 5 checkpoint deletions,
+  1 budget exhaustion) — roughly 8 of 32 minutes.
+- **Related defects found with it:** `stage="schedule_jsp"` stamped on a mid-failure save
+  (`ops_live.py:2389`; nothing reads `stage`, so misleading not load-bearing); the restore rebuilds
+  on the same failed `warm_proxy` and may delete good cookies under its "these cookies are spent"
+  rule (OBSERVED, not proven); F17's missing `cleanup_stale()` caller means a poisoned file has no
+  expiry.
+- **Prior art in this codebase:** the same bug class was already fixed at the *fresh-login* seam —
+  see the N4 comment at `ops_live.py:918`, which names "poisoning the next checkpoint save with a
+  `stage="schedule_jsp"` that isn't true" and calls `_clear_anchor()`. The apply-failure seam never
+  got the same treatment.
+- **Not fixed.** Recommended remedy (operator decision pending): gate `save_checkpoint_now()` on
+  `_anchor_src == "chain"` **and** `_anchor_age()` under the form-state TTL — the invariant already
+  exists (`ops_live.py:641-644, 1453`) and already means "the chain verified this on this session".
+  The age check is not optional: a failed re-warm never reaches `_set_anchor`, so `_anchor_src`
+  retains the previous *successful* warm's value.
