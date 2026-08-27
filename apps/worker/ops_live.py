@@ -2194,6 +2194,32 @@ class LiveEngineOps(EngineOps):
             # trusts it for availability. The HAR precedent that motivated it does not outrank a
             # controlled measurement.
 
+            # DIAGNOSTIC ONLY (2026-08-27b) -- observational, changes no control flow.
+            #
+            # Removing the /slots primer did NOT stop form_stale, which falsifies the assumption the
+            # removal rested on: that Schedule.jsp carrying _SCHED_PAGE_MARKERS is the same thing
+            # the submit needs. The markers were provably present after the warm-up and the submit
+            # was still answered with the questionnaire page.
+            #
+            # Everything measured so far looked at the cursor in ISOLATION -- in a probe, seconds
+            # after a warm-up. Nothing has ever measured it at the instant of the REAL submit,
+            # inside the real round, with real timing (28s elapse between ScheduleController's 200
+            # and the submit). Read the document the form is about to be built in: one in-page eval,
+            # no navigation, no extra request.
+            #
+            #   markers ABSENT  -> something in that gap still destroys the cursor; hunt it.
+            #   markers PRESENT -> the cursor is fine and form_stale means the slot really is taken,
+            #                      which makes this a DISCOVERY problem, not an apply one.
+            try:
+                _pre = self.session.browser_eval("document.documentElement.outerHTML") or ""
+                _marks = [m for m in _SCHED_PAGE_MARKERS if m in _pre]
+                _t = re.search(r"<title[^>]*>(.*?)</title>", _pre, re.S | re.I)
+                self._log(f"do_apply: PRE-SUBMIT doc {len(_pre)}B markers={_marks or 'NONE'} "
+                          f"title={(_t.group(1).strip()[:50] if _t else '?')!r} "
+                          f"origin_ok={self._on_portal_origin()}")
+            except Exception as e:
+                self._log(f"do_apply: PRE-SUBMIT doc unreadable ({type(e).__name__}: {str(e)[:90]})")
+
             body = booking_payload(self.quest_steps, slot, residence=self.residence)
             submit_url = SUBMIT_URL + "?posto_id=" + str(self.posto_pdf)
             try:

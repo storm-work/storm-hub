@@ -2565,3 +2565,39 @@ def test_the_apply_round_still_submits_exactly_once():
     assert ops.do_apply({"date": "2026-09-01", "period": 4}) == "booked"
     submits = [u for u in ops.session.posted_urls if "SubmeterVistoCriaPDF" in u]
     assert len(submits) == 1, f"expected exactly one submit, got {ops.session.posted_urls}"
+
+
+# ── pre-submit cursor diagnostic (2026-08-27b) ───────────────────────────────────────────────
+# Removing the /slots primer did not stop form_stale, which falsified the assumption that
+# Schedule.jsp's markers are the cursor the submit needs. This records the document the form is
+# actually built in, at the instant of the real submit. Observational: it must never gate anything.
+
+def test_the_pre_submit_document_is_recorded():
+    logs = []
+    ops = _apply_ops(b"%PDF-1.4 real", [])
+    ops.session = _UrlRecordingSession(b"%PDF-1.4 real")
+    ops._save_pdf = lambda b: "/tmp/x.pdf"
+    ops._log = lambda m, *a, **k: logs.append(m)
+
+    ops.do_apply({"date": "2026-09-01", "period": 4})
+
+    assert any("PRE-SUBMIT doc" in m for m in logs), \
+        "the document the submit is built in was not recorded"
+
+
+def test_an_unreadable_pre_submit_document_does_not_change_the_outcome():
+    """A diagnostic that can break an apply round is worse than no diagnostic."""
+    class _EvalBlows(_UrlRecordingSession):
+        def browser_eval(self, js, *a, **k):
+            if "outerHTML" in js:
+                raise RuntimeError("Execution context was destroyed")
+            return super().browser_eval(js, *a, **k)
+
+    logs = []
+    ops = _apply_ops(b"%PDF-1.4 real", [])
+    ops.session = _EvalBlows(b"%PDF-1.4 real")
+    ops._save_pdf = lambda b: "/tmp/x.pdf"
+    ops._log = lambda m, *a, **k: logs.append(m)
+
+    assert ops.do_apply({"date": "2026-09-01", "period": 4}) == "booked"
+    assert any("PRE-SUBMIT doc unreadable" in m for m in logs)
