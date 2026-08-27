@@ -757,3 +757,124 @@ cookie presence is not evidence of a usable form state.
 **Architectural consequence.** "Discovery-as-keepalive" is not available. The existing design --
 `discover -> detect expiry -> re-warm` -- is the correct one, and the only mechanism shown to
 restore a lapsed anchor remains a real `_run_warmup_steps()`.
+
+## 31. FIRST BOOKINGS SINCE 2026-08-21 — two, verified on %PDF bytes, 2026-08-27
+
+**CONFIRMED.** The strict rule was applied: reaching `MostrarPdf` is not a booking; only `%PDF`
+magic bytes are.
+
+| | AMILCAR LOPES SILVA | SOFIA FILOMENA COSTA |
+|---|---|---|
+| booked at | 19:15:42 UTC | 19:20:44 UTC |
+| PDF magic | `%PDF-1.6` | `%PDF-1.6` |
+| PDF size | 250,821 B | 250,824 B |
+| slot | 2026-09-02 / period 7 | 2026-09-02 / period 8 |
+| slot status after | `taken` | `taken` |
+| booking / posto | `Test 3018` / **3018** | `Test 3018` / **3018** |
+| residence | FRA | FRA |
+| proxy | webshare / rotating, `PROXY_GEOS=''` | same |
+| `MONO_BOOKING` | True | True |
+| `KEEPALIVE_INTERVAL` | **600.0** | **600.0** |
+
+Artifacts: `var/artifacts/aa4f2d44-…_1787858142.pdf`, `var/artifacts/8fc207be-…_1787858444.pdf`.
+
+**The healthy submit signature**, now the reference for the `PRE-SUBMIT` diagnostic:
+
+```
+19:15:29  ScheduleController -> 200, 54,171B
+19:15:38  do_apply: PRE-SUBMIT doc 54,865B markers=['getSlots','captchaDiv',
+          'SubmeterVistoCriaPDF','f_date_c','cmbPeriodo'] title='Visa Application Scheduling' origin_ok=True
+19:15:42  do_apply: BOOKED -- verified PDF (250,821B) at …/MostrarPdf?
+```
+
+Four seconds from pre-submit to booked.
+
+**Both booked with NO `/slots` call at all** — the workers spawned at 19:10, after the primer was
+removed at 16:59. This **disproves** the reading of `data/new_booking.har` that `/slots` is required
+for a submit to be accepted (see §33).
+
+## 32. A rejected `/slots` POST destroys the server-side booking cursor — 2026-08-27
+
+**CONFIRMED 3/3**, controlled, fresh session per arm, only the primer differing. Probe:
+`probes/cursor_survives_primer_probe.py`. Raw: `scratchpad/cursor_survives_primer.json`.
+
+| run | CONTROL (6s wait, no primer) | PRIMER (`captcha=""`) |
+|---|---|---|
+| 1 | 55,194 B / 5 markers → 55,196 B / 5 | 55,196 B / 5 → **39 B / 0** |
+| 2 | 55,198 B / 5 → 55,198 B / 5 | 55,194 B / 5 → **39 B / 0** |
+| 3 | 55,200 B / 5 → 55,200 B / 5 | 55,208 B / 5 → **39 B / 0** |
+
+`_SCHED_PAGE_MARKERS` on `Schedule.jsp` is this codebase's definition of a live cursor (the exact
+check `_run_warmup_steps` uses). The identical 39-byte answer across three runs is deterministic,
+not flaky.
+
+**Endpoint → cursor matrix** (`probes/endpoint_cursor_matrix_probe.py`) — exactly ONE endpoint in
+the pipeline destroys it:
+
+| endpoint | response | cursor |
+|---|---:|---|
+| `GET /VistosOnline/` | 57,488 B | preserves |
+| `GET Questionario` | 72,128 B | preserves |
+| `GET profile.jsp` | 75,276 B | preserves |
+| `GET gettime` | 673 B | preserves |
+| `GET getPeriodosOcupados` | 189 B | preserves |
+| `GET Schedule.jsp` | 54,861 B | preserves |
+| **`POST /slots` (`captcha=""`)** | 28,514 B | **DESTROYS** |
+
+Removing the primer was correct and is committed (`39bfd1c`). It was **necessary but not
+sufficient** — `form_stale` continued at posto 2032 afterwards (see §34).
+
+## 33. What `data/new_booking.har` does and does not prove — 2026-08-27
+
+A manually captured **successful** booking (posto 3059, residence FRA, 2026-08-24, 33 entries,
+request-side only — response bodies were not recorded).
+
+The real flow: `POST /login` → 9 × `GET QuestNextQuestion` → `POST /slots?posto_id=3059` (200,
+21,191 B, `captcha` **2,617 chars**) → `POST /SubmeterVistoCriaPDF?posto_id=3059` (200, 1,572 B).
+
+**CONFIRMED differences from storm-hub:**
+
+| | HAR (successful) | storm-hub |
+|---|---|---|
+| submit transport | **XHR** — `X-Requested-With: XMLHttpRequest`, `Sec-Fetch-Mode: cors`, `Dest: empty` | **navigation** (`browser_form_post` → `form.submit()`) |
+| submit `lang` | **`PT`** | **`ENG`** |
+| `Referer` (both calls) | `…/Schedule.jsp?posto_id=N` | whatever page the nav is on |
+| quest steps | **9** (incl. `id_pergunta=3 valor=TRAT`, `id_pergunta=22 valor=N`) | **7** — those two missing |
+| `/slots` captcha | solved, 2,617 chars, **accepted** (21 KB slot list) | `""` → rejected |
+
+The 2,617-char token length is **exactly** what our own solver produces, so our tokens are the right
+shape; the difference is acceptance, not generation.
+
+**DISPROVEN by §31:** that `/slots` is *required*. Two real bookings were made with no `/slots` call
+at all, five hours after this HAR was analysed. A single capture of one successful path shows what
+that path did — not what is necessary.
+
+## 34. Posto 3018 books; posto 2032 answers form_stale on every slot — 2026-08-27, UNEXPLAINED
+
+Same code, same night, same `MONO_BOOKING=True`, same webshare/rotating provider:
+
+| | `Test 3018` | `E2E VALIDATION 0827` |
+|---|---|---|
+| posto | 3018 | 2032 |
+| residence | **FRA** | **IRL** |
+| `PROXY_GEOS` | `''` | `'FR, DE, PT, IT'` |
+| result | **9 booked** | **22 × form_stale, 0 booked** |
+
+The 2032 run leased **10 distinct slots** (after the form_stale ordering fix) and every one answered
+`form_stale` — the questionnaire page, 72,211 B, carrying the authenticated Logout / Change-Password
+nav, so the SESSION was never the problem. Captured bodies in `var/submits/`.
+
+Per storm-auto's own semantics (quoted at `ops_live.py` `_BOUNCE_KEYWORDS`) that response means
+*"the slot was taken, session is FINE"* — so ten genuinely-taken slots is a live reading, not only a
+defect. **The `PRE-SUBMIT` diagnostic (`8c1049f`) did not exist during that run**, so there is no
+cursor measurement at the instant of those submits. One 2032 run now would settle it.
+
+## 35. The portal throttles gettime, login and /slots with one page — 2026-08-27
+
+`portal_try_again_later`, **~28.5 KB**, `Não foi possível de momento concretizar o seu pedido, por
+favor tente mais tarde`. The same page answers all three endpoints during a throttle window.
+
+Measured on `Test 2032`: one worker went `-> discovering` **twenty times in ~10 minutes**, every one
+blocked, five workers wide, for hours — asking again 30 s after the portal said to try later. Fixed
+by `4bc66d9` (`DISCOVERY_BLOCKED_BACKOFF`, doubling, capped, jittered, resets on a healthy gettime).
+storm-auto's precedent: *"~2.5h of empty polling drew 77 DataDome pages → fixed by bounded backoff."*

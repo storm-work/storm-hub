@@ -200,3 +200,40 @@ scheduler should know it; if they are rare, recovery alone suffices.
 across a full 24h and record every simultaneous invalidation. The harness already exists
 (`probes/q21_auth_refresh_probe.py`). **Not a blocker for the recovery design**, which must handle
 the event whatever its cadence.
+
+## Q24 — The form-state TTL is recorded twice, 3× apart, and nobody has reconciled it
+
+- `libs/domain/settings/catalog.py` (KEEPALIVE_INTERVAL rationale, measured **2026-08-20**, 28
+  keepalive cycles on `Test 3018`): *"the portal's scheduling form state dies on a **16.1-minute
+  median** clock (min 15.8, max 33.6)"*.
+- `CONFIRMED_FACTS` §30 (measured **2026-08-27**, controlled two-arm probe): last ALIVE **4.17 min**,
+  first DEAD **6.12 min**.
+
+Both are ours. They disagree by ~3×, and `KEEPALIVE_INTERVAL=600.0` is defensible under one and
+indefensible under the other. **It was NOT changed**, because the two bookings in §31 ran at exactly
+600.0 — changing the value that just booked, on a contested measurement, is not a fix.
+
+Resolve with a probe (the §30 shape, repeated on posto 3018 for like-for-like), not by editing the
+default.
+
+## Q25 — Why does posto 2032 answer form_stale on every slot while 3018 books?
+
+See `CONFIRMED_FACTS` §34. Candidate variables, none isolated: posto, residence (FRA vs IRL — note
+the HAR's successful booking was also FRA), `PROXY_GEOS`, and whether 2032's discovered slots were
+genuinely taken. The cheapest next step is one 2032 run now that the `PRE-SUBMIT` diagnostic exists:
+markers present ⇒ the cursor is fine and the slots were taken (a discovery problem); markers absent
+⇒ something posto- or residence-specific destroys the cursor.
+
+## Q26 — Does the scout/apply split model work at all?
+
+Never fairly tested. All four split-mode bookings ran on posto **5084**, which yielded 0–4 slots
+(two found none at all); all four booked zero. Every booking that ever succeeded had **no scouts**.
+Posto is a total confound.
+
+The structural concern is real and documented in `phases.py`: an idle applier does nothing but a
+keepalive nav between slot-open and slot-found, which *verifies* the anchor without *renewing* it.
+Measured 2026-08-27 on `Test 2032`: ESPERANCA CUNHA held **8.1 minutes** before slot-open — past the
+§30 TTL, though not past the catalog's (see Q24).
+
+Test it on a posto that has slots (3018 has 75) and read the appliers' `PRE-SUBMIT doc` line at
+assignment time.
