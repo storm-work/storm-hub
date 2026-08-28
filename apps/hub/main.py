@@ -1205,7 +1205,8 @@ def import_identities(body: IdentityImport, db: Session = Depends(get_db),
             continue
         ident = M.Identity(full_name=pi.full_name, type=pi.type, birthdate=pi.birthdate,
                            passport_no=pi.passport_no, gender=pi.gender, nationality=pi.nationality,
-                           status="active" if pi.sub_accounts else "empty")
+                           status="active" if pi.sub_accounts else "empty",
+                           target_posto=body.default_target_posto if pi.type == "real" else None)
         if pi.passport_no:
             known_passports.add(pi.passport_no)
         db.add(ident)
@@ -1472,11 +1473,44 @@ def reset_sub_accounts(body: SubAccountResetRequest, db: Session = Depends(get_d
     return ImportResult(created=updated, errors=errors)
 
 
+@app.post("/sub-accounts/retire", response_model=ImportResult)
+def retire_sub_accounts(body: SubAccountResetRequest, db: Session = Depends(get_db),
+                        _op: Principal = Depends(require_operator)) -> ImportResult:
+    """Give up on selected sub-accounts -- the dashboard Registration page's "Retire" button, for
+    accounts that exhausted their registration attempts without ever reaching VERIFIED (found live,
+    2026-08-27: 8 accounts sitting at NEW/REGISTERED with registration_jobs.attempts of 12-20 and a
+    FAILED last run, cluttering the "not verified" queue with rows that will never succeed on a retry
+    -- they need to stop being offered for registration and stop being counted against it, not be
+    deleted (their history -- attempts, identity link -- stays queryable).
+
+    Status is set directly, not via subaccount_transition(): a deliberate operator override, same
+    treatment as Reset's regen-credentials path just above (which is also this status's un-retire
+    route -- it forces status back to NEW regardless of current status, exactly as it already does
+    for BURNED). _rank_live_sub_accounts excludes RETIRED the same way it already excludes BURNED, so
+    a retired account is never selected for a live login even as a last resort."""
+    updated = 0
+    errors: list[str] = []
+    for sid in body.sub_account_ids:
+        sa = db.get(M.SubAccount, sid)
+        if not sa:
+            errors.append(f"{sid}: not found")
+            continue
+        sa.status = SubAccountStatus.RETIRED
+        updated += 1
+    db.commit()
+    return ImportResult(created=updated, errors=errors)
+
+
 @app.post("/registration/run")
 def run_registration(body: RegistrationRunRequest, db: Session = Depends(get_db),
                      _op: Principal = Depends(require_operator)) -> dict:
     subs = [db.get(M.SubAccount, sid) for sid in body.sub_account_ids]
     subs = [s for s in subs if s is not None]
+    # A retired account is a deliberate operator decision to stop trying it (POST /sub-accounts/
+    # retire) -- honour that here too, not only in _rank_live_sub_accounts's own exclusion, or the
+    # endpoint remains reachable directly (bypassing the dashboard's own filtered view) and queues a
+    # run against an account the operator already gave up on.
+    subs = [s for s in subs if s.status != SubAccountStatus.RETIRED]
     if not subs:
         raise HTTPException(400, "no valid sub_account_ids")
 
@@ -1512,6 +1546,14 @@ def run_registration(body: RegistrationRunRequest, db: Session = Depends(get_db)
         # NULL geo is never excluded, exactly as in lease_proxy: a filter narrows the pool, it must
         # not silently empty it for a provider whose credentials carry no country.
         q = q.where(M.Proxy.geo.in_(geos) | M.Proxy.geo.is_(None))
+    # Already-used sessions first, LRU within that, never-touched sessions last. Mirrors
+    # lease_proxy's _candidate_query tiering fix (commit e327392): a provider like SOAX does not
+    # establish unlimited concurrent sticky sessions per package, so a virgin sessionid is far
+    # less likely to survive CapSolver's remote solve than one that has already been proven to
+    # connect. This path had no ordering at all until 2026-08-27's reg-82ed3ef705cb run showed a
+    # 0/268 CAPTCHA-solve rate (ERROR_CAPTCHA_SOLVE_FAILED / ERROR_PROXY_CONNECT_REFUSED only)
+    # against a soax/mobile pool where 94% of rows had never been used.
+    q = q.order_by(M.Proxy.last_used_at.asc().nullslast())
     proxy_rows = list(db.scalars(q).all())
     if not proxy_rows:
         raise HTTPException(409, f"no active healthy {body.provider} proxies available"
@@ -2140,17 +2182,20 @@ def _live_account(identity: M.Identity, sub_account: M.SubAccount) -> dict:
 
 
 def _rank_live_sub_accounts(db: Session, identity_id: str) -> list[M.SubAccount]:
-    """ALL usable (non-BURNED) sub-accounts for an identity, ranked best-first (LOGIN_OK > HELD >
-    VERIFIED > REGISTERED > NEW). The full ranked list -- not just the top pick -- is what
-    LiveEngineOps.do_login() rotates through once its sticky-retry budget on the current sub-account
-    is exhausted (operator spec: sticky=2, rotating=number of subaccounts, e.g. a 3-subaccount
-    identity gets up to 2x3=6 login attempts total, ported from storm-auto's confirmed
-    app/worker.py:323-326 sticky-then-rotate pattern)."""
+    """ALL usable (non-BURNED, non-RETIRED) sub-accounts for an identity, ranked best-first
+    (LOGIN_OK > HELD > VERIFIED > REGISTERED > NEW). The full ranked list -- not just the top pick --
+    is what LiveEngineOps.do_login() rotates through once its sticky-retry budget on the current
+    sub-account is exhausted (operator spec: sticky=2, rotating=number of subaccounts, e.g. a
+    3-subaccount identity gets up to 2x3=6 login attempts total, ported from storm-auto's confirmed
+    app/worker.py:323-326 sticky-then-rotate pattern). RETIRED is excluded on the exact same
+    reasoning as BURNED: an operator decided this account is not worth attempting again, and a
+    live login run must honour that, not silently fall back to it as a last resort."""
     rank = {SubAccountStatus.LOGIN_OK: 0, SubAccountStatus.HELD: 1, SubAccountStatus.VERIFIED: 2,
             SubAccountStatus.REGISTERED: 3, SubAccountStatus.NEW: 4}
     candidates = list(db.scalars(
         select(M.SubAccount).where(M.SubAccount.identity_id == identity_id,
-                                   M.SubAccount.status != SubAccountStatus.BURNED)
+                                   M.SubAccount.status.notin_(
+                                       [SubAccountStatus.BURNED, SubAccountStatus.RETIRED]))
     ).all())
     candidates.sort(key=lambda s: rank.get(s.status, 99))
     return candidates

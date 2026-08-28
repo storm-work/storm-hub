@@ -200,6 +200,26 @@ def test_import_identities_and_proxies(client):
     assert client.get("/proxies", headers=h).json()[0]["provider"] == "soax"
 
 
+def test_import_default_target_posto_applies_to_real_only(client):
+    h = _operate_headers(client)
+    csv = ("identity_id,first_name,last_name,account_type,username,password\n"
+          "R1,Real,One,real,r1,pw1\nT1,Test,One,test,t1,pw2\n")
+    r = client.post("/identities/import",
+                    json={"csv": csv, "default_target_posto": "5084"}, headers=h).json()
+    assert r["created"] == 2
+    got = {i["full_name"]: i["target_posto"] for i in client.get("/identities", headers=h).json()}
+    assert got["Real One"] == "5084"   # real identity gets the default
+    assert got["Test One"] is None     # target_posto is app-enforced real-identities-only
+
+
+def test_import_without_default_target_posto_leaves_it_unset(client):
+    h = _operate_headers(client)
+    csv = "identity_id,first_name,last_name,account_type,username,password\nR1,Real,One,real,r1,pw1\n"
+    client.post("/identities/import", json={"csv": csv}, headers=h)
+    got = client.get("/identities", headers=h).json()
+    assert got[0]["target_posto"] is None
+
+
 def test_templates_crud_and_seed(client):
     h = _operate_headers(client)
     # seed defaults via startup isn't run in tests; create explicitly

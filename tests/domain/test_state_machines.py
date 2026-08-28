@@ -51,6 +51,19 @@ def test_subaccount_burn_and_rehab():
     assert subaccount_transition(SubAccountStatus.BURNED, SubAccountStatus.VERIFIED) == SubAccountStatus.VERIFIED
 
 
+def test_subaccount_retire_reachable_from_every_non_terminal_state():
+    for frm in (SubAccountStatus.NEW, SubAccountStatus.REGISTERED, SubAccountStatus.VERIFIED,
+               SubAccountStatus.LOGIN_OK, SubAccountStatus.HELD):
+        assert subaccount_transition(frm, SubAccountStatus.RETIRED) == SubAccountStatus.RETIRED
+
+
+def test_subaccount_retired_is_terminal_within_the_table():
+    # No table-defined way back -- Reset's direct status assignment is the un-retire path, same as
+    # it already is for BURNED, bypassing this table entirely rather than adding a second rung to it.
+    with pytest.raises(IllegalTransition):
+        subaccount_transition(SubAccountStatus.RETIRED, SubAccountStatus.NEW)
+
+
 def test_booking_lifecycle():
     assert booking_transition(BookingStatus.DRAFT, BookingStatus.SCHEDULED)
     assert booking_transition(BookingStatus.WARMING, BookingStatus.ARMED)

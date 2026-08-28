@@ -232,6 +232,10 @@ class ProxyImport(BaseModel):
 class IdentityImport(BaseModel):
     csv: str
     default_type: IdentityType = IdentityType.TEST
+    # Applied to every REAL identity this import creates that doesn't already carry one (the CSV
+    # format itself has no target_posto column -- app-enforced real-identities-only, same as
+    # IdentityCreate's own target_posto). None/absent leaves it unset, matching pre-existing behavior.
+    default_target_posto: str | None = None
 
 
 class ImportResult(BaseModel):

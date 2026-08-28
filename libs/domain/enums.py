@@ -39,6 +39,12 @@ class SubAccountStatus(StrEnum):
     HELD = "held"
     BOOKED = "booked"
     BURNED = "burned"
+    # Operator override: gave up on this account (exhausted registration attempts, never reached
+    # VERIFIED). Distinct from BURNED, which the PORTAL rejected -- RETIRED is our own bookkeeping
+    # decision to stop trying, so it can filter out of "not verified" work queues without implying
+    # the portal did anything. Reset (regen credentials) already provides the un-retire path, direct-
+    # assignment back to NEW, same as it already does for BURNED -- no separate rehab route needed.
+    RETIRED = "retired"
 
 
 # ── Booking ───────────────────────────────────────────────────────────────────

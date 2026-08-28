@@ -46,22 +46,29 @@ def identity_transition(frm: IdentityStatus, to: IdentityStatus) -> IdentityStat
 
 # ── Sub-account ───────────────────────────────────────────────────────────────
 SUBACCOUNT_TRANSITIONS = {
-    SubAccountStatus.NEW:        frozenset({SubAccountStatus.REGISTERED, SubAccountStatus.BURNED}),
-    SubAccountStatus.REGISTERED: frozenset({SubAccountStatus.VERIFIED, SubAccountStatus.BURNED}),
+    SubAccountStatus.NEW:        frozenset({SubAccountStatus.REGISTERED, SubAccountStatus.BURNED,
+                                            SubAccountStatus.RETIRED}),
+    SubAccountStatus.REGISTERED: frozenset({SubAccountStatus.VERIFIED, SubAccountStatus.BURNED,
+                                            SubAccountStatus.RETIRED}),
     SubAccountStatus.VERIFIED:   frozenset({SubAccountStatus.LOGIN_OK, SubAccountStatus.HELD,
-                                            SubAccountStatus.BURNED}),
+                                            SubAccountStatus.BURNED, SubAccountStatus.RETIRED}),
     # login_ok is durable; a proven account can hold, book, or burn, but never regress below verified.
     SubAccountStatus.LOGIN_OK:   frozenset({SubAccountStatus.HELD, SubAccountStatus.BOOKED,
-                                            SubAccountStatus.BURNED}),
+                                            SubAccountStatus.BURNED, SubAccountStatus.RETIRED}),
     SubAccountStatus.HELD:       frozenset({SubAccountStatus.BOOKED, SubAccountStatus.LOGIN_OK,
-                                            SubAccountStatus.BURNED}),
+                                            SubAccountStatus.BURNED, SubAccountStatus.RETIRED}),
     SubAccountStatus.BOOKED:     frozenset(),
     SubAccountStatus.BURNED:     frozenset({SubAccountStatus.VERIFIED}),  # rehab allowed
+    # Terminal within this formal ladder, same as BURNED effectively is: the un-retire path is
+    # Reset's direct status assignment back to NEW (apps/hub/main.py), bypassing this table
+    # entirely -- exactly how an operator already un-burns an account today.
+    SubAccountStatus.RETIRED:    frozenset(),
 }
 # NOTE: registration-attempt failure is tracked on RegistrationJob.status (RegistrationStatus.FAILED),
 # not here -- SubAccountStatus only records durable/settled outcomes. A failed attempt leaves
 # SubAccount.status wherever it last settled (usually NEW), so the account is naturally re-selectable
-# for another registration run without needing a "failed" rung on this ladder.
+# for another registration run without needing a "failed" rung on this ladder. RETIRED is the
+# operator's own escape hatch for an account that failed enough times to not be worth that anymore.
 
 
 def subaccount_transition(frm: SubAccountStatus, to: SubAccountStatus) -> SubAccountStatus:

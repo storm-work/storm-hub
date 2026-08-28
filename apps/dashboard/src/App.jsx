@@ -95,7 +95,7 @@ function Sortable({ label, k, sort, setSort, w }) {
 // full-height docked sidebar flush to the viewport edge, not a floating card next to the table). A
 // page calls the setLeftPanel/setRightPanel callbacks App passes it: setLeftPanel({title, content})
 // to open, setLeftPanel(null) to close. See Identities() for the reference usage.
-function SidePanel({ side, title, onClose, children }) {
+function SidePanel({ side, title, onClose, wide, children }) {
   // onClose omitted (e.g. Proxies' pool tree, which is permanent page navigation, not an on-demand
   // action panel like Identities'/Bookings' fold-outs) -> no × button, nothing to dismiss it with.
   // The fold/unfold toggle is independent of onClose -- available on every SidePanel (permanent nav
@@ -103,7 +103,7 @@ function SidePanel({ side, title, onClose, children }) {
   const [collapsed, setCollapsed] = useState(false);
   const foldGlyph = side === "left" ? (collapsed ? "»" : "«") : (collapsed ? "«" : "»");
   return (
-    <div className={`side-panel ${side}${collapsed ? " collapsed" : ""}`}>
+    <div className={`side-panel ${side}${wide ? " wide" : ""}${collapsed ? " collapsed" : ""}`}>
       <div className="side-panel-header">
         {!collapsed && <h3>{title}</h3>}
         <button className="panel-fold" onClick={() => setCollapsed(!collapsed)}
@@ -203,7 +203,7 @@ export default function App() {
         </button>
       </div>
       <div className="app-body">
-        {leftPanel && <SidePanel side="left" title={leftPanel.title}
+        {leftPanel && <SidePanel side="left" title={leftPanel.title} wide={leftPanel.wide}
           onClose={leftPanel.closable === false ? undefined : () => setLeftPanel(null)}>{leftPanel.content}</SidePanel>}
         <div className="container">
           {!me.is_operating && (
@@ -215,7 +215,7 @@ export default function App() {
               can outlive a role change or point at a hidden page after a re-login. */}
           {visiblePages.includes(page) ? pages[page] : pages[visiblePages[0]]}
         </div>
-        {rightPanel && <SidePanel side="right" title={rightPanel.title} onClose={() => setRightPanel(null)}>{rightPanel.content}</SidePanel>}
+        {rightPanel && <SidePanel side="right" title={rightPanel.title} wide={rightPanel.wide} onClose={() => setRightPanel(null)}>{rightPanel.content}</SidePanel>}
       </div>
     </>
   );
@@ -1178,6 +1178,7 @@ function BookingWorkers({ me, booking, events, workers, setRightPanel }) {
   function openAttachPanel() {
     setRightPanel({
       title: "Attach identities",
+      wide: true,
       content: <AttachPanel me={me} booking={booking} identities={identities.rows} templates={templates.rows}
         attached={new Set(workers.rows.map((w) => w.identity_id))}
         onAttached={() => { workers.reload(); }} />,
@@ -1226,7 +1227,7 @@ function BookingWorkers({ me, booking, events, workers, setRightPanel }) {
             })}
         </div>
       )}
-      <table className="table-compact">
+      <table className="table-compact table-nowrap">
         <thead><tr>
           <th style={{ width: 28 }}><input type="checkbox" checked={shown.length > 0 && shown.every((w) => sel[w.id])}
             onChange={(e) => { const s = {}; if (e.target.checked) shown.forEach((w) => (s[w.id] = true)); setSel(s); }} /></th>
@@ -1252,7 +1253,7 @@ function BookingWorkers({ me, booking, events, workers, setRightPanel }) {
                     title={w.substate_detail || ""}>
                   {w.live_substate}{w.live_outcome ? ` (${w.live_outcome})` : ""}
                 </td>
-                <td className="row" style={{ flexWrap: "nowrap", gap: 4, overflowX: "auto" }}>
+                <td className="row" style={{ flexWrap: "nowrap", gap: 4 }}>
                   <button className="btn-sm btn" disabled={!op || !canWorkerAction("launch", w.status)}
                     title={actionTitle("launch", w.status)}
                     onClick={() => run(() => api(`/workers/${w.id}/launch`, { method: "POST" }))}>Launch</button>
@@ -1372,6 +1373,13 @@ function AttachPanel({ me, booking, identities, templates, attached, onAttached 
   const [showRole, setShowRole] = useState("all");
   const [tplId, setTplId] = useState("");
   const [msg, setMsg] = useState("");
+  // `attached`/`identities` are plain props captured on the JSX element the instant openAttachPanel()
+  // built it (App owns rightPanel.content as an already-constructed element, not a render prop) -- a
+  // successful attach here triggers onAttached() -> the PARENT's workers.reload(), which updates the
+  // parent's own state and does nothing to refresh props already baked into this mounted element. So
+  // a just-attached identity kept showing as still-eligible until the panel was closed and reopened.
+  // Tracked locally instead of depending on that refresh: filtered out below alongside `attached`.
+  const [justAttached, setJustAttached] = useState(new Set());
   const op = me.is_operating;
 
   // Eligible = right type for this booking, not already attached HERE, not allocated to another
@@ -1404,7 +1412,8 @@ function AttachPanel({ me, booking, identities, templates, attached, onAttached 
   // booking `role` is an ASSIGNMENT applied to everything selected, not a filter, so it is not
   // applied here.
   const eligible = forThisBooking.filter(
-    (i) => !attached.has(i.id) && !i.allocated_booking_id && i.status === "active"
+    (i) => !attached.has(i.id) && !justAttached.has(i.id) && !i.allocated_booking_id
+           && i.status === "active"
            && (booking.type === "test" || showRole === "all" || roleFor(i) === showRole));
 
   // An identity attached ANYWHERE is not mentioned at all (operator, 2026-08-21). It was already
@@ -1420,71 +1429,96 @@ function AttachPanel({ me, booking, identities, templates, attached, onAttached 
   const hiddenNotReady = forThisBooking.filter(
     (i) => !attached.has(i.id) && !i.allocated_booking_id && i.status !== "active").length;
 
+  // Sort only -- reuses useSortSearch's sort/rows half; its own `q`/setQ is unused here because the
+  // panel already has a deliberately narrow passport/name search above (matchesSearch), not the
+  // generic whole-row JSON match useSortSearch's search half does.
+  const { sort, setSort, rows: sortedEligible } = useSortSearch(eligible, { key: "created_at", dir: "desc" });
+
   const selectedIds = Object.keys(sel).filter((k) => sel[k]);
 
   async function attachSelected() {
     setMsg("");
-    try {
-      for (const identity_id of selectedIds) {
+    // Mark each identity attached (removing it from the table below) as soon as ITS OWN request
+    // succeeds, not only after the whole batch finishes -- a later identity in the selection
+    // failing (e.g. a 409) must not leave the ones that already succeeded sitting in the list,
+    // selectable again, inviting a duplicate attach attempt on retry.
+    for (const identity_id of selectedIds) {
+      try {
         await api(`/bookings/${booking.id}/identities`, {
           method: "POST",
           body: { identity_id, assigned_role: booking.type === "test" ? role : undefined,
                   template_id: tplId || undefined },
         });
+        setJustAttached((prev) => new Set([...prev, identity_id]));
+        setSel((prev) => { const next = { ...prev }; delete next[identity_id]; return next; });
+      } catch (e) {
+        setMsg(e.message);
+        return;   // stop the batch here -- the operator sees why, and can retry just what's left
       }
-      setSel({});
-      onAttached();
-    } catch (e) { setMsg(e.message); }
+    }
+    onAttached();
   }
 
   return (
     <>
-      <div className="field"><SearchBox q={q} setQ={setQ} placeholder="filter by passport or name…" /></div>
       {booking.type === "real" && (
         <div className="muted" style={{ fontSize: 12, marginBottom: 8 }}>
           Role is derived from identity type on a real booking — test identities become scouts,
           real identities become appliers. The Role column below shows what each one will get.
         </div>
       )}
-      {booking.type === "real" && (
-        <div className="field"><label>Show</label>
-          <select value={showRole} onChange={(e) => { setShowRole(e.target.value); setSel({}); }}
-                  style={{ width: "100%" }}>
-            <option value="all">all eligible</option>
-            <option value="scout">scouts only (test identities)</option>
-            <option value="apply">appliers only (real identities)</option>
+      <div className="panel-toolbar">
+        <div className="field grow-2"><label>Filter</label>
+          <SearchBox q={q} setQ={setQ} placeholder="filter by passport or name…" /></div>
+        {booking.type === "real" && (
+          <div className="field"><label>Show</label>
+            <select value={showRole} onChange={(e) => { setShowRole(e.target.value); setSel({}); }}
+                    style={{ width: "100%" }}>
+              <option value="all">all eligible</option>
+              <option value="scout">scouts only (test identities)</option>
+              <option value="apply">appliers only (real identities)</option>
+            </select></div>
+        )}
+        {booking.type === "test" && (
+          <div className="field"><label>Role (applied to selection)</label>
+            <select value={role} onChange={(e) => setRole(e.target.value)} style={{ width: "100%" }}>
+              <option value="scout">scout</option><option value="apply">apply</option>
+            </select></div>
+        )}
+        <div className="field"><label>Template</label>
+          <select value={tplId} onChange={(e) => setTplId(e.target.value)} style={{ width: "100%" }}>
+            <option value="">auto (by role)</option>
+            {templates.map((t) => (<option key={t.id} value={t.id}>{t.name} ({t.role})</option>))}
           </select></div>
-      )}
-      {booking.type === "test" && (
-        <div className="field"><label>Role</label>
-          <select value={role} onChange={(e) => setRole(e.target.value)} style={{ width: "100%" }}>
-            <option value="scout">scout</option><option value="apply">apply</option>
-          </select></div>
-      )}
-      <div className="field"><label>Template</label>
-        <select value={tplId} onChange={(e) => setTplId(e.target.value)} style={{ width: "100%" }}>
-          <option value="">auto (by role)</option>
-          {templates.map((t) => (<option key={t.id} value={t.id}>{t.name} ({t.role})</option>))}
-        </select></div>
-      <div className="muted" style={{ fontSize: 12, marginBottom: 8 }}>{selectedIds.length} selected · {eligible.length} eligible</div>
-      <button className="btn" disabled={!op || selectedIds.length === 0} onClick={attachSelected} style={{ width: "100%", marginBottom: 12 }}>
-        Attach {selectedIds.length > 0 ? `(${selectedIds.length})` : ""}
-      </button>
+      </div>
+      <div className="row" style={{ marginBottom: 12 }}>
+        <div className="muted" style={{ fontSize: 12 }}>{selectedIds.length} selected · {eligible.length} eligible</div>
+        <span className="grow" />
+        <button className="btn" disabled={!op || selectedIds.length === 0} onClick={attachSelected}>
+          Attach {selectedIds.length > 0 ? `(${selectedIds.length})` : ""}
+        </button>
+      </div>
       {msg && <div className="banner err">{msg}</div>}
-      <table>
+      <table className="table-nowrap">
         <thead><tr>
           <th style={{ width: 28 }}><input type="checkbox" checked={eligible.length > 0 && eligible.every((i) => sel[i.id])}
             onChange={(e) => { const s = {}; if (e.target.checked) eligible.forEach((i) => (s[i.id] = true)); setSel(s); }} /></th>
-          {/* px, not %: this table lives in a narrow side panel where 16% is ~40px -- less than
-              the word "apply" -- so the pills had nothing to sit in. Passport takes what is left. */}
-          <th>Passport</th><th style={{ width: 74 }}>Type</th><th style={{ width: 74 }}>Role</th>
+          <th>Passport</th>
+          <th>Name</th>
+          <Sortable label="Type" k="type" sort={sort} setSort={setSort} w={70} />
+          <th style={{ width: 70 }}>Role</th>
+          <Sortable label="Target" k="target_posto" sort={sort} setSort={setSort} w={80} />
+          <Sortable label="Created" k="created_at" sort={sort} setSort={setSort} w={130} />
         </tr></thead>
-        <tbody>{eligible.map((i) => (
+        <tbody>{sortedEligible.map((i) => (
           <tr key={i.id}>
             <td><input type="checkbox" checked={!!sel[i.id]} onChange={(e) => setSel({ ...sel, [i.id]: e.target.checked })} /></td>
-            <td title={i.full_name}>{i.passport_no || <span className="muted">— none —</span>}</td>
+            <td>{i.passport_no || <span className="muted">— none —</span>}</td>
+            <td>{i.full_name}</td>
             <td><span className="pill">{i.type}</span></td>
             <td><span className="pill">{roleFor(i)}</span></td>
+            <td className="muted">{i.target_posto || "—"}</td>
+            <td className="muted">{i.created_at ? new Date(i.created_at).toLocaleDateString() : "—"}</td>
           </tr>
         ))}</tbody>
       </table>
@@ -1737,7 +1771,7 @@ function Identities({ me, setLeftPanel, setRightPanel }) {
           <button className="btn" disabled={!op} onClick={genSubs}>Gen sub-accounts</button>
         </div>
       )}
-      <table>
+      <table className="table-nowrap">
         <thead><tr>
           <th style={{ width: 36 }}><input type="checkbox" checked={shown.length > 0 && shown.every((i) => sel[i.id])}
             onChange={(e) => { const s = {}; if (e.target.checked) shown.forEach((i) => (s[i.id] = true)); setSel(s); }} /></th>
@@ -1776,14 +1810,14 @@ function Identities({ me, setLeftPanel, setRightPanel }) {
 function IdentityCreatePanel({ me, onDone }) {
   const op = me.is_operating;
   const [f, setF] = useState({ full_name: "", type: "test", birthdate: "", gender: "M",
-                               passport_no: "", nationality: "CPV", comment: "", target_posto: "" });
+                               passport_no: "", nationality: "CPV", comment: "", target_posto: "5084" });
   const [msg, setMsg] = useState("");
   const [gt, setGt] = useState({ count: 10, accounts_per_identity: 3, nationality: "CPV" });
 
   async function create() {
     setMsg("");
     const body = { ...f, target_posto: f.type === "real" ? (f.target_posto || null) : null };
-    try { await api("/identities", { method: "POST", body }); onDone(); setF({ ...f, full_name: "", passport_no: "", comment: "", target_posto: "" }); }
+    try { await api("/identities", { method: "POST", body }); onDone(); setF({ ...f, full_name: "", passport_no: "", comment: "", target_posto: "5084" }); }
     catch (e) { setMsg(e.message); }
   }
   async function genTest() {
@@ -1810,7 +1844,7 @@ function IdentityCreatePanel({ me, onDone }) {
       <div className="field"><label>Passport</label><input value={f.passport_no} onChange={(e) => setF({ ...f, passport_no: e.target.value })} style={{ width: "100%" }} /></div>
       <div className="field"><label>Nationality</label><input value={f.nationality} onChange={(e) => setF({ ...f, nationality: e.target.value })} style={{ width: "100%" }} /></div>
       {f.type === "real" && (
-        <div className="field"><label>Target posto</label><input value={f.target_posto} onChange={(e) => setF({ ...f, target_posto: e.target.value })} style={{ width: "100%" }} /></div>
+        <div className="field"><label>Target posto (default 5084)</label><input value={f.target_posto} onChange={(e) => setF({ ...f, target_posto: e.target.value })} style={{ width: "100%" }} /></div>
       )}
       <div className="field"><label>Comment</label><input value={f.comment} onChange={(e) => setF({ ...f, comment: e.target.value })} style={{ width: "100%" }} /></div>
       <button className="btn" disabled={!op || !f.full_name} onClick={create} style={{ width: "100%", marginBottom: 18 }}>Create identity</button>
@@ -1836,6 +1870,7 @@ function IdentityImportPipeline({ me, onDone }) {
   const [fileName, setFileName] = useState("");
   const [text, setText] = useState("");
   const [defaultType, setDefaultType] = useState("real");
+  const [targetPosto, setTargetPosto] = useState("5084");
   const [autoGen, setAutoGen] = useState(true);
   const [subCount, setSubCount] = useState(3);
   const [autoRegister, setAutoRegister] = useState(true);
@@ -1860,7 +1895,8 @@ function IdentityImportPipeline({ me, onDone }) {
     setErr(""); setSteps([]); setBusy(true);
     const log = [];
     try {
-      const imp = await api("/identities/import", { method: "POST", body: { csv: text, default_type: defaultType } });
+      const imp = await api("/identities/import", { method: "POST",
+        body: { csv: text, default_type: defaultType, default_target_posto: targetPosto || null } });
       log.push({ label: "Import", detail: `${imp.created} identities created, ${imp.sub_accounts} sub-accounts from file, ${imp.errors.length} skipped/errors` });
       setSteps([...log]);
 
@@ -1907,11 +1943,18 @@ function IdentityImportPipeline({ me, onDone }) {
       <textarea value={text} onChange={(e) => { setText(e.target.value); setFileName(""); }} rows={6} disabled={!op}
         style={{ width: "100%", fontFamily: "monospace", fontSize: 12, background: "var(--panel2)", color: "var(--text)", border: "1px solid var(--border)", borderRadius: 8, padding: 8, marginBottom: 8 }}
         placeholder="…or paste content here" />
-      <div className="field">
-        <label>Default type (CSV rows without an explicit type; labeled-block files always import as real)</label>
-        <select value={defaultType} onChange={(e) => setDefaultType(e.target.value)} disabled={!op} style={{ width: "100%" }}>
-          <option value="real">real</option><option value="test">test</option>
-        </select>
+      <div className="row" style={{ flexWrap: "wrap", gap: 8, marginBottom: 4 }}>
+        <div className="field" style={{ margin: 0, flex: 1, minWidth: 220 }}>
+          <label>Default type (CSV rows without an explicit type; labeled-block files always import as real)</label>
+          <select value={defaultType} onChange={(e) => setDefaultType(e.target.value)} disabled={!op} style={{ width: "100%" }}>
+            <option value="real">real</option><option value="test">test</option>
+          </select>
+        </div>
+        <div className="field" style={{ margin: 0, minWidth: 140 }}>
+          <label>Target posto (real identities)</label>
+          <input value={targetPosto} onChange={(e) => setTargetPosto(e.target.value)} disabled={!op}
+            placeholder="5084" style={{ width: "100%" }} />
+        </div>
       </div>
 
       <div className="field" style={{ display: "flex", alignItems: "center", gap: 8 }}>
@@ -2110,8 +2153,12 @@ function Registration({ me, events }) {
   const typeFiltered = rows.filter((s) => typeFilter === "all" || s.identity_type === typeFilter);
   const statusFiltered = typeFiltered.filter((s) => {
     if (statusFilter === "all") return true;
+    // Retired is a deliberate "stop offering this one" decision (exhausted registration attempts,
+    // never reached verified) -- excluded from the default queue same as verified/login_ok/booked
+    // are, just for the opposite reason (done vs. given up on), so it doesn't clutter the list of
+    // accounts that are actually still worth registering.
     if (statusFilter === "not_verified") return s.status !== "verified" && s.status !== "login_ok"
-      && s.status !== "booked";
+      && s.status !== "booked" && s.status !== "retired";
     if (statusFilter === "failed") return s.registration_status === "failed";
     return s.status === statusFilter;
   });
@@ -2133,10 +2180,32 @@ function Registration({ me, events }) {
     } catch (e) { setMsg(e.message); }
   }
 
+  async function stopRun() {
+    if (!runInfo) return;
+    setMsg("");
+    try {
+      await api(`/registration/runs/${runInfo.run_id}/stop`, { method: "POST" });
+      setRunInfo(null);
+    } catch (e) { setMsg(e.message); }
+  }
+
   async function reset() {
     setMsg("");
     try {
       await api("/sub-accounts/reset", { method: "POST", body: { sub_account_ids: selectedIds } });
+      setSel({});
+      reload();
+    } catch (e) { setMsg(e.message); }
+  }
+
+  async function retire() {
+    setMsg("");
+    if (!window.confirm(
+      `Retire ${selectedIds.length} sub-account(s)?\n\n` +
+      "They stop being offered for registration or live login, and drop out of the " +
+      "\"not verified\" queue. Reset still brings one back if needed.")) return;
+    try {
+      await api("/sub-accounts/retire", { method: "POST", body: { sub_account_ids: selectedIds } });
       setSel({});
       reload();
     } catch (e) { setMsg(e.message); }
@@ -2157,6 +2226,7 @@ function Registration({ me, events }) {
               <option value="registered">registered</option>
               <option value="verified">verified</option>
               <option value="failed">failed last attempt</option>
+              <option value="retired">retired</option>
             </select></div>
           <div className="field" style={{ margin: 0 }}><label>Type</label>
             <select value={typeFilter} onChange={(e) => setTypeFilter(e.target.value)}>
@@ -2166,7 +2236,13 @@ function Registration({ me, events }) {
         </div>
         {err && <div className="banner err">{err}</div>}
         {msg && <div className="banner err">{msg}</div>}
-        {runInfo && <div className="banner info">Run {runInfo.run_id} started — {runInfo.queued} account(s) queued.</div>}
+        {runInfo && (
+          <div className="banner info row" style={{ flexWrap: "wrap", gap: 10 }}>
+            <span>Run {runInfo.run_id} started — {runInfo.queued} account(s) queued.</span>
+            <span className="grow" />
+            <button className="btn danger" onClick={stopRun} disabled={!op}>Stop run</button>
+          </div>
+        )}
         {selectedIds.length > 0 && (
           <div className="banner info row" style={{ flexWrap: "wrap", gap: 10 }}>
             <span>{selectedIds.length} selected</span>
@@ -2194,10 +2270,12 @@ function Registration({ me, events }) {
             <div className="field" style={{ margin: 0 }}><label>Concurrency</label>
               <input type="number" value={concurrency} onChange={(e) => setConcurrency(e.target.value)} disabled={!op} style={{ width: 60 }} /></div>
             <button className="btn ghost" disabled={!op} onClick={reset}>Reset (regen credentials)</button>
+            <button className="btn ghost" disabled={!op} onClick={retire}
+                    title="stop offering these for registration or live login">Retire</button>
             <button className="btn" disabled={!op} onClick={register}>Register selected</button>
           </div>
         )}
-        <table>
+        <table className="table-nowrap">
           <thead><tr>
             <th style={{ width: 36 }}><input type="checkbox" checked={shown.length > 0 && shown.every((s) => sel[s.id])}
               onChange={(e) => { const s = {}; if (e.target.checked) shown.forEach((r) => (s[r.id] = true)); setSel(s); }} /></th>

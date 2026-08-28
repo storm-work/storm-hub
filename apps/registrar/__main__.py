@@ -156,8 +156,17 @@ async def _register_one(acct: dict, proxies_cycle, capsolver_keys: list[str], la
             progress("form filled")
             progress("submitting registration")
             try:
+                # browser_fetch, not s.post: the raw primp client shares the sticky proxy session
+                # the browser above already opened, and issuing a second, separate connection
+                # through that same session breaks the tunnel (measured elsewhere in this project --
+                # raw-request-after-browser-use on one sticky session: 0/6 vs browser-only: 5/6).
+                # 2026-08-27's reg-d0dbc700552f run showed this exact signature: CAPTCHA solving at
+                # 92% (the proxy-ordering fix worked) but 89% of the *register POSTs that followed*
+                # killed by "peer closed connection without sending TLS close_notify" -- the portal
+                # resetting a tunnel the raw client just reused. browser_fetch submits through the
+                # live browser context instead, same as every other proven request in this codebase.
                 def _do(s=s, payload=payload):
-                    return s.post(REGISTER_URL, data=payload, headers=HEADERS_XHR, timeout=90)
+                    return s.browser_fetch(REGISTER_URL, data=payload, headers=HEADERS_XHR, timeout=90)
                 reg_resp = await loop.run_in_executor(executor, _do)
             except Exception as e:
                 progress(f"register POST failed: {e}")
@@ -166,11 +175,11 @@ async def _register_one(acct: dict, proxies_cycle, capsolver_keys: list[str], la
                 continue
 
             try:
-                reg_json = json.loads(reg_resp.text.strip())
+                reg_json = json.loads(reg_resp["body"].strip())
                 reg_type = reg_json.get("type", "")
                 reg_desc = reg_json.get("description", "")
             except Exception:
-                reg_type, reg_desc = "", reg_resp.text[:80]
+                reg_type, reg_desc = "", reg_resp["body"][:80]
 
             if "already_exists" in reg_type or "already_exists" in reg_desc.lower():
                 progress("account already exists on server")
@@ -179,7 +188,7 @@ async def _register_one(acct: dict, proxies_cycle, capsolver_keys: list[str], la
                 except Exception: pass
                 return "exists"
 
-            if reg_type == "200" or reg_resp.status_code == 503:
+            if reg_type == "200" or reg_resp["status"] == 503:
                 reg_token_raw = reg_json.get("description", "") if reg_type == "200" else ""
                 used_proxy = proxy
                 used_proxy_id = proxy_id

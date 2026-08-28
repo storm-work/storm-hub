@@ -107,6 +107,66 @@ def test_reset_unknown_id_reported_as_error_not_exception(client):
     assert "not found" in r.json()["errors"][0]
 
 
+# ── POST /sub-accounts/retire ────────────────────────────────────────────────
+def test_retire_sets_status(client):
+    """Regression, live 2026-08-27: 8 accounts stuck at NEW/REGISTERED with 12-20 failed
+    registration attempts each, cluttering the Registration page's "not verified" queue with rows
+    that will never succeed on a retry. Retire is the operator's way to say so."""
+    c, _ = client
+    h = _op_headers(c)
+    _iid, subs = _make_identity_with_subs(c, h, n=1)
+    sid = subs[0]["id"]
+
+    r = c.post("/sub-accounts/retire", json={"sub_account_ids": [sid]}, headers=h)
+    assert r.status_code == 200
+    assert r.json()["created"] == 1
+
+    updated = next(s for s in c.get("/sub-accounts", headers=h).json() if s["id"] == sid)
+    assert updated["status"] == "retired"
+
+
+def test_retire_unknown_id_reported_as_error_not_exception(client):
+    c, _ = client
+    h = _op_headers(c)
+    r = c.post("/sub-accounts/retire", json={"sub_account_ids": ["nope"]}, headers=h)
+    assert r.status_code == 200
+    assert r.json()["created"] == 0
+    assert "not found" in r.json()["errors"][0]
+
+
+def test_retired_account_excluded_from_live_ranking(client):
+    """The exact safety property retiring exists for: a retired account must never be picked for a
+    real login, not even as a last resort -- mirrors BURNED's existing exclusion."""
+    import apps.hub.main as hub_main
+    from libs.db import models as M
+
+    c, TestSession = client
+    h = _op_headers(c)
+    iid, subs = _make_identity_with_subs(c, h, n=2)
+    retire_id = subs[0]["id"]
+    c.post("/sub-accounts/retire", json={"sub_account_ids": [retire_id]}, headers=h)
+
+    db = TestSession()
+    try:
+        ranked = hub_main._rank_live_sub_accounts(db, iid)
+        assert retire_id not in [s.id for s in ranked]
+        assert len(ranked) == 1   # the other (untouched) sub-account is still offered
+    finally:
+        db.close()
+
+
+def test_run_registration_rejects_a_selection_of_only_retired_accounts(client):
+    c, _ = client
+    h = _op_headers(c)
+    _iid, subs = _make_identity_with_subs(c, h, n=1)
+    sid = subs[0]["id"]
+    c.post("/sub-accounts/retire", json={"sub_account_ids": [sid]}, headers=h)
+
+    r = c.post("/registration/run", json={"sub_account_ids": [sid], "concurrency": 1,
+                                          "provider": "soax"}, headers=h)
+    assert r.status_code == 400
+
+
 # ── POST /registration/run ───────────────────────────────────────────────────
 def test_run_registration_rejects_without_capsolver_keys(client):
     c, _ = client
