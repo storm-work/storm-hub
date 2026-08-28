@@ -878,3 +878,37 @@ Measured on `Test 2032`: one worker went `-> discovering` **twenty times in ~10 
 blocked, five workers wide, for hours — asking again 30 s after the portal said to try later. Fixed
 by `4bc66d9` (`DISCOVERY_BLOCKED_BACKOFF`, doubling, capped, jittered, resets on a healthy gettime).
 storm-auto's precedent: *"~2.5h of empty polling drew 77 DataDome pages → fixed by bounded backoff."*
+
+## 36. The apply path is HEALTHY at the moment of submit — 2026-08-28, posto 5084
+
+**CONFIRMED, and it eliminates every cursor-side hypothesis.** This is the first direct measurement
+of the document the submit is built in, taken inside the real round rather than in a probe. Raw:
+`scratchpad/run0828_dump.json` (5,007 events), 291 bodies in `var/submits/`.
+
+Two concurrent bookings, 80 workers, posto 5084. **All 8 `PRE-SUBMIT` lines carried the identical
+signature to the two %PDF-verified bookings of 2026-08-27 (§31):**
+
+```
+do_apply: PRE-SUBMIT doc 55,198B markers=['getSlots','captchaDiv','SubmeterVistoCriaPDF',
+          'f_date_c','cmbPeriodo'] title='Visa Application Scheduling' origin_ok=True
+```
+
+Cursor intact, all five markers, live portal origin, authenticated session — and the portal answered
+with the questionnaire page anyway (64,241 B, `Logout` x4, zero scheduling markers).
+
+**Therefore NOT any of:** a lost booking cursor, the `/slots` primer (§32 — already removed), a dead
+or expired session, an opaque `chrome-error` origin, a malformed payload. The submit is well-formed
+and the portal rejects it on its merits.
+
+Per storm-auto's semantics quoted at `ops_live.py` `_BOUNCE_KEYWORDS`, that response means **"the
+slot was taken, session is FINE."**
+
+**Supporting numbers:** 641 leases across both bookings — `form_stale` 246, `session` 393,
+**`booked` 0, `bounced` 0** — against only **8 and 20** advertised slots, with the same handful
+hammered repeatedly (`2026-09-17/3` x7, `2026-09-18/4` x5). Consistent with the long-recorded
+portal behaviour that *"most postos permanently advertise 3-4 phantom periods that cannot be booked
+by anyone"* (`_maybe_revert_false_slot_found` docstring).
+
+Also observed: 3 x `This applicant already has an application registered with a future schedule`
+(identities that can never book and will retry until stopped), and 88 `no scheduling markers`
+warm-up failures against 101 ScheduleController calls.

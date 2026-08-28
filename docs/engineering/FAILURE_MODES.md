@@ -392,3 +392,36 @@ APP (our logic/state) · OPS (configuration, deployment, human action).
   exists (`ops_live.py:641-644, 1453`) and already means "the chain verified this on this session".
   The age check is not optional: a failed re-warm never reaches `_set_anchor`, so `_anchor_src`
   retains the previous *successful* warm's value.
+
+## F29 — The phantom-slot detector is blind to the outcomes we actually produce
+- **Class:** APP
+- **What:** `_maybe_revert_false_slot_found` decides a pool is phantom by counting **`bounced`**
+  leases against `FALSE_SLOT_BOUNCE_LIMIT` (default 12). MEASURED 2026-08-28 across two concurrent
+  bookings on posto 5084: **641 leases — `form_stale` 246, `session` 393, `bounced` 0.** The guard
+  cannot fire, so a fleet can grind advertised-but-unbookable slots indefinitely with nothing
+  noticing.
+- **How it got this way, and why the cause was itself correct:** `bounced` used to be the catch-all.
+  Reclassifying our own gates and transport failures away from it (2026-08-15 onward) was right —
+  it stopped 5,082 bounced leases being charged to a pool that was never phantom, and stopped that
+  misattribution driving the false-slot revert on real slots. But it also removed the only signal
+  feeding phantom detection, and nothing replaced it.
+- **Why it matters at scale:** with 80 workers on a posto advertising 8-20 phantom periods, the
+  fleet burns sub-account login budget and portal goodwill against slots no one can book, while the
+  dashboard shows healthy `applying` workers. Compounds with the portal throttling already recorded
+  in CONFIRMED_FACTS §35.
+- **Detection today:** none automatic. Visible only by reading lease outcomes and noticing
+  `booked 0 / bounced 0` against a non-empty pool.
+- **FIX PLAN (not yet implemented):**
+  1. Count `form_stale` toward the phantom verdict on its **own, higher** threshold — a
+     `FALSE_SLOT_STALE_LIMIT`, separate from `FALSE_SLOT_BOUNCE_LIMIT`. `form_stale` is weaker
+     evidence than `bounced` (it is ambiguous between "slot taken" and "our form lapsed"), so it
+     must not share the bounce threshold.
+  2. Deliberately EXCLUDE `session`. That is transport dying, genuinely not the slot's fault, and
+     counting it would recreate exactly the misattribution the reclassification fixed.
+  3. Require the evidence to span **distinct slots**, not repeats of one — the 2026-08-27 defect was
+     14 leases on ONE slot, and a per-slot loop must not be mistaken for a phantom pool.
+  4. Tests: phantom pool detected from `form_stale` across distinct slots; NOT detected from
+     `session`; NOT detected from repeated `form_stale` on a single slot; existing `bounced`
+     behaviour unchanged.
+- **Do NOT** widen `FALSE_SLOT_BOUNCE_LIMIT` to cover these — that conflates three different
+  failures under one counter, which is how this blind spot was created.
