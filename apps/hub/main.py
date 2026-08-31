@@ -66,7 +66,7 @@ from libs.domain.enums import WorkerRole, WorkerStatus, WorkerSubstate
 from libs.domain.settings import resolve
 
 from libs.domain.enums import RegistrationMode, RegistrationStatus, SubAccountStatus
-from libs.proxies.health import check_proxy, quick_screen
+from libs.proxies.health import check_proxy, provider_reachable, quick_screen
 from libs.proxies.health import check_proxy as _REAL_CHECK_PROXY
 from libs.proxies.lease import ProxyLeaseError, lease_proxy, release_proxy, conn_url
 
@@ -2206,6 +2206,16 @@ def _pick_live_sub_account(db: Session, identity_id: str) -> M.SubAccount | None
     return candidates[0] if candidates else None
 
 
+def _static_pool(kind: str | None) -> bool:
+    """Does this request want a FIXED exit, where a per-row health flag has a real subject?
+
+    Only a static/ISP resource has one. Everything in the pool today is rotating (32,600/32,600),
+    so this is False in practice -- but the branch keeps per-row screening intact for a static pool
+    rather than deleting a mechanism a future pool might need.
+    """
+    return str(kind or "").strip().lower() in ("static", "isp")
+
+
 def _screen_tier1():
     """DISABLED: returns None. See libs/proxies/lease.py's TIER 1 comment.
 
@@ -2296,13 +2306,45 @@ def _do_launch_worker(db: Session, w: M.Worker) -> None:
         eff["_sub_account_id"] = sub_account.id
         w.sub_account_id = sub_account.id
         try:
+            _prov = str(eff.get("PROXY_PROVIDER", "soax"))
+            _kind = eff.get("PROXY_KIND") or None
             proxy, warm_proxy = lease_proxy(
-                db, w.id, provider=str(eff.get("PROXY_PROVIDER", "soax")),
-                kind=eff.get("PROXY_KIND") or None, health_check=check_proxy, quick_screen=_screen_tier1(),
+                db, w.id, provider=_prov,
+                # NO per-row health probe for a ROTATING pool. There is no row-level subject to
+                # screen: every row is a credential template and the exit is a session id we
+                # generate, measured at 100% survival to 60 min and 0% at 75 (CONFIRMED_FACTS §17).
+                # The probe was also a nav to the REAL PORTAL, so a throttle condemned the pool --
+                # 4,489 webshare rows flipped to is_healthy=False on 2026-08-28 and 73 of 120
+                # workers never launched. Re-checked against a neutral url on 2026-08-31: those
+                # condemned rows connected 20/20, identical to the healthy control.
+                #
+                # It also cost up to max_probes x ~20s of throwaway headless Chromium PER LAUNCH,
+                # inline -- the confirmed cause of the 2026-08-21 tick stall that stopped slot-open
+                # reaching the scouts of three live bookings.
+                #
+                # A dead EXIT is not knowable before use and is already handled after use by the
+                # worker's own _roll_exit (measured 25% -> 83% reachable, commit 6fa5899). A dead
+                # CREDENTIAL is knowable, and that is what provider_reachable checks below.
+                kind=_kind, health_check=(check_proxy if _static_pool(_kind) else None),
+                quick_screen=_screen_tier1(),
                 geos=_geos(eff.get("PROXY_GEOS")),
             )
         except ProxyLeaseError as e:
             raise HTTPException(409, f"worker {w.id}: {e}")
+
+        # Provider-level availability, ONCE per provider (cached), on a neutral url. This is the
+        # only proxy-side failure a pre-lease check can honestly detect: a dead account, a suspended
+        # plan, the wrong endpoint/port, an auth rejection. It never touches the portal and never
+        # probes the session id just leased (tier-1 poisoning: browser-only 5/6, primp-then-browser
+        # 0/6). Advisory only -- it does NOT fail the launch, because a gateway that answered 8s ago
+        # is weak evidence about this exit and the worker's own login is the real test.
+        try:
+            _ok, _why = provider_reachable(_prov, warm_proxy)
+            if not _ok:
+                logger.warning("provider %s gateway did not answer (%s) -- launching worker %s "
+                               "anyway; its login will be the real test", _prov, _why, w.id)
+        except Exception:
+            pass
 
         # Phase-2 (hold/apply/discovery) proxy, only leased when the swap is actually switched on
         # (HOLD_SWAP_AFTER_WARMUP) -- a worker with swap off keeps its phase-1 proxy for the whole

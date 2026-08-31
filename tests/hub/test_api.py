@@ -872,3 +872,16 @@ def test_attach_refuses_identity_that_already_holds_an_appointment(client):
                      headers=h).json()["id"]
     assert client.post(f"/bookings/{bid}/identities", json={"identity_id": ok},
                        headers=h).status_code == 201
+
+
+# ── a rotating launch must not run a per-row portal health probe (2026-08-31) ────────────────
+def test_static_pool_helper_only_treats_fixed_exits_as_screenable():
+    from apps.hub.main import _static_pool
+    assert _static_pool("static") is True
+    assert _static_pool("isp") is True
+    assert _static_pool("ISP") is True
+    assert _static_pool("rotating") is False, \
+        "a rotating row has no fixed exit to screen -- probing it condemned 4,489 good rows"
+    assert _static_pool("mobile") is False
+    assert _static_pool(None) is False
+    assert _static_pool("") is False

@@ -117,3 +117,53 @@ def apply_result(proxy, ok: bool, detail: str) -> None:
         proxy.score = min(SCORE_MAX, proxy.score + SCORE_STEP_UP)
     else:
         proxy.score = max(SCORE_MIN, proxy.score - SCORE_STEP_DOWN)
+
+
+# ── Provider-level availability (2026-08-31) ─────────────────────────────────────────────────
+# check_proxy above screens ONE ROW against the real portal. That was wrong twice over, and both
+# were measured:
+#
+#   1. There is no row-level subject to screen. All 32,600 rows are resource_type='rotating' and
+#      resolve to TWO credentials on TWO endpoints (soax 20,000 rows -> proxy.soax.com:5000,
+#      webshare 9,001 -> p.webshare.io:80). A row is a credential template; the exit is chosen by a
+#      session id we generate, and CONFIRMED_FACTS §17 measured those exits at 100% survival to
+#      60 min and 0% at 75. Scoring a row records the quality of an exit that no longer exists.
+#   2. It probed the PORTAL, so it measured portal availability. On 2026-08-28, while the portal
+#      throttled (§35), 4,489 webshare rows flipped to is_healthy=False and 73 of 120 workers never
+#      launched ("no proxy leased after 5 probe(s): 5 failed health"). Re-checked 2026-08-31 against
+#      a NEUTRAL url: condemned rows connected 20/20 (100%), identical to the healthy control, 20
+#      distinct exits. The flag was recording the portal, not the proxy.
+#
+# So availability is checked where a real subject exists -- the CREDENTIAL and ENDPOINT -- once per
+# provider, cached, against a neutral url, on a THROWAWAY session id. Never the portal (that is what
+# condemned the pool) and never the session id being leased out (tier-1 poisoning: browser-only 5/6
+# vs primp-then-browser 0/6).
+_PROVIDER_CACHE: dict[str, tuple[float, bool, str]] = {}
+PROVIDER_CHECK_TTL = 300.0
+
+
+def provider_reachable(provider: str, conn_url: str, *, ttl: float = PROVIDER_CHECK_TTL,
+                       now: float | None = None) -> tuple[bool, str]:
+    """Is this provider's gateway usable at all? Cached per provider for `ttl` seconds.
+
+    Catches the failures that are genuinely per-credential -- dead account, suspended plan, wrong
+    endpoint/port, auth rejection -- which are the only proxy-side failures a pre-lease check can
+    honestly detect. It deliberately says nothing about any individual exit: that is unknowable
+    before use and is handled after use by the worker's own _roll_exit.
+    """
+    import time as _t
+    now = _t.time() if now is None else now
+    hit = _PROVIDER_CACHE.get(provider)
+    if hit and now - hit[0] < ttl:
+        return hit[1], hit[2]
+    from .exit_ip import observe_exit_ip
+    ip = observe_exit_ip(conn_url, timeout=8.0)
+    ok = ip is not None
+    detail = f"exit {ip}" if ok else "no response from the provider gateway"
+    _PROVIDER_CACHE[provider] = (now, ok, detail)
+    return ok, detail
+
+
+def reset_provider_cache() -> None:
+    """Test seam / operator escape hatch -- forget every cached provider verdict."""
+    _PROVIDER_CACHE.clear()

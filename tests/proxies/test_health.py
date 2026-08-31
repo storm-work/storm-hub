@@ -39,3 +39,55 @@ def test_apply_result_failure_floors_score_at_min():
     p = _proxy(score=10.0)
     apply_result(p, False, "ConnectionError: refused")
     assert p.score == SCORE_MIN
+
+
+# ── rotating pools are not screened per row (2026-08-31) ─────────────────────────────────────
+# MEASURED: all 32,600 rows are resource_type='rotating' and resolve to TWO credentials on TWO
+# endpoints. A row is a credential template; the exit is a session id we generate, measured at 100%
+# survival to 60 min and 0% at 75. The old probe navigated the REAL PORTAL, so a throttle condemned
+# 4,489 webshare rows on 2026-08-28 and 73 of 120 workers never launched. Re-checked 2026-08-31
+# against a neutral url: condemned rows connected 20/20, identical to the healthy control.
+
+def test_provider_reachable_is_cached_per_provider(monkeypatch):
+    from libs.proxies import health
+    health.reset_provider_cache()
+    calls = []
+    monkeypatch.setattr("libs.proxies.exit_ip.observe_exit_ip",
+                        lambda url, timeout=8.0: calls.append(url) or "1.2.3.4")
+    a = health.provider_reachable("soax", "http://u:p@gw:1")
+    b = health.provider_reachable("soax", "http://u:p@gw:1")
+    assert a[0] is True and b[0] is True
+    assert len(calls) == 1, f"the gateway was probed once per lease, not once per provider: {calls}"
+
+
+def test_provider_reachable_reports_a_dead_gateway(monkeypatch):
+    from libs.proxies import health
+    health.reset_provider_cache()
+    monkeypatch.setattr("libs.proxies.exit_ip.observe_exit_ip", lambda url, timeout=8.0: None)
+    ok, why = health.provider_reachable("webshare", "http://u:p@gw:1")
+    assert ok is False and "gateway" in why
+
+
+def test_the_cache_expires(monkeypatch):
+    from libs.proxies import health
+    health.reset_provider_cache()
+    n = []
+    monkeypatch.setattr("libs.proxies.exit_ip.observe_exit_ip",
+                        lambda url, timeout=8.0: n.append(1) or "1.2.3.4")
+    health.provider_reachable("soax", "u", ttl=100.0, now=0.0)
+    health.provider_reachable("soax", "u", ttl=100.0, now=50.0)
+    assert len(n) == 1
+    health.provider_reachable("soax", "u", ttl=100.0, now=200.0)
+    assert len(n) == 2, "a stale verdict was served forever"
+
+
+def test_provider_reachable_never_touches_the_portal(monkeypatch):
+    """The whole defect being fixed: probing the portal made a throttle look like 4,489 dead rows."""
+    from libs.proxies import health
+    health.reset_provider_cache()
+    seen = []
+    monkeypatch.setattr("libs.proxies.exit_ip.observe_exit_ip",
+                        lambda url, timeout=8.0: seen.append(url) or "1.2.3.4")
+    health.provider_reachable("soax", "http://u:p@proxy.soax.com:5000")
+    assert not any("pedidodevistos" in s for s in seen), \
+        "the provider screen reached for the portal -- that is the bug, not the check"
