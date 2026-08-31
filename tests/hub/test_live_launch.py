@@ -585,6 +585,62 @@ def test_launch_aborts_when_the_worker_itself_was_stopped_mid_flight(db_session,
     assert spawned == []
 
 
+def test_launch_aborts_and_releases_the_lease_when_stop_lands_mid_lease(client, monkeypatch):
+    """F30, CONFIRMED LIVE 2026-08-28/2026-08-31: the entry guard (previous two tests) only fires
+    if the booking was ALREADY stopped before _do_launch_worker started. lease_proxy can spend up
+    to ~100s in real proxy health probes -- plenty of time for /stop to land in between. Two scout
+    relaunches passed the entry guard while RUNNING, then spawned real processes 25-44s after their
+    booking was STOPPED mid-lease, and held forever with no way to recover (see FAILURE_MODES.md
+    F30). Simulates the race by flipping the booking to STOPPED from inside lease_proxy itself."""
+    import apps.hub.main as hub_main
+    from libs.db import models as M
+    from libs.domain.enums import BookingStatus
+
+    h = _operate_headers(client)
+    tpl = client.post("/templates", json={"name": "Race Apply", "role": "apply", "settings": {}},
+                      headers=h).json()
+    iid = client.post("/identities", json={"full_name": "Race Test", "type": "real"},
+                      headers=h).json()["id"]
+    client.post("/identities/gen-subaccounts", json={"identity_ids": [iid], "count": 1}, headers=h)
+    client.post("/proxies", json={"provider": "soax", "kind": "rotating", "endpoint": "soax:1",
+                                  "credentials_ref": "u:p", "max_sessions": 5}, headers=h)
+    bid = client.post(
+        "/bookings",
+        json={"name": "race-b", "type": "real", "posto_id": "5084",
+              "settings": {"ENGINE_MODE": "live"}},
+        headers=h,
+    ).json()["id"]
+    w = client.post(f"/bookings/{bid}/identities",
+                    json={"identity_id": iid, "template_id": tpl["id"]}, headers=h).json()
+
+    orig_lease = hub_main.lease_proxy
+
+    def _lease_then_concurrent_stop(db, worker_id, **kwargs):
+        # The lease itself succeeds -- exactly what happened live: the proxy health probe passed,
+        # the process just hadn't spawned yet when the operator's /stop committed underneath it.
+        result = orig_lease(db, worker_id, **kwargs)
+        bk = db.get(M.Booking, bid)
+        bk.status = BookingStatus.STOPPED
+        db.commit()
+        return result
+
+    monkeypatch.setattr(hub_main, "lease_proxy", _lease_then_concurrent_stop)
+    spawned = []
+    monkeypatch.setattr(hub_main.supervisor, "spawn", lambda wid: spawned.append(wid))
+
+    r = client.post(f"/workers/{w['id']}/launch", headers=h)
+    assert r.status_code == 200               # aborts quietly, same shape as the entry guard
+    assert spawned == [], "spawned a worker whose booking was stopped mid-lease"
+    assert r.json()["status"] != "running"
+
+    db = hub_main.SessionLocal()
+    try:
+        leases = db.query(M.ProxyLease).filter_by(worker_id=w["id"], released_at=None).all()
+        assert leases == [], "proxy lease taken during the race was never released"
+    finally:
+        db.close()
+
+
 def test_start_launches_only_after_the_booking_transition_is_committed(client, monkeypatch):
     """CONFIRMED LIVE 2026-08-14. start_booking called _begin_fleet_launch BEFORE the commit that
     moved the booking out of STOPPED. The fleet launch runs on its own thread with its own DB

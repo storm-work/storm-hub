@@ -2677,3 +2677,99 @@ def test_a_healthy_gettime_resets_the_streak(monkeypatch):
     ops.do_discover(["2026-08-28"])
     assert slept[-1] <= first_two[0] * 1.2, \
         f"the streak did not reset after a healthy gettime: {slept}"
+
+
+# ── DISCOVERY_SOURCE finally has a read site (2026-08-31) ────────────────────────────────────
+# It sat in the settings catalog and in EngineConfig.discovery.source from the start with NOTHING
+# consuming it -- the same unwired-setting trap as QUEST_STEP_GAP and PARTIAL_RENDER_RETRIES.
+# The /slots path delivers the token the way the portal's own page does: onCaptchaSuccess(token)
+# -> the page's getSlots() -> handleServerResponse() populates window.data. data/new_booking.har
+# (a real booking) shows /slots returning 21,191B, so the endpoint works when driven correctly.
+
+class _SlotsPageSession(_FakeSession):
+    """Page-world stub: browser_eval returns whatever the portal's own script would have left."""
+    def __init__(self, payload):
+        super().__init__()
+        self.payload = payload
+        self.evals = []
+
+    def browser_nav(self, url, timeout=30, **kw):
+        return url
+
+    def browser_eval(self, js, timeout=30):
+        self.evals.append(js)
+        if "onCaptchaSuccess" in js:
+            return self.payload
+        if "location.origin" in (js or ""):
+            return _origin_reply(js)
+        return ""
+
+
+def _slots_ops(payload, source, monkeypatch):
+    monkeypatch.setattr("libs.engine.vendor.race_all",
+                        lambda *a, **k: "T" * 2617)
+    ops = _make_ops(emit=lambda t, **p: None)
+    ops.session = _SlotsPageSession(payload)
+    ops._log = lambda *a, **k: None
+    ops.posto_pdf = "3059"
+    ops.cfg.raw["DISCOVERY_SOURCE"] = source
+    object.__setattr__(ops.cfg.discovery, "source", source)
+    return ops
+
+
+def test_slots_source_parses_the_page_world_payload(monkeypatch):
+    payload = {"ok": True, "data": [{"date": "2026-09-14", "periods": [3, 5]},
+                                    {"date": "2026-09-15", "periods": []}]}
+    ops = _slots_ops(payload, "slots", monkeypatch)
+    out = ops.do_discover(["2026-09-14", "2026-09-15", "2026-09-16"])
+    by = {r["date"]: r for r in out}
+    assert by["2026-09-14"]["outcome"] == "found" and by["2026-09-14"]["periods"] == [3, 5]
+    assert by["2026-09-15"]["outcome"] == "empty"
+    assert by["2026-09-16"]["outcome"] == "empty", "absent from a payload the portal DID return"
+
+
+def test_a_non_array_payload_is_failed_not_empty(monkeypatch):
+    """The crash guard AND the classification guard. A non-array body is the portal declining, not
+    an empty calendar -- reporting `empty` would prune real dates from the pool (bug fix #6)."""
+    ops = _slots_ops({"coerced": True, "raw": '{"error":"ReCaptchaError"}'}, "slots", monkeypatch)
+    out = ops.do_discover(["2026-09-14", "2026-09-15"])
+    assert all(r["outcome"] == "failed" for r in out), out
+
+
+def test_calendar_remains_the_default(monkeypatch):
+    """The proven path must stay the default until a measurement justifies flipping it."""
+    ops = _slots_ops({"ok": True, "data": []}, "calendar", monkeypatch)
+    called = []
+    ops._discover_via_calendar = lambda dates: called.append(dates) or [
+        {"date": d, "outcome": "empty"} for d in dates]
+    ops._discover_via_slots = lambda dates: (_ for _ in ()).throw(
+        AssertionError("slots path ran while DISCOVERY_SOURCE=calendar"))
+    ops.do_discover(["2026-09-14"])
+    assert called == [["2026-09-14"]]
+
+
+def test_both_falls_back_to_calendar_only_for_unresolved_dates(monkeypatch):
+    ops = _slots_ops({"ok": True, "data": []}, "both", monkeypatch)
+    ops._discover_via_slots = lambda dates: [
+        {"date": "2026-09-14", "outcome": "found", "periods": [5]},
+        {"date": "2026-09-15", "outcome": "failed"}]
+    seen = []
+    ops._discover_via_calendar = lambda dates: seen.append(list(dates)) or [
+        {"date": d, "outcome": "empty"} for d in dates]
+    out = {r["date"]: r["outcome"] for r in ops.do_discover(["2026-09-14", "2026-09-15"])}
+    assert seen == [["2026-09-15"]], f"calendar was asked for the wrong dates: {seen}"
+    assert out == {"2026-09-14": "found", "2026-09-15": "empty"}
+
+
+def test_the_token_is_bound_to_SCHEDULE_EVISA(monkeypatch):
+    """Action mismatch is the documented way this fails: a LOGIN_EVISA token is validated for the
+    wrong action and the backend answers {"ReCaptchaError": true}."""
+    seen = {}
+    monkeypatch.setattr("libs.engine.vendor.race_all",
+                        lambda *a, **k: seen.setdefault("action", a[4]) or "T" * 2617)
+    ops = _make_ops(emit=lambda t, **p: None)
+    ops.session = _SlotsPageSession({"ok": True, "data": []})
+    ops._log = lambda *a, **k: None
+    ops.posto_pdf = "3059"
+    ops._discover_via_slots(["2026-09-14"])
+    assert seen.get("action") == "SCHEDULE_EVISA", f"token bound to {seen.get('action')!r}"

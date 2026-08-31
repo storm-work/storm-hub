@@ -2432,6 +2432,23 @@ def _do_launch_worker(db: Session, w: M.Worker) -> None:
     else:
         launch_kwargs = dict(_engine="sim")
 
+    # Second guard, not a duplicate of the one at entry: a live-mode lease above can spend up to
+    # ~100s in real proxy health probes (see lease_proxy's own comment), and the entry check runs
+    # BEFORE that wait, not after it. CONFIRMED LIVE 2026-08-28: two scout workers on "Booking
+    # 0828"/"Booking 0828 ws" were mid-lease when /stop landed; the entry check had already passed,
+    # so they spawned 25-44s after the booking was STOPPED and then held forever with no way to
+    # recover (their slot_found signal had already fired hours earlier and a relaunch's bus-state
+    # reset means it can never fire for them again -- see [[hold-respawn-launches-past-stop]]).
+    # db.refresh, not another db.get: `bk` is already in this session's identity map from the entry
+    # check, so a plain db.get would return that same cached object and never see a STOP committed
+    # by a different session in between.
+    db.refresh(bk)
+    if bk.status in _LAUNCH_BLOCKED_BOOKING_STATUSES:
+        logger.warning("launch aborted for worker %s: booking became %s while leasing a proxy",
+                       w.id, bk.status)
+        release_proxy(db, w.id)
+        return
+
     w.effective_settings_json = eff
     db.commit()   # freeze settings before spawn; status flips only after spawn+group are confirmed
 

@@ -1967,6 +1967,107 @@ class LiveEngineOps(EngineOps):
             self._emit("log_line", text=f"keepalive: restore {'succeeded' if ok else 'FAILED'}")
         return bool(ok)
 
+    # ── /slots discovery, page-world (2026-08-31) ────────────────────────────────────────────
+    # WHY THIS EXISTS. The belief that /slots returns zero/phantom data is contradicted by our own
+    # capture: data/new_booking.har (a real manual booking, 2026-08-24) shows
+    #     POST /slots?posto_id=3059 -> 200, 21,191 B, captcha = 2,617 chars
+    # i.e. a full slot payload, 15s before the submit that booked. Meanwhile our own probe sent a
+    # 2,617-char SCHEDULE_EVISA token -- same length, same action -- and got {"error":
+    # ReCaptchaError"}. Same token shape, opposite result, so the difference is DELIVERY.
+    #
+    # The portal's page binds the token itself: the reCAPTCHA container carries
+    # data-action="SCHEDULE_EVISA" data-callback="onCaptchaSuccess", and onCaptchaSuccess(token)
+    # calls the page's own getSlots(posto_id, token), whose handleServerResponse() assigns the
+    # result to window.data and unhides #calendarDiv. A DETACHED POST never runs any of that, so
+    # window.data stays null and the portal never sees the token arrive through its own callback.
+    #
+    # So this delivers the token the way the page does, in the page world, and reads what the
+    # page's own script produced. It is not a bypass of anything -- it is the portal's documented
+    # client flow, driven correctly.
+    _SLOTS_WAIT_MS = 12000
+
+    def _discover_via_slots(self, dates: list[str]) -> list[dict]:
+        """Solve SCHEDULE_EVISA, hand the token to window.onCaptchaSuccess, read window.data."""
+        from libs.engine.vendor import race_all
+        want = {str(d) for d in dates}
+        try:
+            self.session.browser_nav(SCHED_JSP + "?posto_id=" + str(self.posto_pdf or self.posto_id),
+                                     timeout=30)
+        except Exception as e:
+            self._log(f"do_discover[slots]: could not reach Schedule.jsp ({str(e)[:90]})")
+            return [{"date": d, "outcome": "failed"} for d in dates]
+        try:
+            token = race_all(self.capsolver_keys, [], [], [], "SCHEDULE_EVISA",
+                             self.warm_proxy, min_score=100) or ""
+        except Exception as e:
+            self._log(f"do_discover[slots]: CAPTCHA solve failed ({str(e)[:90]})")
+            return [{"date": d, "outcome": "failed"} for d in dates]
+        if not token:
+            self._log("do_discover[slots]: no token produced")
+            return [{"date": d, "outcome": "failed"} for d in dates]
+        self._log(f"do_discover[slots]: SCHEDULE_EVISA token len={len(token)} -> onCaptchaSuccess")
+
+        tok = json.dumps(token)
+        # Deliver exactly as the page does, then wait for ITS script to populate window.data.
+        # The `window.data = []` coercion is the crash guard: when the portal answers an error or a
+        # zero-slot response the body is an OBJECT, and the calendar's own
+        # `data.find(d => d.date === key)` throws "data.find is not a function" and freezes the UI.
+        js = """
+        (async () => {
+          const t = %s;
+          if (typeof window.onCaptchaSuccess !== 'function')
+            return {err: 'onCaptchaSuccess not defined'};
+          try { window.onCaptchaSuccess(t); } catch (e) { return {err: 'callback threw: ' + e}; }
+          const deadline = Date.now() + %d;
+          while (Date.now() < deadline) {
+            if (window.data !== undefined && window.data !== null) break;
+            await new Promise(r => setTimeout(r, 250));
+          }
+          let d = window.data;
+          if (d && !Array.isArray(d)) { window.data = []; return {coerced: true, raw: JSON.stringify(d).slice(0,300)}; }
+          if (!Array.isArray(d)) return {err: 'window.data never populated'};
+          return {ok: true, data: d};
+        })()
+        """ % (tok, self._SLOTS_WAIT_MS)
+        try:
+            res = self.session.browser_eval(js, timeout=45)
+        except Exception as e:
+            self._log(f"do_discover[slots]: page-world eval failed ({str(e)[:90]})")
+            return [{"date": d, "outcome": "failed"} for d in dates]
+        if isinstance(res, str):
+            try: res = json.loads(res)
+            except Exception: res = {"err": f"unparseable: {str(res)[:120]}"}
+        res = res or {}
+        if res.get("err"):
+            self._log(f"do_discover[slots]: {res['err']}")
+            return [{"date": d, "outcome": "failed"} for d in dates]
+        if res.get("coerced"):
+            # A NON-ARRAY body is the portal declining, not an empty calendar. Reporting it as
+            # `empty` would prune real dates from the pool (bug fix #6's whole point).
+            self._log(f"do_discover[slots]: non-array payload, coerced to [] to protect the page "
+                      f"| raw={str(res.get('raw'))[:160]}")
+            return [{"date": d, "outcome": "failed"} for d in dates]
+
+        found = {}
+        for entry in (res.get("data") or []):
+            if not isinstance(entry, dict):
+                continue
+            d = str(entry.get("date") or "")
+            periods = [p for p in (entry.get("periods") or []) if p is not None]
+            if d:
+                found[d] = periods
+        self._log(f"do_discover[slots]: window.data carried {len(found)} date(s)")
+        out = []
+        for d in dates:
+            if d in found and found[d]:
+                out.append({"date": d, "outcome": "found", "periods": found[d]})
+            elif d in found:
+                out.append({"date": d, "outcome": "empty"})
+            else:
+                # Absent from a payload the portal DID return means no availability for that date.
+                out.append({"date": d, "outcome": "empty"})
+        return out
+
     def do_discover(self, dates: list[str]) -> list[dict]:
         """Bug fix #6: 3-way per-date outcome (found/empty/failed). Uses gettime + real-browser-nav
         getPeriodosOcupados per confirmed_pipeline_path.md -- never browser_fetch/primp for these
@@ -1977,7 +2078,40 @@ class LiveEngineOps(EngineOps):
         GETTIME_CACHE_SECS), skip the gettime fetch entirely and use it directly -- storm-auto's
         proven pattern (app/core/slot_manager.py's _gettime_cache) is a fleet-wide shared TTL cache,
         not a per-worker one. Otherwise fetch fresh and, on success, report it back via a
-        `gettime_result` event so the Hub can cache it for the rest of the fleet."""
+        `gettime_result` event so the Hub can cache it for the rest of the fleet.
+
+        DISCOVERY_SOURCE (2026-08-31) finally has a read site. It has been in the settings catalog
+        from the start and parsed into EngineConfig.discovery.source, and NOTHING consumed it -- the
+        same unwired-setting trap as QUEST_STEP_GAP and PARTIAL_RENDER_RETRIES before it.
+
+            "calendar"  gettime + getPeriodosOcupados (DEFAULT, unchanged -- the confirmed path)
+            "slots"     the portal's own page-world flow via onCaptchaSuccess -> getSlots
+            "both"      slots first, then calendar for any date slots could not resolve
+
+        `both` exists because the two disagree in a useful direction: /slots is what the live page
+        itself uses, and data/new_booking.har shows it returning a 21KB payload 15s before a real
+        booking -- while the calendar path is the one this project has actually booked with.
+        Preferring slots and back-filling from calendar takes the better answer without giving up
+        the proven one."""
+        source = str(getattr(self.cfg.discovery, "source", "calendar") or "calendar").lower()
+        if source in ("slots", "both"):
+            res = self._discover_via_slots(dates)
+            if source == "slots":
+                return res
+            unresolved = [r["date"] for r in res if r.get("outcome") == "failed"]
+            if not unresolved:
+                return res
+            self._log(f"do_discover[both]: slots resolved {len(dates) - len(unresolved)}/"
+                      f"{len(dates)} date(s); falling back to calendar for the rest")
+            by_date = {r["date"]: r for r in res}
+            for r in self._discover_via_calendar(unresolved):
+                by_date[r["date"]] = r
+            return [by_date[d] for d in dates if d in by_date]
+        return self._discover_via_calendar(dates)
+
+    def _discover_via_calendar(self, dates: list[str]) -> list[dict]:
+        """gettime + getPeriodosOcupados -- the confirmed path, logic untouched. Split out of
+        do_discover only so DISCOVERY_SOURCE can dispatch without editing a line of it."""
         out = []
         special_days = getattr(self, "_pending_special_days", None)
         self._pending_special_days = None
