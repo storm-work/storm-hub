@@ -2048,14 +2048,42 @@ class LiveEngineOps(EngineOps):
                       f"| raw={str(res.get('raw'))[:160]}")
             return [{"date": d, "outcome": "failed"} for d in dates]
 
-        found = {}
+        found, capacity = {}, {}
         for entry in (res.get("data") or []):
             if not isinstance(entry, dict):
                 continue
             d = str(entry.get("date") or "")
-            periods = [p for p in (entry.get("periods") or []) if p is not None]
-            if d:
-                found[d] = periods
+            if not d:
+                continue
+            # CONFIRMED response shape (operator capture, 2026-08-31):
+            #   [{"date":"2026-08-31","periods":[{"id":3,"description":"8-9"},
+            #                                    {"id":3,"description":"9-10"},
+            #                                    {"id":4,"description":"10-11"}]}]
+            # Two things this codebase would otherwise get wrong:
+            #   * a period is an OBJECT, not a scalar. Passing it through unchanged puts a dict into
+            #     `cmbPeriodo` (booking_payload does str(slot["period"])) and submits garbage.
+            #   * the SAME id repeats with different descriptions -- id 3 appears twice above, as
+            #     08-09 and 09-10. That is two bookable times behind ONE selector value, so the
+            #     repeat is CAPACITY, not a duplicate to be silently collapsed and forgotten.
+            # Accepts bare scalars too, so a payload of plain ids still parses.
+            ids, seen = [], set()
+            for p in (entry.get("periods") or []):
+                pid = p.get("id") if isinstance(p, dict) else p
+                if pid is None:
+                    continue
+                try:
+                    pid = int(pid)
+                except (TypeError, ValueError):
+                    continue
+                capacity[(d, pid)] = capacity.get((d, pid), 0) + 1
+                if pid not in seen:
+                    seen.add(pid)
+                    ids.append(pid)
+            found[d] = ids
+        if capacity:
+            multi = {f"{d}/{p}": n for (d, p), n in capacity.items() if n > 1}
+            if multi:
+                self._log(f"do_discover[slots]: repeated period ids (= capacity) {multi}")
         self._log(f"do_discover[slots]: window.data carried {len(found)} date(s)")
         out = []
         for d in dates:

@@ -2773,3 +2773,47 @@ def test_the_token_is_bound_to_SCHEDULE_EVISA(monkeypatch):
     ops.posto_pdf = "3059"
     ops._discover_via_slots(["2026-09-14"])
     assert seen.get("action") == "SCHEDULE_EVISA", f"token bound to {seen.get('action')!r}"
+
+
+# ── the real /slots payload shape (operator capture, 2026-08-31) ─────────────────────────────
+#   [{"date":"2026-08-31","periods":[{"id":3,"description":"8-9"},
+#                                    {"id":3,"description":"9-10"},
+#                                    {"id":4,"description":"10-11"}]}]
+# Top-level RAW ARRAY, and a period is an OBJECT not a scalar. Passing the object through puts a
+# dict into cmbPeriodo (booking_payload does str(slot["period"])) and submits garbage.
+
+_REAL_SLOTS_PAYLOAD = {"ok": True, "data": [
+    {"date": "2026-08-31", "periods": [{"id": 3, "description": "8-9"},
+                                       {"id": 3, "description": "9-10"},
+                                       {"id": 4, "description": "10-11"}]}]}
+
+
+def test_object_periods_are_reduced_to_integer_ids(monkeypatch):
+    ops = _slots_ops(_REAL_SLOTS_PAYLOAD, "slots", monkeypatch)
+    out = ops.do_discover(["2026-08-31"])
+    assert len(out) == 1 and out[0]["outcome"] == "found"
+    periods = out[0]["periods"]
+    assert periods == [3, 4], f"expected integer ids, got {periods!r}"
+    assert all(isinstance(p, int) for p in periods), \
+        "a dict reached cmbPeriodo -- booking_payload would submit str(dict)"
+
+
+def test_a_repeated_period_id_is_not_emitted_twice(monkeypatch):
+    """id 3 appears twice (08-09 and 09-10). One selector value -- emit it once."""
+    ops = _slots_ops(_REAL_SLOTS_PAYLOAD, "slots", monkeypatch)
+    periods = ops.do_discover(["2026-08-31"])[0]["periods"]
+    assert periods.count(3) == 1, f"duplicate selector value emitted: {periods!r}"
+
+
+def test_scalar_periods_still_parse(monkeypatch):
+    """Tolerate a payload of bare ids -- we have only one capture of the object form."""
+    ops = _slots_ops({"ok": True, "data": [{"date": "2026-09-14", "periods": [5, 7]}]},
+                     "slots", monkeypatch)
+    assert ops.do_discover(["2026-09-14"])[0]["periods"] == [5, 7]
+
+
+def test_unparseable_period_entries_are_skipped_not_crashed(monkeypatch):
+    ops = _slots_ops({"ok": True, "data": [
+        {"date": "2026-09-14", "periods": [{"id": "5"}, {"description": "no id"},
+                                           None, {"id": "x"}, 7]}]}, "slots", monkeypatch)
+    assert ops.do_discover(["2026-09-14"])[0]["periods"] == [5, 7]
