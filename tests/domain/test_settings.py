@@ -84,3 +84,35 @@ def test_the_exemptions_are_still_justified():
     assert _ALLOWED_UNREAD <= set(CATALOG), "an exemption names a setting that no longer exists"
     now_read = sorted(k for k in _ALLOWED_UNREAD if _read_sites(k))
     assert not now_read, f"these are consumed now -- remove them from _ALLOWED_UNREAD: {now_read}"
+
+
+# ── every setting carries operator guidance (2026-09-01) ─────────────────────────────────────
+# 62 of 112 had no note at all, so the dashboard rendered a bare box with a key name and nothing
+# about what the value does. The tooltip composes the mechanical facts (type, default, owning
+# layer, legal values) from metadata, so this only has to guarantee the half metadata cannot
+# supply: what it DOES and what to pick.
+
+def test_every_setting_has_a_note():
+    from libs.domain.settings.catalog import CATALOG
+    bare = sorted(k for k, s in CATALOG.items() if not (s.note or "").strip())
+    assert not bare, f"these render to the operator with no guidance at all: {bare}"
+
+
+def test_notes_are_substantive_not_a_restatement_of_the_key():
+    """A note that just spells the key back is worse than none -- it looks documented and isn't."""
+    from libs.domain.settings.catalog import CATALOG
+    weak = []
+    for k, s in CATALOG.items():
+        note = (s.note or "").strip()
+        if len(note) < 25 or note.strip(". ").lower() == k.replace("_", " ").lower():
+            weak.append(k)
+    assert not weak, f"these notes say nothing an operator could act on: {weak}"
+
+
+# NOT TESTED, deliberately: an earlier version of this file tried to catch the space-loss bug from
+# wrapping notes into adjacent string literals ("rationale" + "measured" -> "rationalemeasured") by
+# regexing for a lowercase->uppercase transition. In a codebase whose notes legitimately name
+# getPeriodosOcupados, onCaptchaSuccess, getSlots, EngineConfig, LiveEngineOps, RedisBreaker and
+# SubmeterVistoCriaPDF, that heuristic is mostly false positives, and padding an allow-list until it
+# passes would make it look like protection while testing nothing. All 71 joins were repaired and
+# read back; test_notes_are_substantive is the check that carries real weight here.

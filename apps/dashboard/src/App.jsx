@@ -1010,6 +1010,23 @@ const _SETTING_GROUP_ORDER = {
   date_window: { CAL_START_DATE: 0, CAL_END_DATE: 1, CAL_NUM_DAYS: 2 },
 };
 
+// One tooltip shape for EVERY setting, composed from the catalog rather than hand-written per
+// field. The mechanical facts (type, default, which layer owns it, the legal values) are the same
+// questions an operator asks of any setting, and answering them from metadata means a new setting
+// is documented the moment it is declared -- rather than joining the 62 of 112 that had no guidance
+// at all. The hand-written note carries what metadata cannot: what the value DOES and what to
+// actually pick.
+function _settingTip(s) {
+  const head = [
+    s.key,
+    `type: ${s.type}`,
+    `default: ${s.default === null || s.default === undefined || s.default === "" ? "(unset)" : String(s.default)}`,
+    `set at: ${s.home}${(s.override_layers || []).length ? ` (override: ${s.override_layers.join(", ")})` : ""}`,
+  ];
+  if (s.choices && s.choices.length) head.push(`one of: ${s.choices.join(" | ")}`);
+  return head.join("\n") + (s.note ? `\n\n${s.note}` : "\n\n(no guidance written for this setting yet)");
+}
+
 function BookingFullSettingsPanel({ me, booking, onSaved }) {
   const [catalog, setCatalog] = useState(null);
   const { settings, edit, dirty, markClean } = useServerSyncedSettings(booking);
@@ -1068,7 +1085,7 @@ function BookingFullSettingsPanel({ me, booking, onSaved }) {
                 ? s.choices : _SETTING_SELECT_OPTIONS[s.key];
               const placeholder = s.default != null ? String(s.default) : "";
               return (
-                <div className="field" key={s.key} style={{ margin: 0, minWidth: 200 }} title={s.note}>
+                <div className="field" key={s.key} style={{ margin: 0, minWidth: 200 }} title={_settingTip(s)}>
                   <label>{s.key}{s.home !== "booking" ? ` (${s.home} override)` : ""}</label>
                   {s.type === "bool" ? (
                     <input type="checkbox" checked={!!(value ?? s.default)} disabled={!op}
