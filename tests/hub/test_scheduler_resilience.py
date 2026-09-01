@@ -435,12 +435,22 @@ def test_maybe_self_scout_throttled(db):
     assert len(bus.sent) == first_len
 
 
-def test_maybe_self_scout_skips_once_slot_found(db):
+def test_maybe_self_scout_skips_while_found_slots_are_still_there(db):
+    """Renamed and corrected 2026-09-01 (was test_maybe_self_scout_skips_once_slot_found).
+
+    It asserted that setting slot_found_fired_at alone suppresses the fallback, with NO slot rows
+    in the booking at all -- which is the one-shot-latch defect stated as a requirement. What the
+    gate is actually for is "we already have slots to work", so the fixture now has one. The
+    exhausted-pool half of the old assertion moved to
+    test_an_exhausted_pool_re_enables_the_fallback_even_though_slot_found_fired."""
     bus = _FakeBus()
     sched = _scheduler(bus=bus)
     bk = _make_booking(db, slot_found_fired_at=NOW)
     ident = _make_identity(db)
+    db.add(M.Slot(booking_id=bk.id, posto_id="5084", date="2026-09-14", period=3,
+                  status=SlotStatus.AVAILABLE))
     _make_worker(db, bk, ident, role=WorkerRole.APPLY, substate=WorkerSubstate.HOLDING)
+    db.commit()
 
     sched._maybe_self_scout(db, bk, NOW)
 
@@ -2237,3 +2247,59 @@ def test_a_dead_or_failed_scout_never_counts(db):
                      substate=WorkerSubstate.DISCOVERING)
     w.status = WorkerStatus.FAILED
     assert _scout_is_actually_scouting(w) is False, "a FAILED worker must never count"
+
+
+# ── gate 1 was a one-shot latch, not a question about the pool (2026-09-01) ───────────────────
+# `if bk.slot_found_fired_at is not None: return` is set the first time ANY slot is ever discovered
+# and never cleared. So one phantom slot -- later retired by _maybe_revert_false_slot_found or by
+# miss_count -- permanently disabled the apply-as-scout fallback for the rest of the booking. The
+# mechanism could not fire in the exact state it exists for, because reaching that state requires
+# having had a slot at some point.
+
+def _self_scout_case(db, bus, *, slot_statuses, fired=True):
+    sched = _scheduler(bus=bus)
+    bk = _make_booking(db)
+    if fired:
+        bk.slot_found_fired_at = NOW - timedelta(hours=2)
+    for i, st in enumerate(slot_statuses):
+        db.add(M.Slot(booking_id=bk.id, posto_id="5084", date=f"2026-09-1{i}",
+                      period=3, status=st))
+    _make_worker(db, bk, _make_identity(db), role=WorkerRole.APPLY,
+                 substate=WorkerSubstate.HOLDING)
+    db.commit()
+    sched._maybe_self_scout(db, bk, NOW)
+    return [p for _w, t, p in bus.sent if t == "assign" and p.get("scouts_invalid")]
+
+
+def test_an_exhausted_pool_re_enables_the_fallback_even_though_slot_found_fired(db):
+    """The whole defect: slot_found fired hours ago, every slot has since been retired, no scout is
+    working -- and the fallback stayed off because of a latch that only remembers the past."""
+    fired = _self_scout_case(db, _FakeBus(),
+                             slot_statuses=[SlotStatus.CLOSED, SlotStatus.CLOSED])
+    assert fired, "a booking with zero live slots could not re-enable its own discovery fallback"
+
+
+def test_a_wiped_pool_re_enables_the_fallback(db):
+    """_maybe_revert_false_slot_found deletes the slots it declares phantom, leaving zero rows and
+    a latch that still says 'already found some'."""
+    fired = _self_scout_case(db, _FakeBus(), slot_statuses=[])
+    assert fired, "a booking whose phantom pool was wiped was left with no way to discover again"
+
+
+def test_available_inventory_still_suppresses_the_fallback(db):
+    """The gate must not become 'always fall back' -- real slots mean discovery is not the problem."""
+    fired = _self_scout_case(db, _FakeBus(), slot_statuses=[SlotStatus.CLOSED, SlotStatus.AVAILABLE])
+    assert fired == [], "the fallback fired while the pool still had an applyable slot"
+
+
+def test_all_leased_is_inventory_not_exhaustion(db):
+    """Every slot leased out to a busy worker is the pool at its most productive, not its emptiest.
+    Counting only AVAILABLE would fire the fallback on every busy tick."""
+    fired = _self_scout_case(db, _FakeBus(), slot_statuses=[SlotStatus.LEASED, SlotStatus.LEASED])
+    assert fired == [], "a fully-leased pool was mistaken for an exhausted one"
+
+
+def test_a_taken_slot_is_not_inventory(db):
+    """TAKEN is an exclusive-mode booking already made -- nothing can be applied to it."""
+    fired = _self_scout_case(db, _FakeBus(), slot_statuses=[SlotStatus.TAKEN])
+    assert fired, "a booked-out slot was counted as applyable inventory"

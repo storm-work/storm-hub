@@ -500,3 +500,28 @@ APP (our logic/state) · OPS (configuration, deployment, human action).
 - **Still open:** gate 1 (`bk.slot_found_fired_at is not None` returns early forever, a one-shot
   latch that permanently disables the fallback once any slot has ever been found) is untouched and
   was not authorised. F29's phantom-slot detection likewise remains open.
+
+## F33 — The self-scout fallback's gate 1 was a one-shot latch on the past, not a question about the pool
+- **Class:** APP
+- **Code path:** `_maybe_self_scout` (apps/hub/scheduler.py) opened with
+  `if bk.slot_found_fired_at is not None: return`. That column is set the first time *any* slot is
+  ever discovered for the booking and is never cleared for its lifetime.
+- **The defect:** the apply-as-scout fallback exists for "we have no slots and no working scout" —
+  but it could not fire in that state, because reaching it requires having had a slot at some point,
+  which is exactly what permanently latched the gate shut. One phantom slot, discovered once and
+  retired seconds later, disabled discovery recovery for the rest of the run.
+- **It compounds the two paths that legitimately empty a pool.** `_maybe_revert_false_slot_found`
+  deletes the slots of a pool it has declared phantom, and slot retirement CLOSEs a slot after N
+  misses. Both leave a booking with zero applyable slots and a latch still reporting "already found
+  some" — the F32 scout-liveness fix alone would not have helped any booking that had reached this
+  state, since gate 1 sits *ahead* of gate 3.
+- **Fixed 2026-09-01:** gate 1 now counts live inventory — slots in `AVAILABLE` or `LEASED` — and
+  suppresses the fallback only while some exists. `LEASED` is deliberately included: a pool with
+  every slot leased to a busy worker is at its most productive, and counting only `AVAILABLE` would
+  fire the fallback on every busy tick. `CLOSED` (retired) and `TAKEN` (booked) are not inventory,
+  because nothing can be applied to them.
+- **Note:** the pre-existing `test_maybe_self_scout_skips_once_slot_found` asserted the latch itself
+  as a requirement, with no slot rows in the fixture at all. It is renamed to
+  `test_maybe_self_scout_skips_while_found_slots_are_still_there` and given a slot; the half it used
+  to cover incorrectly is now
+  `test_an_exhausted_pool_re_enables_the_fallback_even_though_slot_found_fired`.

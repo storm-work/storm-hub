@@ -594,7 +594,30 @@ class Scheduler:
     # ── D4: apply-as-scout fallback (proactive half; the reactive half is
     #        PhaseMachine._run_apply's scouts_invalid() check) ────────────────
     def _maybe_self_scout(self, db, bk: M.Booking, now: datetime) -> None:
-        if bk.slot_found_fired_at is not None:
+        # GATE 1: suppress the fallback while the pool still holds LIVE INVENTORY -- not because a
+        # slot was once found.
+        #
+        # This asked `bk.slot_found_fired_at is not None`, which is a one-shot latch: it is set the
+        # first time any slot is ever discovered and never cleared for the life of the booking. So
+        # the moment one slot was found -- even a single phantom that was later retired, even a real
+        # one that was immediately taken by someone else -- the apply-as-scout fallback was disabled
+        # PERMANENTLY, no matter what happened to the pool afterwards. The mechanism that exists for
+        # "we have no slots and no working scout" could not fire in exactly the state it is for,
+        # because reaching that state requires having had a slot at some point.
+        #
+        # Worse, it compounds the two paths that legitimately empty a pool: _maybe_revert_false_slot_found
+        # wipes a pool it has declared phantom, and slot retirement CLOSEs a slot after N misses.
+        # Both leave a booking with zero slots and a latch that says "already found some" forever.
+        #
+        # Live inventory means AVAILABLE or LEASED. LEASED is deliberately included: while workers
+        # are actively applying to every slot there is, the pool is transiently at zero AVAILABLE,
+        # and that must not be read as exhaustion or the fallback would fire on every busy tick.
+        # CLOSED (retired) and TAKEN (booked) are not inventory -- nothing can be applied to them.
+        live_inventory = db.scalar(select(func.count(M.Slot.id)).where(
+            M.Slot.booking_id == bk.id,
+            M.Slot.status.in_([SlotStatus.AVAILABLE, SlotStatus.LEASED]),
+        )) or 0
+        if live_inventory:
             return
         last = self._last_self_scout.get(bk.id, 0)
         if time.time() - last < _SELF_SCOUT_THROTTLE:
