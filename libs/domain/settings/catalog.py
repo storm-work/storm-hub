@@ -38,13 +38,19 @@ class Setting:
     group: str = ""
     note: str = ""
     min_value: float | None = None
+    # Enumerated values, when a setting has a closed set. Empty tuple = free-form (the default, and
+    # what every setting was before 2026-09-01). Added because DISCOVERY_SOURCE rendered as a free
+    # text box in the dashboard, so `slot` instead of `slots` was a realistic operator input that
+    # nothing rejected -- the framework had no way to express "one of these three".
+    choices: tuple = ()
 
     def settable_layers(self) -> frozenset:
         return frozenset({self.home}) | self.override_layers
 
 
-def _s(key, home, type=str, default=None, override=frozenset(), group="", note="", min_value=None):
-    return Setting(key, home, type, default, override, group, note, min_value)
+def _s(key, home, type=str, default=None, override=frozenset(), group="", note="",
+       min_value=None, choices=()):
+    return Setting(key, home, type, default, override, group, note, min_value, tuple(choices))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -213,6 +219,7 @@ _BOOKING = [
     # Discovery / pool policy
     _s("DISCOVERY_MODE", L.BOOKING, str, "parallel", group="discovery"),
     _s("DISCOVERY_SOURCE", L.BOOKING, str, "calendar", group="discovery",
+       choices=("calendar", "slots", "both"),
        note="Which endpoint discovery reads. One of: calendar | slots | both. "
             "calendar = gettime + getPeriodosOcupados (default, the path this project has "
             "actually booked with). slots = the portal's own page-world flow, delivering a "

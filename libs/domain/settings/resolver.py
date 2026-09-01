@@ -59,6 +59,20 @@ class BelowMinimum(SettingsError):
         self.key, self.value, self.min_value = key, value, min_value
 
 
+class NotAChoice(SettingsError):
+    """A setting with a closed set of values was given something outside it.
+
+    Loud on write rather than tolerated at launch: a value the operator typed and the system then
+    ignored is the "looks configured, isn't" failure this project keeps rediscovering.
+    """
+    def __init__(self, key: str, value: Any, choices: tuple):
+        allowed = " | ".join(str(c) for c in choices)
+        super().__init__(
+            f"setting {key!r} was given {value!r}, which is not one of: {allowed}"
+        )
+        self.key, self.value, self.choices = key, value, choices
+
+
 def _coerce(setting: Setting, value: Any) -> Any:
     """Coerce a raw value (possibly a string from a form/env) to the setting's declared type."""
     if value is None:
@@ -102,6 +116,16 @@ def validate_layer(layer: L, values: Mapping[str, Any]) -> dict[str, Any]:
         coerced = _coerce(setting, raw)
         if setting.min_value is not None and coerced is not None and coerced < setting.min_value:
             raise BelowMinimum(key, coerced, setting.min_value)
+        # Enumerated settings are rejected on WRITE, so a typo never reaches a run. DISCOVERY_SOURCE
+        # rendered as a free text box and `slot` (missing the 's') silently ran the old discovery
+        # path while the operator believed the new one was under test -- the whole point of a closed
+        # set is that the framework, not the worker, refuses it.
+        if setting.choices and coerced is not None:
+            norm = str(coerced).strip().lower()
+            match = next((c for c in setting.choices if str(c).lower() == norm), None)
+            if match is None:
+                raise NotAChoice(key, coerced, setting.choices)
+            coerced = match          # canonicalise: "  SLOTS " is stored as "slots"
         out[key] = coerced
     return out
 

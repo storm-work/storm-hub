@@ -755,6 +755,9 @@ def settings_catalog(_v: Principal = Depends(require_viewer)) -> dict:
                 "home": str(s.home),
                 "override_layers": sorted(str(x) for x in s.override_layers),
                 "note": s.note,
+                # Empty list = free-form. The dashboard renders a <select> when this
+                # is non-empty, and validate_layer refuses anything outside it.
+                "choices": list(s.choices),
             }
             for s in settings
         ]

@@ -1058,7 +1058,14 @@ function BookingFullSettingsPanel({ me, booking, onSaved }) {
           <div className="row" style={{ flexWrap: "wrap", gap: 12, marginTop: 10 }}>
             {groups[group].map((s) => {
               const value = settings[s.key];
-              const selectOptions = _SETTING_SELECT_OPTIONS[s.key];
+              // The CATALOG wins over the hardcoded map: a setting that declares `choices` renders
+              // as a dropdown with no dashboard change at all. _SETTING_SELECT_OPTIONS stays as the
+              // fallback for the keys whose options are UI-derived (proxy pools, geo lists) rather
+              // than a closed set the backend can state. Added because DISCOVERY_SOURCE rendered as
+              // free text, so `slot` instead of `slots` was accepted by the UI and then silently
+              // ignored at runtime.
+              const selectOptions = (s.choices && s.choices.length)
+                ? s.choices : _SETTING_SELECT_OPTIONS[s.key];
               const placeholder = s.default != null ? String(s.default) : "";
               return (
                 <div className="field" key={s.key} style={{ margin: 0, minWidth: 200 }} title={s.note}>
