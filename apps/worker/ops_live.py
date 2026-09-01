@@ -110,6 +110,11 @@ _BOUNCE_KEYWORDS = ("questionario", "getslots", "captchadiv", "authentication.js
 # Schedule.jsp means ScheduleController was silently rejected and there is no form state to book
 # against -- see _run_warmup_steps.
 _SCHED_PAGE_MARKERS = ("getSlots", "captchaDiv", "SubmeterVistoCriaPDF", "f_date_c", "cmbPeriodo")
+
+# The only values do_discover accepts for DISCOVERY_SOURCE. Lives here rather than in the settings
+# catalog because that framework has no enum type -- so the dashboard renders the setting as free
+# text and the worker is the only place that can reject a typo. See the setting's own note.
+_DISCOVERY_SOURCES = frozenset({"calendar", "slots", "both"})
 # The portal's own "come back later" page. It is served in either language and is NOT about the
 # slot, the session or the network -- the portal simply declined to process the request.
 #
@@ -2121,7 +2126,18 @@ class LiveEngineOps(EngineOps):
         booking -- while the calendar path is the one this project has actually booked with.
         Preferring slots and back-filling from calendar takes the better answer without giving up
         the proven one."""
-        source = str(getattr(self.cfg.discovery, "source", "calendar") or "calendar").lower()
+        source = str(getattr(self.cfg.discovery, "source", "calendar") or "calendar").strip().lower()
+        if source not in _DISCOVERY_SOURCES:
+            # SAY SO. The dashboard renders this as free text (the settings catalog has no enum
+            # type), so `slot`, `Slots-only` or a typo is a realistic operator input. Silently
+            # defaulting to calendar is the worst outcome available: the operator sets the value,
+            # sees no error, believes the new path is under test, and measures the old one. That is
+            # the same "looks configured, isn't" class as every unwired setting this project has
+            # found. Fall back to the proven path -- but never quietly.
+            self._log(f"do_discover: DISCOVERY_SOURCE={source!r} is not one of "
+                      f"{sorted(_DISCOVERY_SOURCES)} -- REFUSING it and using 'calendar'. "
+                      f"Fix the booking setting; this run is NOT testing what you configured.")
+            source = "calendar"
         if source in ("slots", "both"):
             res = self._discover_via_slots(dates)
             if source == "slots":

@@ -212,7 +212,15 @@ _BOOKING = [
     _s("CAL_NUM_DAYS", L.BOOKING, int, 0, group="date_window"),
     # Discovery / pool policy
     _s("DISCOVERY_MODE", L.BOOKING, str, "parallel", group="discovery"),
-    _s("DISCOVERY_SOURCE", L.BOOKING, str, "calendar", group="discovery"),
+    _s("DISCOVERY_SOURCE", L.BOOKING, str, "calendar", group="discovery",
+       note="Which endpoint discovery reads. One of: calendar | slots | both. "
+            "calendar = gettime + getPeriodosOcupados (default, the path this project has "
+            "actually booked with). slots = the portal's own page-world flow, delivering a "
+            "SCHEDULE_EVISA token through window.onCaptchaSuccess so its getSlots() populates "
+            "window.data (data/new_booking.har shows /slots returning 21KB of real availability "
+            "15s before a confirmed booking). both = slots first, calendar for any date slots "
+            "could not resolve. The catalog has no enum type, so this renders as free text -- an "
+            "unrecognised value is REFUSED LOUDLY by the worker rather than silently falling back."),
     _s("DISCOVERY_MAX_PARALLEL", L.BOOKING, int, 10, group="discovery",
        note="SINGLE-mode (pre slot-found) 'awaken scout limit' -- only up to this many scouts are "
             "ever in the single-mode probe rotation at once, the rest stay parked in hold; a dead "

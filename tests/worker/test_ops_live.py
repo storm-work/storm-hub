@@ -2817,3 +2817,30 @@ def test_unparseable_period_entries_are_skipped_not_crashed(monkeypatch):
         {"date": "2026-09-14", "periods": [{"id": "5"}, {"description": "no id"},
                                            None, {"id": "x"}, 7]}]}, "slots", monkeypatch)
     assert ops.do_discover(["2026-09-14"])[0]["periods"] == [5, 7]
+
+
+def test_an_unrecognised_discovery_source_is_refused_loudly(monkeypatch):
+    """The dashboard renders DISCOVERY_SOURCE as FREE TEXT -- the catalog has no enum type. A typo
+    that silently ran the old path while the operator believed the new one was under test is the
+    same 'looks configured, isn't' failure as every unwired setting found in this project."""
+    ops = _slots_ops({"ok": True, "data": []}, "slot", monkeypatch)   # typo: missing 's'
+    logs = []
+    ops._log = lambda m, *a, **k: logs.append(m)
+    ops._discover_via_slots = lambda dates: (_ for _ in ()).throw(
+        AssertionError("ran the slots path on an invalid setting"))
+    ops._discover_via_calendar = lambda dates: [{"date": d, "outcome": "empty"} for d in dates]
+
+    ops.do_discover(["2026-09-14"])
+
+    joined = " ".join(logs)
+    assert "DISCOVERY_SOURCE" in joined and "REFUSING" in joined, \
+        f"an invalid source fell back silently: {logs}"
+
+
+def test_a_valid_source_is_accepted_case_and_space_insensitively(monkeypatch):
+    ops = _slots_ops({"ok": True, "data": []}, "  SLOTS  ", monkeypatch)
+    hit = []
+    ops._discover_via_slots = lambda dates: hit.append(1) or [
+        {"date": d, "outcome": "empty"} for d in dates]
+    ops.do_discover(["2026-09-14"])
+    assert hit, "a valid value was rejected over case/whitespace"
