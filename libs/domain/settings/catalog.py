@@ -66,7 +66,6 @@ _GLOBAL = [
     _s("CAPSOLVER_KEYS", L.GLOBAL, str, group="credentials"),
     _s("TELEGRAM_BOT_TOKEN", L.GLOBAL, str, group="credentials"),
     _s("TELEGRAM_CHAT_ID", L.GLOBAL, str, group="credentials"),
-    _s("SIGNAL_TOKEN", L.GLOBAL, str, group="credentials"),
     # Registration/mail-verification credentials (the registration UI itself is deferred, but these
     # are legitimate stored GLOBAL config recovered from the dump -- without a catalog entry,
     # resolve() rejects them and breaks EVERY worker launch, not just registration, since it
@@ -95,9 +94,7 @@ _GLOBAL = [
     _s("DETERMINISTIC_FP", L.GLOBAL, bool, True, _TPL, "browser"),
     _s("WEBRTC_BLOCK", L.GLOBAL, bool, True, _TPL, "browser"),
     _s("STEALTH_HARDEN", L.GLOBAL, bool, True, _TPL, "browser"),
-    _s("EPHEMERAL_PROFILE", L.GLOBAL, bool, True, _TPL, "browser"),
     _s("HUMAN_BEHAVIOR", L.GLOBAL, bool, True, _TPL, "browser"),
-    _s("BROWSER_INJECT_ROTATIONS", L.GLOBAL, bool, False, _TPL, "browser"),
     # Solver defaults (override-ok at template for A/B)
     _s("LOGIN_CAPSOLVER_ONLY", L.GLOBAL, bool, False, _TPL, "solver"),
     _s("LOGIN_ANTICAPTCHA_ONLY", L.GLOBAL, bool, False, _TPL, "solver"),
@@ -159,7 +156,6 @@ _BOOKING = [
     # M.IdentityEvent persists identity MILESTONES (booked, etc.); there is no raw-event table.
     _s("persist_events", L.BOOKING, bool, False, group="mode",
        note="NOT IMPLEMENTED (nothing reads it) -- raw events live only in the capped Redis stream"),
-    _s("TEST_POSTO_ID", L.BOOKING, str, group="mode"),
     # Default flipped to "live" (operator, 2026-08-21). The original "sim" default came from the
     # reconstruction, when live mode was unproven and an accidental real booking was the risk worth
     # guarding against. Live is now the only mode anyone runs, and the guard had inverted into a
@@ -208,10 +204,6 @@ _BOOKING = [
             "(_LAUNCH_FLEET_CONCURRENCY, currently a fixed constant, not a setting) separately "
             "bounds how many launches run at once; jitter only spreads out WHEN each one starts "
             "within that window."),
-    # Sim / test hooks
-    _s("SIM_SLOTS_OPEN_AT", L.BOOKING, str, group="sim"),
-    _s("SIMULATE_RELEASE_AT", L.BOOKING, str, group="sim"),
-    _s("SIGNAL_TRIGGER_FILE", L.BOOKING, str, group="sim"),
     # Date window
     _s("CAL_START_DATE", L.BOOKING, str, group="date_window"),
     _s("CAL_END_DATE", L.BOOKING, str, group="date_window"),
@@ -284,12 +276,8 @@ _BOOKING = [
     _s("SCOUT_POOL_KEEP", L.BOOKING, bool, False, group="scout_pool"),
     _s("SCOUT_CLOSE_AFTER_MISSES", L.BOOKING, int, 2, group="scout_pool"),
     _s("SCOUT_LEASE_TIMEOUT", L.BOOKING, float, 120.0, group="scout_pool"),
-    _s("SCOUT_HEARTBEAT_TTL", L.BOOKING, float, 60.0, group="scout_pool"),
-    _s("SCOUT_WAIT_TIMEOUT", L.BOOKING, float, 30.0, group="scout_pool"),
     # Guards
     _s("MAX_BOOKINGS", L.BOOKING, int, 0, group="guards"),
-    _s("BOOKING_CIRCUIT_BREAKER", L.BOOKING, bool, False, group="guards"),
-    _s("BREAKER_HOLD_GAP", L.BOOKING, float, 0.0, group="guards"),
     _s("BOOKING_TIMEOUT_HOURS", L.BOOKING, float, 48.0, group="guards",
        note="hard stop for the whole booking; replaces the removed per-worker hold timeout"),
     _s("BREAKER_TRIP_THRESHOLD", L.BOOKING, int, 5, group="guards",
@@ -315,10 +303,6 @@ _BOOKING = [
     _s("SCOUT_REBUILD_AFTER_FAILED_ROUNDS", L.BOOKING, int, 3, group="guards"),
     _s("WORKER_STALL_TIMEOUT", L.BOOKING, float, 1500.0, group="guards", min_value=1.0,
        note="no events from a worker longer than this -> reaped as stalled"),
-    _s("REDIS_STREAM_MAXLEN", L.BOOKING, int, 200, group="guards",
-       note="approximate XADD maxlen cap on each per-worker cmd stream"),
-    _s("REDIS_EVENT_STREAM_MAXLEN", L.BOOKING, int, 5000, group="guards",
-       note="approximate XADD maxlen cap on the shared evt stream"),
     _s("MAX_RESPAWN_ATTEMPTS", L.BOOKING, int, 5, group="guards",
        note="hold-phase respawn hard cap; beyond this the worker is left FAILED, not retried forever"),
     _s("WORKER_EVENT_RATE_LIMIT", L.BOOKING, float, 5.0, group="guards", min_value=0.5,
@@ -385,7 +369,6 @@ _TEMPLATE = [
     # "Session lost" en masse (852x in one run) and only a FRESH LOGIN rebuilds the anchor. So the
     # ladder is: re-warm once, then re-login IN-PROCESS. Neither step ever ends the process.
     _s("REWARM_MAX_ATTEMPTS", L.TEMPLATE, int, 1, _WRK, "login_resilience"),
-    _s("REWARM_EXPIRED_CAP", L.TEMPLATE, int, 0, _WRK, "login_resilience"),
     # Keepalive
     # 600, not 900. MEASURED 2026-08-20 across 28 keepalive cycles on booking "Test 3018": the
     # portal's scheduling form state dies on a 16.1-minute median clock (min 15.8, max 33.6). A
@@ -430,7 +413,6 @@ _TEMPLATE = [
             "budget and lets the chain run to completion."),
     _s("RESTORE_STAMPEDE_JITTER", L.TEMPLATE, float, 30.0, _WRK, "keepalive",
        note="anti-herd: stagger checkpoint-restore attempts after a mass relaunch"),
-    _s("SESSION_REFRESH_STAGGER", L.TEMPLATE, float, 120.0, _WRK, "keepalive"),
     # Hold / ISP swap
     # Fires right after WARMUP completes (phases.py, between WARMED and HOLDING), NOT after a slot is
     # actually found (PhaseMachine._warmup() calls do_swap() before await_slot_open() even begins).
@@ -463,47 +445,29 @@ _TEMPLATE = [
        note="how long do_swap() holds on the current proxy after a failed swap attempt before "
             "requesting a fresh hold-pool proxy and retrying (operator's example: 10 minutes)."),
     _s("HOLD_VERIFY", L.TEMPLATE, bool, True, _WRK, "hold_swap"),
-    _s("HOLD_VERIFY_MINS", L.TEMPLATE, float, 0.0, _WRK, "hold_swap"),
     # HOLD_POLL_GAP: the hold-loop's own sleep between iterations. A resolved value of 0 means the
     # loop spins unthrottled — this is the CONFIRMED root cause of the 2026-08-07 incident (a worker's
     # frozen effective_settings_json showed HOLD_POLL_GAP=0.0, and it wrote ~150-280 events/sec for 66
     # minutes straight). Never leave this at a 0-is-the-placeholder default; min_value is enforced by
     # the resolver (see resolver.py) as a hard backstop regardless of what any layer sets it to.
     _s("HOLD_POLL_GAP", L.TEMPLATE, float, 5.0, _WRK, "hold_swap", min_value=1.0),
-    _s("HOLD_CKPT_SECS", L.TEMPLATE, float, 0.0, _WRK, "hold_swap"),
     _s("SWAP_DIRECT_BOOTSTRAP", L.TEMPLATE, bool, False, _WRK, "hold_swap"),
     _s("SESSION_PRESERVING_FANOUT", L.TEMPLATE, bool, True, _WRK, "hold_swap"),
     # Discovery / poll cadence
     _s("DISCOVERY_NAV_RETRIES", L.TEMPLATE, int, 0, _WRK, "poll_cadence"),
     _s("DISCOVERY_NAV_BACKOFF", L.TEMPLATE, float, 0.75, _WRK, "poll_cadence"),
-    _s("DETECT_INTERVAL", L.TEMPLATE, float, 0.0, _WRK, "poll_cadence"),
-    _s("DETECT_PROBE_DAYS", L.TEMPLATE, int, 0, _WRK, "poll_cadence"),
-    _s("DETECT_RECHECK", L.TEMPLATE, bool, False, _WRK, "poll_cadence"),
-    _s("POLL_GAP_LIGHT", L.TEMPLATE, float, 8.0, _WRK, "poll_cadence", min_value=0.5),
-    _s("POLL_GAP_HARDENED", L.TEMPLATE, float, 2.0, _WRK, "poll_cadence", min_value=0.5),
-    _s("POLL_GAP_MAX", L.TEMPLATE, float, 45.0, _WRK, "poll_cadence", min_value=0.5),
-    _s("POLL_BACKOFF_AFTER", L.TEMPLATE, int, 0, _WRK, "poll_cadence"),
     _s("GETTIME_CACHE_SECS", L.TEMPLATE, float, 300.0, _WRK, "poll_cadence"),
     # Concurrency
     _s("LOGIN_CONCURRENCY", L.TEMPLATE, int, 10, _WRK, "concurrency"),
     _s("APPLY_CONCURRENCY", L.TEMPLATE, int, 100, _WRK, "concurrency"),
-    _s("POLL_CONCURRENCY", L.TEMPLATE, int, 1, _WRK, "concurrency"),
-    _s("EXECUTOR_THREADS", L.TEMPLATE, int, 300, _WRK, "concurrency"),
-    # Backoff / respawn
-    _s("PROXY_FAULT_BACKOFF", L.TEMPLATE, float, 1.5, _WRK, "backoff"),
-    _s("PROXY_FAULT_BACKOFF_CAP", L.TEMPLATE, float, 8.0, _WRK, "backoff"),
     _s("RESPAWN_BACKOFF_BASE", L.TEMPLATE, float, 2.0, _WRK, "backoff"),
     _s("RESPAWN_BACKOFF_CAP", L.TEMPLATE, float, 120.0, _WRK, "backoff"),
-    _s("PRESERVE_BACKOFF", L.TEMPLATE, float, 0.0, _WRK, "backoff"),
-    _s("EMPTY_HOLD_DEAD_CAP", L.TEMPLATE, int, 0, _WRK, "backoff"),
     _s("HOLD_RESPAWN", L.TEMPLATE, bool, True, _WRK, "backoff",
        note="feature flag for the hold-phase respawn mechanism"),
     # Role behavior
     _s("ROLE", L.TEMPLATE, str, "apply", _WRK, "role"),
     _s("CAPTURE_ONLY", L.TEMPLATE, bool, False, _WRK, "role", note="scout=True"),
     _s("WARMUP_ONLY", L.TEMPLATE, bool, False, _WRK, "role"),
-    _s("FORMSTATE_CHECK_BROWSER", L.TEMPLATE, bool, False, _WRK, "role"),
-    _s("NO_RETIRE_LOGIN", L.TEMPLATE, bool, False, _WRK, "role"),
 ]
 
 # WORKER-instance settings are runtime bindings (proxy/identity/subaccount order) resolved by

@@ -25,8 +25,29 @@ import redis
 
 from .names import CMD_STREAM, EVENT_STREAM, cmd_group, signal_channel
 
-CMD_STREAM_MAXLEN = 200
-EVENT_STREAM_MAXLEN = 5000
+# Env-driven, not catalog settings. The catalog homed these at L.BOOKING -- incoherent, because
+# EVENT_STREAM is ONE stream shared by every booking, so two bookings would fight over one value,
+# and Bus is constructed with a client and no booking context. They were never wireable as declared
+# and nothing read them. Env is the honest mechanism for a process-wide infrastructure knob.
+#
+# EVENT default raised 5,000 -> 50,000. MEASURED 2026-08-31 at 35 running workers: 66 events/min,
+# so 5,000 held ~76 minutes; projected to 80 workers that is ~151/min and a ~33-MINUTE window --
+# and a failure storm is both when the rate is highest and when the evidence matters most. Losing
+# it has already cost this project real answers: Booking 0821's events were gone before its run
+# could be reconstructed. 50,000 buys ~5.5h at 80 workers for ~35MB against 2,144MB of headroom on
+# a 2GB maxmemory. The cap still exists -- this is the F1 growth bound, just sized for the fleet
+# that now exists rather than the one that did when it was written.
+def _env_int(name: str, default: int) -> int:
+    import os
+    try:
+        v = int(os.environ.get(name, "") or default)
+        return v if v > 0 else default
+    except ValueError:
+        return default
+
+
+CMD_STREAM_MAXLEN = _env_int("REDIS_CMD_STREAM_MAXLEN", 200)
+EVENT_STREAM_MAXLEN = _env_int("REDIS_EVENT_STREAM_MAXLEN", 50_000)
 
 
 def connect(url: str, *, decode: bool = True) -> "redis.Redis":
