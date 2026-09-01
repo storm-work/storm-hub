@@ -2675,8 +2675,15 @@ def test_a_healthy_gettime_resets_the_streak(monkeypatch):
     ops.do_discover(["2026-08-28"])
     ops.session.body = _BLOCKED_BODY        # and blocks again later
     ops.do_discover(["2026-08-28"])
-    assert slept[-1] <= first_two[0] * 1.2, \
-        f"the streak did not reset after a healthy gettime: {slept}"
+    # Compare against the LADDER, not against another jittered sample. The nap is
+    # base * 2**(streak-1) * uniform(0.85, 1.15), so a step-1 nap is <= 34.5s and a step-2 nap is
+    # >= 51s -- non-overlapping bounds, hence deterministic. The previous form asserted
+    # `slept[-1] <= first_two[0] * 1.2`, which compared two jittered draws and failed roughly
+    # whenever the first landed low and the last landed high (seen 2026-09-01: 33.42 vs 27.60).
+    base = 30.0
+    assert slept[1] >= base * 2 * 0.85, f"the second block did not escalate: {slept}"
+    assert slept[-1] <= base * 1.15, \
+        f"the streak did not reset after a healthy gettime -- still on the ladder: {slept}"
 
 
 # ── DISCOVERY_SOURCE finally has a read site (2026-08-31) ────────────────────────────────────
@@ -2698,6 +2705,11 @@ class _SlotsPageSession(_FakeSession):
 
     def browser_eval(self, js, timeout=30):
         self.evals.append(js)
+        # The readiness poll added 2026-09-01 also mentions onCaptchaSuccess, so it has to be
+        # matched FIRST -- on the real page the widget script does eventually define the callback,
+        # which is what `True` here stands for.
+        if "onCaptchaSuccess === 'function'" in js and "window.data" not in js:
+            return True
         if "onCaptchaSuccess" in js:
             return self.payload
         if "location.origin" in (js or ""):
@@ -2905,3 +2917,98 @@ def test_a_solver_failure_falls_back_to_calendar_instead_of_failing(monkeypatch)
     assert hit == [["2026-09-14"]], "the calendar path was not used as the fallback"
     assert out[0]["outcome"] == "found", \
         "a solver outage still reported `failed` -- phases.py would re-warm and re-login on it"
+
+
+
+# ── the onCaptchaSuccess race that wasted 47 of 55 solves (2026-09-01) ───────────────────────
+# browser_nav returns when the DOCUMENT loads, but window.onCaptchaSuccess is registered by the
+# portal's reCAPTCHA widget script, which is still loading. MEASURED on booking "Test 0901": 47 of
+# 55 rounds died on `onCaptchaSuccess not defined` -- AFTER the token had been solved (2,553-2,702
+# chars, 7-23s each), so the solver was paid 47 times for tokens the page could never receive. The
+# one round that did land returned SEVENTY slots.
+#
+# The readiness poll loop runs INSIDE the browser, so Python sees a single browser_eval for it and
+# `ready` is just what that loop concluded. What these tests pin is therefore the ORDER -- the probe
+# must precede the solve -- not a poll count.
+
+class _LateCallbackSession(_FakeSession):
+    """Records the order of operations: probe -> solve -> deliver."""
+    def __init__(self, ready=True, payload=None):
+        super().__init__()
+        self.ready = ready
+        self.payload = payload or {"ok": True, "data": [{"date": "2026-09-14", "periods": [5]}]}
+        self.order = []
+
+    def browser_nav(self, url, timeout=30, **kw):
+        return url
+
+    def browser_eval(self, js, timeout=30):
+        if "onCaptchaSuccess === 'function'" in js and "window.data" not in js:
+            self.order.append("probe")           # the readiness poll
+            return self.ready
+        if "onCaptchaSuccess" in js:
+            self.order.append("deliver")         # the real delivery call
+            return self.payload
+        if "location.origin" in (js or ""):
+            return _origin_reply(js)
+        return ""
+
+
+def _callback_ops(sess):
+    ops = _make_ops(emit=lambda t, **p: None)
+    ops.session = sess
+    ops._log = lambda *a, **k: None
+    ops.posto_pdf = "3018"
+    return ops
+
+
+def test_the_callback_is_awaited_before_a_solve_is_spent(monkeypatch):
+    sess = _LateCallbackSession(ready=True)
+    monkeypatch.setattr("libs.engine.vendor.race_all",
+                        lambda *a, **k: sess.order.append("solve") or "T" * 2617)
+
+    out = _callback_ops(sess)._discover_via_slots(["2026-09-14"])
+
+    assert sess.order == ["probe", "solve", "deliver"], (
+        "the solve must come AFTER the readiness probe -- paying for a token the page cannot "
+        f"receive is the 47-of-55 waste this fixes; got {sess.order}")
+    assert out[0]["outcome"] == "found"
+
+
+def test_no_solve_is_spent_when_the_callback_never_appears(monkeypatch):
+    """The whole point: 47 wasted tokens. If the page never registers the callback, pay nothing."""
+    sess = _LateCallbackSession(ready=False)
+    solves = []
+    monkeypatch.setattr("libs.engine.vendor.race_all",
+                        lambda *a, **k: solves.append(1) or "T" * 2617)
+    ops = _callback_ops(sess)
+    hit = []
+    ops._discover_via_calendar = lambda dates: hit.append(dates) or [
+        {"date": d, "outcome": "empty"} for d in dates]
+
+    ops._discover_via_slots(["2026-09-14"])
+
+    assert solves == [], "a CAPTCHA was solved for a page that could not receive the token"
+    assert hit == [["2026-09-14"]], \
+        "should fall back to the calendar path, which needs no token at all"
+
+
+def test_a_probe_that_raises_is_treated_as_not_ready(monkeypatch):
+    """browser_eval can throw outright (destroyed execution context). Still spend no solve."""
+    sess = _LateCallbackSession(ready=True)
+    def _boom(js, timeout=30):
+        if "onCaptchaSuccess === 'function'" in js:
+            raise RuntimeError("Execution context was destroyed")
+        return ""
+    sess.browser_eval = _boom
+    solves = []
+    monkeypatch.setattr("libs.engine.vendor.race_all",
+                        lambda *a, **k: solves.append(1) or "T" * 2617)
+    ops = _callback_ops(sess)
+    hit = []
+    ops._discover_via_calendar = lambda dates: hit.append(dates) or [
+        {"date": d, "outcome": "empty"} for d in dates]
+
+    ops._discover_via_slots(["2026-09-14"])
+
+    assert solves == [] and hit == [["2026-09-14"]]

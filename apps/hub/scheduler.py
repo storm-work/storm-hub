@@ -116,6 +116,29 @@ def should_timeout_booking(status: str, started_at, timeout_hours: float, now: d
 _DEAD_GRACE = 90.0             # seconds a RUNNING-in-DB-but-no-process worker gets before reaping
 _SELF_SCOUT_THROTTLE = 30.0    # seconds between apply-as-scout fallback triggers, per booking
 
+# A scout counts as alive for the apply-as-scout fallback only once it is PAST THE LOGIN WALL.
+# `status == RUNNING` was the old test and it is the wrong one: it means "a process exists", not
+# "this scout is scouting". MEASURED 2026-09-01 on booking "Test 0901": scout 28b8fe7f cycled
+# logging_in -> failed 245 times over four hours and produced ZERO slots_found, yet it was a RUNNING
+# row at any given instant (a worker respawning every ~30s is RUNNING roughly half the time), so it
+# permanently suppressed the very fallback that exists for when scouts are not working. The booking
+# then sat idle with no path to discover anything.
+#
+# These substates all mean the login wall is behind it, which is the thing that was failing. A scout
+# that reaches them and then stalls is caught by the stall/dead-worker reapers, not here -- this
+# guard only has to stop a scout that never gets started from looking productive.
+_SCOUTING_SUBSTATES = frozenset({
+    WorkerSubstate.LOGGED_IN, WorkerSubstate.WARMING_UP, WorkerSubstate.WARMED,
+    WorkerSubstate.SWAPPED, WorkerSubstate.HOLDING, WorkerSubstate.DISCOVERING,
+    WorkerSubstate.POLLING,
+})
+
+
+def _scout_is_actually_scouting(w) -> bool:
+    return w.status == WorkerStatus.RUNNING and w.substate in _SCOUTING_SUBSTATES
+
+
+
 
 class Scheduler:
     def __init__(
@@ -578,8 +601,8 @@ class Scheduler:
             return
         scouts = db.scalars(select(M.Worker).where(
             M.Worker.booking_id == bk.id, M.Worker.role == WorkerRole.SCOUT)).all()
-        if scouts and any(s.status == WorkerStatus.RUNNING for s in scouts):
-            return   # at least one scout alive -- no fallback needed
+        if scouts and any(_scout_is_actually_scouting(s) for s in scouts):
+            return   # at least one scout is past the login wall -- no fallback needed
         self._last_self_scout[bk.id] = time.time()
         holding_apply = db.scalars(select(M.Worker).where(
             M.Worker.booking_id == bk.id, M.Worker.role == WorkerRole.APPLY,

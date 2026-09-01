@@ -425,3 +425,78 @@ APP (our logic/state) · OPS (configuration, deployment, human action).
      behaviour unchanged.
 - **Do NOT** widen `FALSE_SLOT_BOUNCE_LIMIT` to cover these — that conflates three different
   failures under one counter, which is how this blind spot was created.
+
+## F30 — A launch decided before /stop can still spawn long after it, into a booking with no way back
+- **Class:** APP
+- **Code path:** `_do_launch_worker` (apps/hub/main.py) checks `bk.status not in
+  _LAUNCH_BLOCKED_BOOKING_STATUSES` exactly once, at entry — before `lease_proxy`, which can spend
+  up to ~100s in real proxy health probes (its own docstring: `max_probes` candidates at ~20s each,
+  twice over with `HOLD_SWAP_AFTER_WARMUP`). Nothing re-checks between that entry gate and the
+  actual `supervisor.spawn(w.id)` call tens of seconds to minutes later.
+- **CONFIRMED LIVE 2026-08-28/2026-08-31:** two hold-respawn scout relaunches on "Booking
+  0828"/"Booking 0828 ws" (posto 5084) passed the entry check while their bookings were still
+  RUNNING, then spent the lease-probe window mid-flight while the operator hit `/stop` on both
+  (committed 11:31:57 / 11:32:00). Neither relaunch re-checked afterward: both spawned real
+  processes at 11:32:25 / 11:32:44 — 25-44s after their booking was already STOPPED — and were
+  never in `stop_booking`'s own worker sweep (it only catches rows that are already RUNNING at query
+  time; these were still READY, mid-lease). The processes ran for **3 days 9+ hours** before being
+  found and killed by hand.
+- **Why they could never self-recover, and why this is a consequence of F30, not a second bug:**
+  hold-respawn's relaunch path (`_sched_on_relaunch`) correctly calls `_reset_worker_bus_state`
+  before every relaunch, removing the worker from the booking's slot_found "already notified" set so
+  `_latch_signals` can re-deliver a signal the booking fired before this worker existed (F9's own
+  fix, working as designed). But `_latch_signals` — like `_hold_respawn` — only runs `if bk.status in
+  _ACTIVE_BOOKING_STATUSES` (scheduler.py `_tick_once`, itself hardening an earlier instance of this
+  same defect class, 2026-08-14). A worker that only exists because its booking's STOPPED status
+  failed to stop its launch is, from that first tick onward, one `_latch_signals` correctly refuses
+  to touch — so `_maybe_escalate_stuck_rewarm`'s gate (`_slot_found_seen()`) can never open, and the
+  worker re-warms a lapsed form forever. Confirmed via the Redis event stream: 393 identical "this
+  booking has not opened yet" log lines, continuously, from the relaunch through the moment it was
+  killed. Fixing the launch race removes the precondition this deadlock needs — no separate fix was
+  required for the latch side, which is correct as designed.
+- **Fixed 2026-08-31:** a second guard immediately before `supervisor.spawn(w.id)`, using
+  `db.refresh(bk)` (not another `db.get`, which would return the same cached identity-map instance
+  and never observe a STOP committed by a different session in between). On a match, the proxy
+  lease(s) already taken during the probe window are released via `release_proxy(db, w.id)` and the
+  function returns without spawning — the worker is left exactly as `_sched_on_relaunch` queued it
+  (READY), inert, matching the entry-check's own abort shape.
+
+## F31 — A CAPTCHA solved for a page that had not yet registered its callback
+- **Class:** APP
+- **Code path:** `_discover_via_slots` (apps/worker/ops_live.py). `browser_nav` returns when the
+  *document* loads, but `window.onCaptchaSuccess` is registered by the portal's reCAPTCHA widget
+  script, which is still loading. The solve was spent first and the delivery attempted second, so a
+  page that was not ready yet cost a token.
+- **MEASURED 2026-09-01 on booking "Test 0901":** of 55 `/slots` discovery rounds, **47 died on
+  `onCaptchaSuccess not defined`** — and every one of those had *already* solved a CAPTCHA (tokens
+  of 2,553–2,702 chars, 7–23s each). The solver was paid 47 times for tokens the page could never
+  receive. Exactly one round landed; that one returned **70 slots**, so the endpoint itself works.
+- **Fixed 2026-09-01:** an in-page readiness poll (`typeof window.onCaptchaSuccess === 'function'`,
+  250ms interval, `_CALLBACK_WAIT_MS = 20000`) runs *before* the solve. If the callback never
+  appears the round routes to `_calendar_fallback` having spent nothing. `_SLOTS_WAIT_MS` raised
+  12s → 25s, since the one successful round showed the page's own script needs the time. A probe
+  that raises (destroyed execution context) is treated as not-ready — also no solve.
+- **Note:** this is a cost-and-throughput fix, not a correctness one. The 8 non-callback failures
+  are a separate population and are not explained by it.
+
+## F32 — A scout thrashing at the login wall counted as "alive" and suppressed the fallback
+- **Class:** APP
+- **Code path:** `_maybe_self_scout` (apps/hub/scheduler.py) gate 3 tested
+  `any(s.status == WorkerStatus.RUNNING for s in scouts)`. A worker that crashes and respawns every
+  ~30s is RUNNING at roughly half of all instants, so the gate read as "a scout is working" while
+  the scout was in fact discovering nothing.
+- **MEASURED 2026-09-01 on booking "Test 0901":** scout `28b8fe7f` cycled `logging_in → failed`
+  **245 times over four hours with zero `slots_found`**. The apply-as-scout fallback — the mechanism
+  that exists precisely for when scouts are not working — was suppressed for that entire window,
+  while two apply workers sat warmed and idle with no path to discover anything.
+- **Fixed 2026-09-01:** `_scout_is_actually_scouting(w)` requires RUNNING **and** a substate in
+  `_SCOUTING_SUBSTATES` (LOGGED_IN, WARMING_UP, WARMED, SWAPPED, HOLDING, DISCOVERING, POLLING) —
+  i.e. past the login wall. `LOGGING_IN`, `IDLE`, `FAILED` and `substate=None` no longer count.
+- **Accepted cost, pinned by a test:** a RUNNING scout that has not yet reported a substate
+  (mid-launch) now also fails the gate, so the fallback can fire during a healthy scout's login.
+  That is at most one command to one holding apply worker per `_SELF_SCOUT_THROTTLE` (30s) window,
+  against a measured alternative of four booking runs with zero bookings. Firing early is the
+  cheaper error — see `test_a_scout_with_no_substate_yet_does_not_suppress_the_fallback`.
+- **Still open:** gate 1 (`bk.slot_found_fired_at is not None` returns early forever, a one-shot
+  latch that permanently disables the fallback once any slot has ever been found) is untouched and
+  was not authorised. F29's phantom-slot detection likewise remains open.

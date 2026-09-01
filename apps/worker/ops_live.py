@@ -1989,7 +1989,13 @@ class LiveEngineOps(EngineOps):
     # So this delivers the token the way the page does, in the page world, and reads what the
     # page's own script produced. It is not a bypass of anything -- it is the portal's documented
     # client flow, driven correctly.
-    _SLOTS_WAIT_MS = 12000
+    # How long to wait for the portal's widget script to register window.onCaptchaSuccess. Checked
+    # BEFORE the solve, so a page that never registers it costs seconds rather than a wasted token.
+    _CALLBACK_WAIT_MS = 20000
+    # How long to wait for the page's own getSlots()/handleServerResponse() to populate window.data
+    # after the token is delivered. Raised 12s -> 25s: 5 of 55 rounds on "Test 0901" reached the
+    # callback and then timed out here, which throws away a token that had already been accepted.
+    _SLOTS_WAIT_MS = 25000
 
     def _calendar_fallback(self, dates: list[str], why: str) -> list[dict]:
         """OUR tooling failed before we ever asked the portal -- use the endpoint that needs no token.
@@ -2019,6 +2025,32 @@ class LiveEngineOps(EngineOps):
         except Exception as e:
             self._log(f"do_discover[slots]: could not reach Schedule.jsp ({str(e)[:90]})")
             return [{"date": d, "outcome": "failed"} for d in dates]
+
+        # WAIT FOR THE CALLBACK TO EXIST BEFORE SPENDING A SOLVE.
+        #
+        # browser_nav returns when the document loads, but window.onCaptchaSuccess is registered by
+        # the portal's reCAPTCHA widget script, which is still loading. MEASURED 2026-09-01 on
+        # booking "Test 0901": of 55 attempts, 47 died on `onCaptchaSuccess not defined` -- and the
+        # CAPTCHA had ALREADY been solved by then (tokens of 2,553-2,702 chars, 7-23s each), so we
+        # paid the solver 47 times and threw every token away because the page was not ready to
+        # receive it. One round in 55 succeeded; that one returned SEVENTY slots.
+        #
+        # Polling for the callback costs nothing and moves the check BEFORE the solve, so a page
+        # that never registers it costs a few seconds instead of a wasted token.
+        ready_js = ("(async () => { const dl = Date.now() + %d;"
+                    "  while (Date.now() < dl) {"
+                    "    if (typeof window.onCaptchaSuccess === 'function') return true;"
+                    "    await new Promise(r => setTimeout(r, 250)); }"
+                    "  return false; })()" % self._CALLBACK_WAIT_MS)
+        try:
+            ready = self.session.browser_eval(ready_js, timeout=45)
+        except Exception as e:
+            self._log(f"do_discover[slots]: could not probe for onCaptchaSuccess ({str(e)[:80]})")
+            ready = False
+        if not (ready is True or str(ready).lower() == "true"):
+            return self._calendar_fallback(
+                dates, f"window.onCaptchaSuccess never appeared within "
+                       f"{self._CALLBACK_WAIT_MS // 1000}s (no solve spent)")
         try:
             # HONOUR RECAPTCHA_SOLVE_PROXY, exactly as the login path does
             # (session.py:1712 `_rc_proxy = self.proxy if _recaptcha_solve_proxy() else None`).

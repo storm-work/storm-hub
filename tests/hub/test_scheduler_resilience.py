@@ -384,16 +384,42 @@ def test_maybe_self_scout_triggers_when_no_scouts_alive(db):
 
 
 def test_maybe_self_scout_does_nothing_when_scout_alive(db):
+    """A scout that is genuinely scouting still suppresses the fallback.
+
+    Updated 2026-09-01: this scout used to be created with substate=None, which passed under the
+    old `status == RUNNING` gate. That gate is what let a scout thrashing at the login wall count
+    as alive (see test_a_scout_stuck_in_login_does_not_suppress_the_fallback), so "alive" now means
+    a scouting substate -- and the fixture has to say which one it is."""
     bus = _FakeBus()
     sched = _scheduler(bus=bus)
     bk = _make_booking(db)
     ident = _make_identity(db)
-    _make_worker(db, bk, ident, role=WorkerRole.SCOUT, status=WorkerStatus.RUNNING)
+    _make_worker(db, bk, ident, role=WorkerRole.SCOUT, status=WorkerStatus.RUNNING,
+                 substate=WorkerSubstate.HOLDING)
     _make_worker(db, bk, ident, role=WorkerRole.APPLY, substate=WorkerSubstate.HOLDING)
 
     sched._maybe_self_scout(db, bk, NOW)
 
     assert bus.sent == []
+
+
+def test_a_scout_with_no_substate_yet_does_not_suppress_the_fallback(db):
+    """Deliberate, and the one behaviour change with a real cost: a RUNNING scout that has not yet
+    reported a substate (mid-launch) no longer counts as alive, so the fallback can fire during a
+    healthy scout's login. That costs at most ONE command to one holding apply worker per
+    _SELF_SCOUT_THROTTLE (30s) window, and the apply worker only self-discovers. Weighed against
+    the measured alternative -- four booking runs, zero bookings, the fallback permanently
+    suppressed -- firing early is the cheaper error. Pinned here so it cannot change silently."""
+    bus = _FakeBus()
+    sched = _scheduler(bus=bus)
+    bk = _make_booking(db)
+    ident = _make_identity(db)
+    _make_worker(db, bk, ident, role=WorkerRole.SCOUT, status=WorkerStatus.RUNNING, substate=None)
+    _make_worker(db, bk, ident, role=WorkerRole.APPLY, substate=WorkerSubstate.HOLDING)
+
+    sched._maybe_self_scout(db, bk, NOW)
+
+    assert any(t == "assign" and p.get("scouts_invalid") for _w, t, p in bus.sent)
 
 
 def test_maybe_self_scout_throttled(db):
@@ -2157,3 +2183,57 @@ def test_a_single_stale_slot_is_still_offered(db):
     lease = db.scalars(select(M.SlotLease).where(
         M.SlotLease.worker_id == w.id, M.SlotLease.released_at.is_(None))).first()
     assert lease is not None and lease.slot_id == only.id, "a one-slot pool was never assigned"
+
+
+# ── a scout that never gets past login is not "alive" (2026-09-01) ───────────────────────────
+# MEASURED on booking "Test 0901": scout 28b8fe7f cycled logging_in -> failed 245 times over four
+# hours with ZERO slots_found, yet `status == RUNNING` was true at any instant (a worker respawning
+# every ~30s is RUNNING roughly half the time). That permanently suppressed the apply-as-scout
+# fallback -- the mechanism that exists precisely for when scouts are not working -- and the booking
+# sat idle with no path to discover anything.
+
+def test_a_scout_stuck_in_login_does_not_suppress_the_fallback(db):
+    from apps.hub.scheduler import _scout_is_actually_scouting
+    bus = _FakeBus()
+    sched = _scheduler(bus=bus)
+    bk = _make_booking(db)
+    ident = _make_identity(db)
+    scout = _make_worker(db, bk, ident, role=WorkerRole.SCOUT, substate=WorkerSubstate.LOGGING_IN)
+    scout.status = WorkerStatus.RUNNING
+    applier = _make_worker(db, bk, _make_identity(db), role=WorkerRole.APPLY,
+                           substate=WorkerSubstate.HOLDING)
+    db.commit()
+
+    assert _scout_is_actually_scouting(scout) is False, \
+        "a scout stuck at the login wall counted as alive -- this is the 245-failure case"
+
+    sched._maybe_self_scout(db, bk, NOW)
+
+    # _FakeBus records (worker_id, type, payload)
+    assert any(t == "assign" and p.get("scouts_invalid") for _w, t, p in bus.sent), \
+        f"the apply-as-scout fallback never fired for a booking whose only scout cannot log in: {bus.sent}"
+
+
+def test_a_scout_that_is_past_login_still_suppresses_the_fallback(db):
+    """The guard must not become 'always fall back' -- a working scout is still a working scout."""
+    from apps.hub.scheduler import _scout_is_actually_scouting
+    from libs.domain.enums import WorkerSubstate as S
+    ident_bk = _make_booking(db)
+    for sub in (S.LOGGED_IN, S.WARMING_UP, S.WARMED, S.HOLDING, S.DISCOVERING, S.POLLING):
+        w = _make_worker(db, ident_bk, _make_identity(db), role=WorkerRole.SCOUT, substate=sub)
+        w.status = WorkerStatus.RUNNING
+        assert _scout_is_actually_scouting(w) is True, f"{sub} should count as scouting"
+
+
+def test_a_dead_or_failed_scout_never_counts(db):
+    from apps.hub.scheduler import _scout_is_actually_scouting
+    from libs.domain.enums import WorkerSubstate as S
+    bk = _make_booking(db)
+    for sub in (S.LOGGING_IN, S.FAILED, S.IDLE):
+        w = _make_worker(db, bk, _make_identity(db), role=WorkerRole.SCOUT, substate=sub)
+        w.status = WorkerStatus.RUNNING
+        assert _scout_is_actually_scouting(w) is False, f"{sub} must not count as scouting"
+    w = _make_worker(db, bk, _make_identity(db), role=WorkerRole.SCOUT,
+                     substate=WorkerSubstate.DISCOVERING)
+    w.status = WorkerStatus.FAILED
+    assert _scout_is_actually_scouting(w) is False, "a FAILED worker must never count"
