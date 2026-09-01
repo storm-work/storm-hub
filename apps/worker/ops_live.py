@@ -1991,6 +1991,24 @@ class LiveEngineOps(EngineOps):
     # client flow, driven correctly.
     _SLOTS_WAIT_MS = 12000
 
+    def _calendar_fallback(self, dates: list[str], why: str) -> list[dict]:
+        """OUR tooling failed before we ever asked the portal -- use the endpoint that needs no token.
+
+        Returning all-`failed` here is what the operator caught on booking "Test 0901": phases.py
+        reads a round where every date failed as a SESSION problem and calls _rebuild_session, so a
+        CapSolver outage produced `-> holding (re-warming: discovery failing every round)` and then
+        a re-login. Re-warming cannot make CapSolver reachable; it just spends the login wall and a
+        slice of the sub-account budget on a fault that has nothing to do with the session.
+
+        The calendar path (gettime + getPeriodosOcupados) needs no CAPTCHA at all, so a solver
+        failure has an answer that is strictly better than either failing or rebuilding: ask the
+        other endpoint. Only if THAT also fails is the round genuinely failed, and then the
+        rebuild is the right response.
+        """
+        self._log(f"do_discover[slots]: {why} -- falling back to the calendar path "
+                  f"(no token needed); NOT a session fault, so nothing to re-warm")
+        return self._discover_via_calendar(dates)
+
     def _discover_via_slots(self, dates: list[str]) -> list[dict]:
         """Solve SCHEDULE_EVISA, hand the token to window.onCaptchaSuccess, read window.data."""
         from libs.engine.vendor import race_all
@@ -2002,14 +2020,31 @@ class LiveEngineOps(EngineOps):
             self._log(f"do_discover[slots]: could not reach Schedule.jsp ({str(e)[:90]})")
             return [{"date": d, "outcome": "failed"} for d in dates]
         try:
+            # HONOUR RECAPTCHA_SOLVE_PROXY, exactly as the login path does
+            # (session.py:1712 `_rc_proxy = self.proxy if _recaptcha_solve_proxy() else None`).
+            #
+            # This was hardcoded to self.warm_proxy and it produced a 100% reCAPTCHA failure rate on
+            # booking "Test 0901": every solve came back `createTask failed: ERROR_PROXY...` because
+            # CapSolver cannot connect out through our webshare exits. The vendored helper's own
+            # docstring names that pool -- "measured only against soax/mobile and webshare and was
+            # WRONG for soax/rotating" -- and the catalog records 5 solves/mode: proxied 2/5 (3
+            # failed outright), proxyless 5/5. The booking had RECAPTCHA_SOLVE_PROXY=False set; this
+            # path simply never read it.
+            #
+            # No min_score either. It was 100, which makes race_all sit out its full grace waiting
+            # for a token score_token() only awards below 2,320 chars -- a length heuristic, and one
+            # whose ordering rationale §16 already invalidated. The login path passes no min_score
+            # (first usable token wins) and that is the path with the bookings behind it.
+            _rc_proxy = self.warm_proxy if self.cfg.solver.solve_proxy else None
+            self._log(f"do_discover[slots]: solving SCHEDULE_EVISA "
+                      f"({'via our proxy' if _rc_proxy else 'proxyless'})")
             token = race_all(self.capsolver_keys, [], [], [], "SCHEDULE_EVISA",
-                             self.warm_proxy, min_score=100) or ""
+                             proxy=_rc_proxy) or ""
         except Exception as e:
             self._log(f"do_discover[slots]: CAPTCHA solve failed ({str(e)[:90]})")
-            return [{"date": d, "outcome": "failed"} for d in dates]
+            return self._calendar_fallback(dates, "the CAPTCHA solve failed")
         if not token:
-            self._log("do_discover[slots]: no token produced")
-            return [{"date": d, "outcome": "failed"} for d in dates]
+            return self._calendar_fallback(dates, "no token was produced")
         self._log(f"do_discover[slots]: SCHEDULE_EVISA token len={len(token)} -> onCaptchaSuccess")
 
         tok = json.dumps(token)

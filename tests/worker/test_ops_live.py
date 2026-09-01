@@ -2844,3 +2844,64 @@ def test_a_valid_source_is_accepted_case_and_space_insensitively(monkeypatch):
         {"date": d, "outcome": "empty"} for d in dates]
     ops.do_discover(["2026-09-14"])
     assert hit, "a valid value was rejected over case/whitespace"
+
+
+# ── the reCAPTCHA failure that made discovery 0% (2026-09-01) ────────────────────────────────
+# Booking "Test 0901", webshare, RECAPTCHA_SOLVE_PROXY=False. Every solve returned
+# `createTask failed: ERROR_PROXY...` because _discover_via_slots hardcoded self.warm_proxy and
+# CapSolver cannot connect out through our webshare exits. The login path has always honoured the
+# setting (session.py:1712); this path simply never read it. Catalog: proxied 2/5, proxyless 5/5.
+
+def test_the_solve_is_proxyless_when_RECAPTCHA_SOLVE_PROXY_is_off(monkeypatch):
+    # Capture the proxy however it is passed. The buggy version passed it POSITIONALLY, so a
+    # kwargs-only assertion passed vacuously against the very code it was meant to catch.
+    seen = {}
+    def _spy(*a, **k):
+        seen["proxy"] = k["proxy"] if "proxy" in k else (a[5] if len(a) > 5 else None)
+        return "T" * 2617
+    monkeypatch.setattr("libs.engine.vendor.race_all", _spy)
+    ops = _make_ops(emit=lambda t, **p: None)
+    ops.session = _SlotsPageSession({"ok": True, "data": []})
+    ops._log = lambda *a, **k: None
+    ops.posto_pdf = "3018"
+    ops.warm_proxy = "http://u:p@gw:1"
+    object.__setattr__(ops.cfg.solver, "solve_proxy", False)
+    ops._discover_via_slots(["2026-09-14"])
+    assert seen["proxy"] is None, \
+        f"solved through our proxy despite RECAPTCHA_SOLVE_PROXY=False -> ERROR_PROXY: {seen}"
+
+
+def test_the_solve_uses_our_proxy_when_the_setting_is_on(monkeypatch):
+    seen = {}
+    def _spy(*a, **k):
+        seen["proxy"] = k["proxy"] if "proxy" in k else (a[5] if len(a) > 5 else None)
+        return "T" * 2617
+    monkeypatch.setattr("libs.engine.vendor.race_all", _spy)
+    ops = _make_ops(emit=lambda t, **p: None)
+    ops.session = _SlotsPageSession({"ok": True, "data": []})
+    ops._log = lambda *a, **k: None
+    ops.posto_pdf = "3018"
+    ops.warm_proxy = "http://u:p@gw:1"
+    object.__setattr__(ops.cfg.solver, "solve_proxy", True)
+    ops._discover_via_slots(["2026-09-14"])
+    assert seen["proxy"] == "http://u:p@gw:1"
+
+
+def test_a_solver_failure_falls_back_to_calendar_instead_of_failing(monkeypatch):
+    """phases.py reads an all-failed round as a SESSION fault and re-warms + re-logs in. A CapSolver
+    outage is not a session fault, and the calendar path needs no token at all."""
+    def _boom(*a, **k): raise RuntimeError("capsolver: createTask failed: ERROR_PROXY_CONNECT_REFUSED")
+    monkeypatch.setattr("libs.engine.vendor.race_all", _boom)
+    ops = _make_ops(emit=lambda t, **p: None)
+    ops.session = _SlotsPageSession({"ok": True, "data": []})
+    ops._log = lambda *a, **k: None
+    ops.posto_pdf = "3018"
+    hit = []
+    ops._discover_via_calendar = lambda dates: hit.append(list(dates)) or [
+        {"date": d, "outcome": "found", "periods": [5]} for d in dates]
+
+    out = ops._discover_via_slots(["2026-09-14"])
+
+    assert hit == [["2026-09-14"]], "the calendar path was not used as the fallback"
+    assert out[0]["outcome"] == "found", \
+        "a solver outage still reported `failed` -- phases.py would re-warm and re-login on it"
