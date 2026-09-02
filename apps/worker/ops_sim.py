@@ -74,6 +74,11 @@ class SimEngineOps(EngineOps):
             time.sleep(self._delay)
 
     # shared
+    def breaker_tripped(self) -> bool:
+        """The simulator has no circuit breaker, so a failed do_login is always a real
+        login failure -- which keeps every existing simulated run behaving exactly as before."""
+        return False
+
     def do_login(self) -> bool:
         self._pause(); self.logins += 1; return self._login_ok
 

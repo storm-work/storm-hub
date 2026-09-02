@@ -73,6 +73,57 @@ SLOTS_URL = BASE + "/slots"
 _SLOTS_PATH_MARK = "/slots"
 
 
+# What /slots actually answered, as four outcomes that need four DIFFERENT responses. Every one of
+# these used to be `failed`, which routed all of them into the re-warm ladder -- a treatment that
+# fixes none of them. MEASURED on the 2026-09-02 17:15 run of "Test 0901", where two scouts polled
+# the same endpoint seconds apart for the same dates:
+#   * scout 88d2046d alternated strictly reject/success/reject/success, successes 99s and 117s
+#     apart -> the endpoint grants roughly ONE real response per ~100s per session and answers
+#     anything sooner with {"error": ReCaptchaError"}. Nothing is wrong with the session.
+#   * scout 28b8fe7f returned {"data":{}} SIX times out of six and never once got data, having also
+#     gone 8-for-8 the same way earlier that day. Its form state was fine -- it re-warmed
+#     successfully four times -- and a re-warm never once helped. In the 04:22 run the same worker
+#     recovered the instant it re-logged in.
+# The two are told apart by the response, not by guesswork: the empty answer carries a doubled
+# content-type (application/octet-stream, application/js) that the real one never has, the rate
+# limit comes back as application/json, and a real array arrives with no content-type at all.
+SLOTS_OK = "ok"
+SLOTS_RATE_LIMITED = "rate_limited"    # token refused; wait, do NOT touch the session
+SLOTS_SESSION_BURNED = "session_burned"  # 200 + {"data":{}}; only a fresh LOGIN clears it
+SLOTS_BLOCKED = "blocked"              # 4xx/HTML; this exit is done
+SLOTS_UNKNOWN = "unknown"
+
+
+def _classify_slots_response(res: dict) -> str:
+    """Read the intercepted response first and the page residue only as a fallback.
+
+    Order matters: the block check comes before the body checks because a 403 can carry any body,
+    and ReCaptchaError before the empty-object check because a rejected token is a statement about
+    the REQUEST while the empty object is a statement about the SESSION.
+    """
+    probe = res.get("probe") if isinstance(res, dict) else None
+    body = ""
+    status = None
+    if isinstance(probe, dict):
+        status = probe.get("status")
+        body = str(probe.get("body") or "")
+    if not body:
+        body = str(res.get("raw") or "")          # residue fallback when nothing was captured
+    try:
+        if status is not None and int(status) >= 400:
+            return SLOTS_BLOCKED
+    except (TypeError, ValueError):
+        pass
+    if "ReCaptchaError" in body or "recaptcha" in body.lower():
+        return SLOTS_RATE_LIMITED
+    if '"data"' in body.replace(" ", ""):
+        # {"data":{}} -- a 200 whose body announces no payload at all.
+        return SLOTS_SESSION_BURNED
+    if res.get("ok"):
+        return SLOTS_OK
+    return SLOTS_UNKNOWN
+
+
 def _fmt_slots_probe(probe) -> str:
     """Render the intercepted /slots response for the log in one line.
 
@@ -551,6 +602,12 @@ class LiveEngineOps(EngineOps):
         self._login_sem: RedisSemaphore | None = None
         self._apply_sem: RedisSemaphore | None = None
         self._breaker: RedisBreaker | None = None
+        # /slots pacing + recovery state (2026-09-02). _slots_backoff_until gates the next attempt
+        # so we stop buying tokens the endpoint will refuse; _slots_needs_relogin tells phases.py
+        # that the ladder's cheap rung (re-warm) cannot help this failure.
+        self._slots_backoff_until: float = 0.0
+        self._slots_last_grant_at: float = 0.0
+        self._slots_needs_relogin: bool = False
         if redis_client is not None and booking_id:
             from libs.bus.semaphore import make_gate
             self._login_sem = make_gate(redis_client, booking_id, "login", cfg.raw.get("LOGIN_CONCURRENCY", 10))
@@ -562,6 +619,27 @@ class LiveEngineOps(EngineOps):
             )
 
     # ── shared warm-up ──────────────────────────────────────────────────────────
+    def discovery_needs_relogin(self) -> bool:
+        """True when the last /slots round returned the burned-session signature.
+
+        The rebuild ladder tries a re-warm first and stops if it succeeds -- correct for a lapsed
+        form, and useless here: on the 2026-09-02 17:15 run scout 28b8fe7f re-warmed successfully
+        four times and still returned {"data":{}} six times out of six, because the form state was
+        never the problem. Its counterpart that had re-logged in was getting real data from the same
+        endpoint seconds apart.
+        """
+        return self._slots_needs_relogin
+
+    def breaker_tripped(self) -> bool:
+        """Did the last do_login() refuse because the BOOKING'S breaker is tripped?
+
+        Read by PhaseMachine._warmup to tell "the portal is refusing everyone, wait" apart from
+        "this login failed". Without that distinction a tripped breaker terminated the worker and
+        hold-respawn immediately relaunched it into the same refusal -- 55 of one worker's 65
+        process starts on the 2026-09-02 17:15 run died that way without issuing a request.
+        """
+        return bool(self._breaker is not None and self._breaker.is_tripped())
+
     def do_login(self) -> bool:
         if self._breaker is not None and self._breaker.is_tripped():
             self._log("do_login: booking breaker is tripped -- portal appears down, not retrying yet")
@@ -2061,6 +2139,11 @@ class LiveEngineOps(EngineOps):
     # How long to wait for the intercepted /slots response to finish being read, in the case where
     # the page's own handler populated window.data before our clone().text() promise resolved.
     _SLOTS_PROBE_GRACE_MS = 1500
+    # The endpoint grants roughly one real response per ~100s per session (measured: successes
+    # 99s and 117s apart, every attempt in between refused). Asking sooner does not get data -- it
+    # buys a CAPTCHA token and trades it for {"error": ReCaptchaError"}. Gated on the last GRANT,
+    # because that is what the limit keys on.
+    _SLOTS_MIN_INTERVAL = 100.0
 
     def _no_report(self, why: str) -> list[dict]:
         """OUR tooling failed before the portal was ever asked -- report nothing about any date.
@@ -2089,6 +2172,16 @@ class LiveEngineOps(EngineOps):
         """Solve SCHEDULE_EVISA, hand the token to window.onCaptchaSuccess, read window.data."""
         from libs.engine.vendor import race_all
         want = {str(d) for d in dates}
+        # DON'T BUY A TOKEN THE ENDPOINT WILL REFUSE. Returning early rather than sleeping keeps the
+        # worker responsive to stop and lets the normal poll_gap do the pacing; the round simply
+        # reports nothing, which is true -- we did not ask.
+        _wait = max(self._slots_backoff_until - time.time(),
+                    self._SLOTS_MIN_INTERVAL - (time.time() - self._slots_last_grant_at)
+                    if self._slots_last_grant_at else 0.0)
+        if _wait > 0:
+            return self._no_report(
+                f"/slots grants about one response per {self._SLOTS_MIN_INTERVAL:.0f}s and the last "
+                f"one was too recent ({_wait:.0f}s to go) -- not spending a solve")
         try:
             self.session.browser_nav(SCHED_JSP + "?posto_id=" + str(self.posto_pdf or self.posto_id),
                                      timeout=30)
@@ -2252,16 +2345,43 @@ class LiveEngineOps(EngineOps):
             except Exception: res = {"err": f"unparseable: {str(res)[:120]}"}
         res = res or {}
         self._log(f"do_discover[slots]: endpoint said {_fmt_slots_probe(res.get('probe'))}")
+        kind = _classify_slots_response(res)
+        if kind == SLOTS_RATE_LIMITED:
+            # Not a session fault and not news about the calendar: the token was refused because we
+            # asked too soon. Reporting `failed` here is what drove the re-warm ladder over a
+            # response that has nothing to do with the session.
+            self._slots_backoff_until = time.time() + self._SLOTS_MIN_INTERVAL
+            return self._no_report(
+                f"the endpoint refused the token (rate limit); next attempt in "
+                f"{self._SLOTS_MIN_INTERVAL:.0f}s")
+        if kind == SLOTS_SESSION_BURNED:
+            # Only a fresh LOGIN clears this. Flagged for phases.py so the rebuild ladder skips
+            # straight past the re-warm rung, which is measured to never help here.
+            self._slots_needs_relogin = True
+            self._log("do_discover[slots]: the endpoint returned an empty object -- this SESSION is "
+                      "burned for /slots; a re-warm cannot fix it, only a fresh login")
+            return [{"date": d, "outcome": "failed"} for d in dates]
+        if kind == SLOTS_BLOCKED:
+            # The exit is done, not the session. Roll it and let the next round try from elsewhere.
+            self._log("do_discover[slots]: the endpoint blocked this exit -- rolling off it")
+            if not self._roll_exit("slots blocked"):
+                new_proxy = self._request_proxy_rotation(self._current_phase)
+                if new_proxy:
+                    self.warm_proxy = new_proxy
+            return self._no_report("the endpoint blocked this exit")
         if res.get("err"):
             self._log(f"do_discover[slots]: {res['err']}")
             return [{"date": d, "outcome": "failed"} for d in dates]
         if res.get("coerced"):
-            # A NON-ARRAY body is the portal declining, not an empty calendar. Reporting it as
-            # `empty` would prune real dates from the pool (bug fix #6's whole point).
+            # A NON-ARRAY body we do NOT recognise. Still `failed` rather than `empty`: reporting
+            # it as empty would prune real dates from the pool (bug fix #6's whole point).
             self._log(f"do_discover[slots]: non-array payload, coerced to [] to protect the page "
                       f"| raw={str(res.get('raw'))[:160]}")
             return [{"date": d, "outcome": "failed"} for d in dates]
 
+        # A real array is the grant the rate limit meters, and proof the session is fine.
+        self._slots_last_grant_at = time.time()
+        self._slots_needs_relogin = False
         found, capacity = {}, {}
         for entry in (res.get("data") or []):
             if not isinstance(entry, dict):

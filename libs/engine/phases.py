@@ -39,6 +39,10 @@ INACTIVATE = object()
 # constant rather than a setting: it is a back-off shape, not an operator knob, and every unit of it
 # is a poll_gap() carrying the enforced minimum floor.
 _PARK_POLL_GAPS = 3
+# Poll gaps a worker will wait out a tripped booking breaker before giving up. The
+# breaker's own cooldown is 120s, so this is deliberately several cooldowns' worth:
+# the point is to outlast the outage, not to sample it once.
+_BREAKER_WAIT_GAPS = 40
 
 
 def _flatten_found(results: list[dict]) -> list[dict]:
@@ -58,6 +62,9 @@ class EngineOps(Protocol):
 
     # ── shared warm-up ────────────────────────────────────────────────────────
     def do_login(self) -> bool: ...
+    # True when the last do_login() refused because the BOOKING'S circuit breaker is tripped --
+    # "the portal is refusing everyone, come back later", which is not a verdict on this worker.
+    def breaker_tripped(self) -> bool: ...
     def do_warmup(self) -> bool: ...
     def do_swap(self) -> str | None: ...          # ISP exit ip if swapped, else None
     def await_slot_open(self) -> str: ...         # block until the slot-open signal
@@ -174,8 +181,45 @@ class PhaseMachine:
     # ── shared warm-up: login -> warmup -> swap -> hold ───────────────────────
     def _warmup(self) -> PhaseResult | None:
         self._to(WorkerSubstate.LOGGING_IN)
-        if not self.ops.do_login():
-            return self._fail("login")
+        # A TRIPPED BREAKER MEANS WAIT, NOT DIE.
+        #
+        # do_login() refuses outright while the booking's breaker is tripped, and that refusal used
+        # to be indistinguishable from a real login failure -- so the worker terminated, hold-respawn
+        # relaunched it, the new process hit the same tripped breaker, and it terminated again.
+        # MEASURED on the 2026-09-02 17:15 run of "Test 0901": worker 0c255d40 made 65 process
+        # starts, and 55 of them died on "booking breaker is tripped" WITHOUT ISSUING A SINGLE
+        # REQUEST. Two workers burned 102 process starts between them this way.
+        #
+        # The breaker's entire purpose is "back off and come back later"; answering it by dying and
+        # being resurrected every ~30s is the opposite, and it costs a process start, a proxy lease
+        # and a Hub scheduling round each time. Waiting costs nothing scarce -- the cooldown is
+        # bounded (BREAKER_COOLDOWN, 120s) and is_tripped() clears itself when it elapses.
+        waits = 0
+        while not self.ops.do_login():
+            # getattr, not a bare call: EngineOps is a Protocol with many test doubles and
+            # partial implementations, and an ops object that cannot answer the question has by
+            # definition no breaker -- so it must keep the original behaviour (fail immediately)
+            # rather than crash. Failing closed here would turn a missing method into a worker that
+            # waits 40 poll gaps on every genuine login failure.
+            _tripped = getattr(self.ops, "breaker_tripped", None)
+            if not (callable(_tripped) and _tripped()):
+                return self._fail("login")          # a real login failure, unchanged
+            if self.ops.is_stopped():
+                return PhaseResult("stopped", self._sub, "stopped while the breaker was tripped",
+                                   self.visited)
+            waits += 1
+            if waits > _BREAKER_WAIT_GAPS:
+                # Still refusing after a full budget of poll gaps. Fail out so the operator sees it
+                # and the supervisor's own respawn accounting applies -- an unbounded wait would
+                # just move the invisible-worker problem somewhere else.
+                return self._fail("login")
+            # Stays in LOGGING_IN (a legal self-transition) rather than moving to HOLDING: this
+            # worker has NOT authenticated, and HOLDING means a warmed session is being kept alive.
+            # The state machine rejects logging_in -> holding for exactly that reason, and it is
+            # right to -- the detail carries the "why", the substate keeps telling the truth.
+            self._to(WorkerSubstate.LOGGING_IN,
+                     detail=f"waiting out the booking breaker ({waits}/{_BREAKER_WAIT_GAPS})")
+            self.ops.poll_gap()
         self._to(WorkerSubstate.LOGGED_IN)
         self._to(WorkerSubstate.WARMING_UP)
         # NOT terminal on the first failure any more -- see _warm_with_recovery. Terminating here
@@ -266,7 +310,10 @@ class PhaseMachine:
                     # single unlucky round.
                     rebuild_after = steady_rebuild_after
                     self._to(WorkerSubstate.POLLING)
-                    if not self._rebuild_session("discovery failing every round"):
+                    _relogin = getattr(self.ops, "discovery_needs_relogin", None)
+                    _skip = bool(callable(_relogin) and _relogin())
+                    if not self._rebuild_session("discovery failing every round",
+                                                 skip_rewarm=_skip):
                         return self._fail("scout session unrecoverable")
                     continue
             elif results:
@@ -288,7 +335,7 @@ class PhaseMachine:
         return PhaseResult("discovered", self._sub, f"pushed {pushed_total}", self.visited)
 
     # ── apply: hold -> await assignment -> book; fallback self-scout ──────────
-    def _rebuild_session(self, why: str) -> bool:
+    def _rebuild_session(self, why: str, *, skip_rewarm: bool = False) -> bool:
         """Recover a degraded session IN PROCESS, cheapest step first.
 
         RE-WARM, then re-login only if that fails. This went straight to do_login(), which is the
@@ -301,6 +348,27 @@ class PhaseMachine:
         which is exactly what a re-warm restores. Same ladder the apply path already uses for
         form_stale (REWARM_MAX_ATTEMPTS) and the one storm-auto uses. Returns False only when even a
         fresh login can't recover -- the one genuinely terminal case."""
+        # skip_rewarm: the caller has POSITIVE evidence the cheap rung cannot help.
+        #
+        # The ladder's premise -- "nearly always the auth session is fine and only the form-state
+        # lapsed" -- is exactly inverted for a /slots session that has been burned. MEASURED on the
+        # 2026-09-02 17:15 run: scout 28b8fe7f re-warmed successfully FOUR times and still answered
+        # {"data":{}} six times out of six. Because a successful re-warm returns True here, the
+        # ladder never reached the re-login rung at all, and the worker sat in that loop for two
+        # hours looking healthy. The escalation only ever fired when the re-warm happened to fail.
+        if skip_rewarm:
+            self._to(WorkerSubstate.HOLDING, detail=f"re-warm cannot fix this; re-login: {why}")
+            self._to(WorkerSubstate.LOGGING_IN)
+            if not self.ops.do_login():
+                return False
+            self._to(WorkerSubstate.LOGGED_IN)
+            self._to(WorkerSubstate.WARMING_UP)
+            if not self.ops.do_warmup():
+                return False
+            self._to(WorkerSubstate.WARMED)
+            self._to(WorkerSubstate.HOLDING)
+            self.ops.poll_gap()
+            return True
         self._to(WorkerSubstate.HOLDING, detail=f"re-warming: {why}")
         self._to(WorkerSubstate.WARMING_UP)
         if self.ops.do_warmup():

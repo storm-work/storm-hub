@@ -3165,3 +3165,101 @@ def test_rolling_is_bounded_so_a_genuine_outage_still_reaches_the_fleet(monkeypa
 
     assert rolls == [], "with the budget at 0 no exit roll should be attempted"
     assert ops._breaker.downs > 0, "a genuine outage never reached the breaker"
+
+
+# ── four /slots answers that need four different responses (2026-09-02) ───────────────────────
+# All of them were `failed`, which routed every one into the re-warm ladder -- a treatment that
+# fixes none of them. MEASURED on the 17:15 run of "Test 0901", two scouts polling the same endpoint
+# seconds apart for the same dates: 88d2046d alternated strictly reject/success with successes 99s
+# and 117s apart (a rate limit), while 28b8fe7f returned {"data":{}} six times out of six after
+# re-warming successfully four times (a burned session, which only a fresh login cleared).
+
+def test_the_four_responses_are_classified_apart():
+    from apps.worker.ops_live import (_classify_slots_response, SLOTS_OK, SLOTS_RATE_LIMITED,
+                                      SLOTS_SESSION_BURNED, SLOTS_BLOCKED)
+    P = lambda st, b: {"probe": {"status": st, "body": b}}
+    assert _classify_slots_response(P(200, '{"error": ReCaptchaError"}')) == SLOTS_RATE_LIMITED
+    assert _classify_slots_response(P(200, '{"data":{}}\n')) == SLOTS_SESSION_BURNED
+    assert _classify_slots_response(P(403, "<!DOCTYPE html>")) == SLOTS_BLOCKED
+    out = dict(P(200, '[{"date":"2026-09-08"}]')); out["ok"] = True
+    assert _classify_slots_response(out) == SLOTS_OK
+
+
+def test_a_403_is_blocked_whatever_body_it_carries():
+    """Status is checked before the body: a block page can say anything, including nothing."""
+    from apps.worker.ops_live import _classify_slots_response, SLOTS_BLOCKED
+    assert _classify_slots_response({"probe": {"status": 429, "body": '{"data":{}}'}}) == SLOTS_BLOCKED
+
+
+def test_the_residue_is_used_when_nothing_was_captured():
+    """The interceptor can miss (cache, or a request issued before the hook existed) -- the old
+    page residue must still classify rather than silently becoming 'unknown'."""
+    from apps.worker.ops_live import _classify_slots_response, SLOTS_SESSION_BURNED
+    assert _classify_slots_response({"coerced": True, "raw": '{"data":{}}'}) == SLOTS_SESSION_BURNED
+
+
+def _slots_kind_ops(monkeypatch, payload):
+    sess = _LateCallbackSession(ready=True, payload=payload)
+    monkeypatch.setattr("libs.engine.vendor.race_all", lambda *a, **k: "T" * 2617)
+    ops = _callback_ops(sess)
+    ops._roll_exit = lambda why="": True
+    return ops
+
+
+def test_a_rate_limit_reports_nothing_and_does_not_touch_the_session(monkeypatch):
+    ops = _slots_kind_ops(monkeypatch, {"coerced": True, "raw": '{"error": ReCaptchaError"}',
+                                        "probe": {"status": 200, "body": '{"error": ReCaptchaError"}'}})
+    out = ops._discover_via_slots(["2026-09-14"])
+
+    assert out == [], "a rate limit reported `failed`, which drives the re-warm ladder"
+    assert ops.discovery_needs_relogin() is False, "a rate limit is not a session fault"
+    assert ops._slots_backoff_until > 0, "no back-off was armed, so the next round refuses again"
+
+
+def test_a_burned_session_asks_for_a_re_login_not_a_re_warm(monkeypatch):
+    ops = _slots_kind_ops(monkeypatch, {"coerced": True, "raw": '{"data":{}}',
+                                        "probe": {"status": 200, "body": '{"data":{}}\n'}})
+    out = ops._discover_via_slots(["2026-09-14"])
+
+    assert [r["outcome"] for r in out] == ["failed"], "the ladder must still engage"
+    assert ops.discovery_needs_relogin() is True, \
+        "without this the ladder re-warms, which is measured never to clear {\"data\":{}}"
+
+
+def test_a_block_rolls_the_exit(monkeypatch):
+    ops = _slots_kind_ops(monkeypatch, {"coerced": True, "raw": "<html>",
+                                        "probe": {"status": 403, "body": "<!DOCTYPE html>"}})
+    rolled = []
+    ops._roll_exit = lambda why="": rolled.append(why) or True
+    out = ops._discover_via_slots(["2026-09-14"])
+
+    assert rolled, "a 403 left the worker on the exit that had just been blocked"
+    assert out == [], "a blocked exit says nothing about the dates"
+
+
+def test_a_grant_clears_the_relogin_flag_and_arms_the_pacing(monkeypatch):
+    ops = _slots_kind_ops(monkeypatch, {"ok": True, "data": [{"date": "2026-09-14", "periods": [5]}],
+                                        "probe": {"status": 200, "body": "[...]"}})
+    ops._slots_needs_relogin = True
+    out = ops._discover_via_slots(["2026-09-14"])
+
+    assert out[0]["outcome"] == "found"
+    assert ops.discovery_needs_relogin() is False, "a real array proves the session is fine"
+    assert ops._slots_last_grant_at > 0
+
+
+def test_no_solve_is_bought_inside_the_grant_interval(monkeypatch):
+    """The measured limit is ~1 response per 100s. Asking sooner buys a token and trades it for a
+    refusal, which is exactly the spend this removes."""
+    solves = []
+    sess = _LateCallbackSession(ready=True)
+    monkeypatch.setattr("libs.engine.vendor.race_all",
+                        lambda *a, **k: solves.append(1) or "T" * 2617)
+    ops = _callback_ops(sess)
+    import time as _t
+    ops._slots_last_grant_at = _t.time()      # a grant just landed
+
+    out = ops._discover_via_slots(["2026-09-14"])
+
+    assert solves == [], "bought a CAPTCHA token inside the interval the endpoint refuses"
+    assert out == [], "the skipped round must report nothing, not guess at the dates"
