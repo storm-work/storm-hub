@@ -883,6 +883,12 @@ class LiveEngineOps(EngineOps):
         # `transient` and, like it, not charged to the sub-account -- see the use site below.
         ip_moves = 0
         max_ip_moves = max(0, int(self.cfg.raw.get("LOGIN_IP_MISMATCH_RETRIES", 2)))
+        # "Try again later" refusals, each answered by rolling to a DIFFERENT exit before the fleet
+        # is told anything. Bounded like `transient` and `ip_moves`, and like them not charged to
+        # the sub-account. Its own counter rather than sharing `transient`: a dead tunnel and a
+        # portal refusal are different signals and must not spend each other's budget.
+        busy_rolls = 0
+        max_busy_rolls = max(0, int(self.cfg.raw.get("LOGIN_PORTAL_BUSY_ROLLS", 3)))
         rounds = 0
         while attempt < sticky_max:
             rounds += 1
@@ -991,6 +997,16 @@ class LiveEngineOps(EngineOps):
                         self.warm_proxy = new_proxy
                 self._backoff(ip_moves)
                 continue          # deliberately does NOT advance `attempt` or `captcha_fails`
+            if _is_portal_busy(reason) and busy_rolls < max_busy_rolls:
+                busy_rolls += 1
+                self._log(f"login: 'try again later' on this exit ({busy_rolls}/{max_busy_rolls}) "
+                          f"-- rolling to a different exit before blaming the portal")
+                if not self._roll_exit(f"portal busy {busy_rolls}/{max_busy_rolls}"):
+                    new_proxy = self._request_proxy_rotation(self._current_phase)
+                    if new_proxy:
+                        self.warm_proxy = new_proxy
+                self._backoff(busy_rolls)
+                continue
             attempt += 1
             self._log(f"login attempt {attempt}/{sticky_max} [{_proxy_label(self.warm_proxy)}"
                       f" acct={self.sub_account_id[:8]}]: rejected ({reason})")
@@ -1005,10 +1021,29 @@ class LiveEngineOps(EngineOps):
             # an isolated refusal among successes cannot trip it). Deliberately NOT counted for a
             # credential rejection or a reCAPTCHA verdict -- those say something about this account,
             # not about the portal's willingness to serve anyone.
+            #
+            # CORRECTED 2026-09-02. The paragraph above is right that a refusal can be fleet-wide,
+            # and wrong that it always is -- it went straight to the fleet breaker without ever
+            # testing whether THIS EXIT was the problem. MEASURED on the 2026-09-01 23:18 run of
+            # "Test 0901": in the 23:30 bucket, ELEVEN "try again later" pages coexisted with FOUR
+            # successful logins. A page that one exit receives while another exit is logging in
+            # successfully is per-exit evidence by definition.
+            #
+            # The cost of getting that backwards is not small. record_success() is the only thing
+            # that resets the breaker's counter, and it is only reached by a login that succeeded --
+            # so once the exit pool degrades, the breaker trips, suppresses the attempts that could
+            # have found a good exit, and nothing can ever clear it. It re-opens after each 120s
+            # cooldown, is re-tripped by the next few refusals, and repeats: 145 refusals over 91
+            # minutes, ZERO successful logins after 23:37:52.
+            #
+            # So a refusal is charged to the exit first and to the portal only once several
+            # DIFFERENT exits have said the same thing -- which is the fleet-wide evidence the
+            # original reasoning wanted, actually established rather than assumed.
             if self._breaker is not None and _is_portal_busy(reason):
                 self._breaker.record_portal_down()
-                self._log("login: that was the portal's 'try again later' page -- reported to the "
-                          "booking breaker so the whole fleet backs off, not just this worker")
+                self._log(f"login: 'try again later' from {busy_rolls + 1} different exits -- that "
+                          f"is the portal declining to serve anyone, reported to the booking "
+                          f"breaker so the whole fleet backs off")
             # CAPTCHA BUDGET. The portal allows this account TWO reCAPTCHA failures before blocking
             # platform access outright, and the sticky budget was happily spending both -- leaving
             # the account at the edge, where any later retry in the same window blocks it for good.

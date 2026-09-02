@@ -3089,3 +3089,79 @@ def test_a_healthy_round_also_records_what_the_endpoint_said(monkeypatch):
 
     assert out[0]["outcome"] == "found"
     assert any("HTTP 200" in l for l in lines), f"a successful round logged no response: {lines}"
+
+
+# ── a "try again later" page is per-exit evidence before it is fleet-wide (2026-09-02) ────────
+# It went straight to the booking's circuit breaker without ever testing whether THIS EXIT was the
+# problem. MEASURED on the 2026-09-01 23:18 run of "Test 0901": in the 23:30 bucket ELEVEN such
+# pages coexisted with FOUR successful logins, so the page plainly does not mean "the portal is
+# down for everyone". And because only a SUCCESSFUL login calls record_success(), a degraded exit
+# pool locked the fleet out with no way back: 145 refusals over 91 minutes, zero logins after
+# 23:37:52. The breaker re-opened every 120s and the next few refusals re-tripped it.
+
+_BUSY_BODY = ('{"type":"error","description":"N\\u00e3o foi poss\\u00edvel de momento concretizar '
+              'o seu pedido. Por favor tente mais tarde."}')
+
+
+class _RecordingBreaker:
+    def __init__(self): self.downs = 0; self.successes = 0
+    def is_tripped(self): return False
+    def record_portal_down(self): self.downs += 1
+    def record_success(self): self.successes += 1
+
+
+def _busy_login_ops(monkeypatch, calls, *, busy_rolls=3, sticky=2):
+    import apps.worker.ops_live as ops_live_mod
+
+    class _AlwaysBusy(_FakeSession):
+        def browser_login(self, *a, **k):
+            calls["n"] += 1
+            return {"status": 200, "body": _BUSY_BODY}
+
+    monkeypatch.setattr(ops_live_mod, "get_session", lambda **kw: _AlwaysBusy())
+    ops = _make_ops(cfg=_cfg(STICKY_RETRY_MAX=sticky, LOGIN_TRANSIENT_RETRY_MAX=0,
+                             LOGIN_PORTAL_BUSY_ROLLS=busy_rolls))
+    ops._backoff = lambda n: None
+    ops._request_proxy_rotation = lambda phase=None: None
+    ops._breaker = _RecordingBreaker()
+    rolls = []
+    ops._roll_exit = lambda why="": rolls.append(why) or True
+    return ops, rolls
+
+
+def test_a_busy_page_rolls_the_exit_before_the_fleet_is_told_anything(monkeypatch):
+    calls = {"n": 0}
+    ops, rolls = _busy_login_ops(monkeypatch, calls, busy_rolls=3)
+
+    ops._sticky_login_attempts(ops.cfg.login.sticky_retry_max)
+
+    assert len(rolls) == 3, f"the refusal was blamed on the portal without trying another exit: {rolls}"
+    assert ops._breaker.downs == 2, (
+        "the breaker should hear about it only after 3 DIFFERENT exits refused -- then once per "
+        f"remaining sticky attempt (got {ops._breaker.downs})")
+
+
+def test_a_busy_page_is_not_charged_to_the_sub_account_while_rolling(monkeypatch):
+    """It is not a verdict on the credentials, so it belongs beside `transient`/`ip_moves`, above
+    the `attempt += 1`. Charged too early it would burn the sticky budget and rotate accounts over
+    an exit problem."""
+    calls = {"n": 0}
+    ops, _ = _busy_login_ops(monkeypatch, calls, busy_rolls=3, sticky=2)
+
+    ops._sticky_login_attempts(ops.cfg.login.sticky_retry_max)
+
+    assert calls["n"] == 5, \
+        f"expected 3 uncharged rolls + 2 charged sticky attempts, got {calls['n']}"
+
+
+def test_rolling_is_bounded_so_a_genuine_outage_still_reaches_the_fleet(monkeypatch):
+    """The 2026-08-23 finding stands: when the portal really is refusing everyone, the fleet must
+    back off together rather than each worker grinding alone. Rolling only delays that until it is
+    established, and setting the budget to 0 restores the original straight-to-breaker behaviour."""
+    calls = {"n": 0}
+    ops, rolls = _busy_login_ops(monkeypatch, calls, busy_rolls=0)
+
+    ops._sticky_login_attempts(ops.cfg.login.sticky_retry_max)
+
+    assert rolls == [], "with the budget at 0 no exit roll should be attempted"
+    assert ops._breaker.downs > 0, "a genuine outage never reached the breaker"

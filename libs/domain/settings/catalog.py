@@ -443,6 +443,17 @@ _TEMPLATE = [
             "-- and blocks platform access beyond it, so the default of 1 leaves a margin. The "
             "login path used to spend its whole sticky budget walking an account to that edge; "
             "measured 2026-08-23, 34 accounts were taken there."),
+    _s("LOGIN_PORTAL_BUSY_ROLLS", L.TEMPLATE, int, 3, _WRK, "login_resilience", min_value=0.0,
+       note="how many DIFFERENT exits must receive the portal's 'try again later' refusal before "
+            "the booking's circuit breaker is told the portal is declining to serve anyone. Each "
+            "refusal below this rolls to a fresh exit and retries, and is not charged to the "
+            "sub-account. Default 3. Raise it if your exit pool is large and flaky; set 0 to go "
+            "straight to the fleet breaker on the first refusal, which is the pre-2026-09-02 "
+            "behaviour. Rationale: that behaviour treated a per-exit refusal as portal-wide -- "
+            "measured on the 2026-09-01 run, 11 such pages coexisted with 4 successful logins in "
+            "one 10-minute window -- and because only a SUCCESSFUL login resets the breaker, a "
+            "degraded exit pool locked the fleet out entirely: 145 refusals over 91 minutes with "
+            "zero logins after the first 14."),
     _s("LOGIN_IP_MISMATCH_RETRIES", L.TEMPLATE, int, 2, _WRK, "login_resilience", min_value=0.0,
        note="reCAPTCHA rejections that may be excused as OUR exit moving rather than charged to "
             "the sub-account, per login. 'Por favor, confirma o reCAPTCHA' is the token/IP mismatch "

@@ -525,3 +525,35 @@ APP (our logic/state) · OPS (configuration, deployment, human action).
   `test_maybe_self_scout_skips_while_found_slots_are_still_there` and given a slot; the half it used
   to cover incorrectly is now
   `test_an_exhausted_pool_re_enables_the_fallback_even_though_slot_found_fired`.
+
+## F34 — A per-exit refusal was read as a portal outage, and only a success could clear it
+- **Class:** APP
+- **Code path:** `_sticky_login_attempts` (apps/worker/ops_live.py) called
+  `self._breaker.record_portal_down()` on any `_is_portal_busy(reason)` at login, without first
+  testing whether *this exit* was the problem.
+- **MEASURED 2026-09-01 (23:18 run of "Test 0901"):** in the 23:30 bucket, **11 "try again later"
+  pages coexisted with 4 successful logins**. A page one exit receives while another exit logs in
+  successfully is per-exit evidence by definition, not "the portal is down for everyone".
+- **Why it could not recover.** `RedisBreaker.record_success()` is reached only by a login that
+  succeeded. Once the exit pool degraded, the breaker tripped, suppressed the very attempts that
+  could have found a working exit, and nothing could clear the counter. It auto-opens after each
+  120s cooldown, the next few refusals re-tripped it, and the cycle repeated: **145 refusals over 91
+  minutes, and zero successful logins after 23:37:52** — all 6 of the run's logins landed in its
+  first 14 minutes.
+- **Not the transport failures.** Those (147 in the same run: `ERR_TIMED_OUT` 53,
+  `ERR_TUNNEL_CONNECTION_FAILED` 52, `ERR_CONNECTION_CLOSED` 42) were already classified correctly
+  — `_is_transient_login_failure` rolls the exit and never touches the breaker. Only the refusal
+  page was mis-attributed.
+- **Fixed 2026-09-02:** a refusal is charged to the exit first. `LOGIN_PORTAL_BUSY_ROLLS` (default
+  3) refusals each roll to a different exit, uncharged to the sub-account — placed beside
+  `transient`/`ip_moves` and *above* `attempt += 1`, since a refusal is not a verdict on the
+  credentials. Only once that many **different** exits have refused does the breaker hear about it.
+- **The 2026-08-23 finding it revises is preserved, not discarded.** That run (265 of 266 refusals
+  at login; 341 attempts for 30 sessions) correctly concluded the fleet should back off together
+  when the portal really is refusing everyone. Rolling only delays that until it is *established*
+  rather than assumed; `LOGIN_PORTAL_BUSY_ROLLS=0` restores the original straight-to-breaker
+  behaviour exactly.
+- **Still open:** why zero logins succeeded after 23:37:52 is NOT settled by this. The breaker
+  suppressing attempts is one contributor; a genuinely degraded webshare pool is another, and the
+  two cannot be separated from this run's data because the breaker prevented the test. The next run
+  with this fix is that test.
