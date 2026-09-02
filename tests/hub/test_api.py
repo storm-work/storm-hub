@@ -885,3 +885,62 @@ def test_static_pool_helper_only_treats_fixed_exits_as_screenable():
     assert _static_pool("mobile") is False
     assert _static_pool(None) is False
     assert _static_pool("") is False
+
+
+# ── manual self-scout: for when the scouts are lying (2026-09-02) ─────────────────────────────
+def _make_holding_worker(bid, role, substate):
+    """Reach the same StaticPool engine the client fixture monkeypatched SessionLocal onto."""
+    import apps.hub.main as hub_main
+    from libs.db import models as M
+    db = hub_main.SessionLocal()
+    try:
+        ident = M.Identity(full_name="X", type="real", status="active")
+        db.add(ident); db.flush()
+        w = M.Worker(booking_id=bid, identity_id=ident.id, role=role,
+                     status="running", substate=substate)
+        db.add(w); db.commit()
+        return w.id
+    finally:
+        db.close()
+
+
+def test_force_self_scout_commands_every_holding_apply_worker(client):
+    """_maybe_self_scout's automatic gates cannot see the case this exists for: a scout that is
+    RUNNING, in `discovering`, and returning nothing. MEASURED on the 17:15 run of "Test 0901",
+    scout 28b8fe7f reported substate=discovering for two hours while answering {"data":{}} six times
+    out of six -- by every automatic test, a working scout."""
+    h = _operate_headers(client)
+    bid = client.post("/bookings", json={"name": "b-ss", "type": "real", "posto_id": "5084"},
+                      headers=h).json()["id"]
+
+    assert client.post(f"/bookings/{bid}/self-scout", headers=h).status_code == 409, \
+        "a booking that is not running has nothing holding yet"
+
+    client.post(f"/bookings/{bid}/start", headers=h)
+    assert client.post(f"/bookings/{bid}/self-scout", headers=h).status_code == 409, \
+        "WARMING is not RUNNING: before slot-open there is nothing to discover, and the endpoint " \
+        "mirrors _maybe_self_scout's own precondition rather than inventing a looser one"
+
+    client.post(f"/bookings/{bid}/fire-slot-open", headers=h)
+    assert client.post(f"/bookings/{bid}/self-scout", headers=h).status_code == 409, \
+        "running, but with no HOLDING apply worker there is nothing to command"
+
+    want = sorted(_make_holding_worker(bid, "apply", "holding") for _ in range(2))
+    # neither of these may be commanded: a scout, and an apply worker that is not holding
+    _make_holding_worker(bid, "scout", "discovering")
+    _make_holding_worker(bid, "apply", "logging_in")
+
+    r = client.post(f"/bookings/{bid}/self-scout", headers=h)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["commanded"] == 2, f"expected both HOLDING apply workers, got {body}"
+    assert sorted(body["worker_ids"]) == want, \
+        "commanded something other than the holding apply workers (a scout, or a logging-in one)"
+
+
+def test_force_self_scout_is_not_open_to_anonymous_callers(client):
+    """It makes the fleet spend CAPTCHA solves against the live portal, so it is an operator action."""
+    bid = client.post("/bookings", json={"name": "b-ss2", "type": "real", "posto_id": "5084"},
+                      headers=_operate_headers(client)).json()["id"]
+    r = client.post(f"/bookings/{bid}/self-scout")
+    assert r.status_code in (401, 403), r.status_code

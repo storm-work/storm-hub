@@ -579,6 +579,14 @@ function BookingOverview({ me, booking, events, workers, onBookingChanged, onDel
   const schedule = () => act(() => api(`/bookings/${booking.id}/schedule`, { method: "POST" }));
   const fireSlotOpen = () => act(() => api(`/bookings/${booking.id}/fire-slot-open`, { method: "POST" }));
   const fireSlotFound = () => act(() => api(`/bookings/${booking.id}/fire-slot-found`, { method: "POST" }));
+  // Manual override for the apply-as-scout fallback. Its automatic gates are conservative by
+  // design and cannot see the case this is for: a scout that is RUNNING, in `discovering`, and
+  // returning nothing at all (measured 2026-09-02 -- one reported `discovering` for two hours
+  // while every response was empty).
+  const forceSelfScout = () => act(async () => {
+    const r = await api(`/bookings/${booking.id}/self-scout`, { method: "POST" });
+    if (r && r.commanded) setMsg(`${r.commanded} apply worker(s) told to discover slots themselves.`);
+  }, "self-scouting");
   async function duplicateBooking() {
     setMsg("");
     try {
@@ -686,6 +694,12 @@ function BookingOverview({ me, booking, events, workers, onBookingChanged, onDel
           title={booking.slot_open_fired_at ? "already fired" : "manually fire slot-open now"}>⚡ Fire slot-open</button>
         <button className="btn ghost" disabled={!op || !canFireSlotFound || !!busy} onClick={fireSlotFound}
           title={booking.slot_found_fired_at ? "already fired" : !booking.slot_open_fired_at ? "fire slot-open first" : "manually fire slot-found now"}>🔔 Fire slot-found</button>
+        <button className="btn ghost" disabled={!op || booking.status !== "running" || !!busy}
+          onClick={forceSelfScout}
+          title={booking.status !== "running"
+                 ? `booking is ${booking.status} — self-scout needs a running booking (there is nothing to discover before slot-open)`
+                 : "tell every HOLDING apply worker to discover slots itself — use when the scouts look busy but are finding nothing"}>
+          {busy === "self-scouting" ? "Sending…" : "🔎 Self-scout now"}</button>
         <button className="btn ghost" disabled={!op || !canStop || !!busy} onClick={stopAll} title={!canStop ? `booking is ${booking.status}` : "stop all running workers"}>■ Stop</button>
         <button className="btn ghost" disabled={!op || !!busy} onClick={duplicateBooking}
           title="create a DRAFT copy of this booking's configuration — identities are not carried over">⧉ Duplicate</button>

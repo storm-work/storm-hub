@@ -2668,6 +2668,43 @@ def fire_slot_found(booking_id: str, db: Session = Depends(get_db),
     return {"fired": True, "booking_status": str(bk.status)}
 
 
+@app.post("/bookings/{booking_id}/self-scout")
+def force_self_scout(booking_id: str, db: Session = Depends(get_db),
+                     _op: Principal = Depends(require_operator)) -> dict:
+    """Tell every HOLDING apply worker to start discovering slots itself, right now.
+
+    The manual override for _maybe_self_scout, whose automatic gates are deliberately conservative:
+    it fires only when no scout is in a scouting substate, only for ONE holding apply worker, and
+    only once per _SELF_SCOUT_THROTTLE. Those gates cannot see the case this endpoint exists for --
+    a scout that is genuinely running, genuinely in `discovering`, and genuinely returning nothing.
+    MEASURED on the 2026-09-02 17:15 run of "Test 0901": scout 28b8fe7f reported substate=discovering
+    for two hours while answering {"data":{}} six times out of six, and by every automatic test it
+    looked like a working scout.
+
+    Fans out to ALL holding apply workers rather than one, because the operator reaching for this
+    has already concluded the scouts are lying and wants the fleet looking, not a trickle. Does not
+    touch the scouts and does not stop them -- if they recover, their finds land in the same pool.
+    """
+    bk = db.get(M.Booking, booking_id)
+    if not bk:
+        raise HTTPException(404, "booking not found")
+    if bk.status != BookingStatus.RUNNING:
+        raise HTTPException(409, f"booking is {bk.status}, not running -- nothing is holding yet")
+    holding = db.scalars(select(M.Worker).where(
+        M.Worker.booking_id == bk.id, M.Worker.role == WorkerRole.APPLY,
+        M.Worker.status == WorkerStatus.RUNNING,
+        M.Worker.substate == WorkerSubstate.HOLDING)).all()
+    if not holding:
+        raise HTTPException(409, "no apply worker is HOLDING -- only a warmed, holding worker can "
+                                 "be told to self-scout")
+    sent = []
+    for w in holding:
+        _bus.send_command(w.id, "assign", slot=None, scouts_invalid=True)
+        sent.append(w.id)
+    logger.warning("operator forced self-scout on booking %s: %d apply worker(s)", bk.id, len(sent))
+    return {"commanded": len(sent), "worker_ids": sent}
+
+
 @app.post("/bookings/{booking_id}/schedule", response_model=BookingOut)
 def schedule_booking(booking_id: str, db: Session = Depends(get_db),
                      _op: Principal = Depends(require_operator)) -> M.Booking:
