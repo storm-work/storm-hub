@@ -68,6 +68,33 @@ SCHED_JSP = BASE + "/Schedule.jsp"
 GETTIME_URL = BASE + "/gettime"
 GETPERIODOS_URL = BASE + "/getPeriodosOcupados"
 SLOTS_URL = BASE + "/slots"
+# Substring the in-page interceptor matches a request URL against. Deliberately the PATH, not the
+# full URL: the page issues /slots with a posto_id query string, and may issue it relative.
+_SLOTS_PATH_MARK = "/slots"
+
+
+def _fmt_slots_probe(probe) -> str:
+    """Render the intercepted /slots response for the log in one line.
+
+    This exists because `{"data":{}}` in window.data is not a diagnosis. A 200 carrying an empty
+    object, a 429, a 403, a DataDome interstitial and a session redirect all leave the same residue
+    there, and they call for opposite responses -- wait, rotate the exit, re-login. MEASURED on the
+    2026-09-01 23:18 run of "Test 0901": 206 of 214 delivered tokens produced that residue, and
+    nothing recorded which of those five it was. The body head is included (600 chars, captured
+    in-page) because for the HTML answers -- the interstitial and the login redirect -- the status
+    code alone is frequently 200 and only the body distinguishes them.
+    """
+    if not isinstance(probe, dict):
+        # Not a failure in itself: the page may have answered from cache, or the request may have
+        # been issued before our hook existed. Distinguished from a captured error so the two are
+        # never conflated in the logs.
+        return "<no response captured>"
+    if probe.get("err"):
+        return f"<network error via {probe.get('via')}: {str(probe['err'])[:120]}>"
+    body = str(probe.get("body") or "")
+    return (f"HTTP {probe.get('status')} via {probe.get('via')} "
+            f"ct={str(probe.get('ct') or '')[:40]!r} len={probe.get('len')} "
+            f"body={body[:220]!r}")
 SUBMIT_URL = BASE + "/SubmeterVistoCriaPDF"
 
 _CSRF_RE = re.compile(
@@ -1996,6 +2023,9 @@ class LiveEngineOps(EngineOps):
     # after the token is delivered. Raised 12s -> 25s: 5 of 55 rounds on "Test 0901" reached the
     # callback and then timed out here, which throws away a token that had already been accepted.
     _SLOTS_WAIT_MS = 25000
+    # How long to wait for the intercepted /slots response to finish being read, in the case where
+    # the page's own handler populated window.data before our clone().text() promise resolved.
+    _SLOTS_PROBE_GRACE_MS = 1500
 
     def _calendar_fallback(self, dates: list[str], why: str) -> list[dict]:
         """OUR tooling failed before we ever asked the portal -- use the endpoint that needs no token.
@@ -2084,23 +2114,90 @@ class LiveEngineOps(EngineOps):
         # The `window.data = []` coercion is the crash guard: when the portal answers an error or a
         # zero-slot response the body is an OBJECT, and the calendar's own
         # `data.find(d => d.date === key)` throws "data.find is not a function" and freezes the UI.
+        #
+        # INSTRUMENTATION (2026-09-02): capture the ACTUAL /slots response, not just its residue.
+        #
+        # Everything this code knew about /slots came from window.data -- a value left behind by the
+        # portal's own handler. MEASURED on the 2026-09-01 23:18 run: 206 of 214 delivered tokens
+        # produced `{"data":{}}` there, and nothing in the system could say whether that was a 200
+        # carrying no slots, a 429, a 403, a DataDome interstitial, or a session redirect. Those
+        # demand opposite responses (wait / rotate the exit / re-login), so guessing between them is
+        # how a fleet spends 200 CAPTCHA solves re-warming against a wall. The interceptor is
+        # installed in THIS eval, strictly before onCaptchaSuccess fires, so the request cannot be
+        # issued before the hook exists.
+        #
+        # Both transports are patched because we do not control which one the portal's script uses,
+        # and clone() is mandatory on the fetch path: reading the original body consumes the stream
+        # and the page's own handler would then receive nothing. Read-only -- it records and returns
+        # the response untouched.
         js = """
         (async () => {
           const t = %s;
           if (typeof window.onCaptchaSuccess !== 'function')
             return {err: 'onCaptchaSuccess not defined'};
+
+          const MARK = %s;
+          window.__slotsProbe = null;
+          const rec = (o) => { if (!window.__slotsProbe) window.__slotsProbe = o; };
+          if (!window.__slotsHooked) {
+            window.__slotsHooked = true;
+            const of_ = window.fetch;
+            window.fetch = function () {
+              const a = arguments;
+              const u = String((a[0] && a[0].url) || a[0] || '');
+              const pr = of_.apply(this, a);
+              if (u.indexOf(MARK) !== -1) {
+                pr.then(function (r) {
+                  r.clone().text().then(function (b) {
+                    rec({via: 'fetch', url: u, status: r.status,
+                         ct: (r.headers && r.headers.get('content-type')) || '',
+                         len: b.length, body: b.slice(0, 600)});
+                  }, function () { rec({via: 'fetch', url: u, status: r.status, err: 'body unreadable'}); });
+                }, function (e) { rec({via: 'fetch', url: u, err: String(e)}); });
+              }
+              return pr;
+            };
+            const oo = XMLHttpRequest.prototype.open;
+            const os_ = XMLHttpRequest.prototype.send;
+            XMLHttpRequest.prototype.open = function (m, u) {
+              this.__slotsUrl = String(u || ''); return oo.apply(this, arguments);
+            };
+            XMLHttpRequest.prototype.send = function () {
+              const self_ = this;
+              if (this.__slotsUrl && this.__slotsUrl.indexOf(MARK) !== -1) {
+                this.addEventListener('loadend', function () {
+                  let b = '';
+                  try { b = self_.responseText || ''; } catch (e) { b = '<unreadable>'; }
+                  let ct = '';
+                  try { ct = self_.getResponseHeader('content-type') || ''; } catch (e) { ct = ''; }
+                  rec({via: 'xhr', url: self_.__slotsUrl, status: self_.status,
+                       ct: ct, len: b.length, body: b.slice(0, 600)});
+                });
+              }
+              return os_.apply(this, arguments);
+            };
+          }
+
           try { window.onCaptchaSuccess(t); } catch (e) { return {err: 'callback threw: ' + e}; }
           const deadline = Date.now() + %d;
           while (Date.now() < deadline) {
             if (window.data !== undefined && window.data !== null) break;
             await new Promise(r => setTimeout(r, 250));
           }
+          // window.data is set by the page's handler, which can win the race against our own
+          // clone().text(). Give the probe a bounded grace so a successful round still reports what
+          // the endpoint actually said.
+          const pdl = Date.now() + %d;
+          while (window.__slotsProbe === null && Date.now() < pdl) {
+            await new Promise(r => setTimeout(r, 100));
+          }
+          const probe = window.__slotsProbe;
           let d = window.data;
-          if (d && !Array.isArray(d)) { window.data = []; return {coerced: true, raw: JSON.stringify(d).slice(0,300)}; }
-          if (!Array.isArray(d)) return {err: 'window.data never populated'};
-          return {ok: true, data: d};
+          if (d && !Array.isArray(d)) { window.data = []; return {coerced: true, raw: JSON.stringify(d).slice(0,300), probe: probe}; }
+          if (!Array.isArray(d)) return {err: 'window.data never populated', probe: probe};
+          return {ok: true, data: d, probe: probe};
         })()
-        """ % (tok, self._SLOTS_WAIT_MS)
+        """ % (tok, json.dumps(_SLOTS_PATH_MARK), self._SLOTS_WAIT_MS, self._SLOTS_PROBE_GRACE_MS)
         try:
             res = self.session.browser_eval(js, timeout=45)
         except Exception as e:
@@ -2110,6 +2207,7 @@ class LiveEngineOps(EngineOps):
             try: res = json.loads(res)
             except Exception: res = {"err": f"unparseable: {str(res)[:120]}"}
         res = res or {}
+        self._log(f"do_discover[slots]: endpoint said {_fmt_slots_probe(res.get('probe'))}")
         if res.get("err"):
             self._log(f"do_discover[slots]: {res['err']}")
             return [{"date": d, "outcome": "failed"} for d in dates]

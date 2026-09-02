@@ -3012,3 +3012,71 @@ def test_a_probe_that_raises_is_treated_as_not_ready(monkeypatch):
     ops._discover_via_slots(["2026-09-14"])
 
     assert solves == [] and hit == [["2026-09-14"]]
+
+
+# ── the /slots response itself is now recorded, not just its residue (2026-09-02) ─────────────
+# window.data cannot distinguish a 200 carrying an empty object from a 429, a 403, a DataDome
+# interstitial or a session redirect -- all four leave `{"data":{}}` behind. MEASURED on the
+# 2026-09-01 23:18 run of "Test 0901": 206 of 214 delivered tokens produced exactly that residue and
+# nothing recorded which it was, so the fleet re-warmed against a wall for 85 minutes. The JS half
+# of this (clone() not breaking the page; the three ambiguous responses coming apart) is exercised
+# by probes/slots_probe_harness.mjs, which node can run and pytest cannot.
+
+def test_a_captured_response_is_rendered_with_what_distinguishes_it():
+    from apps.worker.ops_live import _fmt_slots_probe
+    out = _fmt_slots_probe({"via": "fetch", "status": 429, "ct": "text/plain",
+                            "len": 17, "body": "Too Many Requests"})
+    assert "429" in out and "Too Many Requests" in out, out
+
+
+def test_an_html_interstitial_served_as_200_is_still_legible():
+    """The status code alone is not enough -- this is the case that looks healthy and is not."""
+    from apps.worker.ops_live import _fmt_slots_probe
+    out = _fmt_slots_probe({"via": "xhr", "status": 200, "ct": "text/html",
+                            "len": 42, "body": "<html><body>captcha-delivery</body></html>"})
+    assert "200" in out and "text/html" in out and "captcha-delivery" in out, out
+
+
+def test_no_capture_is_reported_as_such_not_as_an_error():
+    """Absent and failed are different facts and must never render alike: the request may simply
+    have been served from cache or issued before the hook existed."""
+    from apps.worker.ops_live import _fmt_slots_probe
+    assert _fmt_slots_probe(None) == "<no response captured>"
+    assert "network error" in _fmt_slots_probe({"via": "fetch", "err": "TypeError: failed to fetch"})
+
+
+def test_the_probe_is_logged_on_the_empty_object_case(monkeypatch):
+    """The 206-of-214 path specifically: the round still reports `failed`, but the log now carries
+    what the endpoint actually said instead of leaving it unknowable."""
+    payload = {"coerced": True, "raw": '{"data":{}}',
+               "probe": {"via": "fetch", "status": 403, "ct": "text/html",
+                         "len": 9, "body": "Forbidden"}}
+    sess = _LateCallbackSession(ready=True, payload=payload)
+    monkeypatch.setattr("libs.engine.vendor.race_all", lambda *a, **k: "T" * 2617)
+    ops = _callback_ops(sess)
+    lines = []
+    ops._log = lambda m, *a, **k: lines.append(m)
+
+    out = ops._discover_via_slots(["2026-09-14"])
+
+    assert all(r["outcome"] == "failed" for r in out), "classification must not change yet"
+    assert any("403" in l and "Forbidden" in l for l in lines), \
+        f"the endpoint's actual answer never reached the log: {lines}"
+
+
+def test_a_healthy_round_also_records_what_the_endpoint_said(monkeypatch):
+    """Not only failures: a success must report its response too, or there is no baseline to
+    compare the failures against."""
+    payload = {"ok": True, "data": [{"date": "2026-09-14", "periods": [5]}],
+               "probe": {"via": "fetch", "status": 200, "ct": "application/json",
+                         "len": 64, "body": '[{"date":"2026-09-14"}]'}}
+    sess = _LateCallbackSession(ready=True, payload=payload)
+    monkeypatch.setattr("libs.engine.vendor.race_all", lambda *a, **k: "T" * 2617)
+    ops = _callback_ops(sess)
+    lines = []
+    ops._log = lambda m, *a, **k: lines.append(m)
+
+    out = ops._discover_via_slots(["2026-09-14"])
+
+    assert out[0]["outcome"] == "found"
+    assert any("HTTP 200" in l for l in lines), f"a successful round logged no response: {lines}"
