@@ -2055,16 +2055,20 @@ function IdentityImportPipeline({ me, onDone }) {
 function IdentityDetailPanel({ i, op, subs, onChanged, onClose }) {
   const [comment, setComment] = useState(i.comment || "");
   const [posto, setPosto] = useState(i.target_posto || "");
+  const [prio, setPrio] = useState(i.priority ?? 100);
   const [msg, setMsg] = useState("");
   // Re-sync when a DIFFERENT identity is selected -- without this the panel kept showing (and would
   // have saved) the previously-selected identity's comment/posto.
-  useEffect(() => { setComment(i.comment || ""); setPosto(i.target_posto || ""); setMsg(""); }, [i.id]);
+  useEffect(() => {
+    setComment(i.comment || ""); setPosto(i.target_posto || "");
+    setPrio(i.priority ?? 100); setMsg("");
+  }, [i.id]);
 
   async function save() {
     setMsg("");
     try {
       await api(`/identities/${i.id}`, { method: "PATCH",
-        body: { comment, target_posto: i.type === "real" ? posto : undefined } });
+        body: { comment, priority: prio, target_posto: i.type === "real" ? posto : undefined } });
       onChanged();
     } catch (e) { setMsg(e.message); }
   }
@@ -2076,7 +2080,18 @@ function IdentityDetailPanel({ i, op, subs, onChanged, onClose }) {
   async function del() {
     setMsg("");
     try { await api(`/identities/${i.id}`, { method: "DELETE" }); onChanged(); onClose(); }
-    catch (e) { setMsg(e.message); }
+    catch (e) {
+      // A plain delete refuses while the identity still owns rows WE generated (sub-accounts,
+      // allocations, event history). That is the ordinary state of a burned-out identity, so
+      // offering force here is the difference between "removable" and "archivable forever".
+      // A booked appointment is refused either way and no amount of force changes it.
+      if (!window.confirm(
+        `${e.message}\n\nDelete it anyway, including its sub-accounts, allocations and event ` +
+        `history? This cannot be undone. (An identity with a real booked appointment is still refused.)`
+      )) { setMsg(e.message); return; }
+      try { await api(`/identities/${i.id}?force=true`, { method: "DELETE" }); onChanged(); onClose(); }
+      catch (e2) { setMsg(e2.message); }
+    }
   }
 
   return (
@@ -2093,6 +2108,13 @@ function IdentityDetailPanel({ i, op, subs, onChanged, onClose }) {
         <div className="field"><label>Target posto</label>
           <input value={posto} onChange={(e) => setPosto(e.target.value)} style={{ width: "100%" }} /></div>
       )}
+      <div className="field"><label>Priority</label>
+        <select value={String(prio)} onChange={(e) => setPrio(Number(e.target.value))}
+                title="selection preference — the identity list is ordered by this, highest first. Import sets fresh identities High and drops any duplicate they supersede to Low.">
+          <option value="200">High (freshly imported)</option>
+          <option value="100">Normal</option>
+          <option value="0">Low (superseded)</option>
+        </select></div>
       <div className="field"><label>Comment</label>
         <input value={comment} onChange={(e) => setComment(e.target.value)} style={{ width: "100%" }} /></div>
       <button className="btn" disabled={!op} onClick={save} style={{ width: "100%", marginBottom: 18 }}>Save</button>

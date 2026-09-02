@@ -71,6 +71,8 @@ class IdentityCreate(BaseModel):
 class IdentityUpdate(BaseModel):
     comment: str | None = None
     target_posto: str | None = None
+    # Selection preference, higher first. See libs/domain/priority.py for the named levels.
+    priority: int | None = None
 
 
 class IdentityOut(BaseModel):
@@ -84,6 +86,7 @@ class IdentityOut(BaseModel):
     nationality: str | None = None
     comment: str | None = None
     target_posto: str | None = None
+    priority: int = 100
     created_at: datetime | None = None
     # C2 exclusivity, surfaced so the UI can filter instead of letting an operator pick an identity
     # that attach_identity will 409. Set whenever the identity holds an UNRELEASED allocation, to
@@ -242,6 +245,9 @@ class ImportResult(BaseModel):
     created: int
     sub_accounts: int = 0
     skipped: int = 0
+    # Pre-existing identities this import superseded: same passport arrived again, so the fresh row
+    # takes HIGH priority and these were demoted to LOW rather than silently skipped.
+    superseded: list[str] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
     # Populated by identity-related imports/generators (empty/unused for proxy imports) so the
     # dashboard can chain follow-up actions (gen-subaccounts, then registration/run) onto exactly
@@ -375,3 +381,19 @@ class AuditRowOut(BaseModel):
     payload: dict = Field(default_factory=dict)
     ts: datetime
     model_config = {"from_attributes": True}
+
+
+class IdentityBulkDelete(BaseModel):
+    """Bulk removal of identities that are no longer usable.
+
+    Reports per-id outcomes rather than failing the whole call on the first refusal: an operator
+    clearing out a burned batch wants the ones that CAN go to go, and a precise list of which could
+    not and why -- not an all-or-nothing 409 that leaves them guessing which id caused it.
+    """
+    identity_ids: list[str]
+    force: bool = False
+
+
+class IdentityBulkDeleteResult(BaseModel):
+    deleted: list[str] = Field(default_factory=list)
+    refused: dict[str, str] = Field(default_factory=dict)   # identity_id -> why

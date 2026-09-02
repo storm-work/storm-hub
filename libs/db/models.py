@@ -78,7 +78,15 @@ class Identity(Base, PKMixin, TimestampMixin):
     archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     comment: Mapped[str | None] = mapped_column(String(512))
     target_posto: Mapped[str | None] = mapped_column(String(16))  # real identities only (app-enforced)
-    __table_args__ = (Index("ix_identities_type_status", "type", "status"),)
+    # Selection preference, higher first. Read by GET /identities' ordering, which is what the
+    # attach panel lists -- so it decides what the operator reaches for first, not just what is
+    # stored. Import sets fresh identities HIGH and demotes any duplicate they supersede to LOW,
+    # so a re-imported passport takes precedence over the copy that was already there.
+    priority: Mapped[int] = mapped_column(Integer, nullable=False, default=100, server_default="100")
+    __table_args__ = (
+        Index("ix_identities_type_status", "type", "status"),
+        Index("ix_identities_priority", "priority"),
+    )
 
 
 class SubAccount(Base, PKMixin, TimestampMixin):

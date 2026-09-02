@@ -39,6 +39,7 @@ from libs.domain.enums import (
     UserRole,
 )
 from libs.domain.enums import SettingsLayer as L
+from libs.domain import priority
 from libs.domain.rules import RuleViolation, resolve_worker_role
 from libs.domain.settings import CATALOG, settings_for_layer, validate_layer
 from libs.domain.state_machines import IllegalTransition, booking_transition
@@ -95,6 +96,8 @@ from .schemas import (
     GenTestIdentities,
     GlobalSettingsPut,
     IdentityCreate,
+    IdentityBulkDelete,
+    IdentityBulkDeleteResult,
     IdentityImport,
     IdentityOut,
     IdentityUpdate,
@@ -1022,7 +1025,12 @@ def list_identities(db: Session = Depends(get_db),
     identities that were guaranteed to fail -- the operator only found out by picking one. One
     grouped query rather than per-identity lookups, so this stays a single round trip for the whole
     list."""
-    identities = list(db.scalars(select(M.Identity).order_by(M.Identity.created_at.desc())).all())
+    # Priority first, then recency. This ordering IS priority's read site: the attach panel renders
+    # this list in order, so a freshly imported (HIGH) identity is what the operator reaches for and
+    # a superseded (LOW) duplicate sinks below everything. A priority column that only ever got
+    # written would be the "looks configured, isn't" trap.
+    identities = list(db.scalars(
+        select(M.Identity).order_by(*priority.order_key(M.Identity))).all())
     # Keyed on an UNRELEASED allocation, deliberately NOT on BOOKING_ACTIVE_STATUSES: the partial
     # unique index uq_identity_active_allocation is UNIQUE(identity_id) WHERE released_at IS NULL
     # and does not look at booking status at all, so an unreleased row blocks re-attachment no
@@ -1150,6 +1158,8 @@ def update_identity(identity_id: str, body: IdentityUpdate, db: Session = Depend
         if ident.type != "real":
             raise HTTPException(400, "target_posto only applies to real identities")
         ident.target_posto = body.target_posto
+    if body.priority is not None:
+        ident.priority = int(body.priority)
     db.commit()
     db.refresh(ident)
     return ident
@@ -1169,8 +1179,11 @@ def archive_identity(identity_id: str, db: Session = Depends(get_db),
 
 
 @app.delete("/identities/{identity_id}", status_code=204)
-def delete_identity(identity_id: str, db: Session = Depends(get_db),
+def delete_identity(identity_id: str, force: bool = False, db: Session = Depends(get_db),
                     _op: Principal = Depends(require_operator)) -> None:
+    """Delete an identity. `force=true` also removes the rows we generated for it -- sub-accounts,
+    allocations, booking links, event history -- which is what makes a burned-out identity actually
+    removable rather than permanently archivable."""
     ident = db.get(M.Identity, identity_id)
     if not ident:
         return
@@ -1183,13 +1196,51 @@ def delete_identity(identity_id: str, db: Session = Depends(get_db),
                                .where(M.Worker.identity_id == identity_id))
     if still_attached:
         raise HTTPException(409, "identity is attached to a booking -- detach it first")
+    # A REAL BOOKED APPOINTMENT IS NEVER DELETABLE, force or not. Same rule as DELETE /bookings:
+    # the appointment is the only record that a real person has a real slot, and it is not ours to
+    # discard because the identity behind it has gone stale.
+    booked = db.scalar(select(func.count()).select_from(M.BookedAppointment)
+                       .where(M.BookedAppointment.identity_id == identity_id))
+    if booked:
+        raise HTTPException(409, f"identity has {booked} booked appointment(s) -- archive it "
+                                 f"instead; deleting would destroy the only record of them")
+    if force:
+        # Everything else hanging off the identity is OURS: generated sub-accounts, allocation
+        # rows, and the event history. Without this, an identity whose sub-accounts were all burned
+        # -- exactly the "no longer available" case -- could never be removed at all, because the
+        # FK raised and the only advice was "archive it", which leaves it in the pool forever.
+        for model, col in ((M.IdentityEvent, M.IdentityEvent.identity_id),
+                           (M.IdentityAllocation, M.IdentityAllocation.identity_id),
+                           (M.BookingIdentity, M.BookingIdentity.identity_id),
+                           (M.SubAccount, M.SubAccount.identity_id)):
+            db.execute(delete(model).where(col == identity_id))
     try:
         db.delete(ident)
         db.commit()
     except IntegrityError:
         db.rollback()
         raise HTTPException(409, "identity has related records (sub-accounts, bookings, appointments) "
-                                 "-- archive it instead of deleting")
+                                 "-- retry with ?force=true, or archive it instead of deleting")
+
+
+@app.post("/identities/bulk-delete", response_model=IdentityBulkDeleteResult)
+def bulk_delete_identities(body: IdentityBulkDelete, db: Session = Depends(get_db),
+                           _op: Principal = Depends(require_operator)) -> IdentityBulkDeleteResult:
+    """Delete many identities, reporting per-id outcomes instead of failing on the first refusal.
+
+    Reuses delete_identity so there is exactly one place the rules live -- a booked appointment is
+    never deletable, an attached identity must be detached first, and force also clears the rows we
+    generated. A second implementation here would drift from that one the first time a rule changed.
+    """
+    deleted: list[str] = []
+    refused: dict[str, str] = {}
+    for iid in body.identity_ids:
+        try:
+            delete_identity(iid, force=body.force, db=db, _op=_op)
+            deleted.append(iid)
+        except HTTPException as e:
+            refused[iid] = str(e.detail)
+    return IdentityBulkDeleteResult(deleted=deleted, refused=refused)
 
 
 @app.post("/identities/import", response_model=ImportResult)
@@ -1200,18 +1251,33 @@ def import_identities(body: IdentityImport, db: Session = Depends(get_db),
     identity_ids: list[str] = []
     sub_account_ids: list[str] = []
     existing = {u for (u,) in db.execute(select(M.SubAccount.username)).all()}
-    known_passports = {p for (p,) in db.execute(
-        select(M.Identity.passport_no).where(M.Identity.passport_no.isnot(None))).all()}
+    # Passport -> the identity rows already carrying it. A list, not a flag: the same passport can
+    # legitimately have been imported more than once before this rule existed.
+    by_passport: dict[str, list[M.Identity]] = {}
+    for row in db.scalars(select(M.Identity).where(M.Identity.passport_no.isnot(None))).all():
+        by_passport.setdefault(row.passport_no, []).append(row)
+    superseded: list[str] = []
     for pi in parsed:
-        if pi.passport_no and pi.passport_no in known_passports:
-            errors.append(f"skip duplicate passport {pi.passport_no}")
-            continue
+        # A RE-IMPORTED PASSPORT SUPERSEDES, IT DOES NOT BOUNCE.
+        #
+        # This used to `continue` with "skip duplicate passport", so re-importing a corrected or
+        # refreshed identity silently did nothing and the stale row stayed the only one. Operator
+        # decision 2026-09-02: the newly imported row is the one to prefer, so it is created at HIGH
+        # and every row it supersedes drops to LOW. Nothing is deleted -- the old rows keep their
+        # sub-accounts, their history, and their bookings; they just sink to the bottom of the list
+        # the attach panel offers.
+        prior = by_passport.get(pi.passport_no or "", [])
+        for old in prior:
+            if old.priority > priority.LOW:
+                old.priority = priority.LOW
+                superseded.append(old.id)
         ident = M.Identity(full_name=pi.full_name, type=pi.type, birthdate=pi.birthdate,
                            passport_no=pi.passport_no, gender=pi.gender, nationality=pi.nationality,
                            status="active" if pi.sub_accounts else "empty",
+                           priority=priority.HIGH,
                            target_posto=body.default_target_posto if pi.type == "real" else None)
         if pi.passport_no:
-            known_passports.add(pi.passport_no)
+            by_passport.setdefault(pi.passport_no, []).append(ident)
         db.add(ident)
         db.flush()
         created += 1
@@ -1228,7 +1294,10 @@ def import_identities(body: IdentityImport, db: Session = Depends(get_db),
             subs += 1
             sub_account_ids.append(new_sa.id)
     db.commit()
-    return ImportResult(created=created, sub_accounts=subs, errors=errors,
+    if superseded:
+        logger.warning("import superseded %d existing identity row(s) with a re-imported passport",
+                       len(superseded))
+    return ImportResult(created=created, sub_accounts=subs, errors=errors, superseded=superseded,
                         identity_ids=identity_ids, sub_account_ids=sub_account_ids)
 
 

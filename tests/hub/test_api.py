@@ -944,3 +944,131 @@ def test_force_self_scout_is_not_open_to_anonymous_callers(client):
                       headers=_operate_headers(client)).json()["id"]
     r = client.post(f"/bookings/{bid}/self-scout")
     assert r.status_code in (401, 403), r.status_code
+
+
+# ── identity priority + real deletion (2026-09-02) ────────────────────────────────────────────
+_CSV_HEAD = ("identity_id,first_name,last_name,traveldoc,nationality,account_type,"
+             "username,password,email\n")
+
+
+def _csv(passport, user="u1", ident="ID1", first="Ana", last="Silva", kind="real"):
+    return _CSV_HEAD + f"{ident},{first},{last},{passport},CPV,{kind},{user},pw1,{user}@x.com\n"
+
+
+def test_a_re_imported_passport_supersedes_the_row_it_duplicates(client):
+    """It used to `continue` with "skip duplicate passport", so re-importing a corrected identity
+    silently did nothing and the stale row stayed the only one. Operator decision: prefer the new
+    row (HIGH) and sink the one it supersedes (LOW) -- deleting nothing, since the old row keeps its
+    sub-accounts, history and bookings."""
+    from libs.domain import priority
+    h = _operate_headers(client)
+    r1 = client.post("/identities/import", json={"csv": _csv("PP-1", user="old1"),
+                                                 "default_type": "real"}, headers=h)
+    assert r1.status_code == 200, r1.text
+    first = r1.json()["identity_ids"][0]
+
+    r2 = client.post("/identities/import", json={"csv": _csv("PP-1", user="new1"),
+                                                 "default_type": "real"}, headers=h)
+    assert r2.status_code == 200, r2.text
+    body = r2.json()
+    assert body["created"] == 1, "the duplicate was skipped instead of superseding"
+    assert body["superseded"] == [first], f"the prior row was not reported as superseded: {body}"
+    second = body["identity_ids"][0]
+
+    rows = {i["id"]: i for i in client.get("/identities", headers=h).json()}
+    assert rows[second]["priority"] == priority.HIGH
+    assert rows[first]["priority"] == priority.LOW
+
+
+def test_priority_orders_the_list_the_attach_panel_renders(client):
+    """Priority's read site. A column that is only ever written is the trap this codebase keeps
+    rediscovering, so the ordering is asserted, not just the stored value."""
+    from libs.domain import priority
+    h = _operate_headers(client)
+    client.post("/identities/import", json={"csv": _csv("PP-A", user="a1"), "default_type": "real"}, headers=h)
+    plain = client.post("/identities", json={"full_name": "Z", "type": "real",
+                                             "passport_no": "PP-Z"}, headers=h).json()
+    assert plain["priority"] == priority.NORMAL, "a hand-created identity should sit at NORMAL"
+
+    listed = client.get("/identities", headers=h).json()
+    assert listed[0]["passport_no"] == "PP-A", \
+        f"the freshly imported HIGH identity is not first: {[i['passport_no'] for i in listed]}"
+
+    # demote it and it must sink below the NORMAL one
+    client.patch(f"/identities/{listed[0]['id']}", json={"priority": priority.LOW}, headers=h)
+    listed2 = client.get("/identities", headers=h).json()
+    assert listed2[0]["passport_no"] == "PP-Z", "priority is stored but not read"
+
+
+def test_force_delete_removes_a_burned_out_identity_and_its_sub_accounts(client):
+    """The "no longer available" case. Without force the FK raises and the only advice was "archive
+    it", which leaves the row in the pool forever."""
+    import apps.hub.main as hub_main
+    from libs.db import models as M
+    from sqlalchemy import select as _select
+    h = _operate_headers(client)
+    iid = client.post("/identities/import", json={"csv": _csv("PP-B", user="b1"),
+                                                  "default_type": "real"},
+                      headers=h).json()["identity_ids"][0]
+
+    def _subs():
+        db = hub_main.SessionLocal()
+        try:
+            return db.scalars(_select(M.SubAccount).where(M.SubAccount.identity_id == iid)).all()
+        finally:
+            db.close()
+
+    assert _subs(), "the import should have created a sub-account to delete"
+
+    # NOTE: this asserts what force DOES, not that a plain delete refuses. SQLite does not enforce
+    # foreign keys by default (delete_identity's own comment says as much), so the plain path here
+    # would orphan the sub-accounts rather than raise -- the 409 only happens on Postgres. Asserting
+    # the refusal would pass or fail on the test backend rather than on the behaviour.
+    r = client.delete(f"/identities/{iid}?force=true", headers=h)
+    assert r.status_code == 204, r.text
+    assert all(i["id"] != iid for i in client.get("/identities", headers=h).json())
+    assert not _subs(), "force left the identity's sub-accounts behind"
+
+
+def test_a_booked_appointment_blocks_deletion_even_with_force(client):
+    """Force clears what we generated. It must never clear the record that a real person holds a
+    real appointment -- the same rule DELETE /bookings enforces."""
+    import apps.hub.main as hub_main
+    from libs.db import models as M
+    h = _operate_headers(client)
+    iid = client.post("/identities", json={"full_name": "B", "type": "real",
+                                           "passport_no": "PP-C"}, headers=h).json()["id"]
+    bid = client.post("/bookings", json={"name": "bk", "type": "real", "posto_id": "5084"},
+                      headers=h).json()["id"]
+    db = hub_main.SessionLocal()
+    try:
+        slot = M.Slot(booking_id=bid, posto_id="5084", date="2026-09-09", period=3)
+        sa = M.SubAccount(identity_id=iid, username="bk1", password="pw")
+        db.add_all([slot, sa]); db.flush()
+        db.add(M.BookedAppointment(booking_id=bid, identity_id=iid, slot_id=slot.id,
+                                   sub_account_id=sa.id))
+        db.commit()
+    finally:
+        db.close()
+
+    r = client.delete(f"/identities/{iid}?force=true", headers=h)
+    assert r.status_code == 409 and "booked appointment" in r.json()["detail"], r.text
+
+
+def test_bulk_delete_reports_per_id_instead_of_failing_on_the_first_refusal(client):
+    """An operator clearing a burned batch wants the removable ones gone and a precise list of what
+    could not go -- not an all-or-nothing 409 that leaves them guessing which id caused it."""
+    h = _operate_headers(client)
+    ok1 = client.post("/identities", json={"full_name": "K1", "type": "real", "passport_no": "PP-D"},
+                      headers=h).json()["id"]
+    ok2 = client.post("/identities", json={"full_name": "K2", "type": "real", "passport_no": "PP-E"},
+                      headers=h).json()["id"]
+
+    r = client.post("/identities/bulk-delete",
+                    json={"identity_ids": [ok1, "does-not-exist", ok2], "force": True}, headers=h)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert sorted(body["deleted"]) == sorted([ok1, ok2, "does-not-exist"]) or \
+           sorted(body["deleted"]) == sorted([ok1, ok2]), body
+    remaining = {i["id"] for i in client.get("/identities", headers=h).json()}
+    assert ok1 not in remaining and ok2 not in remaining
