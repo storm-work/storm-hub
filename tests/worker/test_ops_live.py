@@ -2899,9 +2899,17 @@ def test_the_solve_uses_our_proxy_when_the_setting_is_on(monkeypatch):
     assert seen["proxy"] == "http://u:p@gw:1"
 
 
-def test_a_solver_failure_falls_back_to_calendar_instead_of_failing(monkeypatch):
-    """phases.py reads an all-failed round as a SESSION fault and re-warms + re-logs in. A CapSolver
-    outage is not a session fault, and the calendar path needs no token at all."""
+def test_a_solver_failure_reports_nothing_rather_than_guessing(monkeypatch):
+    """Rewritten 2026-09-02 (was ..._falls_back_to_calendar_instead_of_failing).
+
+    The original insight stands: phases.py reads an all-`failed` round as a SESSION fault and
+    re-warms + re-logs in, and a CapSolver outage is not a session fault. The answer is no longer to
+    ask the calendar, though -- /slots is this pool's ground truth, and the calendar derives
+    availability by subtraction, which is how phantom slots are made. On the 2026-09-01 run its one
+    round re-confirmed 48 slots and shielded them from the retirement that had correctly closed 3.
+
+    So: report NOTHING. An empty list writes nothing to the pool, pushes nothing, and (with the
+    matching phases.py guard) neither feeds nor clears the rebuild counter."""
     def _boom(*a, **k): raise RuntimeError("capsolver: createTask failed: ERROR_PROXY_CONNECT_REFUSED")
     monkeypatch.setattr("libs.engine.vendor.race_all", _boom)
     ops = _make_ops(emit=lambda t, **p: None)
@@ -2914,9 +2922,9 @@ def test_a_solver_failure_falls_back_to_calendar_instead_of_failing(monkeypatch)
 
     out = ops._discover_via_slots(["2026-09-14"])
 
-    assert hit == [["2026-09-14"]], "the calendar path was not used as the fallback"
-    assert out[0]["outcome"] == "found", \
-        "a solver outage still reported `failed` -- phases.py would re-warm and re-login on it"
+    assert hit == [], "the calendar was consulted -- it must never write into the /slots pool"
+    assert out == [], \
+        "a solver outage must report nothing: `failed` re-warms the session, `empty` prunes real dates"
 
 
 
@@ -2983,14 +2991,15 @@ def test_no_solve_is_spent_when_the_callback_never_appears(monkeypatch):
                         lambda *a, **k: solves.append(1) or "T" * 2617)
     ops = _callback_ops(sess)
     hit = []
-    ops._discover_via_calendar = lambda dates: hit.append(dates) or [
-        {"date": d, "outcome": "empty"} for d in dates]
+    ops._discover_via_calendar = lambda dates: hit.append(dates) or []
 
-    ops._discover_via_slots(["2026-09-14"])
+    out = ops._discover_via_slots(["2026-09-14"])
 
     assert solves == [], "a CAPTCHA was solved for a page that could not receive the token"
-    assert hit == [["2026-09-14"]], \
-        "should fall back to the calendar path, which needs no token at all"
+    assert hit == [], "the calendar must never be consulted (removed 2026-09-02: /slots is the " \
+                      "ground truth and calendar-derived slots were laundering into the pool)"
+    assert [r["outcome"] for r in out] == ["failed"], \
+        "we DID reach the portal and it served a page with no widget -- that is session evidence"
 
 
 def test_a_probe_that_raises_is_treated_as_not_ready(monkeypatch):
@@ -3006,12 +3015,12 @@ def test_a_probe_that_raises_is_treated_as_not_ready(monkeypatch):
                         lambda *a, **k: solves.append(1) or "T" * 2617)
     ops = _callback_ops(sess)
     hit = []
-    ops._discover_via_calendar = lambda dates: hit.append(dates) or [
-        {"date": d, "outcome": "empty"} for d in dates]
+    ops._discover_via_calendar = lambda dates: hit.append(dates) or []
 
-    ops._discover_via_slots(["2026-09-14"])
+    out = ops._discover_via_slots(["2026-09-14"])
 
-    assert solves == [] and hit == [["2026-09-14"]]
+    assert solves == [] and hit == []
+    assert [r["outcome"] for r in out] == ["failed"]
 
 
 # ── the /slots response itself is now recorded, not just its residue (2026-09-02) ─────────────

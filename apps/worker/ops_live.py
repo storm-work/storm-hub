@@ -2027,23 +2027,28 @@ class LiveEngineOps(EngineOps):
     # the page's own handler populated window.data before our clone().text() promise resolved.
     _SLOTS_PROBE_GRACE_MS = 1500
 
-    def _calendar_fallback(self, dates: list[str], why: str) -> list[dict]:
-        """OUR tooling failed before we ever asked the portal -- use the endpoint that needs no token.
+    def _no_report(self, why: str) -> list[dict]:
+        """OUR tooling failed before the portal was ever asked -- report nothing about any date.
 
-        Returning all-`failed` here is what the operator caught on booking "Test 0901": phases.py
-        reads a round where every date failed as a SESSION problem and calls _rebuild_session, so a
-        CapSolver outage produced `-> holding (re-warming: discovery failing every round)` and then
-        a re-login. Re-warming cannot make CapSolver reachable; it just spends the login wall and a
-        slice of the sub-account budget on a fault that has nothing to do with the session.
+        This replaces _calendar_fallback (removed 2026-09-02, operator decision). That helper
+        answered a solver outage by querying gettime+getPeriodosOcupados instead, which avoided a
+        pointless re-warm but had a cost that outweighed it: /slots is the ground truth for this
+        pool, and the calendar derives availability by SUBTRACTION (gettime minus
+        getPeriodosOcupados) -- the exact inference that manufactures phantom slots. MEASURED on the
+        2026-09-01 23:18 run of "Test 0901": the one calendar round re-confirmed 48 slots,
+        refreshing their last_seen and shielding them from the miss-count retirement that had
+        correctly closed 3 others. Weaker evidence was being laundered into the pool and then
+        protecting itself from scrutiny.
 
-        The calendar path (gettime + getPeriodosOcupados) needs no CAPTCHA at all, so a solver
-        failure has an answer that is strictly better than either failing or rebuilding: ask the
-        other endpoint. Only if THAT also fails is the round genuinely failed, and then the
-        rebuild is the right response.
+        Returning [] rather than all-`failed` keeps the distinction the fallback got right: we never
+        reached the portal, so this round is not news about the calendar AND not evidence about the
+        session. An empty outcomes list writes nothing (orchestration.on_dates_reported iterates it)
+        and pushes nothing, while all-`failed` would feed phases.py's rebuild counter and spend the
+        login wall on a fault re-logging in cannot fix.
         """
-        self._log(f"do_discover[slots]: {why} -- falling back to the calendar path "
-                  f"(no token needed); NOT a session fault, so nothing to re-warm")
-        return self._discover_via_calendar(dates)
+        self._log(f"do_discover[slots]: {why} -- reporting nothing for this round "
+                  f"(the portal was never asked, so there is nothing to say about any date)")
+        return []
 
     def _discover_via_slots(self, dates: list[str]) -> list[dict]:
         """Solve SCHEDULE_EVISA, hand the token to window.onCaptchaSuccess, read window.data."""
@@ -2078,9 +2083,13 @@ class LiveEngineOps(EngineOps):
             self._log(f"do_discover[slots]: could not probe for onCaptchaSuccess ({str(e)[:80]})")
             ready = False
         if not (ready is True or str(ready).lower() == "true"):
-            return self._calendar_fallback(
-                dates, f"window.onCaptchaSuccess never appeared within "
-                       f"{self._CALLBACK_WAIT_MS // 1000}s (no solve spent)")
+            # Deliberately `failed`, not _no_report: unlike a solver outage, we DID reach the
+            # portal here -- it served a page that never registered the widget. That is evidence
+            # about the session/page (an interstitial or a stale render both look like this), so it
+            # should keep feeding phases.py's rebuild counter.
+            self._log(f"do_discover[slots]: window.onCaptchaSuccess never appeared within "
+                      f"{self._CALLBACK_WAIT_MS // 1000}s (no solve spent)")
+            return [{"date": d, "outcome": "failed"} for d in dates]
         try:
             # HONOUR RECAPTCHA_SOLVE_PROXY, exactly as the login path does
             # (session.py:1712 `_rc_proxy = self.proxy if _recaptcha_solve_proxy() else None`).
@@ -2104,9 +2113,9 @@ class LiveEngineOps(EngineOps):
                              proxy=_rc_proxy) or ""
         except Exception as e:
             self._log(f"do_discover[slots]: CAPTCHA solve failed ({str(e)[:90]})")
-            return self._calendar_fallback(dates, "the CAPTCHA solve failed")
+            return self._no_report("the CAPTCHA solve failed")
         if not token:
-            return self._calendar_fallback(dates, "no token was produced")
+            return self._no_report("no token was produced")
         self._log(f"do_discover[slots]: SCHEDULE_EVISA token len={len(token)} -> onCaptchaSuccess")
 
         tok = json.dumps(token)

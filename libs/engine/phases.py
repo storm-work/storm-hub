@@ -269,8 +269,13 @@ class PhaseMachine:
                     if not self._rebuild_session("discovery failing every round"):
                         return self._fail("scout session unrecoverable")
                     continue
-            else:
+            elif results:
                 failed_rounds = 0
+            # A round that reported NOTHING (results == []) neither counts toward the rebuild nor
+            # clears it. ops_live._no_report returns that when our own tooling failed before the
+            # portal was asked -- a CapSolver outage says nothing about the session either way.
+            # Resetting here would let a genuinely dead session hide behind an intermittent solver:
+            # alternate failed/empty rounds and the counter never reaches the threshold.
 
             self._to(WorkerSubstate.POLLING)
             self.ops.poll_gap()

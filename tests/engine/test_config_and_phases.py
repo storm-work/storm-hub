@@ -584,3 +584,58 @@ def test_the_exact_test2_recovery_loop_terminates_instead_of_churning():
     # feed the Hub's false-slot revert.
     assert set(ops.release_reasons) <= {"session"}, \
         f"a non-slot failure was charged to the slot: {set(ops.release_reasons)}"
+
+
+# ── a round that reported NOTHING must not clear the rebuild counter (2026-09-02) ─────────────
+# ops_live._no_report returns [] when our own tooling failed before the portal was asked (a
+# CapSolver outage). That is deliberately neither `failed` (which would re-warm and re-login over a
+# fault no session change can fix) nor `empty` (which would prune real dates). It must therefore
+# also not RESET the counter: the reset lived in a bare `else`, so an intermittent solver would let
+# a genuinely dead session alternate failed/nothing forever and never reach the threshold.
+#
+# NOTE on the fixture: passing an empty TASK ([]) does not model this -- the scout loop skips a
+# round with no dates to scan and never calls do_discover at all. The real shape is dates REQUESTED
+# and nothing reported back, so do_discover itself is what has to return [].
+
+class _NoReportOps(SimEngineOps):
+    """Reports nothing on alternate rounds, as _no_report does during a solver outage."""
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.rounds = 0
+
+    def do_discover(self, dates):
+        self.rounds += 1
+        if self.rounds % 2 == 0:
+            return []                      # asked for dates, learned nothing about any of them
+        return super().do_discover(dates)
+
+
+def test_a_round_that_reported_nothing_neither_feeds_nor_clears_the_rebuild_counter():
+    # SEVEN rounds, not four. `rebuild_after` starts at 1 (step 1 deliberately spends a single round
+    # before re-warming), so the FIRST all-failed round always rebuilds and zeroes the counter --
+    # the reset under test cannot matter until after that. Only from round 3 does the steady budget
+    # of 2 apply, and the divergence shows on round 7: interleaved failures reach the threshold with
+    # the guard (3 warmups) and never reach it without one (2).
+    dates = [f"d{i}" for i in range(1, 8)]
+    ops = _NoReportOps(
+        discover_tasks=[[d] for d in dates],
+        discover_outcomes={d: {"outcome": "failed"} for d in dates},
+    )
+    PhaseMachine(_cfg(booking={"SCOUT_REBUILD_AFTER_FAILED_ROUNDS": 2}, ROLE="scout"), ops).run()
+
+    assert ops.warmups == 3, (
+        "a round that reported nothing cleared the rebuild counter between all-failed rounds, so a "
+        f"dead session could hide behind an intermittent solver forever (warmups={ops.warmups})")
+
+
+def test_a_round_that_reported_nothing_does_not_itself_trigger_a_rebuild():
+    """The other half: reporting nothing is not evidence of a broken session either."""
+    class _AlwaysNothing(SimEngineOps):
+        def do_discover(self, dates):
+            return []
+    ops = _AlwaysNothing(discover_tasks=[["d1"], ["d2"], ["d3"], ["d4"]], discover_outcomes={})
+    PhaseMachine(_cfg(booking={"SCOUT_REBUILD_AFTER_FAILED_ROUNDS": 2}, ROLE="scout"), ops).run()
+
+    assert ops.warmups == 1, "rebuilt the session over rounds that said nothing about it"
+    assert ops.logins == 1
+    assert ops.reported_dates == [], "a round that reported nothing still wrote to the pool"
