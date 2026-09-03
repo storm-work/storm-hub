@@ -294,7 +294,15 @@ class PhaseMachine:
             if found:
                 self.ops.push_slots(found)     # orchestrator fires slot-found on the first push
                 pushed_total += len(found)
-            self.ops.report_dates([{"date": r["date"], "outcome": r["outcome"]} for r in results])
+            # Only report when there is something to report. ops_live._no_report returns [] for a
+            # round that never asked the portal (a solver outage, or the /slots pacing gate), and
+            # report_dates([]) still emitted a dates_reported event carrying zero outcomes.
+            # MEASURED on the 2026-09-02 20:45 run: 73 of 96 dates_reported events (76%) were empty,
+            # all from one scout, roughly every 7 seconds -- pure stream noise that also made an
+            # idle scout look busy. The Hub's on_dates_reported iterates the list, so an empty one
+            # was already a no-op there; this just stops paying for the round trip.
+            if results:
+                self.ops.report_dates([{"date": r["date"], "outcome": r["outcome"]} for r in results])
 
             # A round where EVERY date came back "failed" is a session-level problem, not news about
             # the calendar. Confirmed live 2026-08-14: a scout whose browser page had died span this

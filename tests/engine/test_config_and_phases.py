@@ -753,3 +753,42 @@ def test_an_ordinary_failing_round_still_tries_the_cheap_rung_first():
 
     assert ops.logins == 1, "re-logged in over a failure a re-warm was able to handle"
     assert ops.warmups > 1, "the cheap rung was not tried at all"
+
+
+# ── a round that reported nothing must not emit an empty event (2026-09-02) ───────────────────
+def test_a_round_with_no_outcomes_emits_no_dates_reported():
+    """ops_live._no_report returns [] for a round that never asked the portal (a solver outage, or
+    the /slots pacing gate), and report_dates([]) still fired an event carrying zero outcomes.
+    MEASURED on the 20:45 run of "Test 0901": 73 of 96 dates_reported events (76%) were empty, all
+    from one scout, roughly every 7 seconds -- stream noise that also made an idle scout look busy."""
+    class _NothingOps(SimEngineOps):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.report_calls = 0
+
+        def do_discover(self, dates):
+            return []
+
+        def report_dates(self, outcomes):
+            # Counting CALLS, not accumulated outcomes: SimEngineOps.report_dates EXTENDS a list, so
+            # an empty call leaves no trace and an assertion on reported_dates passes either way.
+            # The first version of this test did exactly that and passed against the unfixed code.
+            self.report_calls += 1
+            super().report_dates(outcomes)
+
+    ops = _NothingOps(discover_tasks=[["d1"], ["d2"], ["d3"]], discover_outcomes={})
+    PhaseMachine(_cfg(ROLE="scout"), ops).run()
+
+    assert ops.report_calls == 0, \
+        f"emitted {ops.report_calls} dates_reported event(s) for rounds that had nothing to report"
+
+
+def test_a_round_with_real_outcomes_still_reports():
+    """The suppression must be about emptiness, not about failure -- `failed` is a real outcome the
+    Hub needs, and dropping it would silently disable slot retirement."""
+    ops = SimEngineOps(discover_tasks=[["d1"], ["d2"]],
+                       discover_outcomes={"d1": {"outcome": "failed"}, "d2": {"outcome": "empty"}})
+    PhaseMachine(_cfg(ROLE="scout"), ops).run()
+
+    got = {r["date"]: r["outcome"] for r in ops.reported_dates}
+    assert got == {"d1": "failed", "d2": "empty"}, got

@@ -557,3 +557,46 @@ APP (our logic/state) · OPS (configuration, deployment, human action).
   suppressing attempts is one contributor; a genuinely degraded webshare pool is another, and the
   two cannot be separated from this run's data because the breaker prevented the test. The next run
   with this fix is that test.
+
+## F35 — HOLDING still meant "ready" while the session was being rebuilt
+- **Class:** APP
+- **Code path:** `_assign_slots` (apps/hub/scheduler.py) selects apply workers on
+  `substate == HOLDING` plus the absence of `NOT_BOOKABLE_PREFIX`, and nothing else.
+  `_attempt_keepalive_restore` (apps/worker/ops_live.py) closes the browser and runs a full
+  checkpoint-restore-or-login while the substate stays `HOLDING` — correctly, the worker *is* still
+  holding — so the Hub counted a mid-rebuild worker as ready capacity.
+- **CONFIRMED LIVE 2026-09-02 (20:45 run of "Test 0901"):** the pool's *only* available slot,
+  `2026-09-30 p5`, was leased at 22:22:04 to **two** workers:
+  - `41f656e6` was inside the restore chain and did not reach `applying` until **22:24:41**
+    (2m37s later); its warm-up then failed `csrf_missing` and it released the slot as `session`.
+  - `1d1a9033` reached `applying` immediately and found *"page is not on a live portal origin …
+    the tunnel is genuinely down"*, releasing 8 seconds later, also `session`.
+  One slot, two workers, neither able to act on it, locked for roughly three minutes.
+- **The same defect had already been fixed once, in the neighbouring branch.** The keepalive
+  re-warm-failure path has marked NOT_BOOKABLE since 2026-08-21, with a comment describing exactly
+  this consequence ("the worker kept reporting a bare `holding`, the Hub counted it as ready
+  capacity, and it bounced the first slot it was handed"). The dead-trip branch and the restore
+  chain were both missed.
+- **Fixed 2026-09-02:** `_attempt_keepalive_restore` marks NOT_BOOKABLE for its duration and clears
+  on success; the keepalive dead-trip marks too. Marked at the dead-trip rather than on every probe
+  failure, because a single failure is frequently the spurious "Execution context was destroyed"
+  nav race (6–8 per worker per hold on the 17:15 run) and marking on those would delete real
+  capacity over nothing.
+- **The clear had to be re-plumbed.** It was gated on `_rewarm_fail_streak > 0`, which is only true
+  when the re-warm branch marked; the dead-trip branch leaves that streak at 0, so a recovered
+  worker would have stayed unbookable forever. `_hold_unbookable` now tracks the marker itself. A
+  permanently unbookable holding worker is worse than the bug being fixed — it is invisible
+  capacity loss.
+
+## F36 — a round that reported nothing still emitted an event, and span while doing it
+- **Class:** APP (both introduced by 3d87511, found in its first live run)
+- **`report_dates([])`:** `_no_report` returns `[]` for a round that never asked the portal, and
+  `phases.py` still called `report_dates` with it. MEASURED on the 20:45 run: **73 of 96
+  `dates_reported` events (76%) carried zero outcomes**, all from one scout, roughly every 7
+  seconds — stream noise that also made an idle scout look busy. Now only reported when non-empty;
+  `failed`/`empty` are real outcomes and still reported, or slot retirement would silently stop.
+- **The pacing gate span.** Returning early cost nothing, so the discovery loop cycled at poll_gap
+  speed doing no work — **1,566 status changes in four hours**, almost all `DISCOVERING ↔ POLLING`
+  flapping. It now waits out the remainder in 1s chunks, checking `is_stopped`. The wait is
+  **capped** (`_SLOTS_MAX_PACING_SLEEP = 20s`, not the full 100s interval) because an APPLY worker
+  that is self-scouting runs this same path and must stay able to act on a real assignment.

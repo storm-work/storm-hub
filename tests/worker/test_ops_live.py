@@ -3263,3 +3263,105 @@ def test_no_solve_is_bought_inside_the_grant_interval(monkeypatch):
 
     assert solves == [], "bought a CAPTCHA token inside the interval the endpoint refuses"
     assert out == [], "the skipped round must report nothing, not guess at the dates"
+
+
+# ── HOLDING must stop meaning "ready" while the session is being rebuilt (2026-09-02) ─────────
+# _assign_slots selects on `substate == HOLDING` and the NOT_BOOKABLE marker, nothing else. The
+# keepalive restore closes the browser and runs a full login while the substate stays HOLDING --
+# correctly, the worker IS still holding -- so the Hub kept counting it as ready capacity.
+# CONFIRMED LIVE on the 20:45 run of "Test 0901": the pool's ONLY available slot (2026-09-30 p5)
+# was leased at 22:22:04 to a worker inside that chain, which did not reach `applying` until
+# 22:24:41 and then released it as `session`. The other lease went to a worker whose tunnel was
+# dead. One slot, two workers, neither able to act, locked for three minutes.
+
+def _marks(ops):
+    """Every (bookable, why) the ops published, in order."""
+    return [(p.get("detail") == "", p.get("detail")) for p in ops._emitted
+            if p.get("_type") == "status_change"]
+
+
+class _MarkRecordingOps:
+    """Captures _mark_hold_bookable calls without needing the whole emit pipeline."""
+    def __init__(self, ops):
+        self.ops = ops
+        self.calls = []
+        ops._mark_hold_bookable = lambda bookable, why="": self.calls.append((bookable, why))
+
+
+def test_a_session_rebuild_marks_the_worker_unbookable_for_its_duration(monkeypatch):
+    ops = _make_ops(emit=lambda t, **p: None)
+    ops._log = lambda *a, **k: None
+    rec = _MarkRecordingOps(ops)
+    ops.session = None
+    monkeypatch.setattr(ops, "_try_restore_from_checkpoint", lambda: False)
+    monkeypatch.setattr(ops, "_fresh_login", lambda: False)
+
+    ops._attempt_keepalive_restore("test")
+
+    assert rec.calls and rec.calls[0][0] is False, \
+        f"the rebuild never marked the worker unbookable, so the Hub can still assign it: {rec.calls}"
+    assert not any(b for b, _ in rec.calls), \
+        "a FAILED rebuild must not leave the worker advertising itself as bookable"
+
+
+def test_a_successful_rebuild_clears_the_marker(monkeypatch):
+    """It must not become a one-way latch -- a permanently unbookable holding worker is invisible
+    capacity loss, which is worse than the bug being fixed."""
+    ops = _make_ops(emit=lambda t, **p: None)
+    ops._log = lambda *a, **k: None
+    rec = _MarkRecordingOps(ops)
+    ops.session = None
+    monkeypatch.setattr(ops, "_try_restore_from_checkpoint", lambda: True)
+    monkeypatch.setattr(ops, "_run_warmup_steps", lambda: True)
+    ops._anchor_src = "chain"
+
+    ops._attempt_keepalive_restore("test")
+
+    assert rec.calls[0][0] is False and rec.calls[-1][0] is True, \
+        f"expected unbookable during, bookable after: {rec.calls}"
+
+
+def test_the_marker_is_tracked_so_recovery_can_clear_whatever_set_it():
+    """The clear used to be gated on `_rewarm_fail_streak > 0`, which was only true when the
+    RE-WARM branch had marked. The dead-trip branch leaves that streak at 0, so a recovered worker
+    would have stayed unbookable forever."""
+    ops = _make_ops(emit=lambda t, **p: None)
+    ops._mark_hold_bookable(False, "dead trip")
+    assert ops._hold_unbookable is True
+    ops._mark_hold_bookable(True)
+    assert ops._hold_unbookable is False
+
+
+# ── the two defects introduced by the pacing fix (2026-09-02) ─────────────────────────────────
+def test_a_paced_out_round_waits_instead_of_spinning(monkeypatch):
+    """Returning instantly cost nothing, so the discovery loop span at poll_gap speed doing no work
+    -- 1,566 status changes in four hours, almost all DISCOVERING <-> POLLING flapping."""
+    import time as _t
+    sess = _LateCallbackSession(ready=True)
+    monkeypatch.setattr("libs.engine.vendor.race_all", lambda *a, **k: "T" * 2617)
+    ops = _callback_ops(sess)
+    ops._SLOTS_MAX_PACING_SLEEP = 0.30
+    ops._slots_last_grant_at = _t.time()          # a grant just landed: fully paced out
+
+    t0 = _t.time()
+    out = ops._discover_via_slots(["2026-09-14"])
+    elapsed = _t.time() - t0
+
+    assert out == []
+    assert elapsed >= 0.25, f"returned in {elapsed:.2f}s -- it did not wait at all"
+
+
+def test_the_pacing_wait_is_capped_and_stops_on_stop(monkeypatch):
+    """This path also runs on an APPLY worker that is self-scouting, which must stay able to act on
+    a real assignment -- so the wait is capped, and a stop ends it immediately."""
+    import time as _t
+    sess = _LateCallbackSession(ready=True)
+    monkeypatch.setattr("libs.engine.vendor.race_all", lambda *a, **k: "T" * 2617)
+    ops = _callback_ops(sess)
+    ops._SLOTS_MAX_PACING_SLEEP = 30.0
+    ops._slots_last_grant_at = _t.time()
+    ops.is_stopped = lambda: True                  # operator stopped us mid-wait
+
+    t0 = _t.time()
+    ops._discover_via_slots(["2026-09-14"])
+    assert _t.time() - t0 < 2.0, "a stopped worker sat through the whole pacing wait"

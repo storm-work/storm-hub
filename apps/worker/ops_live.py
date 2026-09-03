@@ -1894,6 +1894,13 @@ class LiveEngineOps(EngineOps):
         changes, carrying apps/hub/scheduler.py's NOT_BOOKABLE_PREFIX marker that _assign_slots
         filters on. Same machine-readable-prefix convention as LAUNCH_FAILED_PREFIX.
         """
+        # Tracked, not just emitted: the recovery path has to know whether ANYTHING marked this
+        # worker unbookable. It used to clear the marker only when `_rewarm_fail_streak > 0`, which
+        # was fine while the re-warm branch was the only writer -- but the dead-trip branch now
+        # marks too, and that leaves the streak at 0, so a recovered worker would have stayed
+        # unbookable forever. A permanently-unbookable holding worker is worse than the bug being
+        # fixed: it is invisible capacity loss.
+        self._hold_unbookable = not bookable
         if self._emit is None:
             return
         detail = f"{NOT_BOOKABLE_PREFIX} {why}" if not bookable else ""
@@ -1949,7 +1956,8 @@ class LiveEngineOps(EngineOps):
                 # behaviour of never emitting a bookable/streak-reset event on an already-healthy
                 # cycle -- an event on every single healthy tick is exactly the kind of
                 # write-amplification F6 exists to guard against.
-                if warmed and getattr(self, "_rewarm_fail_streak", 0) > 0:
+                if warmed and (getattr(self, "_rewarm_fail_streak", 0) > 0
+                               or getattr(self, "_hold_unbookable", False)):
                     self._rewarm_fail_streak = 0
                     self._mark_hold_bookable(True)
                 if self._emit is not None:
@@ -2014,6 +2022,19 @@ class LiveEngineOps(EngineOps):
                                              f"streak={self._keepalive_dead_streak}/{dead_trip} ({context})")
             if self._keepalive_dead_streak >= dead_trip:
                 self._keepalive_dead_streak = 0
+                # NOT BOOKABLE, for the same reason the re-warm branch above already says so: at
+                # this point the code has concluded the session is dead, but the substate stays a
+                # bare HOLDING and _assign_slots counts it as ready capacity. The fix was applied to
+                # the re-warm branch in 2026-08-21 and this branch was missed.
+                # CONFIRMED LIVE 2026-09-02 (20:45 run of "Test 0901"): worker 1d1a9033 was handed
+                # the pool's ONLY available slot at 22:22:04, went straight to `applying`, and
+                # discovered there that its own page was not on a portal origin at all -- "the
+                # tunnel is genuinely down". It released the slot 8 seconds later as `session`.
+                # Marked here rather than on every probe failure: a single failure is frequently the
+                # spurious "Execution context was destroyed" nav race (6-8 per worker per hold in
+                # the 17:15 run), and marking on those would delete real capacity over nothing.
+                # The dead-trip is the point at which this code already believes the session is gone.
+                self._mark_hold_bookable(False, f"keepalive dead-trip ({context})")
                 # LOOSE HOLD rule, ported from storm-auto's confirmed anti-attrition logic: before a
                 # slot has actually been found, there is nothing to book yet, so a proxy/session
                 # blip must NEVER burn a re-login -- the login wall is the scarce resource, not
@@ -2093,6 +2114,23 @@ class LiveEngineOps(EngineOps):
             self._emit("log_line", text=f"keepalive: attempting restore "
                                          f"(attempt {self._keepalive_restore_attempts}/"
                                          f"{_MAX_KEEPALIVE_RESTORE_ATTEMPTS}, {context})")
+        # THE WORKER IS NOT BOOKABLE FOR THE DURATION OF THIS REBUILD.
+        #
+        # The substate stays HOLDING throughout -- correctly, the worker really is still holding --
+        # but the chain below closes the browser and runs a full checkpoint-restore-or-login, which
+        # can take minutes. _assign_slots selects on `substate == HOLDING` and nothing else, so
+        # until now the Hub happily handed a real slot to a worker in the middle of rebuilding its
+        # session. CONFIRMED LIVE 2026-09-02 (20:45 run of "Test 0901"): the pool's ONLY available
+        # slot, 2026-09-30 p5, was leased at 22:22:04 to worker 41f656e6, which was inside this
+        # very chain and did not reach `applying` until 22:24:41 -- 2m37s later -- whereupon its
+        # warm-up failed with csrf_missing and it released the slot as `session`. The other lease
+        # went to a worker whose tunnel was dead. One slot, two workers, both unable to act, and it
+        # sat locked for three minutes.
+        #
+        # This is the marker that already exists for exactly this purpose; it simply was not set
+        # here. Cleared on success below, and left set on failure -- a worker whose restore failed
+        # is not bookable either, and the next successful restore or re-warm clears it.
+        self._mark_hold_bookable(False, "rebuilding the session")
         try:
             if self.session is not None:
                 self.session.close_browser()
@@ -2108,6 +2146,7 @@ class LiveEngineOps(EngineOps):
             ok = self._run_warmup_steps()   # restore only re-authenticates; form-state needs re-warming
         if ok:
             self._keepalive_restore_attempts = 0
+            self._mark_hold_bookable(True)
         if self._emit is not None:
             self._emit("log_line", text=f"keepalive: restore {'succeeded' if ok else 'FAILED'}")
         return bool(ok)
@@ -2144,6 +2183,10 @@ class LiveEngineOps(EngineOps):
     # buys a CAPTCHA token and trades it for {"error": ReCaptchaError"}. Gated on the last GRANT,
     # because that is what the limit keys on.
     _SLOTS_MIN_INTERVAL = 100.0
+    # Longest a single paced-out round will sleep before giving up and reporting nothing. Bounded
+    # because an APPLY worker that is self-scouting runs this same path and must stay able to act
+    # on an assignment.
+    _SLOTS_MAX_PACING_SLEEP = 20.0
 
     def _no_report(self, why: str) -> list[dict]:
         """OUR tooling failed before the portal was ever asked -- report nothing about any date.
@@ -2178,6 +2221,22 @@ class LiveEngineOps(EngineOps):
         _wait = max(self._slots_backoff_until - time.time(),
                     self._SLOTS_MIN_INTERVAL - (time.time() - self._slots_last_grant_at)
                     if self._slots_last_grant_at else 0.0)
+        if _wait > 0:
+            # WAIT OUT the remainder rather than returning instantly. Returning cost nothing, so the
+            # discovery loop simply span at poll_gap speed -- ~7s per cycle doing no work, which on
+            # the 2026-09-02 20:45 run produced 1,566 status changes in four hours, almost all of it
+            # DISCOVERING <-> POLLING flapping. Sleeping in short chunks keeps is_stopped responsive,
+            # and the wait is CAPPED (not the full interval) because this same path runs on an apply
+            # worker that is self-scouting: holding one of those for 100s could delay it acting on a
+            # real assignment, which is a far worse trade than an extra cycle.
+            _deadline = time.time() + min(_wait, self._SLOTS_MAX_PACING_SLEEP)
+            while time.time() < _deadline:
+                if self.is_stopped():
+                    break
+                time.sleep(min(1.0, max(0.0, _deadline - time.time())))
+            _wait = max(self._slots_backoff_until - time.time(),
+                        self._SLOTS_MIN_INTERVAL - (time.time() - self._slots_last_grant_at)
+                        if self._slots_last_grant_at else 0.0)
         if _wait > 0:
             return self._no_report(
                 f"/slots grants about one response per {self._SLOTS_MIN_INTERVAL:.0f}s and the last "
