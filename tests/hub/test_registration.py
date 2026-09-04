@@ -278,6 +278,68 @@ def test_run_registration_sends_proxy_id_alongside_url(client, monkeypatch):
     assert captured["proxies"] == [{"id": pid, "url": "http://1.2.3.4:5000"}]
 
 
+def test_run_registration_defaults_to_captcha_solve_proxyless(client, monkeypatch):
+    """CONFIRMED LIVE 2026-09-03 on reg-8f0c0aa69af3 (webshare/rotating): every registration attempt
+    that reached "register form loaded" -- proving the browser's own connection through that proxy
+    was already working -- then failed CAPTCHA-solving 100% of the time (ERROR_PROXY_CONNECT_REFUSED
+    / ERROR_CAPTCHA_SOLVE_FAILED). CapSolver's remote worker opening a second connection through the
+    same sticky session the browser already holds collides with it -- an isolated ProxyLess solve
+    against the same sitekey succeeded immediately. Same switch and same default as login
+    (RECAPTCHA_SOLVE_PROXY, catalog default False); this pins that the launch payload actually
+    carries it through to apps/registrar, not just that the setting exists."""
+    c, _ = client
+    h = _op_headers(c)
+    iid = c.post("/identities", json={"full_name": "Ana Silva", "type": "test"}, headers=h).json()["id"]
+    c.post("/identities/gen-subaccounts", json={"identity_ids": [iid], "count": 1}, headers=h)
+    sid = next(s["id"] for s in c.get("/sub-accounts", headers=h).json() if s["identity_id"] == iid)
+    c.put("/settings/global", json={"values": {"CAPSOLVER_KEYS": "key1"}}, headers=h)
+    c.post("/proxies", json={"provider": "soax", "kind": "static", "endpoint": "1.2.3.4:5000"}, headers=h)
+
+    import apps.hub.main as hub_main
+    captured = {}
+    orig_send = hub_main._bus.send_command
+
+    def _spy(worker_id, type, **payload):
+        if type == "launch":
+            captured.update(payload)
+        return orig_send(worker_id, type, **payload)
+
+    monkeypatch.setattr(hub_main._bus, "send_command", _spy)
+
+    r = c.post("/registration/run", json={"sub_account_ids": [sid]}, headers=h)
+    assert r.status_code == 200
+    assert captured["captcha_solve_proxy"] is False
+
+
+def test_run_registration_honours_captcha_solve_proxy_when_switched_on(client, monkeypatch):
+    """The dashboard-switchable half: RECAPTCHA_SOLVE_PROXY has its own track record on
+    soax/rotating specifically (342 verified registrations, per session.py's note), so this must
+    stay a real operator switch, not hardcoded off."""
+    c, _ = client
+    h = _op_headers(c)
+    iid = c.post("/identities", json={"full_name": "Ana Silva", "type": "test"}, headers=h).json()["id"]
+    c.post("/identities/gen-subaccounts", json={"identity_ids": [iid], "count": 1}, headers=h)
+    sid = next(s["id"] for s in c.get("/sub-accounts", headers=h).json() if s["identity_id"] == iid)
+    c.put("/settings/global",
+          json={"values": {"CAPSOLVER_KEYS": "key1", "RECAPTCHA_SOLVE_PROXY": "true"}}, headers=h)
+    c.post("/proxies", json={"provider": "soax", "kind": "static", "endpoint": "1.2.3.4:5000"}, headers=h)
+
+    import apps.hub.main as hub_main
+    captured = {}
+    orig_send = hub_main._bus.send_command
+
+    def _spy(worker_id, type, **payload):
+        if type == "launch":
+            captured.update(payload)
+        return orig_send(worker_id, type, **payload)
+
+    monkeypatch.setattr(hub_main._bus, "send_command", _spy)
+
+    r = c.post("/registration/run", json={"sub_account_ids": [sid]}, headers=h)
+    assert r.status_code == 200
+    assert captured["captcha_solve_proxy"] is True
+
+
 def test_reg_result_registered_records_proxy_and_solver_on_job(client):
     c, TestSession = client
     h = _op_headers(c)

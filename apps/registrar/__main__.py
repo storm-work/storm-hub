@@ -77,7 +77,8 @@ def _mk_mail(email_provider: str, email_cfg: dict, proxy: str | None = None):
 
 async def _register_one(acct: dict, proxies_cycle, capsolver_keys: list[str], lang: str,
                         email_provider: str, email_cfg: dict, executor: ThreadPoolExecutor,
-                        bus: Bus, run_id: str, browser_sem: asyncio.Semaphore) -> str:
+                        bus: Bus, run_id: str, browser_sem: asyncio.Semaphore,
+                        captcha_solve_proxy: bool = False) -> str:
     """Full register+verify flow for one sub-account. Returns 'verified' | 'exists' | 'failed'.
     Every phase transition is reported via reg_progress (ephemeral, UI-only); the single settling
     outcome per phase-boundary (registered / exists / verified / failed) is reg_result, which the Hub
@@ -136,8 +137,22 @@ async def _register_one(acct: dict, proxies_cycle, capsolver_keys: list[str], la
 
             progress(f"solving captcha (attempt {attempt + 1}/{MAX_PROXY_RETRIES})")
             try:
+                # RECAPTCHA_SOLVE_PROXY (default False -- same switch and same default as login,
+                # libs/engine/vendor/session.py's _recaptcha_solve_proxy). CONFIRMED LIVE 2026-09-03
+                # on reg-8f0c0aa69af3 (webshare/rotating): every attempt that reached "register form
+                # loaded" -- proving the browser's OWN connection through this proxy was already
+                # working -- then failed CAPTCHA-solving 100% of the time, split between
+                # ERROR_PROXY_CONNECT_REFUSED and ERROR_CAPTCHA_SOLVE_FAILED. A direct, isolated
+                # ProxyLess solve against the same sitekey succeeded in 9s -- CapSolver's account and
+                # pipeline were fine. The pattern matches login's own 2026-08-20 measurement exactly:
+                # CapSolver's remote worker opening a SECOND connection through the SAME sticky
+                # session our browser is already holding open collides with it. Proxy-aware mode
+                # stays available (flip the setting on) since it has its own track record on
+                # soax/rotating specifically (342 verified registrations, per session.py's note) --
+                # this default just stops it being the only option.
+                solve_proxy = proxy if captcha_solve_proxy else None
                 token = await loop.run_in_executor(
-                    executor, race_all, capsolver_keys, [], [], [], "REGISTER_EVISA", proxy)
+                    executor, race_all, capsolver_keys, [], [], [], "REGISTER_EVISA", solve_proxy)
             except Exception as e:
                 progress(f"CAPTCHA failed: {e}")
                 token = None
@@ -332,7 +347,8 @@ async def _register_one(acct: dict, proxies_cycle, capsolver_keys: list[str], la
 
 async def _run_all(bus: Bus, run_id: str, accounts: list[dict], proxies: list[dict],
                    capsolver_keys: list[str], lang: str, email_provider: str, email_cfg: dict,
-                   concurrency: int, browser_concurrency: int) -> None:
+                   concurrency: int, browser_concurrency: int,
+                   captcha_solve_proxy: bool = False) -> None:
     proxies_cycle = itertools.cycle(proxies or [{"id": None, "url": None}])
     sem = asyncio.Semaphore(max(1, concurrency))
     browser_sem = asyncio.Semaphore(max(1, browser_concurrency))
@@ -341,7 +357,8 @@ async def _run_all(bus: Bus, run_id: str, accounts: list[dict], proxies: list[di
     async def bounded(acct: dict) -> str:
         async with sem:
             return await _register_one(acct, proxies_cycle, capsolver_keys, lang, email_provider,
-                                       email_cfg, executor, bus, run_id, browser_sem)
+                                       email_cfg, executor, bus, run_id, browser_sem,
+                                       captcha_solve_proxy)
 
     results = await asyncio.gather(*(bounded(a) for a in accounts), return_exceptions=True)
     counts: dict[str, int] = {}
@@ -377,13 +394,15 @@ def main() -> int:
     email_cfg = payload.get("email_cfg", {})
     concurrency = int(payload.get("concurrency", 10))
     browser_concurrency = int(payload.get("browser_concurrency", concurrency))
+    captcha_solve_proxy = bool(payload.get("captcha_solve_proxy", False))
 
     if not accounts:
         bus.emit_event(run_id, "job_terminal", counts={})
         return 0
 
     asyncio.run(_run_all(bus, run_id, accounts, proxies, capsolver_keys, lang,
-                         email_provider, email_cfg, concurrency, browser_concurrency))
+                         email_provider, email_cfg, concurrency, browser_concurrency,
+                         captcha_solve_proxy))
     return 0
 
 
