@@ -351,12 +351,14 @@ function BookingListPanel({ me, bookings, selectedId, onSelect, onNew }) {
       </div>
       <table className="table-compact">
         <thead><tr>
-          <Sortable label="Name" k="name" sort={sort} setSort={setSort} w="46%" />
-          <Sortable label="Date" k="_date" sort={sort} setSort={setSort} w="28%" />
-          <Sortable label="Status" k="status" sort={sort} setSort={setSort} w="26%" />
+          <th style={{ width: 24 }}>#</th>
+          <Sortable label="Name" k="name" sort={sort} setSort={setSort} w="42%" />
+          <Sortable label="Date" k="_date" sort={sort} setSort={setSort} w="26%" />
+          <Sortable label="Status" k="status" sort={sort} setSort={setSort} w="24%" />
         </tr></thead>
-        <tbody>{shown.map((b) => (
+        <tbody>{shown.map((b, i) => (
           <tr key={b.id} className={`row-clickable${b.id === selectedId ? " row-selected" : ""}`} onClick={() => onSelect(b.id)}>
+            <td className="muted">{i + 1}</td>
             <td>{b.name}</td>
             <td className="muted">{b._date ? b._date.slice(0, 10) : "—"}</td>
             <td className="muted">{b.status}</td>
@@ -920,15 +922,17 @@ function BookingSlots({ booking, me }) {
       {msg && <div className="banner">{msg}</div>}
       {err && <div className="banner err">{err}</div>}
       <table className="table-compact"><thead><tr>
-        <Sortable label="Date" k="date" sort={sort} setSort={setSort} w="20%" />
-        <Sortable label="Period" k="period" sort={sort} setSort={setSort} w="12%" />
+        <th style={{ width: 24 }}>#</th>
+        <Sortable label="Date" k="date" sort={sort} setSort={setSort} w="19%" />
+        <Sortable label="Period" k="period" sort={sort} setSort={setSort} w="11%" />
         <Sortable label="Status" k="status" sort={sort} setSort={setSort} w="16%" />
-        <Sortable label="Capacity" k="capacity_estimate" sort={sort} setSort={setSort} w="14%" />
-        <Sortable label="Misses" k="miss_count" sort={sort} setSort={setSort} w="12%" />
-        <Sortable label="Last seen" k="last_seen" sort={sort} setSort={setSort} w="26%" />
+        <Sortable label="Capacity" k="capacity_estimate" sort={sort} setSort={setSort} w="13%" />
+        <Sortable label="Misses" k="miss_count" sort={sort} setSort={setSort} w="11%" />
+        <Sortable label="Last seen" k="last_seen" sort={sort} setSort={setSort} w="25%" />
       </tr></thead>
-        <tbody>{shown.map((s) => (
+        <tbody>{shown.map((s, i) => (
           <tr key={s.id}>
+            <td className="muted">{i + 1}</td>
             <td>{s.date}</td><td>{s.period}</td>
             <td><span className={`pill ${s.status === "available" ? "ok" : s.status === "taken" ? "err" : ""}`}>{s.status}</span></td>
             <td className="muted">{s.capacity_estimate ?? "—"}</td>
@@ -975,13 +979,15 @@ function BookingAppointments({ booking }) {
       </div>
       {err && <div className="banner err">{err}</div>}
       <table className="table-compact"><thead><tr>
-        <Sortable label="Identity" k="identity_name" sort={sort} setSort={setSort} w="26%" />
-        <Sortable label="Reference" k="appointment_ref" sort={sort} setSort={setSort} w="20%" />
-        <Sortable label="Booked at" k="booked_at" sort={sort} setSort={setSort} w="26%" />
-        <th style={{ width: "28%" }}>PDF</th>
+        <th style={{ width: 24 }}>#</th>
+        <Sortable label="Identity" k="identity_name" sort={sort} setSort={setSort} w="25%" />
+        <Sortable label="Reference" k="appointment_ref" sort={sort} setSort={setSort} w="19%" />
+        <Sortable label="Booked at" k="booked_at" sort={sort} setSort={setSort} w="25%" />
+        <th style={{ width: "27%" }}>PDF</th>
       </tr></thead>
-        <tbody>{shown.map((a) => (
+        <tbody>{shown.map((a, i) => (
           <tr key={a.id}>
+            <td className="muted">{i + 1}</td>
             <td>{a.identity_name}</td>
             <td className="muted">{a.appointment_ref || "—"}</td>
             <td className="muted">{a.booked_at ? a.booked_at.slice(0, 19).replace("T", " ") : "—"}</td>
@@ -1267,19 +1273,21 @@ function BookingWorkers({ me, booking, events, workers, setRightPanel }) {
       )}
       <table className="table-compact table-nowrap">
         <thead><tr>
+          <th style={{ width: 24 }}>#</th>
           <th style={{ width: 28 }}><input type="checkbox" checked={shown.length > 0 && shown.every((w) => sel[w.id])}
             onChange={(e) => { const s = {}; if (e.target.checked) shown.forEach((w) => (s[w.id] = true)); setSel(s); }} /></th>
-          <Sortable label="Identity" k="identity_name" sort={sort} setSort={setSort} w="20%" />
-          <Sortable label="Role" k="role" sort={sort} setSort={setSort} w="8%" />
+          <Sortable label="Identity" k="identity_name" sort={sort} setSort={setSort} w="19%" />
+          <Sortable label="Role" k="role" sort={sort} setSort={setSort} w="7%" />
           <Sortable label="Status" k="status" sort={sort} setSort={setSort} w="9%" />
-          <Sortable label="Live substate" k="live_substate" sort={sort} setSort={setSort} w="16%" />
-          <th style={{ width: "39%" }}>Actions</th>
+          <Sortable label="Live substate" k="live_substate" sort={sort} setSort={setSort} w="15%" />
+          <th style={{ width: "37%" }}>Actions</th>
         </tr></thead>
-        <tbody>{shown.map((w) => {
+        <tbody>{shown.map((w, i) => {
           const live = events.byWorker[w.id] || {};   // log lines only -- status/substate come from workerView
           return (
             <React.Fragment key={w.id}>
               <tr>
+                <td className="muted">{i + 1}</td>
                 <td onClick={(e) => e.stopPropagation()}>
                   <input type="checkbox" checked={!!sel[w.id]} onChange={(e) => setSel({ ...sel, [w.id]: e.target.checked })} />
                 </td>
@@ -1332,7 +1340,7 @@ function BookingWorkers({ me, booking, events, workers, setRightPanel }) {
                 </td>
               </tr>
               {logsFor === w.id && (
-                <tr><td colSpan={6}><WorkerLog workerId={w.id} liveLogs={live.logs} /></td></tr>
+                <tr><td colSpan={7}><WorkerLog workerId={w.id} liveLogs={live.logs} /></td></tr>
               )}
             </React.Fragment>
           );
@@ -1539,6 +1547,7 @@ function AttachPanel({ me, booking, identities, templates, attached, onAttached 
       {msg && <div className="banner err">{msg}</div>}
       <table className="table-nowrap">
         <thead><tr>
+          <th style={{ width: 24 }}>#</th>
           <th style={{ width: 28 }}><input type="checkbox" checked={eligible.length > 0 && eligible.every((i) => sel[i.id])}
             onChange={(e) => { const s = {}; if (e.target.checked) eligible.forEach((i) => (s[i.id] = true)); setSel(s); }} /></th>
           <th>Passport</th>
@@ -1548,8 +1557,9 @@ function AttachPanel({ me, booking, identities, templates, attached, onAttached 
           <Sortable label="Target" k="target_posto" sort={sort} setSort={setSort} w={80} />
           <Sortable label="Created" k="created_at" sort={sort} setSort={setSort} w={130} />
         </tr></thead>
-        <tbody>{sortedEligible.map((i) => (
+        <tbody>{sortedEligible.map((i, idx) => (
           <tr key={i.id}>
+            <td className="muted">{idx + 1}</td>
             <td><input type="checkbox" checked={!!sel[i.id]} onChange={(e) => setSel({ ...sel, [i.id]: e.target.checked })} /></td>
             <td>{i.passport_no || <span className="muted">— none —</span>}</td>
             <td>{i.full_name}</td>
@@ -1585,6 +1595,17 @@ function summarizeSubAccounts(subs) {
   const counts = {};
   for (const s of subs) counts[s.status] = (counts[s.status] || 0) + 1;
   return Object.entries(counts).map(([status, n]) => `${n} ${status}`).join(" + ");
+}
+
+// Named levels only (libs/domain/priority.py: HIGH=200, NORMAL=100, LOW=0) -- anything else is an
+// operator-set custom value (PATCH /identities/{id} takes a raw int), shown as the bare number
+// rather than invented as a fourth name.
+function priorityLabel(p) {
+  const n = p ?? 100;
+  if (n === 200) return "high";
+  if (n === 100) return "normal";
+  if (n === 0) return "low";
+  return String(n);
 }
 
 
@@ -1697,20 +1718,22 @@ function BookedIdentities({ me }) {
       {err && <div className="banner err">{err}</div>}
       {msg && <div className="banner">{msg}</div>}
       <table className="table-compact"><thead><tr>
+        <th style={{ width: 24 }}>#</th>
         {me.role === "admin" && <th style={{ width: "3%" }}>
           <input type="checkbox"
                  checked={!!shown.length && shown.every((r) => sel[r.identity_id])}
                  onChange={(e) => setSel(e.target.checked
                    ? Object.fromEntries(shown.map((r) => [r.identity_id, true])) : {})} /></th>}
-        <Sortable label="Identity" k="full_name" sort={sort} setSort={setSort} w="22%" />
+        <Sortable label="Identity" k="full_name" sort={sort} setSort={setSort} w="21%" />
         <Sortable label="Type" k="type" sort={sort} setSort={setSort} w="7%" />
-        <Sortable label="Booked sub-account" k="sub_account_username" sort={sort} setSort={setSort} w="16%" />
+        <Sortable label="Booked sub-account" k="sub_account_username" sort={sort} setSort={setSort} w="15%" />
         <Sortable label="Posto" k="posto_id" sort={sort} setSort={setSort} w="8%" />
-        <Sortable label="Appointment" k="slot_date" sort={sort} setSort={setSort} w="14%" />
-        <Sortable label="Booked at" k="booked_at" sort={sort} setSort={setSort} w="16%" />
+        <Sortable label="Appointment" k="slot_date" sort={sort} setSort={setSort} w="13%" />
+        <Sortable label="Booked at" k="booked_at" sort={sort} setSort={setSort} w="15%" />
         <th style={{ width: "8%" }}>PDF</th></tr></thead>
-        <tbody>{shown.map((r) => (
+        <tbody>{shown.map((r, i) => (
           <tr key={r.identity_id}>
+            <td className="muted">{i + 1}</td>
             {me.role === "admin" && <td><input type="checkbox" checked={!!sel[r.identity_id]}
               onChange={(e) => setSel({ ...sel, [r.identity_id]: e.target.checked })} /></td>}
             <td>{r.full_name}</td>
@@ -1736,6 +1759,9 @@ function Identities({ me, setLeftPanel, setRightPanel }) {
   const [selectedId, setSelectedId] = useState(null);  // visual highlight only; panel content lives in App
   const [sel, setSel] = useState({});           // id -> bool (bulk multi-select, unrelated to selectedId)
   const [filter, setFilter] = useState("all");  // all | test | real
+  // Named levels only (libs/domain/priority.py: HIGH=200, NORMAL=100, LOW=0) -- an operator can
+  // PATCH any int in between, so "all" is the escape hatch for anything off the three named points.
+  const [priorityFilter, setPriorityFilter] = useState("all");  // all | 200 | 100 | 0
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
   const [subCount, setSubCount] = useState(3);
@@ -1743,7 +1769,9 @@ function Identities({ me, setLeftPanel, setRightPanel }) {
   const op = me.is_operating;
 
   const typeAndStatus = rows.filter((i) => filter === "all" ? true : i.type === filter);
-  const dateFiltered = typeAndStatus.filter((i) => {
+  const priorityFiltered = typeAndStatus.filter((i) =>
+    priorityFilter === "all" ? true : (i.priority ?? 100) === Number(priorityFilter));
+  const dateFiltered = priorityFiltered.filter((i) => {
     if (!i.created_at) return true;
     const d = i.created_at.slice(0, 10);
     if (dateFrom && d < dateFrom) return false;
@@ -1787,6 +1815,13 @@ function Identities({ me, setLeftPanel, setRightPanel }) {
             <option value="all">all</option><option value="test">test</option>
             <option value="real">real</option>
           </select></div>
+        <div className="field" style={{ margin: 0 }}><label>Priority</label>
+          <select value={priorityFilter} onChange={(e) => setPriorityFilter(e.target.value)}>
+            <option value="all">all</option>
+            <option value="200">high</option>
+            <option value="100">normal</option>
+            <option value="0">low</option>
+          </select></div>
         <div className="field" style={{ margin: 0 }}><label>Created from</label>
           <input type="date" value={dateFrom} onChange={(e) => setDateFrom(e.target.value)} /></div>
         <div className="field" style={{ margin: 0 }}><label>to</label>
@@ -1811,23 +1846,27 @@ function Identities({ me, setLeftPanel, setRightPanel }) {
       )}
       <table className="table-nowrap">
         <thead><tr>
+          <th style={{ width: 24 }}>#</th>
           <th style={{ width: 36 }}><input type="checkbox" checked={shown.length > 0 && shown.every((i) => sel[i.id])}
             onChange={(e) => { const s = {}; if (e.target.checked) shown.forEach((i) => (s[i.id] = true)); setSel(s); }} /></th>
-          <Sortable label="Name" k="full_name" sort={sort} setSort={setSort} w="19%" />
-          <Sortable label="Type" k="type" sort={sort} setSort={setSort} w="7%" />
-          <th style={{ width: "17%" }}>Sub-accounts</th>
-          <Sortable label="Passport" k="passport_no" sort={sort} setSort={setSort} w="11%" />
+          <Sortable label="Name" k="full_name" sort={sort} setSort={setSort} w="17%" />
+          <Sortable label="Type" k="type" sort={sort} setSort={setSort} w="6%" />
+          <Sortable label="Priority" k="priority" sort={sort} setSort={setSort} w="8%" />
+          <th style={{ width: "16%" }}>Sub-accounts</th>
+          <Sortable label="Passport" k="passport_no" sort={sort} setSort={setSort} w="10%" />
           <Sortable label="Nat." k="nationality" sort={sort} setSort={setSort} w="6%" />
-          <th style={{ width: "7%" }}>Posto</th><th style={{ width: "12%" }}>Comment</th>
+          <th style={{ width: "6%" }}>Posto</th><th style={{ width: "11%" }}>Comment</th>
           <Sortable label="Created" k="created_at" sort={sort} setSort={setSort} w="10%" />
         </tr></thead>
-        <tbody>{shown.map((i) => (
+        <tbody>{shown.map((i, idx) => (
           <tr key={i.id} className={`row-clickable${i.id === selectedId ? " row-selected" : ""}`}
             onClick={() => openDetailPanel(i)}>
+            <td className="muted">{idx + 1}</td>
             <td onClick={(e) => e.stopPropagation()}>
               <input type="checkbox" checked={!!sel[i.id]} onChange={(e) => setSel({ ...sel, [i.id]: e.target.checked })} />
             </td>
             <td>{i.full_name}</td><td><span className="pill">{i.type}</span></td>
+            <td className="muted">{priorityLabel(i.priority)}</td>
             <td className="muted" style={{ fontSize: 13 }} title={i.status}>{summarizeSubAccounts(subsByIdentity[i.id])}</td>
             <td className="muted">{i.passport_no || "—"}</td><td className="muted">{i.nationality || "—"}</td>
             <td className="muted">{i.target_posto || "—"}</td>
@@ -2337,20 +2376,22 @@ function Registration({ me, events }) {
         )}
         <table className="table-nowrap">
           <thead><tr>
+            <th style={{ width: 24 }}>#</th>
             <th style={{ width: 36 }}><input type="checkbox" checked={shown.length > 0 && shown.every((s) => sel[s.id])}
               onChange={(e) => { const s = {}; if (e.target.checked) shown.forEach((r) => (s[r.id] = true)); setSel(s); }} /></th>
-            <Sortable label="Identity" k="identity_name" sort={sort} setSort={setSort} w="18%" />
-            <Sortable label="Type" k="identity_type" sort={sort} setSort={setSort} w="7%" />
-            <Sortable label="Username" k="username" sort={sort} setSort={setSort} w="13%" />
-            <Sortable label="Status" k="status" sort={sort} setSort={setSort} w="8%" />
-            <th style={{ width: "17%" }}>Live</th>
-            <Sortable label="Last run" k="registration_status" sort={sort} setSort={setSort} w="10%" />
-            <th style={{ width: "9%" }}>Attempts</th><th>Email</th>
+            <Sortable label="Identity" k="identity_name" sort={sort} setSort={setSort} w="17%" />
+            <Sortable label="Type" k="identity_type" sort={sort} setSort={setSort} w="6%" />
+            <Sortable label="Username" k="username" sort={sort} setSort={setSort} w="12%" />
+            <Sortable label="Status" k="status" sort={sort} setSort={setSort} w="7%" />
+            <th style={{ width: "16%" }}>Live</th>
+            <Sortable label="Last run" k="registration_status" sort={sort} setSort={setSort} w="9%" />
+            <th style={{ width: "8%" }}>Attempts</th><th>Email</th>
           </tr></thead>
-          <tbody>{shown.map((s) => {
+          <tbody>{shown.map((s, i) => {
             const live = events.bySubAccount[s.id] || {};
             return (
               <tr key={s.id}>
+                <td className="muted">{i + 1}</td>
                 <td><input type="checkbox" checked={!!sel[s.id]} onChange={(e) => setSel({ ...sel, [s.id]: e.target.checked })} /></td>
                 <td>{s.identity_name}</td>
                 <td><span className="pill">{s.identity_type}</span></td>
@@ -2384,9 +2425,10 @@ function RegistrationJobHistory() {
         <button className="btn ghost" onClick={reload}>Refresh</button>
       </div>
       {err && <div className="banner err">{err}</div>}
-      <table><thead><tr><th>Sub-account</th><th>Mode</th><th>Status</th><th>Attempts</th><th>When</th></tr></thead>
-        <tbody>{rows.map((j) => (
+      <table><thead><tr><th style={{ width: 24 }}>#</th><th>Sub-account</th><th>Mode</th><th>Status</th><th>Attempts</th><th>When</th></tr></thead>
+        <tbody>{rows.map((j, i) => (
           <tr key={j.id}>
+            <td className="muted">{i + 1}</td>
             <td className="muted">{j.sub_account_id.slice(0, 8)}</td>
             <td>{j.mode}</td>
             <td className={j.status === "failed" ? "err" : j.status === "verified" ? "ok" : ""}>{j.status}</td>
@@ -2537,14 +2579,15 @@ condemned by a failed probe. Shows the scope before writing.">
           ) : null;
         })()}
         <table><thead><tr>
+          <th style={{ width: 40 }}>#</th>
           <Sortable label="Provider" k="provider" sort={sort} setSort={setSort} w="15%" />
           <Sortable label="Kind" k="kind" sort={sort} setSort={setSort} w="15%" />
           <Sortable label="Endpoint" k="endpoint" sort={sort} setSort={setSort} />
           <Sortable label="Active" k="active" sort={sort} setSort={setSort} w="10%" />
           <Sortable label="Health" k="is_healthy" sort={sort} setSort={setSort} w="16%" />
           <th style={{ width: "10%" }}>Max/IP</th><th style={{ width: "12%" }}></th></tr></thead>
-          <tbody>{shown.map((p) => (
-            <tr key={p.id}><td><span className="pill">{p.provider}</span></td><td>{p.kind}</td>
+          <tbody>{shown.map((p, i) => (
+            <tr key={p.id}><td className="muted">{i + 1}</td><td><span className="pill">{p.provider}</span></td><td>{p.kind}</td>
               <td className="muted">{p.endpoint}</td><td className={p.active ? "ok" : "muted"}>{String(p.active)}</td>
               <td className={p.is_healthy === false ? "err" : "muted"}
                   title={p.health || "unprobed"}>
@@ -2719,7 +2762,13 @@ function GlobalSettingsEditor({ me }) {
           )}
         </div>
         <div className="field grow"><label>Value</label>
-          {_SETTING_SELECT_OPTIONS[key] ? (
+          {chosen && chosen.type === "bool" ? (
+            <select value={val} onChange={(e) => setVal(e.target.value)} style={{ width: "100%" }}>
+              <option value="">— choose —</option>
+              <option value="true">true</option>
+              <option value="false">false</option>
+            </select>
+          ) : _SETTING_SELECT_OPTIONS[key] ? (
             <select value={val} onChange={(e) => setVal(e.target.value)} style={{ width: "100%" }}>
               <option value="">— choose —</option>
               {_SETTING_SELECT_OPTIONS[key].map((o) => (<option key={o} value={o}>{o}</option>))}
@@ -2730,10 +2779,10 @@ function GlobalSettingsEditor({ me }) {
         </div>
         <div className="field" style={{ alignSelf: "end" }}><button className="btn" disabled={!me.is_operating || !key || !val} onClick={save}>Save</button></div>
       </div>
-      <table><thead><tr><th>Key</th><th>Value</th></tr></thead>
-        <tbody>{Object.entries(current).map(([k, v]) => (
-          <tr key={k}><td><code>{k}</code></td><td className="muted">{String(v)}</td></tr>
-        ))}{Object.keys(current).length === 0 && <tr><td colSpan={2} className="muted">none set</td></tr>}</tbody></table>
+      <table><thead><tr><th style={{ width: 24 }}>#</th><th>Key</th><th>Value</th></tr></thead>
+        <tbody>{Object.entries(current).map(([k, v], i) => (
+          <tr key={k}><td className="muted">{i + 1}</td><td><code>{k}</code></td><td className="muted">{String(v)}</td></tr>
+        ))}{Object.keys(current).length === 0 && <tr><td colSpan={3} className="muted">none set</td></tr>}</tbody></table>
     </div>
   );
 }
@@ -2844,9 +2893,9 @@ function Templates({ me }) {
       <div className="card">
         <h2>Templates ({rows.length})</h2>
         {err && <div className="banner err">{err}</div>}
-        <table><thead><tr><th>Name</th><th>Role</th><th>Settings</th><th></th></tr></thead>
-          <tbody>{rows.map((t) => (
-            <tr key={t.id}><td>{t.name}</td><td><span className="pill">{t.role}</span></td>
+        <table><thead><tr><th style={{ width: 24 }}>#</th><th>Name</th><th>Role</th><th>Settings</th><th></th></tr></thead>
+          <tbody>{rows.map((t, i) => (
+            <tr key={t.id}><td className="muted">{i + 1}</td><td>{t.name}</td><td><span className="pill">{t.role}</span></td>
               <td className="muted" style={{ fontFamily: "monospace", fontSize: 12 }}>{JSON.stringify(t.settings_json)}</td>
               <td className="row">
                 <button className="btn ghost" disabled={!op} onClick={() => startEdit(t)}>Edit</button>
@@ -2877,9 +2926,9 @@ function Settings({ me }) {
       {layers.map((l) => (
         <div className="card" key={l}>
           <h2>{l} ({cat[l].length})</h2>
-          <table><thead><tr><th>Key</th><th>Type</th><th>Default</th><th>Group</th><th>Override at</th></tr></thead>
-            <tbody>{cat[l].map((s) => (
-              <tr key={s.key}><td><code>{s.key}</code></td><td className="muted">{s.type}</td>
+          <table><thead><tr><th style={{ width: 24 }}>#</th><th>Key</th><th>Type</th><th>Default</th><th>Group</th><th>Override at</th></tr></thead>
+            <tbody>{cat[l].map((s, i) => (
+              <tr key={s.key}><td className="muted">{i + 1}</td><td><code>{s.key}</code></td><td className="muted">{s.type}</td>
                 <td className="muted">{String(s.default)}</td><td>{s.group}</td>
                 <td className="muted">{s.override_layers.join(", ") || "—"}</td></tr>
             ))}</tbody></table>
@@ -2946,14 +2995,16 @@ function Audit() {
       </div>
       {err && <div className="banner err">{err}</div>}
       <table><thead><tr>
+        <th style={{ width: 24 }}>#</th>
         <Sortable label="Time" k="ts" sort={sort} setSort={setSort} />
         <Sortable label="Actor" k="actor" sort={sort} setSort={setSort} />
         <Sortable label="Action" k="action" sort={sort} setSort={setSort} />
         <Sortable label="Target" k="target" sort={sort} setSort={setSort} />
         <th>IP</th><th>Status</th>
       </tr></thead>
-        <tbody>{shown.map((r) => (
+        <tbody>{shown.map((r, i) => (
           <tr key={r.id}>
+            <td className="muted">{i + 1}</td>
             <td className="muted">{r.ts ? r.ts.replace("T", " ").slice(0, 19) : "—"}</td>
             <td>{r.actor || "—"}</td>
             <td><span className="pill">{r.action}</span></td>
@@ -2982,9 +3033,9 @@ function Sessions({ me, onChange }) {
           </button>
         )}
       </div>
-      <table><thead><tr><th>User</th><th>Purpose</th><th>Status</th><th></th></tr></thead>
-        <tbody>{rows.map((s) => (
-          <tr key={s.session_id}><td>{s.user}</td><td><span className="pill">{s.purpose}</span></td><td>{s.status}</td>
+      <table><thead><tr><th style={{ width: 24 }}>#</th><th>User</th><th>Purpose</th><th>Status</th><th></th></tr></thead>
+        <tbody>{rows.map((s, i) => (
+          <tr key={s.session_id}><td className="muted">{i + 1}</td><td>{s.user}</td><td><span className="pill">{s.purpose}</span></td><td>{s.status}</td>
             <td>{me.role === "admin" && s.purpose === "operate" && s.status === "active" && (
               <button className="btn ghost" onClick={() => act(() => api(`/sessions/${s.session_id}/force-release`, { method: "POST" }))}>Force-release</button>
             )}</td></tr>
