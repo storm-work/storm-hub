@@ -581,3 +581,130 @@ def test_persist_booked_pdf_creates_artifact_and_appointment(client, tmp_path):
     dl = c.get(f"/artifacts/{artifact_id}/file", headers=h)
     assert dl.status_code == 200
     assert dl.content == b"%PDF-1.4 fake"
+
+
+def test_a_booked_slot_stays_available_while_capacity_remains(client, tmp_path):
+    """Multi-capacity leasing (operator spec 2026-08-14): one physical (date, period) slot can
+    absorb SLOT_CAPACITY_PER_PERIOD concurrent bookings before it's exhausted -- 10 open slots at
+    cap=5 is 50 leasable units, not 10. _assign_slots and _reclaim_stale_slot_leases both correctly
+    compute remaining capacity from live lease counts -- but _persist_booked_pdf set
+    slot.status = TAKEN unconditionally on every successful booking, with no capacity check at all.
+    TAKEN is excluded from every reconsideration path in the codebase by design
+    (_assign_slots' own candidate query is `status == AVAILABLE`; _reclaim_stale_slot_leases
+    explicitly refuses to touch it: "genuinely booked -- never reopen"). So the FIRST booking on a
+    5-capacity slot discarded the other 4 units, permanently, until a scout happened to
+    independently rediscover that exact (date, period) later. CONFIRMED LIVE 2026-09-0X: 9
+    previously-taken slots sat invisible for a whole booking run because nothing ever re-touched
+    them. This pins the fix: a slot with resolved capacity > the number of bookings actually landed
+    on it must stay reconsiderable, not jump straight to the single-capacity terminal state."""
+    c, TestSession = client
+    h = _op_headers(c)
+    iid = c.post("/identities", json={"full_name": "X", "type": "test"}, headers=h).json()["id"]
+    bid = c.post("/bookings", json={"name": "b", "type": "test", "posto_id": "2032",
+                                    "settings": {"SLOT_CAPACITY_PER_PERIOD": "3"}}, headers=h).json()["id"]
+    wid = c.post(f"/bookings/{bid}/identities",
+                 json={"identity_id": iid, "assigned_role": "apply"}, headers=h).json()["id"]
+
+    pdf_path = tmp_path / "booked.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4 fake")
+
+    from datetime import datetime, timezone
+
+    from libs.db import models as M
+    from libs.domain.enums import SlotStatus
+    db = TestSession()
+    try:
+        w = db.get(M.Worker, wid)
+        w.effective_settings_json = {"_sub_account_id": "sa-123"}
+        slot = M.Slot(booking_id=bid, posto_id="2032", date="2027-01-05", period=1,
+                      status=SlotStatus.AVAILABLE)
+        db.add(slot)
+        db.flush()
+        # _persist_booked_pdf only marks leases it finds already open -- _assign_slots always
+        # creates this row before a worker starts applying, so the test must too, or the "how
+        # many bookings does this slot actually carry" count stays 0 no matter what happens.
+        db.add(M.SlotLease(slot_id=slot.id, worker_id=wid, leased_at=datetime.now(timezone.utc)))
+        db.commit()
+    finally:
+        db.close()
+
+    import apps.hub.events as events_mod
+    hub = events_mod.EventHub.__new__(events_mod.EventHub)
+    import apps.hub.db as hub_db
+    orig = hub_db.SessionLocal
+    hub_db.SessionLocal = TestSession
+    try:
+        events_mod.SessionLocal = TestSession
+        hub._persist_booked_pdf(wid, str(pdf_path), {"date": "2027-01-05", "period": 1})
+    finally:
+        hub_db.SessionLocal = orig
+        events_mod.SessionLocal = orig
+
+    from sqlalchemy import select
+    db = TestSession()
+    try:
+        slot = db.scalar(select(M.Slot).where(M.Slot.booking_id == bid, M.Slot.date == "2027-01-05",
+                                              M.Slot.period == 1))
+        assert slot.status != SlotStatus.TAKEN, (
+            "1/3 capacity used but the slot was marked TAKEN -- the other 2 leasable units were "
+            "discarded and are now invisible to _assign_slots/_reclaim_stale_slot_leases until a "
+            "scout happens to independently rediscover this exact (date, period) again")
+    finally:
+        db.close()
+
+
+def test_a_booked_slot_still_becomes_taken_once_capacity_is_exhausted(client, tmp_path):
+    """The other half of the fix above: the common case (SLOT_CAPACITY_PER_PERIOD unset, or a
+    genuinely single-capacity test posto) must still transition to TAKEN once the resolved cap is
+    actually reached -- the fix narrows WHEN this fires, it must not remove it."""
+    c, TestSession = client
+    h = _op_headers(c)
+    iid = c.post("/identities", json={"full_name": "X", "type": "test"}, headers=h).json()["id"]
+    # No SLOT_CAPACITY_PER_PERIOD override -- "auto" with no capacity_estimate resolves to
+    # DEFAULT_SLOT_CAPACITY, so pin the case that actually matters here explicitly: cap=1.
+    bid = c.post("/bookings", json={"name": "b", "type": "test", "posto_id": "2032",
+                                    "settings": {"SLOT_CAPACITY_PER_PERIOD": "1"}}, headers=h).json()["id"]
+    wid = c.post(f"/bookings/{bid}/identities",
+                 json={"identity_id": iid, "assigned_role": "apply"}, headers=h).json()["id"]
+
+    pdf_path = tmp_path / "booked.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4 fake")
+
+    from datetime import datetime, timezone
+
+    from libs.db import models as M
+    from libs.domain.enums import SlotStatus
+    db = TestSession()
+    try:
+        w = db.get(M.Worker, wid)
+        w.effective_settings_json = {"_sub_account_id": "sa-123"}
+        slot = M.Slot(booking_id=bid, posto_id="2032", date="2027-01-05", period=1,
+                      status=SlotStatus.AVAILABLE)
+        db.add(slot)
+        db.flush()
+        db.add(M.SlotLease(slot_id=slot.id, worker_id=wid, leased_at=datetime.now(timezone.utc)))
+        db.commit()
+    finally:
+        db.close()
+
+    import apps.hub.events as events_mod
+    hub = events_mod.EventHub.__new__(events_mod.EventHub)
+    import apps.hub.db as hub_db
+    orig = hub_db.SessionLocal
+    hub_db.SessionLocal = TestSession
+    try:
+        events_mod.SessionLocal = TestSession
+        hub._persist_booked_pdf(wid, str(pdf_path), {"date": "2027-01-05", "period": 1})
+    finally:
+        hub_db.SessionLocal = orig
+        events_mod.SessionLocal = orig
+
+    from sqlalchemy import select
+    db = TestSession()
+    try:
+        slot = db.scalar(select(M.Slot).where(M.Slot.booking_id == bid, M.Slot.date == "2027-01-05",
+                                              M.Slot.period == 1))
+        assert slot.status == SlotStatus.TAKEN, (
+            "cap=1 and 1/1 capacity used -- the slot must still transition to TAKEN")
+    finally:
+        db.close()

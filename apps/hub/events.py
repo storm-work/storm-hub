@@ -541,9 +541,10 @@ class EventHub:
         Artifact/BookedAppointment) but that nothing wrote to before this."""
         from datetime import datetime, timezone
 
-        from sqlalchemy import select
+        from sqlalchemy import func, select
 
         from libs.domain.enums import SlotLeaseOutcome, SlotStatus
+        from libs.engine import pool_manager
 
         db = SessionLocal()
         try:
@@ -573,12 +574,37 @@ class EventHub:
                             M.SlotLease.released_at.is_(None))).all():
                         le.released_at = datetime.now(timezone.utc)
                         le.outcome = SlotLeaseOutcome.BOOKED
-                    # SlotStatus has no BOOKED member -- TAKEN is the booked terminal state.
-                    # Confirmed live 2026-08-14: this raised AttributeError inside the booked_pdf
-                    # handler, so the whole transaction rolled back and a REAL booking (verified
-                    # 250KB PDF on disk) produced no Artifact and no BookedAppointment row. A bug
-                    # that can only fire on the success path survives every failing run.
-                    slot_row.status = SlotStatus.TAKEN
+                    # Multi-capacity leasing (operator spec 2026-08-14): one physical (date, period)
+                    # can absorb SLOT_CAPACITY_PER_PERIOD concurrent bookings before it's exhausted.
+                    # This used to set TAKEN unconditionally -- SlotStatus has no BOOKED member, and
+                    # the 2026-08-14 fix above (this comment's previous version) only fixed the
+                    # AttributeError crash, not the missing capacity check. So the FIRST booking on
+                    # a slot resolved to capacity 5 discarded the other 4 leasable units, permanently:
+                    # TAKEN is excluded from every reconsideration path in this codebase BY DESIGN
+                    # (_assign_slots' own candidate query is `status == AVAILABLE`;
+                    # _reclaim_stale_slot_leases explicitly refuses to touch it -- "genuinely
+                    # booked -- never reopen"). The only way back was a scout independently
+                    # rediscovering that exact (date, period) later, which is opportunistic, not
+                    # guaranteed. CONFIRMED LIVE 2026-09-0X: 9 previously-taken slots sat invisible
+                    # for a whole booking run because nothing ever re-touched them.
+                    #
+                    # db.flush(), not autoflush (SessionLocal is built with autoflush=False): the
+                    # count below must see the released_at/outcome writes just made above, in the
+                    # SAME transaction, or it undercounts by exactly the booking that just landed.
+                    db.flush()
+                    bk_for_cap = db.get(M.Booking, w.booking_id)
+                    cap_setting = str((bk_for_cap.settings_json or {}).get(
+                        "SLOT_CAPACITY_PER_PERIOD", "auto")) if bk_for_cap else "auto"
+                    cap = pool_manager.resolve_slot_capacity(cap_setting, slot_row.capacity_estimate)
+                    booked_count = db.scalar(select(func.count()).select_from(M.SlotLease).where(
+                        M.SlotLease.slot_id == slot_row.id,
+                        M.SlotLease.outcome == SlotLeaseOutcome.BOOKED)) or 0
+                    # Below cap: leave the slot exactly as it was (AVAILABLE, or LEASED if other
+                    # in-flight leases already filled the rest) -- _assign_slots' own query already
+                    # excludes it correctly once genuinely full, no extra write needed here for that
+                    # case. Only the exhausted case needs an explicit transition.
+                    if booked_count >= cap:
+                        slot_row.status = SlotStatus.TAKEN
             sub_account_id = (w.effective_settings_json or {}).get("_sub_account_id")
             if not sub_account_id:
                 return  # sim-engine or pre-upgrade worker with no recorded sub-account; nothing to link

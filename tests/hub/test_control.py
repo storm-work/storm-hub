@@ -318,9 +318,16 @@ def test_booked_pdf_writes_the_artifact_appointment_and_marks_the_slot_taken(slo
 
     bid, wid = _seed_apply_worker(slots_db)
     db = slots_db()
-    db.add(M.Slot(booking_id=bid, posto_id="3018", date="2026-09-10", period=7,
-                  status=SlotStatus.LEASED))
-    db.commit(); db.close()
+    # Multi-capacity leasing (2026-09-0X fix): TAKEN now only fires once the resolved capacity is
+    # actually exhausted by confirmed bookings, not unconditionally on the first one -- pin cap=1
+    # here so this test still exercises (and asserts) that terminal transition unambiguously.
+    bk = db.get(M.Booking, bid)
+    bk.settings_json = {"SLOT_CAPACITY_PER_PERIOD": "1"}
+    slot = M.Slot(booking_id=bid, posto_id="3018", date="2026-09-10", period=7,
+                  status=SlotStatus.LEASED)
+    db.add(slot); db.commit()
+    db.add(M.SlotLease(slot_id=slot.id, worker_id=wid)); db.commit()
+    db.close()
 
     ev.EventHub.__new__(ev.EventHub)._persist_booked_pdf(
         wid, "/var/artifacts/x.pdf", {"date": "2026-09-10", "period": 7})
@@ -417,9 +424,15 @@ def test_a_confirmed_booking_is_recorded_even_when_the_pdf_never_arrives(slots_d
 
     bid, wid = _seed_apply_worker(slots_db)
     db = slots_db()
-    db.add(M.Slot(booking_id=bid, posto_id="3018", date="2026-09-10", period=7,
-                  status=SlotStatus.LEASED))
-    db.commit(); db.close()
+    # Multi-capacity leasing: pin cap=1 so this test's own TAKEN assertion stays unambiguous
+    # (see test_booked_pdf_writes_the_artifact_appointment_and_marks_the_slot_taken's comment).
+    bk = db.get(M.Booking, bid)
+    bk.settings_json = {"SLOT_CAPACITY_PER_PERIOD": "1"}
+    slot = M.Slot(booking_id=bid, posto_id="3018", date="2026-09-10", period=7,
+                  status=SlotStatus.LEASED)
+    db.add(slot); db.commit()
+    db.add(M.SlotLease(slot_id=slot.id, worker_id=wid)); db.commit()
+    db.close()
 
     ev.EventHub.__new__(ev.EventHub)._persist_booking(
         wid, {"date": "2026-09-10", "period": 7})       # no pdf_path at all

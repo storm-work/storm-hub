@@ -198,6 +198,13 @@ def test_long_hold_then_slot_open_discovery_then_apply_books(env):
     scout_id, apply_id = wids[WorkerRole.SCOUT], wids[WorkerRole.APPLY]
     fleet = _Fleet(Session, bus, r); fleets.append(fleet)
 
+    # Multi-capacity leasing: pin cap=1 so this test's own TAKEN assertion (step 4 below) stays
+    # unambiguous -- the fix only marks TAKEN once the resolved capacity is actually exhausted.
+    db = Session()
+    bk = db.get(M.Booking, bid)
+    bk.settings_json = {**(bk.settings_json or {}), "SLOT_CAPACITY_PER_PERIOD": "1"}
+    db.commit(); db.close()
+
     sched = Scheduler(session_local=Session, on_start=lambda db, bk: None,
                       on_slot_open=lambda db, bk: None,
                       # Exactly apps/hub/main.py's _sched_on_assign -- the slot must cross the bus
