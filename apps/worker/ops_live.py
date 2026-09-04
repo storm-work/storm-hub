@@ -1940,16 +1940,29 @@ class LiveEngineOps(EngineOps):
             url = HOME_URL if probe == "home" else probe
         try:
             final_url = self.session.browser_nav(url, timeout=30)
-            self._keepalive_dead_streak = 0
             if probe != "home":
                 # A custom KEEPALIVE_PROBE URL: no positive/negative content evidence is known for
                 # an arbitrary operator-chosen page, so this stays exactly what it was -- a
                 # successful nav is all that's checked. Only the two real pages (home, Schedule.jsp)
-                # get classified below.
+                # get classified below, so this is the one path where a bare successful nav IS the
+                # whole check and resetting the streak here is correct.
+                self._keepalive_dead_streak = 0
                 if self._emit is not None:
                     self._emit("log_line", text=f"keepalive: probe OK ({context})")
                 return
             page = self.session.browser_eval("document.documentElement.outerHTML") or ""
+            # CONFIRMED LIVE 2026-09-03 ("Test 0901"): this reset used to sit right after
+            # browser_nav, above -- before browser_eval, which is the call that actually throws
+            # "Execution context was destroyed, most likely because of a navigation" (a nav race,
+            # not evidence of a dead session, per the 2026-09-02 comment on the except branch
+            # below). Resetting on the nav alone meant every failing cycle netted exactly
+            # dead_streak=1 (0, just reset, +1 from this cycle's own eval exception) forever --
+            # `dead_trip` (default 3) requires CONSECUTIVE cycle failures to accumulate, and this
+            # structurally could never reach it: 3 apply workers sat at "streak=1/3" for 2+ hours
+            # straight, so _attempt_keepalive_restore never fired even once. The reset now only
+            # fires once the FULL cycle -- nav AND eval -- has completed without raising, so a
+            # nav-succeeds-then-eval-throws cycle correctly counts as one failure toward dead_trip.
+            self._keepalive_dead_streak = 0
             state = classify_session_state(page, final_url, warmed=warmed)
             if state == SessionState.AUTHENTICATED:
                 # Only fires on a RECOVERY transition (streak was > 0), matching the original

@@ -799,6 +799,33 @@ def test_keepalive_dead_trip_after_slot_found_triggers_restore_attempt():
     assert restore_calls == ["await_slot_open"]
 
 
+def test_keepalive_dead_trip_accumulates_across_a_nav_succeeds_eval_throws_cycle():
+    """CONFIRMED LIVE 2026-09-03 ("Test 0901"): browser_nav succeeding is not the whole keepalive
+    cycle -- browser_eval runs right after it and can throw on its own (the well-known Playwright
+    "Execution context was destroyed, most likely because of a navigation" race). The dead-streak
+    reset used to sit right after browser_nav, BEFORE the eval call -- so a cycle where nav
+    succeeds and eval throws always netted dead_streak = 0 (just reset) + 1 (this cycle's own
+    exception) = 1, forever, no matter how many consecutive cycles failed this exact way.
+    dead_trip (a CONSECUTIVE-failure counter) could structurally never be reached: three apply
+    workers sat at "streak=1/3" for 2+ hours straight and _attempt_keepalive_restore never fired.
+    This pins the fix: the reset now only happens once nav AND eval have both succeeded, so this
+    failure mode counts toward dead_trip like any other."""
+    ops = _make_ops(cfg=_cfg(KEEPALIVE_DEAD_TRIP=2), signals=_FakeSignals(timeouts=2, final="slot_open"))
+    ops._signals.slot_found_seen = True
+
+    class _EvalAlwaysThrows(_FakeSession):
+        def browser_eval(self, js):
+            raise RuntimeError("Execution context was destroyed, most likely because of a navigation")
+
+    ops.session = _EvalAlwaysThrows()
+    restore_calls = []
+    ops._attempt_keepalive_restore = lambda context="": restore_calls.append(context)
+    ops.await_slot_open()
+    assert restore_calls == ["await_slot_open"], (
+        "two consecutive nav-succeeds-eval-throws cycles must reach KEEPALIVE_DEAD_TRIP=2 and "
+        "trigger a restore -- got no restore, meaning the streak is still being reset mid-cycle")
+
+
 def test_keepalive_no_restore_skips_restore_on_dead_trip():
     ops = _make_ops(cfg=_cfg(KEEPALIVE_DEAD_TRIP=1, KEEPALIVE_NO_RESTORE=True),
                     signals=_FakeSignals(timeouts=1, final="slot_open"))
