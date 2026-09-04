@@ -1643,6 +1643,17 @@ def run_registration(body: RegistrationRunRequest, db: Session = Depends(get_db)
         "cf_worker_url": g.get("CF_WORKER_URL"),
         "cf_worker_secret": g.get("CF_WORKER_SECRET"),
     }
+    # Same global switch and same default as login (RECAPTCHA_SOLVE_PROXY, catalog default False --
+    # solve through CapSolver's own IPs, not the session's proxy). CONFIRMED LIVE 2026-09-03: with
+    # this on, every registration attempt that reached "register form loaded" (proving the browser's
+    # own connection through that proxy already worked) then failed CAPTCHA-solving 100% of the
+    # time -- CapSolver's remote worker opening a SECOND connection through the same sticky session
+    # our browser already holds collides with it. An isolated ProxyLess solve against the same
+    # sitekey succeeded immediately. Kept as a real switch, not hardcoded off, because proxy-aware
+    # mode has its own track record on soax/rotating specifically (session.py's note: 342 verified
+    # registrations, all proxied) -- some pools may still do better with it on.
+    captcha_solve_proxy = str(g.get("RECAPTCHA_SOLVE_PROXY", "")).strip().lower() in (
+        "1", "true", "yes", "on", "force")
 
     accounts = []
     for sa in subs:
@@ -1665,6 +1676,7 @@ def run_registration(body: RegistrationRunRequest, db: Session = Depends(get_db)
         capsolver_keys=capsolver_keys, lang="PT", email_provider=email_provider,
         email_cfg=email_cfg, concurrency=body.concurrency,
         browser_concurrency=body.browser_concurrency or body.concurrency,
+        captcha_solve_proxy=captcha_solve_proxy,
     )
     return {"run_id": run_id, "queued": len(accounts)}
 
