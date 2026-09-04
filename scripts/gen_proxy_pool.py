@@ -16,7 +16,7 @@ popup, or import in bulk:
 Usage:
   python scripts/gen_proxy_pool.py soax --count 1000 --countries PT,DE,IT,ES,LU,NL,CZ
   python scripts/gen_proxy_pool.py webshare --count 1000 --countries PT,DE,IT,ES,LU,NL,CZ
-  python scripts/gen_proxy_pool.py soax --package 335959 --password ... --out data/proxies_soax.txt
+  python scripts/gen_proxy_pool.py soax --package 352438 --password ... --out data/proxies_soax.txt
 
 Country counts split as evenly as possible (remainder goes to the first countries in the given
 order) -- e.g. 1000 over 7 countries = six at 143, one at 142.
@@ -37,9 +37,14 @@ from libs.proxies.credentials import (  # noqa: E402
 
 _DATA_DIR = _ROOT / "data"
 
-# Non-secret defaults confirmed working as of 2026-08-13 -- update these (or pass
-# --package/--prefix) when the account/package changes.
-_SOAX_PACKAGE = "335959"
+# Non-secret defaults -- update these (or pass --package/--prefix) when the account/package
+# changes. Rotating package updated 2026-09-03 (335959 -> 352438, new SOAX subscription); mobile
+# (350716) is untouched and always passed explicitly via --package, never through this default.
+#
+# TRAP: the new rotating package has its OWN password, different from SOAX_PASSWORD (which is
+# still mobile's). Regenerating rotating now REQUIRES --password on the command line -- the bare
+# env-var default silently resolves to the wrong (mobile) password otherwise.
+_SOAX_PACKAGE = "352438"
 _SOAX_SESSIONLENGTH = 3600
 # 600, reverted from 5 on 2026-08-22 -- read this before "fixing" it back.
 #

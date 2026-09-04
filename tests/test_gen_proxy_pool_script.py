@@ -37,7 +37,7 @@ def test_soax_generates_expected_line_count_and_grammar(tmp_path):
     assert r.returncode == 0, r.stderr
     lines = out.read_text().strip().splitlines()
     assert len(lines) == 10
-    assert all(line.startswith("package-335959-country-") for line in lines)
+    assert all(line.startswith("package-352438-country-") for line in lines)
     assert all("-opt-wb:testpw@proxy.soax.com:5000" in line for line in lines)
 
 
