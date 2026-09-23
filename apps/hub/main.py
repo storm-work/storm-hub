@@ -3677,6 +3677,35 @@ def clear_worker_checkpoint(worker_id: str, db: Session = Depends(get_db),
     return {"cleared": existed, "identity_id": w.identity_id}
 
 
+@app.delete("/bookings/{booking_id}/checkpoints")
+def clear_booking_checkpoints(booking_id: str, db: Session = Depends(get_db),
+                              _op: Principal = Depends(require_operator)) -> dict:
+    """Delete the saved session checkpoints for THIS booking's identities only, so their next launch
+    does a full fresh login. The per-worker version (DELETE /workers/{id}/checkpoint) clears one
+    identity at a time; this is the booking-wide sweep the operator otherwise did by hand in
+    var/checkpoints/ (the ad-hoc-rm-against-production habit that cost the project four days once, F8).
+
+    SCOPED: only identities attached to workers of this booking. Checkpoints are keyed by identity
+    (libs/engine/checkpoint.py), so we collect this booking's distinct identity_ids and clear exactly
+    those files -- never another booking's, and never the whole directory. Allowed from any status
+    (the file is only read at launch and written on healthy transitions, so deleting it never touches
+    a live session -- it only changes what the next launch starts from)."""
+    from libs.engine import checkpoint as ckpt
+
+    bk = db.get(M.Booking, booking_id)
+    if not bk:
+        raise HTTPException(404, "booking not found")
+    ids = {w.identity_id for w in db.scalars(
+        select(M.Worker).where(M.Worker.booking_id == booking_id)).all() if w.identity_id}
+    cleared = 0
+    for iid in ids:
+        if ckpt.load_checkpoint(iid) is not None:
+            ckpt.clear_checkpoint(iid)
+            cleared += 1
+    logger.info("booking %s: cleared %d/%d identity checkpoints by operator", booking_id, cleared, len(ids))
+    return {"cleared": cleared, "identities": len(ids)}
+
+
 @app.post("/workers/{worker_id}/restart", response_model=WorkerOut)
 def restart_worker(worker_id: str, db: Session = Depends(get_db),
                    _op: Principal = Depends(require_operator)) -> M.Worker:

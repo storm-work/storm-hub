@@ -753,6 +753,17 @@ function BookingOverview({ me, booking, events, workers, onBookingChanged, onDel
     try { await api(`/bookings/${booking.id}`, { method: "DELETE" }); onDeleted(); }
     catch (e) { setMsg(e.message); }
   }
+  async function clearCheckpoints() {
+    if (!window.confirm(
+      `Clear saved session checkpoints for "${booking.name}"? This deletes the checkpoint files of ` +
+      `THIS booking's identities only (not other bookings), so each does a full fresh login on its ` +
+      `next launch. Safe to run anytime — it never touches a live session.`
+    )) return;
+    act(async () => {
+      const r = await api(`/bookings/${booking.id}/checkpoints`, { method: "DELETE" });
+      setMsg(`Cleared ${r.cleared} of ${r.identities} identity checkpoints.`);
+    }, "clearing checkpoints");
+  }
   // Archive is a VISIBILITY action, not a lifecycle one -- it never touches `status`, so an
   // archived booking still reads "completed" or "stopped" and keeps the record of how it ended.
   // The server refuses while the booking is live (scheduled/warming/armed/running): hiding a run
@@ -883,6 +894,8 @@ function BookingOverview({ me, booking, events, workers, onBookingChanged, onDel
             : "hide this booking from the default list — keeps its status and history, and is reversible"}>
           {booking.archived_at ? "↩ Unarchive" : "🗄 Archive"}
         </button>
+        <button className="btn ghost" disabled={!op || !!busy} onClick={clearCheckpoints}
+          title="delete this booking's identities' saved session checkpoints — each does a full fresh login next launch (this booking only)">🧹 Clear checkpoints</button>
         <button className="btn ghost" disabled={!op} onClick={deleteBooking} title="permanently delete this booking and everything on it">🗑 Delete</button>
       </div>
       <div className="row muted" style={{ fontSize: 13, marginBottom: 6, gap: 14, flexWrap: "wrap", alignItems: "center" }}>

@@ -91,3 +91,34 @@ def test_workers_endpoint_surfaces_not_bookable_substate_detail(client):
     assert row["substate"] == "keeping"
     assert (row.get("substate_detail") or "").startswith(NOT_BOOKABLE_PREFIX), \
         "the not-bookable marker must reach the client so a dead hold is visibly distinct"
+
+
+def test_clear_booking_checkpoints_is_scoped_to_that_booking(client, tmp_path, monkeypatch):
+    """DELETE /bookings/{id}/checkpoints must clear ONLY this booking's identities' checkpoints --
+    never another booking's, never the whole dir (the ad-hoc-rm-against-production habit, F8)."""
+    import libs.engine.checkpoint as ckpt
+    monkeypatch.setattr(ckpt, "_CHECKPOINTS_DIR", tmp_path)
+    c, _ = client
+    h = _op(c)
+
+    # booking A with an identity + a saved checkpoint; booking B with its own
+    def _booking_with_ckpt(name):
+        bid = c.post("/bookings", json={"name": name, "type": "test", "posto_id": "5084"}, headers=h).json()["id"]
+        iid = c.post("/identities", json={"full_name": name, "type": "test"}, headers=h).json()["id"]
+        c.post(f"/bookings/{bid}/identities", json={"identity_id": iid, "assigned_role": "apply"}, headers=h)
+        ckpt.save_checkpoint(iid, cookies=[], stage="alive", sub_account_id="s", username="u")
+        return bid, iid
+
+    bidA, iidA = _booking_with_ckpt("A")
+    bidB, iidB = _booking_with_ckpt("B")
+    assert (tmp_path / f"{iidA}.json").exists() and (tmp_path / f"{iidB}.json").exists()
+
+    r = c.delete(f"/bookings/{bidA}/checkpoints", headers=h).json()
+    assert r["cleared"] == 1 and r["identities"] == 1
+    assert not (tmp_path / f"{iidA}.json").exists(), "booking A's checkpoint must be cleared"
+    assert (tmp_path / f"{iidB}.json").exists(), "booking B's checkpoint must be UNTOUCHED"
+
+
+def test_clear_booking_checkpoints_404s_for_a_missing_booking(client):
+    c, _ = client
+    assert c.delete("/bookings/nope/checkpoints", headers=_op(c)).status_code == 404
