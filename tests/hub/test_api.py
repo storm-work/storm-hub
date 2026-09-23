@@ -202,8 +202,8 @@ def test_import_identities_and_proxies(client):
 
 def test_import_default_target_posto_applies_to_real_only(client):
     h = _operate_headers(client)
-    csv = ("identity_id,first_name,last_name,account_type,username,password\n"
-          "R1,Real,One,real,r1,pw1\nT1,Test,One,test,t1,pw2\n")
+    csv = ("identity_id,first_name,last_name,account_type,passport_no,nationality,birthdate,gender,username,password\n"
+          "R1,Real,One,real,PA9001,CPV,1985-01-01,M,r1,pw1\nT1,Test,One,test,,,,,t1,pw2\n")
     r = client.post("/identities/import",
                     json={"csv": csv, "default_target_posto": "5084"}, headers=h).json()
     assert r["created"] == 2
@@ -214,7 +214,8 @@ def test_import_default_target_posto_applies_to_real_only(client):
 
 def test_import_without_default_target_posto_leaves_it_unset(client):
     h = _operate_headers(client)
-    csv = "identity_id,first_name,last_name,account_type,username,password\nR1,Real,One,real,r1,pw1\n"
+    csv = ("identity_id,first_name,last_name,account_type,passport_no,nationality,birthdate,gender,username,password\n"
+           "R1,Real,One,real,PA9002,CPV,1985-01-01,M,r1,pw1\n")
     client.post("/identities/import", json={"csv": csv}, headers=h)
     got = client.get("/identities", headers=h).json()
     assert got[0]["target_posto"] is None
@@ -573,6 +574,429 @@ def test_proxy_list_exposes_health_so_the_page_can_show_what_is_condemned(client
     assert any(p["health"] == "ERR_CONNECTION_CLOSED" for p in rows)
 
 
+# ── /proxies must never return the whole table (2026-09-15) ───────────────────────────────────
+# The pool grew 2,600 -> 42,600 (+30k 08-21, +10k 09-03). GET /proxies had no limit, so the
+# dashboard pulled 14.8 MB and rendered ~340k DOM nodes -- the Proxies page stopped working, and
+# every OTHER page's proxy-pool picker paid the same cost to derive ~3 dropdown options.
+def test_proxy_list_is_paginated_and_hard_caps_the_limit(client):
+    h = _operate_headers(client)
+    for i in range(12):
+        client.post("/proxies", json={"provider": "soax", "kind": "rotating",
+                                      "endpoint": f"p{i}:1", "credentials_ref": "u:p",
+                                      "max_sessions": 2}, headers=h)
+    assert len(client.get("/proxies?limit=5", headers=h).json()) == 5
+    assert len(client.get("/proxies?limit=5&offset=10", headers=h).json()) == 2
+    # An unbounded request is the exact mistake the signature exists to prevent.
+    assert len(client.get("/proxies?limit=99999", headers=h).json()) == 12   # capped, not rejected
+
+
+def test_proxy_list_filters_by_provider_and_kind_server_side(client):
+    h = _operate_headers(client)
+    client.post("/proxies", json={"provider": "soax", "kind": "rotating", "endpoint": "a:1",
+                                  "credentials_ref": "u:p", "max_sessions": 2}, headers=h)
+    client.post("/proxies", json={"provider": "soax", "kind": "mobile", "endpoint": "b:1",
+                                  "credentials_ref": "u:p", "max_sessions": 2}, headers=h)
+    client.post("/proxies", json={"provider": "webshare", "kind": "rotating", "endpoint": "c:1",
+                                  "credentials_ref": "u:p", "max_sessions": 2}, headers=h)
+    assert len(client.get("/proxies?provider=soax", headers=h).json()) == 2
+    assert len(client.get("/proxies?provider=soax&kind=mobile", headers=h).json()) == 1
+    assert len(client.get("/proxies?kind=rotating", headers=h).json()) == 2
+
+
+def test_proxy_pools_aggregate_serves_every_picker_without_the_full_table(client):
+    """The pool tree and all three proxy-pool pickers read this instead of the table. It must carry
+    true pool-wide totals -- a picker built from one PAGE would offer only the pools that happened to
+    appear in the first 100 rows."""
+    h = _operate_headers(client)
+    _seed_proxies()
+    pools = client.get("/proxies/pools", headers=h).json()
+    assert pools, "aggregate must not be empty when proxies exist"
+    for p in pools:
+        assert {"provider", "kind", "geo", "resource_type",
+                "total", "active", "unhealthy", "leasable"} <= set(p)
+    # resource_type is load-bearing for the dashboard, not decoration: derivePoolOptions offers
+    # rotating pools from SETTINGS and only STATIC pools from these rows, so dropping this field
+    # would make every static/ISP pool vanish from the pickers.
+    # Totals must reconcile with the real table, not with a page of it.
+    everything = client.get("/proxies?limit=1000", headers=h).json()
+    assert sum(p["total"] for p in pools) == len(everything)
+    assert sum(p["unhealthy"] for p in pools) == sum(
+        1 for r in everything if r["is_healthy"] is False)
+
+
+# ── named ISP pools (operator requirement 2026-09-16) ────────────────────────────────────────
+def _import_isp(client, h, pool, lines, provider="thordata"):
+    return client.post("/proxies/import", json={
+        "provider": provider, "kind": "static", "resource_type": "static",
+        "pool_name": pool, "max_sessions": 1, "text": "\n".join(lines)}, headers=h).json()
+
+
+def test_importing_under_a_new_name_creates_the_pool_and_an_existing_name_appends(client):
+    """The operator's exact workflow: "I will add the name or select from existing ISP pools and
+    add those 10 proxy strings. If that is new then a new pool will be created, if existing then
+    10 proxies will be added to that pool." There is no separate create endpoint because a pool IS
+    the set of rows carrying its name."""
+    h = _operate_headers(client)
+    assert _import_isp(client, h, "thordata-oct",
+                       [f"http://u{i}:p@10.0.0.{i}:8000" for i in range(3)])["created"] == 3
+
+    pools = {p["pool_name"]: p for p in client.get("/proxies/isp-pools", headers=h).json()}
+    assert pools["thordata-oct"]["total"] == 3
+
+    # Same name again -> APPEND, not a second pool.
+    assert _import_isp(client, h, "thordata-oct",
+                       [f"http://u{i}:p@10.0.0.{i}:8000" for i in range(3, 5)])["created"] == 2
+    pools = {p["pool_name"]: p for p in client.get("/proxies/isp-pools", headers=h).json()}
+    assert pools["thordata-oct"]["total"] == 5
+    assert len([p for p in pools if p == "thordata-oct"]) == 1
+
+    # A different name -> a genuinely separate pool, both still listed.
+    _import_isp(client, h, "iproyal-a", ["http://z:p@10.9.9.9:8000"], provider="iproyal")
+    pools = {p["pool_name"]: p for p in client.get("/proxies/isp-pools", headers=h).json()}
+    assert pools["thordata-oct"]["total"] == 5 and pools["iproyal-a"]["total"] == 1
+
+
+def test_a_duplicate_proxy_is_refused_across_pools_and_says_which_pool_holds_it(client):
+    """Dedup is GLOBAL, not per-pool. The same physical ISP proxy in two pools would be leased
+    twice concurrently, and one-worker-one-IP is the entire point of a static resource. The message
+    names the owning pool so an operator who pasted the wrong batch can tell what happened."""
+    h = _operate_headers(client)
+    _import_isp(client, h, "thordata-oct", ["http://u:p@10.0.0.1:8000"])
+    res = _import_isp(client, h, "iproyal-a", ["http://u:p@10.0.0.1:8000"])
+    assert res["created"] == 0
+    assert any("thordata-oct" in e for e in res["errors"]), res["errors"]
+
+
+def test_isp_pool_listing_reports_leasable_not_just_total(client):
+    """`leasable` is the number that answers the operator's real question -- do these pools cover
+    my worker count -- and a condemned STATIC row really is out of service (D33), unlike a rotating
+    one (D19). Reporting only `total` would overstate capacity exactly when it matters."""
+    h = _operate_headers(client)
+    _import_isp(client, h, "thordata-oct",
+                [f"http://u{i}:p@10.0.0.{i}:8000" for i in range(3)])
+    rows = client.get(f"/proxies?limit=10", headers=h).json()
+    client.post(f"/proxies/{rows[0]['id']}/toggle-active", headers=h)
+
+    pool = [p for p in client.get("/proxies/isp-pools", headers=h).json()
+            if p["pool_name"] == "thordata-oct"][0]
+    assert pool["total"] == 3 and pool["leasable"] == 2
+
+
+# ── two-tier health check + delete (operator requirement 2026-09-16) ─────────────────────────
+def _mk_proxies(client, h, n, pool="thordata-oct"):
+    for i in range(n):
+        client.post("/proxies", json={"provider": "thordata", "kind": "static",
+                                      "endpoint": f"10.1.1.{i}:8000", "credentials_ref": "u:p",
+                                      "max_sessions": 1, "resource_type": "static",
+                                      "pool_name": pool}, headers=h)
+    return [p["id"] for p in client.get("/proxies?limit=100", headers=h).json()]
+
+
+def test_health_check_tier1_failure_condemns_and_tier2_failure_does_not(client, monkeypatch):
+    """THE property the whole two-tier split exists for. Tier 2 is 'can this IP reach the portal',
+    which on 2026-08-28 was false for 4,489 perfectly good proxies at once while the portal
+    throttled -- they connected 20/20 when re-probed neutrally. So a tier-2 failure must be
+    RECORDED and must NOT set is_healthy, or a portal outage presents the pool as garbage to a
+    delete button."""
+    import libs.proxies.health as H
+    h = _operate_headers(client)
+    ids = _mk_proxies(client, h, 2)
+
+    # proxy 0: tier 1 alive, tier 2 (portal) fails.  proxy 1: tier 1 dead.
+    def _conn(url):
+        return (False, "dead: connection refused") if url.endswith("10.1.1.1:8000/") or "10.1.1.1" in url else (True, "alive (status=200)")
+    monkeypatch.setattr(H, "connectivity_probe", _conn)
+    monkeypatch.setattr(H, "check_proxy", lambda url: (False, "net::ERR_TIMED_OUT"))
+
+    res = client.post("/proxies/health-check", json={"ids": ids, "portal": True}, headers=h).json()
+    assert res["checked"] == 2 and res["dead"] == 1 and res["alive"] == 1
+
+    by_ep = {p["endpoint"]: p for p in client.get("/proxies?limit=100", headers=h).json()}
+    alive = by_ep["10.1.1.0:8000"]
+    assert alive["is_healthy"] is True, "a portal failure must never condemn the proxy"
+    assert alive["portal_ok"] is False and "ERR_TIMED_OUT" in (alive["portal_health"] or "")
+    assert by_ep["10.1.1.1:8000"]["is_healthy"] is False
+
+
+def test_tier2_is_skipped_when_tier1_fails(client, monkeypatch):
+    """Not just an optimisation (~25s of Chromium per dead proxy): a browser probe through a dead
+    tunnel reports a PORTAL-shaped error for a CONNECTIVITY problem, which is the misattribution
+    that has repeatedly sent investigations here the wrong way."""
+    import libs.proxies.health as H
+    h = _operate_headers(client)
+    ids = _mk_proxies(client, h, 1)
+    monkeypatch.setattr(H, "connectivity_probe", lambda url: (False, "dead: tunnel failed"))
+
+    def _boom(url):
+        raise AssertionError("tier 2 ran for a proxy whose tier 1 failed")
+
+    monkeypatch.setattr(H, "check_proxy", _boom)
+    res = client.post("/proxies/health-check", json={"ids": ids, "portal": True}, headers=h).json()
+    assert res["dead"] == 1 and res["portal_checked"] == 0
+
+
+def test_delete_refuses_a_live_proxy_and_removes_a_dead_one(client, monkeypatch):
+    """Deletion is irreversible and an ISP proxy is a purchased asset, so 'dead' has to mean tier 1
+    actually failed -- not 'unchecked', and not 'the portal was down'."""
+    import libs.proxies.health as H
+    h = _operate_headers(client)
+    ids = _mk_proxies(client, h, 2)
+    monkeypatch.setattr(H, "connectivity_probe",
+                        lambda url: (False, "dead: refused") if "10.1.1.1" in url else (True, "alive"))
+    client.post("/proxies/health-check", json={"ids": ids}, headers=h)
+
+    res = client.post("/proxies/bulk-delete", json={"ids": ids}, headers=h).json()
+    assert res["deleted"] == 1, res
+    assert len(res["skipped"]) == 1 and "alive" in res["skipped"][0]["reason"]
+    left = [p["endpoint"] for p in client.get("/proxies?limit=100", headers=h).json()]
+    assert left == ["10.1.1.0:8000"]
+
+
+def test_delete_refuses_a_never_checked_proxy(client):
+    """Absence of a verdict is not a verdict. Without this an operator could select a freshly
+    imported pool and delete all of it before a single probe had run."""
+    h = _operate_headers(client)
+    ids = _mk_proxies(client, h, 1)
+    res = client.post("/proxies/bulk-delete", json={"ids": ids}, headers=h).json()
+    assert res["deleted"] == 0
+    assert "never health-checked" in res["skipped"][0]["reason"]
+
+
+def test_delete_refuses_a_proxy_that_is_still_leased(client, monkeypatch):
+    """proxy_leases.proxy_id is a live FK: deleting a leased row raises a non-JSON 500, which is
+    exactly what the worker Detach button produced (F-detach) and what made migration ci000droprot
+    fail on its first run. Refuse readably instead."""
+    import libs.proxies.health as H
+    from libs.proxies.lease import lease_proxy
+    h = _operate_headers(client)
+    ids = _mk_proxies(client, h, 1)
+
+    # Lease BEFORE condemning it: _candidate_query excludes an unhealthy static row outright (D33),
+    # so a dead proxy cannot be leased in the first place. The situation this guards is the real
+    # one -- a worker holding a proxy that has since been found dead.
+    import apps.hub.main as hub_main
+    db = hub_main.SessionLocal()
+    try:
+        lease_proxy(db, "some-worker", "thordata", resource_type="static")
+    finally:
+        db.close()
+
+    monkeypatch.setattr(H, "connectivity_probe", lambda url: (False, "dead: refused"))
+    client.post("/proxies/health-check", json={"ids": ids}, headers=h)
+
+    res = client.post("/proxies/bulk-delete", json={"ids": ids}, headers=h).json()
+    assert res["deleted"] == 0
+    assert "leased" in res["skipped"][0]["reason"]
+    assert client.get("/proxies?limit=100", headers=h).json(), "the row must survive the refusal"
+
+
+def test_health_check_rejects_an_oversized_selection(client):
+    """One dashboard click must not be able to launch hundreds of Chromium processes -- that is the
+    shape of the 2026-09-15 incident where an inline probe saturated the executor and took the Hub
+    down."""
+    h = _operate_headers(client)
+    r = client.post("/proxies/health-check",
+                    json={"ids": [f"id-{i}" for i in range(201)]}, headers=h)
+    assert r.status_code == 400 and "max 200" in r.json()["detail"]
+
+
+def test_bulk_update_changes_max_sessions_on_existing_proxies(client):
+    """max_sessions was settable at IMPORT and then frozen forever -- no endpoint could change it,
+    so a pool imported with the wrong capacity had to be deleted and re-imported, losing its health
+    history. It is the pool's real capacity ceiling: on 2026-09-16 seven ISP proxies at
+    max_sessions=1 hit 7/7 concurrent leases and starved both scouts out of the hold swap, while
+    the Hub only ever reported "no thordata proxy leased"."""
+    h = _operate_headers(client)
+    ids = _mk_proxies(client, h, 3)
+
+    out = client.post("/proxies/bulk-update",
+                      json={"ids": ids, "max_sessions": 2}, headers=h).json()
+    assert [p["max_sessions"] for p in out] == [2, 2, 2]
+    rows = client.get("/proxies?limit=10", headers=h).json()
+    assert all(p["max_sessions"] == 2 for p in rows)
+
+
+def test_bulk_update_can_move_proxies_between_pools_and_refuses_nonsense(client):
+    h = _operate_headers(client)
+    ids = _mk_proxies(client, h, 2)
+
+    client.post("/proxies/bulk-update",
+                json={"ids": ids, "pool_name": "thordata-nov"}, headers=h)
+    assert {p["pool_name"] for p in client.get("/proxies?limit=10", headers=h).json()} == {"thordata-nov"}
+
+    # A blank name clears it back to unnamed -- a legitimate thing to want.
+    client.post("/proxies/bulk-update", json={"ids": ids, "pool_name": ""}, headers=h)
+    assert {p["pool_name"] for p in client.get("/proxies?limit=10", headers=h).json()} == {None}
+
+    assert client.post("/proxies/bulk-update", json={"ids": ids, "max_sessions": 0},
+                       headers=h).status_code == 400
+    assert client.post("/proxies/bulk-update", json={"ids": ids}, headers=h).status_code == 400
+
+
+def test_bulk_update_never_touches_endpoint_or_credentials(client):
+    """Deliberately narrow: those identify the resource, and rewriting them under a live lease would
+    silently repoint a worker's exit mid-session."""
+    h = _operate_headers(client)
+    ids = _mk_proxies(client, h, 1)
+    before = client.get("/proxies?limit=10", headers=h).json()[0]
+
+    client.post("/proxies/bulk-update", json={"ids": ids, "max_sessions": 5}, headers=h)
+    after = client.get("/proxies?limit=10", headers=h).json()[0]
+    assert after["endpoint"] == before["endpoint"]
+    assert after["max_sessions"] == 5
+
+
+# ── booking archive / hide-show (operator request 2026-09-17) ────────────────────────────────
+def test_archiving_hides_a_booking_from_the_default_list_without_changing_its_status(client):
+    """A booking's `status` records how the run ENDED -- "completed with three appointments" reads
+    very differently from "stopped" -- and that is the most useful thing about an old booking. So
+    archiving is a separate timestamp, never a BookingStatus value: hide it, keep the outcome."""
+    h = _operate_headers(client)
+    bid = client.post("/bookings", json={"name": "Arch1", "type": "test", "posto_id": "2032"},
+                      headers=h).json()["id"]
+    client.post(f"/bookings/{bid}/stop", headers=h)
+    before = client.get(f"/bookings/{bid}", headers=h).json()["status"]
+
+    r = client.post(f"/bookings/{bid}/archive", headers=h).json()
+    assert r["archived_at"] is not None
+    assert r["status"] == before, "archiving must not rewrite how the booking ended"
+
+    assert bid not in {b["id"] for b in client.get("/bookings", headers=h).json()}
+    assert bid in {b["id"] for b in
+                   client.get("/bookings?include_archived=true", headers=h).json()}
+
+
+def test_unarchive_brings_it_back_and_both_are_idempotent(client):
+    h = _operate_headers(client)
+    bid = client.post("/bookings", json={"name": "Arch2", "type": "test", "posto_id": "2032"},
+                      headers=h).json()["id"]
+    client.post(f"/bookings/{bid}/stop", headers=h)
+
+    client.post(f"/bookings/{bid}/archive", headers=h)
+    first = client.get(f"/bookings/{bid}", headers=h).json()["archived_at"]
+    # Archiving twice must not move the timestamp -- it records WHEN it was archived.
+    assert client.post(f"/bookings/{bid}/archive", headers=h).json()["archived_at"] == first
+
+    assert client.post(f"/bookings/{bid}/unarchive", headers=h).json()["archived_at"] is None
+    assert client.post(f"/bookings/{bid}/unarchive", headers=h).status_code == 200
+    assert bid in {b["id"] for b in client.get("/bookings", headers=h).json()}
+
+
+def test_archiving_a_live_booking_is_refused(client):
+    """THE guard. Archiving is a visibility action; hiding a booking the scheduler is still driving
+    would make a live run invisible on the page an operator uses to watch it -- workers still
+    holding proxies and sub-accounts, and nothing on screen to say so. SCHEDULED counts as live: it
+    is not running yet, but it WILL auto-start at warmup_start_at."""
+    from datetime import datetime, timedelta, timezone
+    h = _operate_headers(client)
+    bid = client.post("/bookings", json={"name": "Arch3", "type": "test", "posto_id": "2032"},
+                      headers=h).json()["id"]
+    fut = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
+    client.put(f"/bookings/{bid}", json={"warmup_start_at": fut,
+                                         "slot_open_at": fut}, headers=h)
+    client.post(f"/bookings/{bid}/schedule", headers=h)
+
+    r = client.post(f"/bookings/{bid}/archive", headers=h)
+    assert r.status_code == 409
+    assert "stop it before archiving" in r.json()["detail"]
+    assert bid in {b["id"] for b in client.get("/bookings", headers=h).json()}, \
+        "a refused archive must leave the booking visible"
+
+
+# ── blind apply (operator direction 2026-09-18) ──────────────────────────────────────────────
+def _running_booking(client, h, posto="2032", **settings):
+    bid = client.post("/bookings", json={"name": "blind-b", "type": "test", "posto_id": posto,
+                                         "settings": settings}, headers=h).json()["id"]
+    client.post(f"/bookings/{bid}/start", headers=h)
+    client.post(f"/bookings/{bid}/fire-slot-open", headers=h)
+    return bid
+
+
+def test_blind_apply_seeds_the_grid_with_the_postos_proven_periods(client):
+    """Operator confirmed 12/13/14 October open by eye; discovery found nothing. Seeding writes one
+    AVAILABLE slot per (date x period), source='blind', using the posto's PROVEN period set --
+    2032 opens 3/4/5, measured over every PDF-verified booking there."""
+    h = _operate_headers(client)
+    bid = _running_booking(client, h, posto="2032")
+    r = client.post(f"/bookings/{bid}/blind-apply",
+                    json={"dates": "2026-10-12, 2026-10-13, 2026-10-14"}, headers=h)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["periods"] == [3, 4, 5] and body["seeded"] == 9
+    rows = client.get(f"/bookings/{bid}/slots", headers=h).json()
+    assert len(rows) == 9 and all(s["status"] == "available" for s in rows)
+
+
+def test_blind_apply_is_idempotent_and_can_widen_the_grid(client):
+    h = _operate_headers(client)
+    bid = _running_booking(client, h, posto="2032")
+    client.post(f"/bookings/{bid}/blind-apply", json={"dates": "2026-10-12", "periods": "3,4"}, headers=h)
+    r = client.post(f"/bookings/{bid}/blind-apply", json={"dates": "2026-10-12", "periods": "3,4,5"}, headers=h).json()
+    assert r["seeded"] == 1 and r["skipped_existing"] == 2, r
+
+
+def test_blind_apply_refuses_when_discovery_already_has_slots_unless_forced(client):
+    """Blind apply is for when the system sees nothing and the operator sees something. Seeding
+    phantoms on top of real finds only dilutes the pool with combinations the fleet then spends
+    attempts on. `force` exists for the operator who has decided otherwise."""
+    import apps.hub.main as hub_main
+    from libs.db import models as M
+    from libs.domain.enums import SlotStatus
+
+    h = _operate_headers(client)
+    bid = _running_booking(client, h)
+    db = hub_main.SessionLocal()
+    try:
+        db.add(M.Slot(booking_id=bid, posto_id="2032", date="2026-10-12", period=3,
+                      status=SlotStatus.AVAILABLE, source="scout"))
+        db.commit()
+    finally:
+        db.close()
+    r = client.post(f"/bookings/{bid}/blind-apply", json={"dates": "2026-10-13"}, headers=h)
+    assert r.status_code == 409 and "already has 1 AVAILABLE" in r.json()["detail"]
+    r = client.post(f"/bookings/{bid}/blind-apply", json={"dates": "2026-10-13", "force": True}, headers=h)
+    assert r.status_code == 200 and r.json()["seeded"] == 3
+
+
+def test_blind_apply_refuses_before_slot_open_and_rejects_garbage(client):
+    h = _operate_headers(client)
+    bid = client.post("/bookings", json={"name": "b", "type": "test", "posto_id": "2032"}, headers=h).json()["id"]
+    client.post(f"/bookings/{bid}/start", headers=h)          # running, slot-open NOT fired
+    r = client.post(f"/bookings/{bid}/blind-apply", json={"dates": "2026-10-12"}, headers=h)
+    assert r.status_code == 409 and "fire slot-open first" in r.json()["detail"]
+    client.post(f"/bookings/{bid}/fire-slot-open", headers=h)
+    r = client.post(f"/bookings/{bid}/blind-apply", json={"dates": "someday"}, headers=h)
+    assert r.status_code == 400
+
+
+def test_posto_change_refuses_to_silently_wipe_a_blind_seed(client):
+    """Confirmed incident 2026-09-21 ("0921+5086"): seeding a blind pool, then editing the booking's
+    posto, silently CLOSED every seeded slot (the posto-change retirement treats them as stale). A
+    blind seed is an operator's deliberate, confirmed-by-eye plan for a SPECIFIC posto -- the PUT must
+    refuse rather than destroy it. A DISCOVERED pool is still retired on posto change as before."""
+    h = _operate_headers(client)
+    bid = _running_booking(client, h, posto="2032", BLIND_APPLY_MODE=True)
+    assert client.post(f"/bookings/{bid}/blind-apply",
+                       json={"dates": "2026-10-12", "periods": "3,4,5"}, headers=h).status_code == 200
+    # the posto edit must be refused while a blind seed exists
+    r = client.put(f"/bookings/{bid}", json={"posto_id": "3018"}, headers=h)
+    assert r.status_code == 409 and "blind" in r.json()["detail"].lower(), r.text
+    # the seed survives untouched, and the posto is unchanged
+    rows = client.get(f"/bookings/{bid}/slots", headers=h).json()
+    assert len(rows) == 3 and all(s["status"] == "available" for s in rows)
+    assert client.get(f"/bookings/{bid}", headers=h).json()["posto_id"] == "2032"
+    # clearing the pool first lets the posto change through
+    assert client.delete(f"/bookings/{bid}/slots", headers=h).status_code == 200
+    assert client.put(f"/bookings/{bid}", json={"posto_id": "3018"}, headers=h).status_code == 200
+
+
+def test_blind_apply_defaults_dates_from_the_cal_window(client):
+    h = _operate_headers(client)
+    bid = _running_booking(client, h, CAL_START_DATE="2026-10-12", CAL_END_DATE="2026-10-14")
+    r = client.post(f"/bookings/{bid}/blind-apply", json={}, headers=h).json()
+    assert r["dates"] == ["2026-10-12", "2026-10-13", "2026-10-14"]
+
+
 # ── scheduling a booking for a LATER run (operator report 2026-08-19) ─────────────────────────
 def _future(minutes):
     from datetime import datetime, timedelta, timezone
@@ -925,7 +1349,7 @@ def test_force_self_scout_commands_every_holding_apply_worker(client):
     assert client.post(f"/bookings/{bid}/self-scout", headers=h).status_code == 409, \
         "running, but with no HOLDING apply worker there is nothing to command"
 
-    want = sorted(_make_holding_worker(bid, "apply", "holding") for _ in range(2))
+    want = sorted(_make_holding_worker(bid, "apply", "keeping") for _ in range(2))
     # neither of these may be commanded: a scout, and an apply worker that is not holding
     _make_holding_worker(bid, "scout", "discovering")
     _make_holding_worker(bid, "apply", "logging_in")
@@ -948,11 +1372,12 @@ def test_force_self_scout_is_not_open_to_anonymous_callers(client):
 
 # ── identity priority + real deletion (2026-09-02) ────────────────────────────────────────────
 _CSV_HEAD = ("identity_id,first_name,last_name,traveldoc,nationality,account_type,"
-             "username,password,email\n")
+             "birthdate,gender,username,password,email\n")
 
 
 def _csv(passport, user="u1", ident="ID1", first="Ana", last="Silva", kind="real"):
-    return _CSV_HEAD + f"{ident},{first},{last},{passport},CPV,{kind},{user},pw1,{user}@x.com\n"
+    # Real identities carry full detail (birthdate + gender) -- required at import since 2026-09-19.
+    return _CSV_HEAD + f"{ident},{first},{last},{passport},CPV,{kind},1985-01-01,F,{user},pw1,{user}@x.com\n"
 
 
 def test_a_re_imported_passport_supersedes_the_row_it_duplicates(client):
@@ -1072,3 +1497,159 @@ def test_bulk_delete_reports_per_id_instead_of_failing_on_the_first_refusal(clie
            sorted(body["deleted"]) == sorted([ok1, ok2]), body
     remaining = {i["id"] for i in client.get("/identities", headers=h).json()}
     assert ok1 not in remaining and ok2 not in remaining
+
+
+def test_bulk_delete_never_removes_an_identity_with_a_booked_appointment_even_with_force(client):
+    """THE guard the bulk-delete UI depends on. An appointment is the only record that a real
+    person holds a real slot, and it is not ours to discard because the identity behind it went
+    stale -- so `force` must NOT override it, unlike sub-accounts/allocations/event history which
+    are rows we generated.
+
+    The dashboard reads this: it offers the force pass only for refusals force can actually fix,
+    and never for a booked appointment, because prompting to force something that cannot be forced
+    is a dishonest prompt."""
+    import apps.hub.main as hub_main
+    from libs.db import models as M
+
+    h = _operate_headers(client)
+    iid = client.post("/identities", json={"full_name": "Booked One", "type": "real",
+                                           "passport_no": "PP-BK1"}, headers=h).json()["id"]
+    bid = client.post("/bookings", json={"name": "bk-guard", "type": "test",
+                                         "posto_id": "2032"}, headers=h).json()["id"]
+    db = hub_main.SessionLocal()
+    try:
+        # sub_account_id is NOT NULL on booked_appointments -- an appointment always belongs to the
+        # sub-account that made it, so the fixture has to create one rather than pass None.
+        sa = M.SubAccount(identity_id=iid, username="bk1", password="pw", status="verified")
+        db.add(sa)
+        db.flush()
+        db.add(M.BookedAppointment(booking_id=bid, identity_id=iid,
+                                   sub_account_id=sa.id, slot_id=None))
+        db.commit()
+        sa_id = sa.id
+    finally:
+        db.close()
+
+    r = client.post("/identities/bulk-delete",
+                    json={"identity_ids": [iid], "force": True}, headers=h).json()
+    assert r["deleted"] == []
+    assert iid in r["refused"]
+    assert "booked appointment" in r["refused"][iid].lower()
+
+    # Asserted against the ROW, not GET /identities: that endpoint annotates and orders for the
+    # attach panel, so a listing miss would not prove the row is gone. The claim here is that the
+    # identity still EXISTS -- and that force did not strip the sub-account out from under the
+    # appointment on its way to refusing (the booked check runs before the force block, and this
+    # pins that ordering).
+    db = hub_main.SessionLocal()
+    try:
+        assert db.get(M.Identity, iid) is not None, "forced bulk delete removed a booked identity"
+        assert db.get(M.SubAccount, sa_id) is not None, "force stripped the appointment's sub-account"
+    finally:
+        db.close()
+
+
+def test_force_delete_clears_registration_jobs_hanging_off_the_sub_accounts(client):
+    """REPRODUCES THE 2026-09-17 FAILURE. registration_jobs references SUB_ACCOUNTS, not the
+    identity, and the force cascade cleared sub_accounts without it -- so deleting any identity
+    that had ever been through registration raised
+
+        ForeignKeyViolation: ... "registration_jobs_sub_account_id_fkey"
+
+    outside the endpoint's try/except, returning an HTML 500. The dashboard rendered that as
+    `Unexpected token 'I', "Internal S"... is not valid JSON`, and a 359-identity bulk delete died
+    on the first offender.
+
+    Second time a missed FK on registration_jobs broke a delete path (after migration ci000droprot),
+    which is why the cascade now carries the full referencing set read from pg_constraint."""
+    import apps.hub.main as hub_main
+    from libs.db import models as M
+
+    h = _operate_headers(client)
+    iid = client.post("/identities", json={"full_name": "RegJob", "type": "real",
+                                           "passport_no": "PP-RJ"}, headers=h).json()["id"]
+    db = hub_main.SessionLocal()
+    try:
+        sa = M.SubAccount(identity_id=iid, username="rj1", password="pw", status="verified")
+        db.add(sa); db.flush()
+        db.add(M.RegistrationJob(sub_account_id=sa.id, mode="parallel", status="verified"))
+        db.commit()
+    finally:
+        db.close()
+
+    r = client.post("/identities/bulk-delete",
+                    json={"identity_ids": [iid], "force": True}, headers=h)
+    assert r.status_code == 200, r.text
+    assert r.json()["deleted"] == [iid], r.json()
+
+    # Asserts the ROW IS GONE, not merely that the call returned 200. The FK-violation form of this
+    # test is untestable here: SQLite does not enforce foreign keys by default (delete_identity's
+    # own comment says so), so removing the cascade still returns 200 under the test DB while
+    # raising ForeignKeyViolation against Postgres. Verified by neutralisation -- with the
+    # registration_jobs delete removed, THIS assertion fails and the status check does not.
+    db = hub_main.SessionLocal()
+    try:
+        assert db.get(M.Identity, iid) is None
+        assert db.query(M.RegistrationJob).count() == 0, (
+            "force delete left an orphaned registration_job -- against Postgres this is the "
+            "ForeignKeyViolation that returned an HTML 500 to the dashboard")
+    finally:
+        db.close()
+
+
+def test_a_database_error_on_one_identity_does_not_500_the_whole_batch(client, monkeypatch):
+    """The endpoint promises per-id outcomes 'instead of failing on the first refusal', but caught
+    only HTTPException -- so any DB error it had not anticipated became a 500 and lost the outcome
+    of every other id in the batch. One bad row must cost one row."""
+    import apps.hub.main as hub_main
+    from sqlalchemy.exc import IntegrityError
+
+    h = _operate_headers(client)
+    good = client.post("/identities", json={"full_name": "G", "type": "real",
+                                            "passport_no": "PP-G1"}, headers=h).json()["id"]
+    bad = client.post("/identities", json={"full_name": "B", "type": "real",
+                                           "passport_no": "PP-B1"}, headers=h).json()["id"]
+
+    real = hub_main.delete_identity
+
+    def _boom(identity_id, force=False, db=None, _op=None):
+        if identity_id == bad:
+            raise IntegrityError("stmt", {}, Exception("simulated FK violation"))
+        return real(identity_id, force=force, db=db, _op=_op)
+
+    monkeypatch.setattr(hub_main, "delete_identity", _boom)
+
+    r = client.post("/identities/bulk-delete",
+                    json={"identity_ids": [bad, good], "force": True}, headers=h)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert good in body["deleted"], "a later id must still be processed after an earlier failure"
+    assert bad in body["refused"]
+
+
+def test_bulk_priority_sets_the_same_level_on_every_selected_identity(client):
+    h = _operate_headers(client)
+    a = client.post("/identities", json={"full_name": "P1", "type": "real", "passport_no": "PP-F"},
+                    headers=h).json()["id"]
+    b = client.post("/identities", json={"full_name": "P2", "type": "real", "passport_no": "PP-G"},
+                    headers=h).json()["id"]
+
+    r = client.post("/identities/bulk-priority",
+                    json={"identity_ids": [a, b], "priority": 0}, headers=h)
+    assert r.status_code == 200, r.text
+    assert sorted(r.json()["updated"]) == sorted([a, b])
+    by_id = {i["id"]: i for i in client.get("/identities", headers=h).json()}
+    assert by_id[a]["priority"] == 0 and by_id[b]["priority"] == 0
+
+
+def test_bulk_priority_skips_unknown_ids_instead_of_failing_the_whole_batch(client):
+    """A stale selection (a row deleted by someone else mid-edit) must not block updating the rest --
+    same discipline as bulk-delete's per-id reporting, just simpler since there is no refusal case."""
+    h = _operate_headers(client)
+    a = client.post("/identities", json={"full_name": "P3", "type": "real", "passport_no": "PP-H"},
+                    headers=h).json()["id"]
+
+    r = client.post("/identities/bulk-priority",
+                    json={"identity_ids": [a, "does-not-exist"], "priority": 200}, headers=h)
+    assert r.status_code == 200, r.text
+    assert r.json()["updated"] == [a]

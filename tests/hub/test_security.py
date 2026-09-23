@@ -11,6 +11,8 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
+import threading
+import time
 
 import apps.hub.main as hub_main
 from apps.hub.db import get_db
@@ -224,6 +226,122 @@ def test_viewer_never_holds_the_operate_seat(client):
         assert r.status_code in (403, 409)
 
 
+# ── viewer session cap + admin-granted extra session (operator spec 2026-09-10) ───────────────
+def test_a_second_viewer_login_is_capped_paused_the_first_is_untouched(client):
+    c, _ = client
+    h = _admin(c)
+    c.post("/auth/users", json={"username": "w1", "password": "pw", "role": "viewer"}, headers=h)
+    r1 = c.post("/auth/login", json={"username": "w1", "password": "pw", "purpose": "view"})
+    assert r1.status_code == 200
+    h1 = {"Authorization": f"Bearer {r1.json()['token']}"}
+    assert c.get("/auth/whoami", headers=h1).json()["session_status"] == "active"
+
+    r2 = c.post("/auth/login", json={"username": "w1", "password": "pw", "purpose": "view"})
+    assert r2.status_code == 200
+    h2 = {"Authorization": f"Bearer {r2.json()['token']}"}
+    who2 = c.get("/auth/whoami", headers=h2).json()
+    assert who2["session_status"] == "paused"
+    assert "extra session" in (r2.json().get("notice") or "")
+
+    # the first session is untouched by the second login being capped
+    assert c.get("/auth/whoami", headers=h1).json()["session_status"] == "active"
+
+
+def test_an_admin_or_operator_logging_in_as_view_twice_is_unrestricted(client):
+    """The cap is scoped to UserRole.VIEWER, not purpose=="view" broadly -- an admin/operator
+    choosing to view the read-only dashboard is not the case this feature is about."""
+    c, _ = client
+    h = _admin(c, username="a1", password="pw-a1")
+    r1 = c.post("/auth/login", json={"username": "a1", "password": "pw-a1", "purpose": "view"})
+    r2 = c.post("/auth/login", json={"username": "a1", "password": "pw-a1", "purpose": "view"})
+    assert r1.status_code == 200 and r2.status_code == 200
+    h2 = {"Authorization": f"Bearer {r2.json()['token']}"}
+    assert c.get("/auth/whoami", headers=h2).json()["session_status"] == "active"
+
+
+def test_extra_session_request_requires_a_paused_viewer_session(client):
+    c, _ = client
+    h = _admin(c)
+    c.post("/auth/users", json={"username": "w2", "password": "pw", "role": "viewer"}, headers=h)
+    r1 = c.post("/auth/login", json={"username": "w2", "password": "pw", "purpose": "view"})
+    h1 = {"Authorization": f"Bearer {r1.json()['token']}"}
+    # active (not paused) session -- must not be allowed to request
+    assert c.post("/sessions/extra-view/request", headers=h1).status_code == 400
+    # non-viewer -- must not be allowed to request
+    assert c.post("/sessions/extra-view/request", headers=h).status_code == 403
+
+
+def test_extra_session_grant_activates_the_second_session_without_touching_the_first(client):
+    c, _ = client
+    h = _admin(c)
+    c.post("/auth/users", json={"username": "w3", "password": "pw", "role": "viewer"}, headers=h)
+    r1 = c.post("/auth/login", json={"username": "w3", "password": "pw", "purpose": "view"})
+    h1 = {"Authorization": f"Bearer {r1.json()['token']}"}
+    r2 = c.post("/auth/login", json={"username": "w3", "password": "pw", "purpose": "view"})
+    h2 = {"Authorization": f"Bearer {r2.json()['token']}"}
+
+    req = c.post("/sessions/extra-view/request", headers=h2)
+    assert req.status_code == 200
+    req_id = req.json()["request_id"]
+
+    pending = c.get("/sessions/extra-view/pending", headers=h).json()
+    assert any(p["request_id"] == req_id and p["requester"] == "w3" for p in pending)
+
+    gr = c.post(f"/sessions/extra-view/{req_id}/grant", headers=h)
+    assert gr.status_code == 200
+
+    assert c.get("/auth/whoami", headers=h2).json()["session_status"] == "active"
+    assert c.get("/auth/whoami", headers=h1).json()["session_status"] == "active"   # untouched
+    assert c.get("/sessions/extra-view/pending", headers=h).json() == []
+
+
+def test_extra_session_deny_ends_the_paused_session(client):
+    c, _ = client
+    h = _admin(c)
+    c.post("/auth/users", json={"username": "w4", "password": "pw", "role": "viewer"}, headers=h)
+    c.post("/auth/login", json={"username": "w4", "password": "pw", "purpose": "view"})
+    r2 = c.post("/auth/login", json={"username": "w4", "password": "pw", "purpose": "view"})
+    h2 = {"Authorization": f"Bearer {r2.json()['token']}"}
+    req_id = c.post("/sessions/extra-view/request", headers=h2).json()["request_id"]
+
+    dn = c.post(f"/sessions/extra-view/{req_id}/deny", headers=h)
+    assert dn.status_code == 200
+    # the paused session is now ENDED -- its token no longer authenticates
+    assert c.get("/auth/whoami", headers=h2).status_code == 401
+
+
+def test_extra_session_grant_and_deny_require_admin_not_just_operator(client):
+    c, _ = client
+    h = _admin(c)
+    c.post("/auth/users", json={"username": "op1", "password": "pw", "role": "operator"}, headers=h)
+    opr = c.post("/auth/login", json={"username": "op1", "password": "pw", "purpose": "operate"})
+    oph = {"Authorization": f"Bearer {opr.json()['token']}"}
+
+    c.post("/auth/users", json={"username": "w5", "password": "pw", "role": "viewer"}, headers=h)
+    c.post("/auth/login", json={"username": "w5", "password": "pw", "purpose": "view"})
+    r2 = c.post("/auth/login", json={"username": "w5", "password": "pw", "purpose": "view"})
+    h2 = {"Authorization": f"Bearer {r2.json()['token']}"}
+    req_id = c.post("/sessions/extra-view/request", headers=h2).json()["request_id"]
+
+    assert c.post(f"/sessions/extra-view/{req_id}/grant", headers=oph).status_code == 403
+    assert c.post(f"/sessions/extra-view/{req_id}/deny", headers=oph).status_code == 403
+
+
+def test_force_release_ends_a_view_session_not_just_operate(client):
+    """The backend was never purpose-restricted -- only the dashboard button used to withhold
+    itself for non-operate rows. Pin the backend behavior directly."""
+    c, _ = client
+    h = _admin(c)
+    c.post("/auth/users", json={"username": "w6", "password": "pw", "role": "viewer"}, headers=h)
+    r = c.post("/auth/login", json={"username": "w6", "password": "pw", "purpose": "view"})
+    vh = {"Authorization": f"Bearer {r.json()['token']}"}
+    # LoginResponse doesn't carry the session id -- fetch it via /sessions instead
+    rows = c.get("/sessions", headers=h).json()
+    sid = next(row["session_id"] for row in rows if row["user"] == "w6")
+    assert c.post(f"/sessions/{sid}/force-release", headers=h).status_code == 200
+    assert c.get("/auth/whoami", headers=vh).status_code == 401
+
+
 def test_dashboard_hides_exactly_the_pages_a_viewer_cannot_use(client):
     """Pins the JS gate list against this file's server-side expectations, so hiding a tab and
     blocking its endpoints can't drift apart."""
@@ -234,7 +352,9 @@ def test_dashboard_hides_exactly_the_pages_a_viewer_cannot_use(client):
     m = re.search(r"const HIDDEN_FOR_VIEWER = new Set\(\[(.*?)\]\)", src, re.S)
     assert m, "HIDDEN_FOR_VIEWER not found in App.jsx -- renamed?"
     hidden = set(re.findall(r'"(\w+)"', m.group(1)))
-    assert hidden == {"templates", "settings", "ops", "audit", "sessions"}
+    # "sessions" deliberately visible to a viewer since 2026-09-10 -- a capped/paused viewer
+    # session needs to reach the "Request extra session" button, which lives on that page.
+    assert hidden == {"templates", "settings", "ops", "audit"}
 
 
 # ── stale operate seat (confirmed live 2026-08-14) ────────────────────────────
@@ -383,3 +503,73 @@ def test_events_websocket_rejects_an_anonymous_client(client):
         with c.websocket_connect("/ws/events?token=garbage") as ws:
             ws.receive_json()
     assert e.value.code == 1008
+
+
+# ── the audit path must never touch the DB on the request/event-loop path (2026-09-13) ────────
+# CONFIRMED LIVE (py-spy dump of a wedged Hub): _audit_middleware did a SECOND DB checkout per
+# mutating request -- while the handler's own Depends(get_db) connection was still held, since
+# FastAPI tears that down only after the response is sent -- and did it with synchronous
+# SQLAlchemy on the asyncio event loop. Once the pool drained, the loop itself parked in
+# QueuePool._do_get, so no response could be sent, so the first connection was never released.
+# Self-sustaining deadlock: every thread waiting for a connection, none holding one and working.
+def test_audit_middleware_does_no_db_work_on_the_request_path(client, monkeypatch):
+    """The regression that matters: the middleware must not open a session of its own. If it ever
+    does again, the deadlock comes back."""
+    import apps.hub.main as hub_main
+
+    c, _TestSession = client
+    h = _admin(c)
+
+    # Any attempt to build a session from inside the request path is a hard failure.
+    calls = []
+    real_submit = hub_main.audit_writer.submit
+
+    def _spy_submit(row):
+        calls.append(row)
+        # Deliberately DOES NOT write -- proves the request completes without the audit row
+        # having touched the DB yet.
+        return None
+
+    monkeypatch.setattr(hub_main.audit_writer, "submit", _spy_submit)
+    r = c.post("/identities", json={"full_name": "No DB On Path", "type": "real"}, headers=h)
+    assert r.status_code == 201, "request must succeed even though nothing persisted the audit row"
+    assert len(calls) == 1, f"expected exactly one non-blocking submit, got {calls}"
+    assert "_actor_sub" in calls[0], "actor must be passed as a token subject, NOT resolved via DB here"
+    assert calls[0]["action"] == "POST" and calls[0]["target"] == "/identities"
+    assert real_submit is not None
+
+
+def test_audit_submit_is_non_blocking_when_the_writer_is_running():
+    """submit() runs on the event loop. It must be a pure in-memory queue put -- never a DB call,
+    never anything that can block -- so a slow/dead DB can no longer stall request serving."""
+    from apps.hub.audit import AuditWriter
+
+    def _explode():
+        raise AssertionError("submit() resolved a session factory on the request path")
+
+    w = AuditWriter(_explode)
+    w._thread = threading.Thread(target=lambda: time.sleep(5), name="fake-writer", daemon=True)
+    w._thread.start()                      # is_running() True -> must take the queue path
+    try:
+        w.submit({"action": "POST", "target": "/x", "ts": None, "payload": {}})
+        assert w._q.qsize() == 1
+    finally:
+        w._thread.join(timeout=6)
+
+
+def test_audit_queue_drops_rather_than_growing_without_bound():
+    """A bounded queue on purpose: an unbounded one turns a DB outage into unbounded memory growth,
+    which is how a logging path takes down the process it exists to observe."""
+    from apps.hub.audit import AuditWriter
+
+    w = AuditWriter(lambda: None)
+    w._thread = threading.Thread(target=lambda: time.sleep(5), name="fake-writer", daemon=True)
+    w._thread.start()
+    try:
+        w._q.maxsize  # bounded
+        for _ in range(w._q.maxsize + 50):
+            w.submit({"action": "POST", "target": "/x", "ts": None, "payload": {}})
+        assert w.dropped >= 50, f"overflow must drop and count, got dropped={w.dropped}"
+        assert w._q.qsize() <= w._q.maxsize
+    finally:
+        w._thread.join(timeout=6)

@@ -22,7 +22,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSock
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import delete, func, select, text, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from libs.db import models as M
@@ -46,6 +46,7 @@ from libs.domain.state_machines import IllegalTransition, booking_transition
 
 from libs.domain.enums import HandoverStatus
 
+from .audit import AuditWriter
 from .auth import (
     require_admin,
     Principal,
@@ -66,10 +67,12 @@ from libs.bus.names import EVENT_STREAM, notified_key, respawn_key
 from libs.domain.enums import WorkerRole, WorkerStatus, WorkerSubstate
 from libs.domain.settings import resolve
 
-from libs.domain.enums import RegistrationMode, RegistrationStatus, SubAccountStatus
-from libs.proxies.health import check_proxy, provider_reachable, quick_screen
+from libs.domain.enums import (READY_SUB_ACCOUNT_STATUSES, RegistrationMode,
+                               RegistrationStatus, SubAccountStatus)
+from libs.proxies.health import apply_result, check_proxy, provider_reachable, quick_screen
 from libs.proxies.health import check_proxy as _REAL_CHECK_PROXY
 from libs.proxies.lease import ProxyLeaseError, lease_proxy, release_proxy, conn_url
+from libs.proxies.rotating import RotatingPoolError, mint_rotating_url
 
 from .config import settings
 from .config_store import get_config, seed_defaults, seed_templates, set_config
@@ -82,6 +85,7 @@ from .scheduler import (LAUNCH_FAILED_PREFIX, _LAUNCH_BLOCKED_BOOKING_STATUSES, 
                         Scheduler)
 from .supervisor import Supervisor
 from .schemas import (
+    BlindApplyRequest, ProxyBulkDelete, ProxyBulkUpdate, ProxyHealthCheck,
     BookedCredentialsRequest,
     BookedIdentityOut,
     ArtifactOut,
@@ -98,6 +102,7 @@ from .schemas import (
     IdentityCreate,
     IdentityBulkDelete,
     IdentityBulkDeleteResult,
+    IdentityBulkPriority,
     IdentityImport,
     IdentityOut,
     IdentityUpdate,
@@ -125,6 +130,9 @@ logger = logging.getLogger(__name__)
 supervisor = Supervisor(settings.redis_url)
 event_hub = EventHub(settings.redis_url)
 _bus = Bus(connect(settings.redis_url))
+# Resolved lazily, per drain, so app.dependency_overrides still applies -- that is what keeps a
+# test's audit rows in its own isolated SQLite instead of the production DB.
+audit_writer = AuditWriter(lambda: app.dependency_overrides.get(get_db, get_db))
 
 # A live-mode launch now runs a real-portal health probe before leasing a proxy (see
 # _do_launch_worker's lease_proxy(..., health_check=check_proxy) calls) -- launching a whole fleet
@@ -146,7 +154,7 @@ def _resolve_booking_setting(db: Session, bk: M.Booking, key: str, default):
 
 # Bookings with a fleet launch currently in flight. A live-mode launch is SLOW -- each worker's
 # proxy lease runs real browser health probes against the portal (libs/proxies/health.py), up to
-# max_probes candidates, twice over when HOLD_SWAP_AFTER_WARMUP is on -- so a six-worker fleet takes
+# max_probes candidates, twice over when HOLD_SWAP_AFTER_LOGIN is on -- so a six-worker fleet takes
 # minutes of wall clock, not milliseconds.
 #
 # Confirmed live 2026-08-14 ("start button doesn't work"): /bookings/{id}/start ran that fleet
@@ -309,8 +317,12 @@ def _sched_on_slot_open(db: Session, bk: M.Booking) -> None:
 
 
 def _sched_on_assign(db: Session, worker: M.Worker, slot: M.Slot) -> None:
+    # `blind` rides along so the phase machine can apply the one blind-specific rule: a form_stale
+    # verdict on a blind slot means "next combination", never "re-warm and retry this one", and
+    # never the re-login escalation that spends sessions (libs/engine/phases.py's apply loop).
     _bus.send_command(worker.id, "assign",
-                      slot={"id": slot.id, "date": slot.date, "period": slot.period})
+                      slot={"id": slot.id, "date": slot.date, "period": slot.period,
+                            "blind": getattr(slot, "source", "scout") == "blind"})
 
 
 def _reset_worker_bus_state(booking_id: str, worker_id: str) -> None:
@@ -461,6 +473,7 @@ async def lifespan(app: FastAPI):
         supervisor.reconcile({wid: "apps.worker" for wid in running_ids})
     except Exception:
         pass                   # DB may be down at boot; endpoints still report degraded
+    audit_writer.start()       # background thread owning ALL audit writes -- see apps/hub/audit.py
     event_hub.start()          # background thread tailing the evt stream -> DB + WS
     scheduler.start()          # auto-ops: scheduled start + slot-open + slot assignment
     yield
@@ -469,6 +482,7 @@ async def lifespan(app: FastAPI):
     event_hub.close_subscribers()
     scheduler.stop()
     event_hub.stop()
+    audit_writer.stop()        # flushes whatever is still queued before the process goes away
     supervisor.shutdown_all()
 
 
@@ -531,35 +545,33 @@ async def _audit_middleware(request: Request, call_next):
     response = await call_next(request)
     if request.method in _AUDIT_METHODS and request.url.path not in _AUDIT_SKIP_PATHS:
         try:
-            # Resolve the session the same way FastAPI's Depends(get_db) would -- respecting
-            # app.dependency_overrides -- so tests (which override get_db onto an isolated
-            # in-memory SQLite session) don't leak audit rows into the real production DB.
-            db_factory = app.dependency_overrides.get(get_db, get_db)
-            gen = db_factory()
-            db = next(gen)
-            try:
-                actor = None
-                auth_header = request.headers.get("authorization", "")
-                if auth_header.lower().startswith("bearer "):
-                    data = try_decode(auth_header[7:])
-                    if data:
-                        u = db.get(M.User, data.get("sub"))
-                        actor = u.username if u else data.get("sub")
-                # action stays just the HTTP method (AuditRow.action is VARCHAR(64)); several
-                # routes' resolved paths (e.g. /bookings/{36-char-uuid}/fire-slot-open) exceed 64
-                # chars once a real id is substituted in, which would silently fail to audit those
-                # calls if the method were prefixed onto the path here. Full path -> target
-                # (VARCHAR(128), comfortably fits every route in this app).
-                db.add(M.AuditRow(
-                    actor=actor,
-                    action=request.method,
-                    target=request.url.path,
-                    ts=_now(),
-                    payload={"status": response.status_code, "ip": _client_ip(request)},
-                ))
-                db.commit()
-            finally:
-                gen.close()
+            # NO DB WORK HERE -- this runs on the asyncio event loop, and it runs while the
+            # handler's own Depends(get_db) connection is STILL checked out (FastAPI tears that
+            # down only after the response is fully sent). Doing a second checkout here, with
+            # synchronous SQLAlchemy, is what wedged the Hub solid on 2026-09-11: the loop parked
+            # in QueuePool._do_get, so no response could be sent, so the first connection was never
+            # released, so the pool never recovered. See apps/hub/audit.py for the full trace.
+            #
+            # try_decode is pure (no DB) -- the token subject is passed through and resolved to a
+            # username inside the writer thread, which is where that query belongs.
+            actor_sub = None
+            auth_header = request.headers.get("authorization", "")
+            if auth_header.lower().startswith("bearer "):
+                data = try_decode(auth_header[7:])
+                if data:
+                    actor_sub = data.get("sub")
+            # action stays just the HTTP method (AuditRow.action is VARCHAR(64)); several
+            # routes' resolved paths (e.g. /bookings/{36-char-uuid}/fire-slot-open) exceed 64
+            # chars once a real id is substituted in, which would silently fail to audit those
+            # calls if the method were prefixed onto the path here. Full path -> target
+            # (VARCHAR(128), comfortably fits every route in this app).
+            audit_writer.submit({
+                "_actor_sub": actor_sub,
+                "action": request.method,
+                "target": request.url.path,
+                "ts": _now(),
+                "payload": {"status": response.status_code, "ip": _client_ip(request)},
+            })
         except Exception:
             pass  # audit logging must never break the actual request
     return response
@@ -741,7 +753,7 @@ def settings_catalog(_v: Principal = Depends(require_viewer)) -> dict:
 
     The "booking" list is the one exception to "home layer only": it also includes settings whose
     home is elsewhere but that declare BOOKING as an override layer (currently just
-    HOLD_SWAP_AFTER_WARMUP, home=TEMPLATE) -- the Booking Settings tab needs the full set of what's
+    HOLD_SWAP_AFTER_LOGIN, home=TEMPLATE) -- the Booking Settings tab needs the full set of what's
     actually legal to set at BOOKING, not just what's homed there."""
     out: dict[str, list[dict]] = {}
     for layer in (L.GLOBAL, L.BOOKING, L.TEMPLATE):
@@ -983,7 +995,10 @@ def deny_handover(req_id: str, db: Session = Depends(get_db),
 @app.post("/sessions/{sid}/force-release")
 def force_release(sid: str, db: Session = Depends(get_db),
                   me: Principal = Depends(current_principal)) -> dict:
-    """Admin frees a stale operate seat."""
+    """Admin force-ends any session (view or operate, active or paused) -- e.g. a stale operate
+    seat, an unwanted extra viewer session, or an abandoned pending extra-session-request row.
+    Takes effect on the session's very next request (principal_from_token rejects on
+    status==ENDED, checked live on every call, not just at token-issue time)."""
     if me.user.role != UserRole.ADMIN:
         raise HTTPException(403, "only admin can force-release")
     s = db.get(M.UserSession, sid)
@@ -992,6 +1007,75 @@ def force_release(sid: str, db: Session = Depends(get_db),
     s.status = SessionStatus.ENDED
     db.commit()
     return {"status": "released", "session_id": sid}
+
+
+# ── Viewer extra-session request (1-active-session-per-viewer cap, operator spec 2026-09-10) ──
+@app.post("/sessions/extra-view/request")
+def request_extra_view_session(db: Session = Depends(get_db),
+                               me: Principal = Depends(current_principal)) -> dict:
+    """A viewer whose 2nd login got capped to PAUSED (see auth.open_session) asks an admin for a
+    second concurrent session. Must be called FROM the paused session itself -- that's the one
+    that gets promoted to ACTIVE on grant, not just any session of this user's."""
+    if me.user.role != UserRole.VIEWER:
+        raise HTTPException(403, "only a viewer can request an extra session")
+    if me.session.status != SessionStatus.PAUSED:
+        raise HTTPException(400, "only a paused (capped) session can request an extra session")
+    req = M.ExtraSessionRequest(paused_session_id=me.session.id, requester_user_id=me.user.id)
+    db.add(req)
+    db.commit()
+    db.refresh(req)
+    return {"status": "pending", "request_id": req.id}
+
+
+@app.get("/sessions/extra-view/pending")
+def list_pending_extra_view_requests(db: Session = Depends(get_db),
+                                     _op: Principal = Depends(require_admin)) -> list[dict]:
+    rows = db.scalars(
+        select(M.ExtraSessionRequest).where(M.ExtraSessionRequest.status == HandoverStatus.PENDING)
+    ).all()
+    out = []
+    for r in rows:
+        u = db.get(M.User, r.requester_user_id)
+        out.append({"request_id": r.id, "requester": u.username if u else None,
+                    "created_at": r.created_at.isoformat() if r.created_at else None})
+    return out
+
+
+@app.post("/sessions/extra-view/{req_id}/grant")
+def grant_extra_view_session(req_id: str, db: Session = Depends(get_db),
+                             _op: Principal = Depends(require_admin)) -> dict:
+    """Promotes the requester's PAUSED session to ACTIVE -- does NOT touch their existing active
+    session. Unlike operate-seat handover, this is additive (two concurrent active sessions),
+    never a transfer."""
+    req = db.get(M.ExtraSessionRequest, req_id)
+    if not req:
+        raise HTTPException(404, "request not found")
+    if req.status != HandoverStatus.PENDING:
+        raise HTTPException(409, f"request already {req.status}")
+    session = db.get(M.UserSession, req.paused_session_id)
+    if session:
+        session.status = SessionStatus.ACTIVE
+    req.status = HandoverStatus.GRANTED
+    db.commit()
+    return {"status": "granted", "session_id": req.paused_session_id}
+
+
+@app.post("/sessions/extra-view/{req_id}/deny")
+def deny_extra_view_session(req_id: str, db: Session = Depends(get_db),
+                            _op: Principal = Depends(require_admin)) -> dict:
+    """Denied means that login attempt is over, not left dangling as an unusable paused row
+    forever -- ends the paused session too, matching force-release's "clean, not orphaned" spirit."""
+    req = db.get(M.ExtraSessionRequest, req_id)
+    if not req:
+        raise HTTPException(404, "request not found")
+    if req.status != HandoverStatus.PENDING:
+        raise HTTPException(409, f"request already {req.status}")
+    session = db.get(M.UserSession, req.paused_session_id)
+    if session:
+        session.status = SessionStatus.ENDED
+    req.status = HandoverStatus.DENIED
+    db.commit()
+    return {"status": "denied"}
 
 
 # ── Identities ────────────────────────────────────────────────────────────────
@@ -1052,11 +1136,25 @@ def list_identities(db: Session = Depends(get_db),
     # 2026-08-19). They remain visible in their own right via /identities/booked.
     booked_ids = {i for (i,) in db.execute(
         select(M.BookedAppointment.identity_id).distinct()).all()}
+    # Readiness is answered HERE, from READY_SUB_ACCOUNT_STATUSES -- the same set the live launch
+    # gate enforces -- rather than left to the caller to infer from Identity.status. ACTIVE only
+    # means ">=1 sub-account row exists" (gen_subaccounts_bulk sets it at generation time), so the
+    # attach panel filtering on it offered identities that could not log in with anything. One
+    # grouped query, same round-trip budget as the allocation annotation above.
+    ready_counts = {
+        identity_id: n
+        for identity_id, n in db.execute(
+            select(M.SubAccount.identity_id, func.count())
+            .where(M.SubAccount.status.in_(list(READY_SUB_ACCOUNT_STATUSES)))
+            .group_by(M.SubAccount.identity_id)
+        ).all()
+    }
     out: list[IdentityOut] = []
     for ident in identities:
         if ident.id in booked_ids:
             continue
         row = IdentityOut.model_validate(ident)
+        row.ready_sub_accounts = ready_counts.get(ident.id, 0)
         booking = held.get(ident.id)
         if booking:
             row.allocated_booking_id, row.allocated_booking_name = booking
@@ -1209,6 +1307,24 @@ def delete_identity(identity_id: str, force: bool = False, db: Session = Depends
         # rows, and the event history. Without this, an identity whose sub-accounts were all burned
         # -- exactly the "no longer available" case -- could never be removed at all, because the
         # FK raised and the only advice was "archive it", which leaves it in the pool forever.
+        #
+        # registration_jobs hangs off SUB_ACCOUNTS, not the identity, and was missed here until
+        # 2026-09-17: a bulk delete of 359 identities died with
+        #   ForeignKeyViolation: ... "registration_jobs_sub_account_id_fkey"
+        # which surfaced in the dashboard as `Unexpected token 'I', "Internal S"... is not valid
+        # JSON` -- the 500-returns-HTML signature. It must be cleared BEFORE sub_accounts, hence
+        # its position in this sequence: the order of these deletes is load-bearing, child first.
+        #
+        # The full referencing set (from pg_constraint, not memory -- this is the second time a
+        # missed FK on registration_jobs has broken a delete path, after migration ci000droprot):
+        #   identities    <- booking_identities, identity_allocations, sub_accounts, workers,
+        #                    booked_appointments, identity_events
+        #   sub_accounts  <- registration_jobs, workers, booked_appointments, identity_events
+        # `workers` and `booked_appointments` are the two GUARDED above (refused, never cascaded);
+        # everything else is cleared here.
+        db.execute(delete(M.RegistrationJob).where(
+            M.RegistrationJob.sub_account_id.in_(
+                select(M.SubAccount.id).where(M.SubAccount.identity_id == identity_id))))
         for model, col in ((M.IdentityEvent, M.IdentityEvent.identity_id),
                            (M.IdentityAllocation, M.IdentityAllocation.identity_id),
                            (M.BookingIdentity, M.BookingIdentity.identity_id),
@@ -1240,7 +1356,40 @@ def bulk_delete_identities(body: IdentityBulkDelete, db: Session = Depends(get_d
             deleted.append(iid)
         except HTTPException as e:
             refused[iid] = str(e.detail)
+        except SQLAlchemyError as e:
+            # ANY database error must stay a per-id refusal, never a 500 for the whole batch.
+            # On 2026-09-17 a bulk delete of 359 identities hit an unhandled ForeignKeyViolation on
+            # the very first offender and returned an HTML 500 -- the dashboard rendered it as
+            # `Unexpected token 'I', "Internal S"... is not valid JSON`, which says nothing about
+            # what went wrong and loses the outcome of all 358 others. Catching only HTTPException
+            # meant this endpoint's whole promise ("reports per-id outcomes instead of failing on
+            # the first refusal") held only for refusals it had already thought of.
+            #
+            # The rollback is mandatory: after an IntegrityError the session is in a failed state
+            # and EVERY subsequent identity in the loop would error too, turning one bad row into a
+            # batch-wide failure.
+            db.rollback()
+            refused[iid] = f"{e.__class__.__name__}: {str(e.orig) if hasattr(e, 'orig') else e}"[:200]
     return IdentityBulkDeleteResult(deleted=deleted, refused=refused)
+
+
+@app.post("/identities/bulk-priority")
+def bulk_set_priority(body: IdentityBulkPriority, db: Session = Depends(get_db),
+                      _op: Principal = Depends(require_operator)) -> dict:
+    """Set the same priority on many identities at once -- the dashboard's per-row PATCH only
+    covers one identity, and re-prioritizing a batch (e.g. after a re-import dropped a group to
+    LOW, or before an attach panel run) one row at a time doesn't scale. Unknown ids are silently
+    skipped rather than raising, since a stale selection (a row deleted by someone else mid-edit)
+    should not block updating the rest."""
+    updated: list[str] = []
+    for iid in body.identity_ids:
+        ident = db.get(M.Identity, iid)
+        if not ident:
+            continue
+        ident.priority = int(body.priority)
+        updated.append(iid)
+    db.commit()
+    return {"updated": updated}
 
 
 @app.post("/identities/import", response_model=ImportResult)
@@ -1356,10 +1505,88 @@ def gen_test_identities(body: GenTestIdentities, db: Session = Depends(get_db),
 
 
 # ── Proxy pool (DB-backed) ────────────────────────────────────────────────────
+@app.get("/proxies/pools")
+def list_proxy_pools(db: Session = Depends(get_db),
+                     _v: Principal = Depends(require_viewer)) -> list[dict]:
+    """Aggregated pool summary -- a few hundred bytes instead of the whole table.
+
+    Exists because every consumer of the proxy list except the Proxies table itself only ever
+    wanted the DISTINCT POOLS: the left-hand pool tree, the booking proxy-pool picker, and the
+    worker-template picker each pulled all 42,600 rows to derive ~3 dropdown options. At 14.8 MB
+    and ~340k DOM nodes that made the pages unusable (measured 2026-09-15; the pool grew 2,600 ->
+    42,600 across 2026-08-21 and 09-03, so this degraded silently rather than breaking at once)."""
+    # Grouped by geo as well, because the registration page needs the geo options and a
+    # "how many would actually be leasable with this selection" count. Only 7 distinct geos exist,
+    # so this is ~24 rows -- still a few hundred bytes, and it means EVERY picker on every page can
+    # be served from this one endpoint instead of the full table.
+    # resource_type is in the grouping because the dashboard's pool pickers key off it: rotating
+    # pools are a fixed list built from SETTINGS (workers mint their own session ids since
+    # 2026-09-15 / ci000droprot), and only STATIC rows are offered from the table. Without this
+    # field the picker cannot tell the two apart and would double-list any pre-migration residue.
+    rows = db.execute(
+        select(M.Proxy.provider, M.Proxy.kind, M.Proxy.geo, M.Proxy.resource_type,
+               M.Proxy.pool_name,
+               func.count().label("total"),
+               func.count().filter(M.Proxy.active.is_(True)).label("active"),
+               func.count().filter(M.Proxy.is_healthy.is_(False)).label("unhealthy"),
+               func.count().filter(M.Proxy.active.is_(True),
+                                   M.Proxy.is_healthy.isnot(False)).label("leasable"))
+        .group_by(M.Proxy.provider, M.Proxy.kind, M.Proxy.geo, M.Proxy.resource_type,
+                  M.Proxy.pool_name)
+        .order_by(M.Proxy.provider, M.Proxy.kind, M.Proxy.geo)
+    ).all()
+    return [{"provider": r.provider, "kind": r.kind, "geo": r.geo,
+             "resource_type": r.resource_type, "pool_name": r.pool_name, "total": r.total,
+             "active": r.active, "unhealthy": r.unhealthy, "leasable": r.leasable} for r in rows]
+
+
+@app.get("/proxies/isp-pools")
+def list_isp_pools(db: Session = Depends(get_db),
+                   _v: Principal = Depends(require_viewer)) -> list[dict]:
+    """Named ISP pools with their usable capacity -- what the import form and the booking's
+    pool picker both read.
+
+    `leasable` is the number that matters and is the reason this is not just a DISTINCT on the
+    name: an ISP pool is FINITE, so the operator's real question when assigning pools to a booking
+    is "do these cover my worker count?". `total` alone would answer it wrongly the moment a row is
+    deactivated or condemned -- and unlike a rotating row, a condemned static row really is out of
+    service (D19/D33: health excludes static rows from selection, never rotating ones).
+
+    Unnamed rows (pool_name IS NULL) are reported under the name "" so the UI can show them without
+    a special case; they are legacy/ad-hoc imports and belong to no named pool.
+    """
+    rows = db.execute(
+        select(M.Proxy.pool_name, M.Proxy.provider,
+               func.count().label("total"),
+               func.count().filter(M.Proxy.active.is_(True),
+                                   M.Proxy.is_healthy.isnot(False)).label("leasable"))
+        .where(M.Proxy.resource_type == "static")
+        .group_by(M.Proxy.pool_name, M.Proxy.provider)
+        .order_by(M.Proxy.pool_name)
+    ).all()
+    return [{"pool_name": r.pool_name or "", "provider": r.provider,
+             "total": r.total, "leasable": r.leasable} for r in rows]
+
+
 @app.get("/proxies", response_model=list[ProxyOut])
-def list_proxies(db: Session = Depends(get_db),
+def list_proxies(provider: str | None = None, kind: str | None = None,
+                 limit: int = 100, offset: int = 0,
+                 db: Session = Depends(get_db),
                  _v: Principal = Depends(require_viewer)) -> list[M.Proxy]:
-    return list(db.scalars(select(M.Proxy).order_by(M.Proxy.created_at.desc())).all())
+    """PAGINATED and filterable since 2026-09-15. This used to return the entire table
+    unconditionally -- fine at the 2,000 rows it was written against, 14.8 MB and 1.41s per request
+    at 42,600. The dashboard cannot render that many rows, so an unbounded list endpoint was not a
+    performance nit but the reason the page stopped working. `limit` is hard-capped: a caller
+    asking for everything is the exact mistake this signature exists to prevent."""
+    limit = max(1, min(int(limit), 1000))
+    offset = max(0, int(offset))
+    q = select(M.Proxy)
+    if provider:
+        q = q.where(M.Proxy.provider == provider)
+    if kind:
+        q = q.where(M.Proxy.kind == kind)
+    q = q.order_by(M.Proxy.created_at.desc()).limit(limit).offset(offset)
+    return list(db.scalars(q).all())
 
 
 @app.post("/proxies", response_model=ProxyOut, status_code=201)
@@ -1367,7 +1594,8 @@ def create_proxy(body: ProxyCreate, db: Session = Depends(get_db),
                  _op: Principal = Depends(require_operator)) -> M.Proxy:
     p = M.Proxy(provider=body.provider, kind=body.kind, resource_type=body.resource_type,
                 endpoint=body.endpoint, credentials_ref=body.credentials_ref,
-                geo=parse_geo(body.credentials_ref), max_sessions=body.max_sessions, active=True)
+                geo=parse_geo(body.credentials_ref), max_sessions=body.max_sessions,
+                pool_name=(body.pool_name or "").strip() or None, active=True)
     db.add(p)
     db.commit()
     db.refresh(p)
@@ -1378,24 +1606,211 @@ def create_proxy(body: ProxyCreate, db: Session = Depends(get_db),
 def import_proxies(body: ProxyImport, db: Session = Depends(get_db),
                    _op: Principal = Depends(require_operator)) -> ImportResult:
     parsed, errors = parse_proxies(body.text)
+    # CREATE-OR-APPEND, with no create step: a pool IS the set of rows carrying its name, so
+    # importing under a new name creates it and importing under an existing one appends. Normalised
+    # (stripped, blank -> None) so " thordata " and "thordata" are the same pool rather than two
+    # that look identical in the picker.
+    pool_name = (body.pool_name or "").strip() or None
     # dedup on (endpoint, credentials_ref): SOAX shares one endpoint (proxy.soax.com:5000) across
     # many distinct session strings, so endpoint alone would collapse the whole pool to one row.
-    existing = {(e, c) for (e, c) in
-                db.execute(select(M.Proxy.endpoint, M.Proxy.credentials_ref)).all()}
+    #
+    # Deliberately GLOBAL, not per-pool: the same physical ISP proxy imported into two pools would
+    # be leased twice concurrently, and a static proxy's whole point is that one worker holds one
+    # IP. The duplicate is reported naming the pool that already has it, so an operator who pasted
+    # the wrong batch can tell what happened.
+    existing = {(e, c): p for (e, c, p) in
+                db.execute(select(M.Proxy.endpoint, M.Proxy.credentials_ref,
+                                  M.Proxy.pool_name)).all()}
     created = 0
     for pp in parsed:
         key = (pp.endpoint, pp.credentials_ref)
         if key in existing:
-            errors.append(f"skip duplicate {pp.endpoint}")
+            owner = existing[key]
+            errors.append(f"skip duplicate {pp.endpoint}"
+                          + (f" (already in pool '{owner}')" if owner else " (already imported)"))
             continue
         db.add(M.Proxy(provider=body.provider, kind=body.kind, resource_type=body.resource_type,
                        endpoint=pp.endpoint, credentials_ref=pp.credentials_ref,
                        geo=parse_geo(pp.credentials_ref), max_sessions=body.max_sessions,
-                       active=True))
-        existing.add(key)
+                       pool_name=pool_name, active=True))
+        existing[key] = pool_name
         created += 1
     db.commit()
     return ImportResult(created=created, errors=errors)
+
+
+# Bounded on purpose. Tier 2 launches a real Chromium per proxy, and an unbounded selection would
+# be an easy way for one dashboard click to exhaust the host -- which is the shape of the incident
+# that took the Hub down on 2026-09-15 (an inline probe saturating a 4-thread executor).
+_HEALTH_CHECK_MAX = 200
+_TIER1_PARALLEL = 16     # raw requests: cheap, network-bound
+_TIER2_PARALLEL = 4      # real browsers: each is a process, memory is the limit
+
+
+@app.post("/proxies/health-check")
+def proxies_health_check(body: ProxyHealthCheck, db: Session = Depends(get_db),
+                         _op: Principal = Depends(require_operator)) -> dict:
+    """Two-tier health check over the SELECTED proxies.
+
+      tier 1  raw request -> NEUTRAL url. "Can this proxy carry traffic at all?" This is the
+              liveness verdict: it writes is_healthy/health and it is what delete keys off.
+      tier 2  real browser -> the PORTAL. "Can this IP reach the portal right now?" Written to
+              portal_ok/portal_health and DIAGNOSTIC ONLY -- it never gates selection or deletion.
+
+    The split is not decoration. On 2026-08-28 a throttling portal flipped 4,489 rows to unhealthy
+    and stopped 73 of 120 workers launching; re-probed against a neutral url the same rows connected
+    20/20. A verdict that mixes the two records the portal, not the proxy -- and these rows are now
+    purchased IPs an operator can delete from this page.
+
+    Probes run OUTSIDE the DB session. This endpoint is sync, so FastAPI already runs it off the
+    event loop, but holding a pooled DB connection open across tens of seconds of browser work is
+    exactly what produced the audit deadlock: the connection is released before probing and
+    re-acquired to write.
+    """
+    ids = list(dict.fromkeys(body.ids or []))
+    if not ids:
+        raise HTTPException(400, "no proxies selected")
+    if len(ids) > _HEALTH_CHECK_MAX:
+        raise HTTPException(400, f"too many proxies selected ({len(ids)}); "
+                                 f"max {_HEALTH_CHECK_MAX} per run")
+
+    rows = db.scalars(select(M.Proxy).where(M.Proxy.id.in_(ids))).all()
+    if not rows:
+        raise HTTPException(404, "none of the selected proxies exist")
+    targets = [(p.id, conn_url(p)) for p in rows]
+    db.commit()          # release the connection before any probing -- see the docstring
+
+    from concurrent.futures import ThreadPoolExecutor
+    from libs.proxies.health import connectivity_probe, probe_tiers
+
+    want_portal = bool(body.portal)
+    workers = _TIER2_PARALLEL if want_portal else _TIER1_PARALLEL
+
+    def _one(item):
+        pid, url = item
+        try:
+            return pid, probe_tiers(url, want_portal=want_portal)
+        except Exception as e:      # a probe failure is a result, never a 500 for the whole batch
+            return pid, {"tier1_ok": False, "tier1_detail": f"probe error: {e}"[:160],
+                         "tier2_ok": None, "tier2_detail": None, "ok": False}
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        results = dict(pool.map(_one, targets))
+
+    now = datetime.now(timezone.utc)
+    dead = 0
+    for p in db.scalars(select(M.Proxy).where(M.Proxy.id.in_(list(results)))).all():
+        r = results[p.id]
+        apply_result(p, bool(r["ok"]), str(r["tier1_detail"]))
+        if r["tier2_ok"] is not None:
+            p.portal_ok = bool(r["tier2_ok"])
+            p.portal_health = str(r["tier2_detail"])[:160]
+        p.checked_at = now
+        if not r["ok"]:
+            dead += 1
+    db.commit()
+
+    return {
+        "checked": len(results),
+        "dead": dead,
+        "alive": len(results) - dead,
+        "portal_checked": sum(1 for r in results.values() if r["tier2_ok"] is not None),
+        "portal_ok": sum(1 for r in results.values() if r["tier2_ok"] is True),
+        "results": [{"id": pid, **r} for pid, r in results.items()],
+    }
+
+
+@app.post("/proxies/bulk-update", response_model=list[ProxyOut])
+def proxies_bulk_update(body: ProxyBulkUpdate, db: Session = Depends(get_db),
+                        _op: Principal = Depends(require_operator)) -> list[M.Proxy]:
+    """Change `max_sessions` and/or `pool_name` on the selected proxies.
+
+    These were settable at import and then frozen forever -- there was no endpoint to change either,
+    so a pool imported with the wrong capacity had to be deleted and re-imported, losing its health
+    history. `max_sessions` in particular is the pool's real capacity ceiling: on the 2026-09-16 run
+    seven ISP proxies at max_sessions=1 hit 7/7 concurrent leases and the two scouts were starved
+    out of the hold swap entirely, while the Hub reported only "no thordata proxy leased".
+
+    Deliberately narrow. Endpoint and credentials are NOT editable here: they identify the resource,
+    and rewriting them under a live lease would silently repoint a worker's exit mid-session.
+    """
+    ids = list(dict.fromkeys(body.ids or []))
+    if not ids:
+        raise HTTPException(400, "no proxies selected")
+    if body.max_sessions is None and body.pool_name is None:
+        raise HTTPException(400, "nothing to update")
+    if body.max_sessions is not None and body.max_sessions < 1:
+        raise HTTPException(400, "max_sessions must be >= 1")
+
+    rows = db.scalars(select(M.Proxy).where(M.Proxy.id.in_(ids))).all()
+    if not rows:
+        raise HTTPException(404, "none of the selected proxies exist")
+    for p in rows:
+        if body.max_sessions is not None:
+            p.max_sessions = body.max_sessions
+        if body.pool_name is not None:
+            # "" clears the pool name back to unnamed, which is a legitimate thing to want.
+            p.pool_name = body.pool_name.strip() or None
+    db.commit()
+    for p in rows:
+        db.refresh(p)
+    return rows
+
+
+@app.post("/proxies/bulk-delete")
+def proxies_bulk_delete(body: ProxyBulkDelete, db: Session = Depends(get_db),
+                        _op: Principal = Depends(require_operator)) -> dict:
+    """Delete selected proxies. Refuses anything still leased, and anything not actually dead.
+
+    TWO GUARDS, both learned the expensive way:
+
+    1. An ACTIVE LEASE blocks deletion. proxy_leases.proxy_id is a live FK, so deleting a leased row
+       raises a non-JSON 500 -- the exact failure the worker Detach button produced (F-detach), and
+       the same FK that made migration ci000droprot fail on its first run. Refusing with a readable
+       message beats discovering it as "Unexpected token I ... not valid JSON".
+
+    2. NOT-DEAD rows are refused unless `force`. Deletion is irreversible and an ISP proxy is a
+       purchased asset. "Dead" means TIER 1 failed -- the proxy cannot carry traffic. A tier-2
+       failure means the PORTAL was unreachable from this IP, which was simultaneously true of
+       4,489 healthy proxies on 2026-08-28; deleting on that signal would have destroyed the pool.
+       A row that has never been checked is also refused: absence of a verdict is not a verdict.
+    """
+    ids = list(dict.fromkeys(body.ids or []))
+    if not ids:
+        raise HTTPException(400, "no proxies selected")
+
+    rows = db.scalars(select(M.Proxy).where(M.Proxy.id.in_(ids))).all()
+    if not rows:
+        raise HTTPException(404, "none of the selected proxies exist")
+
+    leased = {pid for (pid,) in db.execute(
+        select(M.ProxyLease.proxy_id).where(M.ProxyLease.proxy_id.in_(ids),
+                                            M.ProxyLease.released_at.is_(None))).all()}
+
+    deleted, skipped = 0, []
+    for p in rows:
+        if p.id in leased:
+            skipped.append({"id": p.id, "endpoint": p.endpoint,
+                            "reason": "still leased by a running worker"})
+            continue
+        if not body.force:
+            # ORDER MATTERS. is_healthy defaults to True, so an unprobed row looks "alive" -- and
+            # reporting "tier 1 passed" about a proxy that was never probed states a verdict that
+            # does not exist. Check for the absence of a verdict FIRST.
+            if p.checked_at is None:
+                skipped.append({"id": p.id, "endpoint": p.endpoint,
+                                "reason": "never health-checked -- run a check first"})
+                continue
+            if p.is_healthy:
+                skipped.append({"id": p.id, "endpoint": p.endpoint,
+                                "reason": "tier 1 passed (proxy is alive) -- not dead"})
+                continue
+        # Released leases still reference the row; clear them before the parent goes.
+        db.execute(delete(M.ProxyLease).where(M.ProxyLease.proxy_id == p.id))
+        db.delete(p)
+        deleted += 1
+    db.commit()
+    return {"deleted": deleted, "skipped": skipped}
 
 
 @app.post("/proxies/{proxy_id}/toggle-active", response_model=ProxyOut)
@@ -1610,28 +2025,55 @@ def run_registration(body: RegistrationRunRequest, db: Session = Depends(get_db)
     # codebase that still excluded on it -- the booking path stopped doing so when the 639-row
     # false-condemnation incident was fixed, but registration kept the old filter and so kept
     # shrinking its own pool permanently, one transient failure at a time.
-    q = select(M.Proxy).where(M.Proxy.provider == body.provider, M.Proxy.active.is_(True))
-    if body.kind:
-        q = q.where(M.Proxy.kind == body.kind)
     geos = _geos(body.geos)
-    if geos:
-        # NULL geo is never excluded, exactly as in lease_proxy: a filter narrows the pool, it must
-        # not silently empty it for a provider whose credentials carry no country.
-        q = q.where(M.Proxy.geo.in_(geos) | M.Proxy.geo.is_(None))
-    # Already-used sessions first, LRU within that, never-touched sessions last. Mirrors
-    # lease_proxy's _candidate_query tiering fix (commit e327392): a provider like SOAX does not
-    # establish unlimited concurrent sticky sessions per package, so a virgin sessionid is far
-    # less likely to survive CapSolver's remote solve than one that has already been proven to
-    # connect. This path had no ordering at all until 2026-08-27's reg-82ed3ef705cb run showed a
-    # 0/268 CAPTCHA-solve rate (ERROR_CAPTCHA_SOLVE_FAILED / ERROR_PROXY_CONNECT_REFUSED only)
-    # against a soax/mobile pool where 94% of rows had never been used.
-    q = q.order_by(M.Proxy.last_used_at.asc().nullslast())
-    proxy_rows = list(db.scalars(q).all())
-    if not proxy_rows:
-        raise HTTPException(409, f"no active healthy {body.provider} proxies available"
-                                 + (f" (kind={body.kind})" if body.kind else "")
-                                 + (f" (geo={body.geos})" if body.geos else ""))
-    proxies = [{"id": p.id, "url": conn_url(p)} for p in proxy_rows]
+    if not _static_pool(body.kind):
+        # ROTATING: mint, don't query (D39/D40). This path was the last one still selecting rotating
+        # proxies from DB rows, and ci000droprot deleted those rows -- so registration failed with
+        # "409: no active healthy soax proxies available (kind=rotating)" against a perfectly
+        # working pool. Workers have minted their own since 2026-09-15; registration now does too.
+        #
+        # One fresh exit per CONCURRENT SLOT (and never fewer than one per sub-account):
+        # apps/registrar round-robins this
+        # list with itertools.cycle, so a list at least as long as the concurrency guarantees two
+        # simultaneous registrations never share an exit. Minting is free and unbounded, so there is
+        # no reason to be stingy -- but there is also no point minting hundreds that will never be
+        # used concurrently.
+        #
+        # `id` is None because there is no row: RegistrationJob.proxy_id is nullable and the
+        # registrar already writes None when a proxy entry carries none.
+        try:
+            n = max(1, int(body.concurrency or 1), len(subs))
+            proxies = [{"id": None,
+                        "url": mint_rotating_url(body.provider, body.kind,
+                                                 settings=get_global(db),
+                                                 geo=_pick_geo(geos))}
+                       for _ in range(n)]
+        except RotatingPoolError as e:
+            raise HTTPException(409, str(e))
+    else:
+        # STATIC/ISP: a finite pool of individually-owned IPs, still selected from rows. Read-only
+        # selection rather than a per-account lease -- ProxyLease.worker_id is a real FK to
+        # workers.id, which a registration run has none of.
+        # Filtered on KIND, not resource_type. The branch above already decided this is a static
+        # pool from `kind`, and adding a resource_type == 'static' filter here would disagree with
+        # that decision for any row imported with kind='static' but the API's default
+        # resource_type='rotating' -- a 409 that names the kind while a matching row sits in the
+        # table. Rotating rows no longer exist (ci000droprot), so the extra filter excluded nothing
+        # real and only created that inconsistency.
+        q = select(M.Proxy).where(M.Proxy.provider == body.provider,
+                                  M.Proxy.active.is_(True))
+        if body.kind:
+            q = q.where(M.Proxy.kind == body.kind)
+        if geos:
+            # NULL geo is never excluded: a filter narrows the pool, it must not silently empty it.
+            q = q.where(M.Proxy.geo.in_(geos) | M.Proxy.geo.is_(None))
+        q = q.order_by(M.Proxy.last_used_at.asc().nullslast())
+        proxy_rows = list(db.scalars(q).all())
+        if not proxy_rows:
+            raise HTTPException(409, f"no active {body.provider} static proxies available"
+                                     + (f" (kind={body.kind})" if body.kind else "")
+                                     + (f" (geo={body.geos})" if body.geos else ""))
+        proxies = [{"id": p.id, "url": conn_url(p)} for p in proxy_rows]
 
     g = get_global(db)
     capsolver_keys = [k.strip() for k in str(g.get("CAPSOLVER_KEYS", "")).split(",") if k.strip()]
@@ -1913,6 +2355,21 @@ def update_booking(booking_id: str, body: BookingUpdate, db: Session = Depends(g
             raise HTTPException(
                 409, f"cannot change posto while {running} worker(s) are RUNNING: they warmed "
                      f"against posto {bk.posto_id} and would keep booking it. Stop the booking first.")
+        # BLIND-MODE GUARD (confirmed incident 2026-09-21, booking "0921+5086"): the retirement below
+        # closes every AVAILABLE slot as "belonged to the old posto". That is right for a DISCOVERED
+        # pool -- a stale observation of a portal that moved on -- but a BLIND pool is an operator's
+        # deliberate, confirmed-by-eye seed for a SPECIFIC posto. Silently wiping it on a posto edit
+        # cost a whole seeding session with no warning. Refuse instead: the operator clears/re-seeds
+        # on purpose. (Discovered pools fall through and are retired exactly as before.)
+        if bool(_resolve_booking_setting(db, bk, "BLIND_APPLY_MODE", False)):
+            seeded = db.scalar(select(func.count()).select_from(M.Slot).where(
+                M.Slot.booking_id == bk.id, M.Slot.source == "blind",
+                M.Slot.status.notin_([SlotStatus.TAKEN, SlotStatus.CLOSED]))) or 0
+            if seeded:
+                raise HTTPException(
+                    409, f"cannot change posto: this blind-mode booking has {seeded} seeded slot(s) "
+                         f"for posto {bk.posto_id}. Changing posto would silently retire them. Clear "
+                         f"the pool (DELETE /bookings/{bk.id}/slots) and re-seed for the new posto.")
         stale = db.scalars(select(M.Slot).where(
             M.Slot.booking_id == bk.id,
             M.Slot.status.notin_([SlotStatus.TAKEN, SlotStatus.CLOSED]))).all()
@@ -1942,10 +2399,69 @@ def update_booking(booking_id: str, body: BookingUpdate, db: Session = Depends(g
     return bk
 
 
+# Statuses during which archiving is refused. SCHEDULED is in here deliberately: it is not running
+# YET, but the scheduler WILL start it at warmup_start_at, and a booking that is hidden from the
+# list while still auto-starting is the worst version of this feature -- a live run nobody can see.
+# DRAFT, STOPPED, COMPLETED and ABORTED are all archivable; STOPPED is resumable, so archiving one
+# costs nothing that unarchiving cannot restore.
+_LIVE_BOOKING_STATUSES = frozenset({
+    BookingStatus.SCHEDULED, BookingStatus.WARMING,
+    BookingStatus.ARMED, BookingStatus.RUNNING,
+})
+
+
 @app.get("/bookings", response_model=list[BookingOut])
-def list_bookings(db: Session = Depends(get_db),
+def list_bookings(include_archived: bool = False, db: Session = Depends(get_db),
                   _v: Principal = Depends(require_viewer)) -> list[M.Booking]:
-    return list(db.scalars(select(M.Booking).order_by(M.Booking.created_at.desc())).all())
+    """Bookings, newest first. Archived ones are HIDDEN unless asked for.
+
+    Defaulting to hidden is the whole point of the feature -- an operator who archives a finished
+    run expects it gone from the list -- but it also means any caller that needs the full set must
+    now say so. The dashboard's archived view passes include_archived=true.
+    """
+    q = select(M.Booking)
+    if not include_archived:
+        q = q.where(M.Booking.archived_at.is_(None))
+    return list(db.scalars(q.order_by(M.Booking.created_at.desc())).all())
+
+
+@app.post("/bookings/{booking_id}/archive", response_model=BookingOut)
+def archive_booking(booking_id: str, db: Session = Depends(get_db),
+                    _op: Principal = Depends(require_operator)) -> M.Booking:
+    """Hide a finished booking. Does NOT touch `status` -- that records how the run ended, and it is
+    the most useful thing about an old booking.
+
+    REFUSED WHILE THE BOOKING IS LIVE. Archiving is a visibility action, and hiding a booking that
+    still has workers running would make a live run invisible on the page an operator uses to watch
+    it -- with the scheduler still driving it, workers still holding proxies and sub-accounts, and
+    nothing on screen to say so. Stop it first; a STOPPED booking is resumable, so nothing is lost.
+    """
+    bk = db.get(M.Booking, booking_id)
+    if not bk:
+        raise HTTPException(404, "booking not found")
+    if bk.status in _LIVE_BOOKING_STATUSES:
+        raise HTTPException(409, f"booking is {bk.status} -- stop it before archiving "
+                                 f"(a stopped booking is resumable; archiving a live one would "
+                                 f"hide a run that is still going)")
+    if bk.archived_at is None:
+        bk.archived_at = _now()
+        db.commit()
+        db.refresh(bk)
+    return bk
+
+
+@app.post("/bookings/{booking_id}/unarchive", response_model=BookingOut)
+def unarchive_booking(booking_id: str, db: Session = Depends(get_db),
+                      _op: Principal = Depends(require_operator)) -> M.Booking:
+    """Bring an archived booking back into the default list. Idempotent."""
+    bk = db.get(M.Booking, booking_id)
+    if not bk:
+        raise HTTPException(404, "booking not found")
+    if bk.archived_at is not None:
+        bk.archived_at = None
+        db.commit()
+        db.refresh(bk)
+    return bk
 
 
 @app.get("/bookings/{booking_id}", response_model=BookingOut)
@@ -2266,28 +2782,33 @@ def _live_account(identity: M.Identity, sub_account: M.SubAccount) -> dict:
 
 
 def _rank_live_sub_accounts(db: Session, identity_id: str) -> list[M.SubAccount]:
-    """ALL usable (non-BURNED, non-RETIRED) sub-accounts for an identity, ranked best-first
-    (LOGIN_OK > HELD > VERIFIED > REGISTERED > NEW). The full ranked list -- not just the top pick --
-    is what LiveEngineOps.do_login() rotates through once its sticky-retry budget on the current
-    sub-account is exhausted (operator spec: sticky=2, rotating=number of subaccounts, e.g. a
-    3-subaccount identity gets up to 2x3=6 login attempts total, ported from storm-auto's confirmed
-    app/worker.py:323-326 sticky-then-rotate pattern). RETIRED is excluded on the exact same
-    reasoning as BURNED: an operator decided this account is not worth attempting again, and a
-    live login run must honour that, not silently fall back to it as a last resort."""
-    rank = {SubAccountStatus.LOGIN_OK: 0, SubAccountStatus.HELD: 1, SubAccountStatus.VERIFIED: 2,
-            SubAccountStatus.REGISTERED: 3, SubAccountStatus.NEW: 4}
+    """Every sub-account of `identity_id` that can actually attempt a live login, ranked best-first
+    (LOGIN_OK > HELD > VERIFIED). The full ranked list -- not just the top pick -- is what
+    LiveEngineOps.do_login() rotates through once its sticky-retry budget on the current sub-account
+    is exhausted (operator spec: sticky=2, rotating=number of subaccounts, e.g. a 3-subaccount
+    identity gets up to 2x3=6 login attempts total, ported from storm-auto's confirmed
+    app/worker.py:323-326 sticky-then-rotate pattern).
+
+    Membership is READY_SUB_ACCOUNT_STATUSES, defined once in libs.domain.enums -- do not re-spell
+    the set here or anywhere else. It excludes:
+      - BURNED / RETIRED: the portal (resp. an operator) already ruled this account out, and a live
+        run must honour that rather than silently falling back to it as a last resort;
+      - BOOKED: that account's mission is finished, and re-using it invites a second appointment for
+        a person who already has one;
+      - NEW / REGISTERED: never registered at the portal, or registered with an unconfirmed email.
+        These used to rank 4th and 3rd here, i.e. they WERE handed to a live worker once the
+        verified accounts ran out. There is no confirmed account behind those credentials, so the
+        login cannot succeed -- and every such rotation still spent a proxy lease, a CAPTCHA solve
+        and one slot of the login budget to learn nothing. Ranking a login that cannot succeed
+        below a real candidate is not a fallback, it is a slower failure.
+    """
+    rank = {SubAccountStatus.LOGIN_OK: 0, SubAccountStatus.HELD: 1, SubAccountStatus.VERIFIED: 2}
     candidates = list(db.scalars(
         select(M.SubAccount).where(M.SubAccount.identity_id == identity_id,
-                                   M.SubAccount.status.notin_(
-                                       [SubAccountStatus.BURNED, SubAccountStatus.RETIRED]))
+                                   M.SubAccount.status.in_(list(READY_SUB_ACCOUNT_STATUSES)))
     ).all())
     candidates.sort(key=lambda s: rank.get(s.status, 99))
     return candidates
-
-
-def _pick_live_sub_account(db: Session, identity_id: str) -> M.SubAccount | None:
-    candidates = _rank_live_sub_accounts(db, identity_id)
-    return candidates[0] if candidates else None
 
 
 def _static_pool(kind: str | None) -> bool:
@@ -2320,6 +2841,29 @@ def _geos(value) -> set[str] | None:
     """Parse a PROXY_GEOS setting ("DE,IT") into a set. Blank/absent -> None = no restriction."""
     parts = {g.strip().upper() for g in str(value or "").replace(";", ",").split(",") if g.strip()}
     return parts or None
+
+
+def _pools(value) -> set[str] | None:
+    """Parse a PROXY_POOLS setting ("thordata-oct,iproyal-a") into a set of NAMED ISP pools.
+
+    Blank/absent -> None = no restriction, which is what every booking predating named pools means.
+    Case is preserved (unlike _geos, which upper-cases): a pool name is an operator-chosen label
+    matched against what was typed at import, not a country code with a canonical form. Both sides
+    are .strip()ed at the boundary so trailing spaces cannot create a second pool that looks
+    identical in the picker.
+    """
+    parts = {p.strip() for p in str(value or "").replace(";", ",").split(",") if p.strip()}
+    return parts or None
+
+
+def _pick_geo(geos: set[str] | None) -> str | None:
+    """One country per minted credential, chosen uniformly from the allowed set.
+
+    Same rule lease_proxy applies internally (`random.choice(sorted(geos))`, lease.py:397) -- a
+    credential carries exactly one country, so a multi-geo setting means "spread the fleet across
+    these", not "each session may use any of them". Sorted before choosing so the draw does not
+    depend on set iteration order."""
+    return random.choice(sorted(geos)) if geos else None
 
 
 def _do_launch_worker(db: Session, w: M.Worker) -> None:
@@ -2382,39 +2926,62 @@ def _do_launch_worker(db: Session, w: M.Worker) -> None:
         ranked_subs = _rank_live_sub_accounts(db, w.identity_id) if identity else []
         sub_account = ranked_subs[0] if ranked_subs else None
         if identity is None or sub_account is None:
+            # THE enforcement point for sub-account readiness. The attach panel hides not-ready
+            # identities, but a UI filter is a convenience, never a guarantee -- attaching stays
+            # deliberately permissive (registration legitimately finishes after attach), so this is
+            # where an identity with nothing verified is stopped, before it costs a proxy lease and
+            # a CAPTCHA solve. The count is included because "no usable sub-account" on an identity
+            # that visibly HAS sub-accounts reads as a bug in the Hub rather than as work still
+            # owed to the registrar.
+            pending = db.scalar(select(func.count()).select_from(M.SubAccount).where(
+                M.SubAccount.identity_id == w.identity_id,
+                M.SubAccount.status.notin_(list(READY_SUB_ACCOUNT_STATUSES)))) or 0
             raise HTTPException(409, f"worker {w.id}: no usable sub-account for identity "
-                                     f"{w.identity_id} -- cannot launch in live mode")
+                                     f"{w.identity_id} -- none is verified yet "
+                                     f"({pending} not past registration/verification) -- "
+                                     f"cannot launch in live mode")
         # Stashed on the frozen settings blob (no dedicated column) so the Hub has a durable record
         # of which sub-account this worker used -- needed by the booked-PDF event handler
         # (events.py's _persist_booked_pdf) to fill BookedAppointment.sub_account_id.
         eff["_sub_account_id"] = sub_account.id
         w.sub_account_id = sub_account.id
-        try:
-            _prov = str(eff.get("PROXY_PROVIDER", "soax"))
-            _kind = eff.get("PROXY_KIND") or None
-            proxy, warm_proxy = lease_proxy(
-                db, w.id, provider=_prov,
-                # NO per-row health probe for a ROTATING pool. There is no row-level subject to
-                # screen: every row is a credential template and the exit is a session id we
-                # generate, measured at 100% survival to 60 min and 0% at 75 (CONFIRMED_FACTS §17).
-                # The probe was also a nav to the REAL PORTAL, so a throttle condemned the pool --
-                # 4,489 webshare rows flipped to is_healthy=False on 2026-08-28 and 73 of 120
-                # workers never launched. Re-checked against a neutral url on 2026-08-31: those
-                # condemned rows connected 20/20, identical to the healthy control.
-                #
-                # It also cost up to max_probes x ~20s of throwaway headless Chromium PER LAUNCH,
-                # inline -- the confirmed cause of the 2026-08-21 tick stall that stopped slot-open
-                # reaching the scouts of three live bookings.
-                #
-                # A dead EXIT is not knowable before use and is already handled after use by the
-                # worker's own _roll_exit (measured 25% -> 83% reachable, commit 6fa5899). A dead
-                # CREDENTIAL is knowable, and that is what provider_reachable checks below.
-                kind=_kind, health_check=(check_proxy if _static_pool(_kind) else None),
-                quick_screen=_screen_tier1(),
-                geos=_geos(eff.get("PROXY_GEOS")),
-            )
-        except ProxyLeaseError as e:
-            raise HTTPException(409, f"worker {w.id}: {e}")
+        _prov = str(eff.get("PROXY_PROVIDER", "soax"))
+        _kind = eff.get("PROXY_KIND") or None
+        if _static_pool(_kind):
+            # STATIC/ISP: a finite, individually-owned IP. It must be ASSIGNED by the one side with
+            # DB access, held under a lease so two workers never share it, and screened per row --
+            # a probe verdict here has a real subject. Unchanged.
+            try:
+                _proxy_row, warm_proxy = lease_proxy(
+                    db, w.id, provider=_prov, kind=_kind, health_check=check_proxy,
+                    quick_screen=_screen_tier1(), geos=_geos(eff.get("PROXY_GEOS")),
+                    pool_names=_pools(eff.get("PROXY_POOLS")),
+                    resource_type="static",
+                )
+            except ProxyLeaseError as e:
+                raise HTTPException(409, f"worker {w.id}: {e}")
+        else:
+            # ROTATING: MINTED, not leased (operator direction 2026-09-15). A rotating row was never
+            # a resource -- it was a pre-generated session-id string, and the system kept 42,600 of
+            # them behind a lease table, a health-scoring system and a tiered selection query.
+            # libs/proxies/lease.py:153 had already said so: "The session id is just a number we
+            # choose, so the supply of exits is effectively UNLIMITED and costs no Hub round-trip
+            # and no lease."
+            #
+            # What settled the one objection (the tier ordering preferring an "established" id):
+            # our own soax params are sessionlength=3600 / idlettl=900, and 0 of 42,600 rows had
+            # been used inside EITHER window. No pooled row held a live provider-side session, so
+            # there was no established-session advantage to lose. See libs/proxies/rotating.py.
+            try:
+                warm_proxy = mint_rotating_url(
+                    _prov, _kind, settings=get_global(db),
+                    geo=_pick_geo(_geos(eff.get("PROXY_GEOS"))),
+                )
+            except RotatingPoolError as e:
+                # 409, same shape a lease failure used: the operator has to go and configure the
+                # pool's package/password. Launching with a half-built credential would
+                # authenticate as nobody and read as a portal failure.
+                raise HTTPException(409, f"worker {w.id}: {e}")
 
         # Provider-level availability, ONCE per provider (cached), on a neutral url. This is the
         # only proxy-side failure a pre-lease check can honestly detect: a dead account, a suspended
@@ -2431,10 +2998,10 @@ def _do_launch_worker(db: Session, w: M.Worker) -> None:
             pass
 
         # Phase-2 (hold/apply/discovery) proxy, only leased when the swap is actually switched on
-        # (HOLD_SWAP_AFTER_WARMUP) -- a worker with swap off keeps its phase-1 proxy for the whole
+        # (HOLD_SWAP_AFTER_LOGIN) -- a worker with swap off keeps its phase-1 proxy for the whole
         # run, matching do_swap()'s off-by-default behavior in ops_live.py.
         hold_proxy = None
-        if bool(eff.get("HOLD_SWAP_AFTER_WARMUP", False)):
+        if bool(eff.get("HOLD_SWAP_AFTER_LOGIN", False)):
             # Phase 3 (D32): the post-swap pool must be static -- a rotating template's exit can
             # move underneath the swap for no reason related to holding, which is exactly the
             # instability the swap exists to move AWAY from. Reject before ever leasing anything
@@ -2456,7 +3023,7 @@ def _do_launch_worker(db: Session, w: M.Worker) -> None:
                 release_proxy(db, w.id)
                 raise HTTPException(
                     409,
-                    f"worker {w.id}: HOLD_SWAP_AFTER_WARMUP is on but the resolved post-swap pool "
+                    f"worker {w.id}: HOLD_SWAP_AFTER_LOGIN is on but the resolved post-swap pool "
                     f"(provider={hold_provider!r}"
                     f"{f', kind={hold_kind!r}' if hold_kind else ''}) has no active static "
                     f"resource -- the post-swap proxy must be a static/ISP resource, and none is "
@@ -2472,7 +3039,8 @@ def _do_launch_worker(db: Session, w: M.Worker) -> None:
                 _hold_proxy_row, hold_proxy = lease_proxy(
                     db, w.id, provider=str(eff.get("HOLD_PROXY_PROVIDER", "soax")),
                     kind=eff.get("HOLD_PROXY_KIND") or None, health_check=check_proxy, quick_screen=_screen_tier1(),
-                    geos=_geos(eff.get("HOLD_PROXY_GEOS")), resource_type="static",
+                    geos=_geos(eff.get("HOLD_PROXY_GEOS")),
+                    pool_names=_pools(eff.get("HOLD_PROXY_POOLS")), resource_type="static",
                 )
             except ProxyLeaseError as e:
                 # The phase-1 lease already succeeded -- release it, otherwise it's stranded (this
@@ -2480,7 +3048,7 @@ def _do_launch_worker(db: Session, w: M.Worker) -> None:
                 # workers -- would never release it either).
                 release_proxy(db, w.id)
                 raise HTTPException(
-                    409, f"worker {w.id}: HOLD_SWAP_AFTER_WARMUP is on but no hold proxy available: {e}"
+                    409, f"worker {w.id}: HOLD_SWAP_AFTER_LOGIN is on but no hold proxy available: {e}"
                 )
 
         quest_steps = get_config(db, "quest_steps", {}) or {}
@@ -2503,7 +3071,7 @@ def _do_launch_worker(db: Session, w: M.Worker) -> None:
             capsolver_keys=capsolver_keys,
             warm_proxy=warm_proxy,
             hold_proxy=hold_proxy,
-            # Phase 5: a hold_proxy is only ever leased inside the HOLD_SWAP_AFTER_WARMUP branch above,
+            # Phase 5: a hold_proxy is only ever leased inside the HOLD_SWAP_AFTER_LOGIN branch above,
             # and (as of this phase) is now always resource_type='static' when it is. Carrying this
             # one boolean fact -- not a Proxy row, not the DB's own vocabulary -- lets the worker
             # refuse to locally roll/transform it (D1: no DB access, no DB-shaped state; this is a
@@ -2556,9 +3124,9 @@ def _do_launch_worker(db: Session, w: M.Worker) -> None:
     # running concurrently on background threads (P4, _launch_worker_fleet, needed for the
     # live-proxy-lease health probe), the ordering inverted often enough to be common: the worker
     # process would race ahead, get several real status_change events applied by EventHub (up to and
-    # including HOLDING), and then THIS write would land late and stomp substate back to IDLE --
+    # including KEEPING), and then THIS write would land late and stomp substate back to IDLE --
     # permanently, if the worker had nothing further to report (already holding, no more events
-    # coming). That worker then became invisible to the scheduler's HOLDING-only assignment query
+    # coming). That worker then became invisible to the scheduler's KEEPING-only assignment query
     # despite genuinely holding, and the dashboard showed a stale substate that never matched reality
     # again. Fix: never write `substate` here at all -- the worker's own "started" event (handled by
     # EventHub, same as every subsequent transition) is the ONLY source of truth for substate, so
@@ -2749,10 +3317,98 @@ def fire_slot_found(booking_id: str, db: Session = Depends(get_db),
     return {"fired": True, "booking_status": str(bk.status)}
 
 
+@app.post("/bookings/{booking_id}/blind-apply")
+def blind_apply(booking_id: str, body: BlindApplyRequest, db: Session = Depends(get_db),
+                _op: Principal = Depends(require_operator)) -> dict:
+    """Seed the slot pool with a (date x period) grid so apply workers try the combinations
+    directly. Operator-only, and deliberately manual: for the moment the operator has confirmed
+    availability BY EYE on the portal and the system has found nothing.
+
+    HOW IT WORKS -- by reusing everything, not by adding a mode. Each combination becomes a Slot row
+    with source='blind', status AVAILABLE. From there the existing machinery runs unchanged:
+    _fire_slot_found_if_new fires on the next tick because an AVAILABLE row exists, apply workers
+    warm (mandatory, every round), _assign_slots hands out combinations with multi-capacity leasing,
+    a bounce releases the lease and the worker gets the next one, and a booking lands in
+    booked_appointments exactly as a discovered slot would. Three pieces treat a blind row
+    differently -- see the cm000 migration's docstring -- and that is the whole delta.
+
+    GUARDS. The booking must be RUNNING with slot-open fired: before that, apply workers are not
+    waiting for assignments. And unless `force`, there must be NO AVAILABLE discovered slot -- if
+    discovery is already producing, seeding phantoms on top only dilutes the pool.
+
+    Idempotent per (date, period): re-seeding skips combinations that already exist, so the button
+    can be pressed again to widen the grid without duplicating rows.
+    """
+    from libs.domain import blind as B
+    from libs.engine import pool_manager
+
+    bk = db.get(M.Booking, booking_id)
+    if not bk:
+        raise HTTPException(404, "booking not found")
+    blind_mode = bool(_resolve_booking_setting(db, bk, "BLIND_APPLY_MODE", False))
+    if blind_mode:
+        # BLIND-APPLY MODE seeds BEFORE the run: the grid is the booking's entire plan, so it is
+        # seeded while the booking is DRAFT/SCHEDULED/STOPPED (and may be topped up while RUNNING).
+        # Only a terminal booking is refused -- there is nothing left to apply against.
+        if bk.status in (BookingStatus.COMPLETED, BookingStatus.ABORTED):
+            raise HTTPException(409, f"booking is {bk.status} -- nothing left to run")
+    elif bk.status != BookingStatus.RUNNING or bk.slot_open_fired_at is None:
+        # Fallback (non-blind-mode) seeding happens mid-run, so it needs a live booking with
+        # slot-open already fired -- apply workers are not waiting for assignments before then.
+        hint = (" -- fire slot-open first, or set BLIND_APPLY_MODE to seed before starting"
+                if bk.status in (BookingStatus.WARMING, BookingStatus.ARMED,
+                                 BookingStatus.DRAFT, BookingStatus.SCHEDULED, BookingStatus.STOPPED)
+                else "")
+        raise HTTPException(409, f"booking is {bk.status} and slot-open has "
+                                 f"{'not ' if bk.slot_open_fired_at is None else ''}fired{hint}")
+
+    discovered_open = db.scalar(select(func.count()).select_from(M.Slot).where(
+        M.Slot.booking_id == bk.id, M.Slot.status == SlotStatus.AVAILABLE,
+        M.Slot.source != "blind")) or 0
+    if discovered_open and not body.force:
+        raise HTTPException(409, f"discovery already has {discovered_open} AVAILABLE slot(s) -- "
+                                 f"blind apply is for when it has none. Pass force=true to seed anyway.")
+
+    try:
+        dates = B.parse_dates(body.dates)
+        periods = B.parse_periods(body.periods)
+    except ValueError as e:
+        raise HTTPException(400, f"bad dates/periods: {e}")
+    if not dates:
+        start = str(_resolve_booking_setting(db, bk, "CAL_START_DATE", "") or "")
+        end = str(_resolve_booking_setting(db, bk, "CAL_END_DATE", "") or "")
+        if start and end:
+            dates = B.weekdays_between(start, end)
+        else:
+            dates = pool_manager.default_date_window(
+                start_date=start, end_date=end,
+                num_days=int(_resolve_booking_setting(db, bk, "CAL_NUM_DAYS", 20) or 20),
+                today=datetime.now(timezone.utc).date())
+    if not periods:
+        periods = B.default_blind_periods(bk.posto_id)
+    if not dates or not periods:
+        raise HTTPException(400, "nothing to seed: no dates or no periods")
+
+    existing = {(r.date, r.period) for r in db.scalars(select(M.Slot).where(
+        M.Slot.booking_id == bk.id)).all()}
+    now = datetime.now(timezone.utc)
+    seeded = []
+    for d, p in B.blind_grid(dates, periods):
+        if (d, p) in existing:
+            continue
+        db.add(M.Slot(booking_id=bk.id, posto_id=bk.posto_id, date=d, period=p,
+                      status=SlotStatus.AVAILABLE, source="blind",
+                      discovered_by=None, first_seen=now, last_seen=now))
+        seeded.append({"date": d, "period": p})
+    db.commit()
+    return {"seeded": len(seeded), "skipped_existing": len(dates) * len(periods) - len(seeded),
+            "dates": dates, "periods": periods, "slots": seeded}
+
+
 @app.post("/bookings/{booking_id}/self-scout")
 def force_self_scout(booking_id: str, db: Session = Depends(get_db),
                      _op: Principal = Depends(require_operator)) -> dict:
-    """Tell every HOLDING apply worker to start discovering slots itself, right now.
+    """Tell every KEEPING apply worker to start discovering slots itself, right now.
 
     The manual override for _maybe_self_scout, whose automatic gates are deliberately conservative:
     it fires only when no scout is in a scouting substate, only for ONE holding apply worker, and
@@ -2774,9 +3430,9 @@ def force_self_scout(booking_id: str, db: Session = Depends(get_db),
     holding = db.scalars(select(M.Worker).where(
         M.Worker.booking_id == bk.id, M.Worker.role == WorkerRole.APPLY,
         M.Worker.status == WorkerStatus.RUNNING,
-        M.Worker.substate == WorkerSubstate.HOLDING)).all()
+        M.Worker.substate == WorkerSubstate.KEEPING)).all()
     if not holding:
-        raise HTTPException(409, "no apply worker is HOLDING -- only a warmed, holding worker can "
+        raise HTTPException(409, "no apply worker is KEEPING -- only an authenticated, keeping worker can "
                                  "be told to self-scout")
     sent = []
     for w in holding:
@@ -3087,7 +3743,22 @@ if _DIST.is_dir():
         # 404 tells you the route is missing. 405 sends you looking for a bug that isn't there.
         if full_path.split("/", 1)[0] in _API_PREFIXES:
             raise HTTPException(404, f"no such API route: /{full_path}")
-        candidate = _DIST / full_path
-        if candidate.is_file():
+        # CONTAINMENT (2026-09-16). `full_path` is attacker-controlled and was joined onto _DIST
+        # and served with no check that the result stayed inside it. The path math is not subtle:
+        #
+        #     (_DIST / "../../../.env").resolve() == /srv/projects/storm-hub/.env   # is_file: True
+        #
+        # so any "../" reaching this line serves an arbitrary readable file -- .env (DATABASE_URL,
+        # SOAX_PASSWORD, WEBSHARE_PASSWORD), .git/config, anything. This Hub is internet-reachable
+        # and is actively scanned: the journal for 2026-09-16 alone shows GET /.env and
+        # GET /.git/config from three distinct external IPs. Those particular requests were
+        # harmless -- no traversal, so they fell through to index.html -- but they are exactly the
+        # probes that precede a traversal attempt, and a reverse proxy normalising dot segments is
+        # somebody else's configuration, not a guarantee this process may rely on.
+        #
+        # resolve() collapses ".." BEFORE the containment test, so an encoded, doubled or
+        # symlinked path cannot slip past it the way a string prefix check would.
+        candidate = (_DIST / full_path).resolve()
+        if candidate.is_file() and candidate.is_relative_to(_DIST.resolve()):
             return FileResponse(candidate)
         return FileResponse(_DIST / "index.html")

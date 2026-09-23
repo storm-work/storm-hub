@@ -226,7 +226,7 @@ def test_long_hold_then_slot_open_discovery_then_apply_books(env):
     ))
 
     # ── 1. LONG HOLD ─────────────────────────────────────────────────────────
-    assert _wait(lambda: _substate(Session, apply_id) == WorkerSubstate.HOLDING, pump=fleet), \
+    assert _wait(lambda: _substate(Session, apply_id) == WorkerSubstate.KEEPING, pump=fleet), \
         f"apply worker never reached HOLDING (got {_substate(Session, apply_id)})"
     for _ in range(25):                       # many scheduler ticks with no slot-open at all
         sched._tick_once()
@@ -287,7 +287,7 @@ def test_a_long_hold_does_not_consume_the_apply_workers_run(env):
     apply_ops = fleet.start(apply_id, _cfg("apply"), dict(
         assignment=None, apply_outcome="booked", stop_after_polls=200))
 
-    assert _wait(lambda: _substate(Session, apply_id) == WorkerSubstate.HOLDING, pump=fleet)
+    assert _wait(lambda: _substate(Session, apply_id) == WorkerSubstate.KEEPING, pump=fleet)
     for _ in range(40):
         fleet.pump()
         time.sleep(0.01)
@@ -393,7 +393,7 @@ def test_pipeline_runs_to_the_apply_boundary_and_stops_there(env):
         assignment=None, apply_outcome="booked", stop_after_polls=200,
     ))
 
-    assert _wait(lambda: _substate(Session, apply_id) == WorkerSubstate.HOLDING, pump=fleet)
+    assert _wait(lambda: _substate(Session, apply_id) == WorkerSubstate.KEEPING, pump=fleet)
 
     db = Session(); bk = db.get(M.Booking, bid)
     bk.status = BookingStatus.RUNNING; bk.slot_open_fired_at = _now()

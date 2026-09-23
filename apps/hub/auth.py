@@ -163,8 +163,12 @@ def active_operator(db: Session) -> M.UserSession | None:
 def open_session(db: Session, user: M.User, purpose: SessionPurpose) -> tuple[M.UserSession, str | None]:
     """Create a session for a login. Returns (session, notice).
 
-    View: always active. Operate: requires an operate-capable role; if the seat is taken it's created
-    PAUSED (notice names the current holder). The DB partial unique index is the final backstop.
+    View: always active, UNLESS the user is a VIEWER and already has an active VIEW session --
+    capped at 1 (per-user), created PAUSED with a notice past that; see /sessions/extra-view/*
+    for the request-an-extra-session flow. Operate: requires an operate-capable role; if the seat
+    is taken it's created PAUSED (notice names the current holder). The DB partial unique index is
+    the final backstop for operate (host-wide); the viewer cap has no DB-level backstop since it
+    must be exceedable by exactly one on admin grant.
     """
     now = datetime.now(timezone.utc)
     notice = None
@@ -181,7 +185,26 @@ def open_session(db: Session, user: M.User, purpose: SessionPurpose) -> tuple[M.
             # create paused to avoid collision, caller can reuse existing)
             status = SessionStatus.PAUSED
             notice = "you already hold an active operate session elsewhere"
+    elif user.role == UserRole.VIEWER:
+        # A viewer is capped at 1 active VIEW session (operator instruction, 2026-09-10) -- unlike
+        # the operate seat this is PER-USER, not host-wide, and unlike operate it's meant to be
+        # exceedable by exactly one on admin grant (see ExtraSessionRequest/POST
+        # /sessions/extra-view/*), which a static partial-unique index can't express (a granted
+        # extra session must coexist as a SECOND active row, not replace the first) -- so this is
+        # enforced here in Python, not via a DB constraint the way the operate seat is.
+        existing = db.scalars(select(M.UserSession).where(
+            M.UserSession.user_id == user.id,
+            M.UserSession.purpose == SessionPurpose.VIEW,
+            M.UserSession.status == SessionStatus.ACTIVE,
+        )).first()
+        if existing is not None:
+            status = SessionStatus.PAUSED
+            notice = "you already have an active session — request an extra session from an admin"
+        else:
+            status = SessionStatus.ACTIVE
     else:
+        # admin/operator choosing to log in with purpose=view (e.g. to see the read-only
+        # dashboard): unrestricted, unchanged -- the cap above is scoped to VIEWER specifically.
         status = SessionStatus.ACTIVE
 
     sess = M.UserSession(user_id=user.id, purpose=purpose, status=status, started_at=now, last_seen=now)

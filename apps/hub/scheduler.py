@@ -3,7 +3,7 @@
 A background thread ticks every few seconds and drives scheduled bookings with no operator input:
   - at warmup_start_at  -> START (launch all ready workers), booking -> WARMING
   - at slot_open_at      -> latch the slot-open signal (booking -> RUNNING)
-  - continuously          -> assign AVAILABLE pooled slots to HOLDING apply workers
+  - continuously          -> assign AVAILABLE pooled slots to KEEPING apply workers
   - continuously          -> booking-timeout, hold-respawn, dead/stall reap, self-scout fallback,
                              signal latch, scout task assignment (D1-D6)
 
@@ -75,7 +75,7 @@ _LAUNCH_BLOCKED_BOOKING_STATUSES = frozenset({
 LAUNCH_FAILED_PREFIX = "launch failed:"
 
 # Machine-readable marker on substate_detail, same convention as LAUNCH_FAILED_PREFIX above, for a
-# worker that is HOLDING but NOT BOOKABLE: its keepalive found the schedule anchor gone and the
+# worker that is KEEPING but NOT BOOKABLE: its keepalive found the schedule anchor gone and the
 # in-place re-warm failed to rebuild it.
 #
 # CONFIRMED LIVE 2026-08-21: 147 "form-state lapsed" against only 42 "re-warm restored" -- 110
@@ -85,7 +85,7 @@ LAUNCH_FAILED_PREFIX = "launch failed:"
 # ONLY as a log line: no substate, no detail, no counter. So the Hub counted these workers as ready
 # capacity, handed them slot leases the moment slot-open fired, and they bounced.
 #
-# The worker stays in HOLDING on purpose -- it is still authenticated, still keepalive-ing, and still
+# The worker stays in KEEPING on purpose -- it is still authenticated, still keepalive-ing, and still
 # recoverable in place, so neither FAILED (respawn: new proxy + new login) nor a transition-table
 # change is warranted. What changes is that _assign_slots stops treating it as leasable until a
 # re-warm actually succeeds and clears the marker.
@@ -129,7 +129,7 @@ _SELF_SCOUT_THROTTLE = 30.0    # seconds between apply-as-scout fallback trigger
 # guard only has to stop a scout that never gets started from looking productive.
 _SCOUTING_SUBSTATES = frozenset({
     WorkerSubstate.LOGGED_IN, WorkerSubstate.WARMING_UP, WorkerSubstate.WARMED,
-    WorkerSubstate.SWAPPED, WorkerSubstate.HOLDING, WorkerSubstate.DISCOVERING,
+    WorkerSubstate.SWAPPED, WorkerSubstate.KEEPING, WorkerSubstate.DISCOVERING,
     WorkerSubstate.POLLING,
 })
 
@@ -197,6 +197,13 @@ class Scheduler:
                         self._on_start(db, bk)
                     elif action == "slot_open":
                         self._fire_slot_open(db, bk, now)
+                # BLIND-APPLY MODE: no discovery, so nothing waits on a timer. The instant the
+                # booking is warming/armed, fire slot-open -> RUNNING; slot-found then fires off the
+                # seeded blind pool below and apply workers go straight to warmup -> apply.
+                if (bk.status in (BookingStatus.WARMING, BookingStatus.ARMED)
+                        and bk.slot_open_fired_at is None and self._is_blind_mode(db, bk)):
+                    self._fire_slot_open(db, bk, now)
+
                 self._maybe_prewarm(db, bk, now)
 
                 if self._settings_timeout_hours(db, bk) and should_timeout_booking(
@@ -210,6 +217,34 @@ class Scheduler:
                 if bk.status == BookingStatus.RUNNING:
                     self._reclaim_stale_slot_leases(db, bk, now)
                     self._fire_slot_found_if_new(db, bk, now)
+                    if self._is_blind_mode(db, bk):
+                        # Blind mode SUPPLEMENTS discovery, it does not replace it. A booking can carry
+                        # scouts alongside a seeded pool -- confirmed live 2026-09-21 "0921-3059": the
+                        # operator cleared the seed, attached 7 scouts, and restarted expecting a
+                        # discovery run, but this branch's old "skip all scout driving" left every
+                        # scout idle (warmed, awaiting a discover task that never came). So:
+                        #   - _assign_slots     hand any AVAILABLE slot (seeded OR scout-discovered)
+                        #                        to a KEEPING apply worker.
+                        #   - _drive_scouts      keep the scout fleet discovering; its finds become
+                        #                        AVAILABLE slots and fire slot_found via
+                        #                        _fire_slot_found_if_new above. A clean no-op when the
+                        #                        booking has no scouts, so pure-blind is unaffected.
+                        #   - _latch_signals     the ONLY per-tick delivery of slot_open/slot_found to
+                        #                        a worker that reached KEEPING after the broadcast --
+                        #                        without it, workers block in await_slot_open() forever
+                        #                        while holding a leased slot (confirmed live: 25 workers
+                        #                        KEEPING, 25 leases, 0 applies).
+                        #   - _hold_respawn      same as the non-blind tail.
+                        # What blind mode DOES skip: _maybe_inactivate_slot_open and
+                        # _maybe_revert_false_slot_found (both judge a DISCOVERED pool phantom and would
+                        # wrongly retire an operator-seeded one), and _maybe_self_scout (it turns a
+                        # holding APPLY worker into a discoverer, which is exactly wrong when apply
+                        # workers must work the seed).
+                        self._assign_slots(db, bk)
+                        self._drive_scouts(db, bk)
+                        self._latch_signals(db, bk, now)
+                        self._hold_respawn(db, bk, now)
+                        continue
                     if self._maybe_inactivate_slot_open(db, bk, now):
                         continue   # reverted to WARMING -- no discovery/assignment work this tick
                     if self._maybe_revert_false_slot_found(db, bk, now):
@@ -629,7 +664,7 @@ class Scheduler:
         self._last_self_scout[bk.id] = time.time()
         holding_apply = db.scalars(select(M.Worker).where(
             M.Worker.booking_id == bk.id, M.Worker.role == WorkerRole.APPLY,
-            M.Worker.status == WorkerStatus.RUNNING, M.Worker.substate == WorkerSubstate.HOLDING,
+            M.Worker.status == WorkerStatus.RUNNING, M.Worker.substate == WorkerSubstate.KEEPING,
         )).first()
         if holding_apply is None or self._bus is None:
             return
@@ -679,6 +714,9 @@ class Scheduler:
                     self._redis.sadd(key, w.id)
                     self._redis.expire(key, 86400)
 
+    def _is_blind_mode(self, db, bk: M.Booking) -> bool:
+        return bool(self._effective_booking_setting(db, bk, "BLIND_APPLY_MODE", False))
+
     def _fire_slot_open(self, db, bk: M.Booking, now: datetime) -> None:
         bk.slot_open_fired_at = bk.slot_open_fired_at or now
         db.commit()
@@ -711,6 +749,17 @@ class Scheduler:
         True if it reverted."""
         if bk.slot_found_fired_at is None:
             return False
+        # BLIND APPLY DISABLES THE AUTOMATIC REVERT. Once the operator has seeded blind slots they
+        # have taken manual control of the pool, so the "these look phantom, give up and go back to
+        # holding" heuristic must defer to that deliberate decision -- otherwise the revert, tripped
+        # by the ORIGINAL discovered slots' bounces, wipes the freshly-seeded blind grid at step 1
+        # (which closes every AVAILABLE/LEASED slot regardless of source), clears slot-found, and
+        # inactivates the fleet the operator just pointed at the grid. Blind slots retire
+        # individually via BLIND_MAX_BOUNCES; the operator stops the booking by hand. Confirmed as a
+        # gap 2026-09-20 while validating blind apply against the scout->fail->blind path.
+        if db.scalar(select(M.Slot.id).where(
+                M.Slot.booking_id == bk.id, M.Slot.source == "blind").limit(1)):
+            return False
         limit = int(self._effective_booking_setting(db, bk, "FALSE_SLOT_BOUNCE_LIMIT", 12))
         if limit <= 0:
             return False
@@ -726,6 +775,12 @@ class Scheduler:
             select(func.count(M.SlotLease.id))
             .join(M.Slot, M.SlotLease.slot_id == M.Slot.id)
             .where(M.Slot.booking_id == bk.id,
+                   # Blind slots are EXCLUDED. The operator seeded them on sight, so bounces off
+                   # them are expected -- most of a blind grid is phantom by construction -- and
+                   # not evidence that the pool is false. Counting them would wipe the pool after
+                   # a single sweep of a 9-combination grid at the default limit of 12. Blind slots
+                   # retire individually via BLIND_MAX_BOUNCES in events._release_slot_lease.
+                   M.Slot.source != "blind",
                    M.SlotLease.outcome == SlotLeaseOutcome.BOUNCED,
                    M.SlotLease.released_at.is_not(None),
                    M.SlotLease.released_at >= since)) or 0
@@ -858,9 +913,6 @@ class Scheduler:
             return
         bk.slot_found_fired_at = now
         db.commit()
-        state = self._scout_pools.get(bk.id)
-        if state is not None:
-            orchestration.on_slots_found(state)
 
     def fire_slot_found_manual(self, db, bk: M.Booking) -> None:
         """Operator-triggered override of _fire_slot_found_if_new -- skips the "is there actually an
@@ -871,41 +923,20 @@ class Scheduler:
         now = datetime.now(timezone.utc)
         bk.slot_found_fired_at = bk.slot_found_fired_at or now
         db.commit()
-        state = self._scout_pools.get(bk.id)
-        if state is not None:
-            orchestration.on_slots_found(state)
 
-    # ── D6: scout discovery orchestration (single-probe -> split-poll) ──────
+    # ── D6: scout discovery orchestration (round-robin full-range rotation) ──
     def _drive_scouts(self, db, bk: M.Booking, *, sample_dates: list[str] | None = None) -> None:
-        """Phase F2 (caught live in Phase E sim validation, not just designed on paper): never send
-        a scout another `discover` task while it still has an unconsumed one outstanding -- a scout
-        blocked on await_slot_open (or mid-scan) that gets re-sent the same task every tick is
-        exactly the confirmed 2026-08-07 bug's shape (unbounded command pileup in one worker's
-        stream), just in a different command type than the one it was originally caught in.
+        """Rotation model (operator redesign 2026-09-21, replaces the old single-probe/split-partition
+        scheme). ONE scout at a time runs a FULL-range discovery round; the Hub rotates round-robin
+        through the healthy scouts. Successive REAL rounds (ones that reached the portal) are spaced
+        DISCOVERY_MIN_INTERVAL apart, so with n healthy scouts a given scout is revisited ~MIN*n. A
+        FAILED round (dead session/nav error/empty report, or one that never reports within the hang
+        timeout) frees the scout immediately and advances the rotation with no pacing wait -- a bad
+        session never stalls the fleet, and when everyone is unhealthy the attempts just slide through
+        with no results. Identical before and after slot-found; the loop runs the whole booking.
 
-        Two DISTINCT participation models, corrected 2026-08-14 (the original 2026-08-13 version
-        wired DISCOVERY_MAX_PARALLEL as a hard split-mode cap -- confirmed wrong once the operator
-        clarified which knob belongs to which phase):
-
-        SINGLE mode (pre slot-found): only up to SCOUT_AWAKEN_LIMIT scouts are ever "awakened" into
-        the round-robin probe rotation (ensure_awakened) -- the rest stay parked in hold, untouched,
-        until slot-found. A dead awakened scout is replaced from the parked pool. Probes are also
-        PACED: at most one new probe per SINGLE_MODE_INTERVAL seconds fleet-wide, not one per
-        scheduler tick (5s) -- "if there are 10 scout workers ... 1 scout will retry discovery per
-        300s" only holds if the tick cadence itself doesn't dictate the pace.
-
-        SPLIT mode (post slot-found): the FULL date range is partitioned across the FULL scout
-        fleet -- every scout gets a persistent slice (poll_gap-spaced, driven by the scout's own
-        loop), nobody is benched. Execution is throttled instead: at most DISCOVERY_CONCURRENCY
-        scouts may have a discover round in flight at once (`state.busy_scouts`, tracked via
-        dates_reported completion -- NOT has_pending_commands, which acks the instant a scout READS
-        a command, long before do_discover() actually finishes, so it can't tell "sent" from "still
-        running"). A scout's slice survives a tick where it's throttled out -- it just waits its
-        turn in the rotation.
-
-        Dates are retired from a scout's slice after DATE_RETIRE_AFTER_MISSES consecutive empty
-        reports (0/off = never retire; see on_dates_reported/dates_to_retire) -- also corrected from
-        the original single-empty-report pruning."""
+        Phase F2 dedup still holds: a scout with an unconsumed command is not eligible this tick (a
+        re-sent `discover` piling up in one stream was the confirmed 2026-08-07 bug's shape)."""
         if self._bus is None:
             return
         scouts = db.scalars(select(M.Worker).where(
@@ -913,85 +944,57 @@ class Scheduler:
             M.Worker.status == WorkerStatus.RUNNING)).all()
         scout_ids = [s.id for s in scouts]
         state = self._scout_pools.setdefault(bk.id, orchestration.ScoutPoolState())
+        now = time.time()
 
-        if bk.slot_found_fired_at is not None and state.mode == "single":
-            orchestration.on_slots_found(state)
-
-        # A scout holding a persistent slice that's no longer RUNNING (dead/reaped/stopped) hands
-        # its remaining dates to the surviving/spare scouts -- "if one scout failed then replace it
-        # with another available one."
-        for dead_id in [sid for sid in list(state.remaining_by_scout) if sid not in scout_ids]:
-            orchestration.on_scout_died(state, dead_id, scout_ids)
-
-        # Retire confirmed-empty (multi-strike) dates out of each scout's own slice as scan results
-        # come in (never a 'failed'/unknown date -- bug fix #6). dates_reported events are buffered
-        # by EventHub (a different thread) and drained here each tick, matching last_seen/
-        # event_rate's existing "EventHub owns process-local advisory state, Scheduler polls it
-        # every tick" pattern. Also clears the reporting scout from `busy_scouts` (it just finished).
-        retire_after = 0
-        if bool(self._effective_booking_setting(db, bk, "DATE_RETIRE_ENABLED", True)):
-            retire_after = int(self._effective_booking_setting(db, bk, "DATE_RETIRE_AFTER_MISSES", 3))
+        # Drain finished rounds. dates_reported events are buffered by EventHub (a different thread)
+        # and drained here each tick -- each completes the reporting scout's round and records whether
+        # it reached the portal (paces the next dispatch) or not (frees the rotation to advance now).
         if self._event_hub is not None:
             for sid in scout_ids:
                 for outcomes in self._event_hub.pop_dates_reported(sid):
-                    orchestration.on_dates_reported(state, sid, outcomes, retire_after_misses=retire_after)
+                    orchestration.on_round_reported(state, sid, outcomes, now=now)
 
-        available = [sid for sid in scout_ids if not self._bus.has_pending_commands(sid)]
-        if not available:
+        # Healthy = RUNNING (query filter) and no unconsumed command outstanding (F2). A scout's
+        # availability is "restored right away" simply by having no benching state to clear -- the
+        # rotation never marks a scout unhealthy, it just skips whoever has a pending command.
+        healthy = [sid for sid in scout_ids if not self._bus.has_pending_commands(sid)]
+
+        min_interval = float(self._effective_booking_setting(db, bk, "DISCOVERY_MIN_INTERVAL", 30.0))
+        # A round that never reports (hung page, killed process mid-scan) must not wedge the single
+        # in-flight slot forever. Generous -- a real full-range round is many portal calls -- but
+        # finite: MIN plus a floor, so a genuine slow round is not reclaimed out from under itself.
+        hang_timeout = max(min_interval * 2.0, 180.0)
+        chosen = orchestration.plan_rotation_round(
+            state, healthy, now=now, min_interval=min_interval, hang_timeout=hang_timeout)
+        if chosen is None:
             return
 
-        # The booking's OWN discovery window. Confirmed live 2026-08-14: start/end were hardcoded
-        # empty with num_days=20, so CAL_START_DATE/CAL_END_DATE/CAL_NUM_DAYS -- which the operator
-        # sets per booking, which the resolver validates, and which EngineConfig.discovery faithfully
-        # parses -- were read by nothing on this path. A booking configured for 2026-09-01..09-20
-        # discovered 2026-08-28..09-11 instead: the default 20 weekdays from tomorrow, ignoring both
-        # ends of the window that was actually asked for.
+        # The booking's OWN discovery window -- the WHOLE thing every round (full discovery per scout,
+        # not a slice). CAL_START_DATE/CAL_END_DATE/CAL_NUM_DAYS, per booking; a bug in the old path
+        # once ignored both ends and scanned 20 default weekdays instead (confirmed live 2026-08-14).
         dates = sample_dates or pool_manager.default_date_window(
             start_date=str(self._effective_booking_setting(db, bk, "CAL_START_DATE", "") or ""),
             end_date=str(self._effective_booking_setting(db, bk, "CAL_END_DATE", "") or ""),
             num_days=int(self._effective_booking_setting(db, bk, "CAL_NUM_DAYS", 20) or 20),
             today=datetime.now(timezone.utc).date(),
         )
+        if not dates:
+            state.inflight = None   # nothing to scan -- don't hold the in-flight slot on an empty window
+            return
 
-        if state.mode == "single":
-            awaken_limit = int(self._effective_booking_setting(db, bk, "DISCOVERY_MAX_PARALLEL", 10))
-            orchestration.ensure_awakened(state, scout_ids, awaken_limit)
-            interval = float(self._effective_booking_setting(db, bk, "SINGLE_MODE_INTERVAL", 30.0))
-            if time.time() - state.last_single_probe_at < interval:
-                return
-            eligible = [sid for sid in available if sid in state.awakened_scouts]
-            tasks = orchestration.plan_initial_tasks(eligible, dates, state)
-            if tasks:
-                state.last_single_probe_at = time.time()
-        else:
-            if not state.remaining_by_scout:
-                # First tick in split mode (or a fresh Hub restart with no prior in-memory state,
-                # Phase F9) -- partition the FULL range across the FULL fleet once; every scout's
-                # slice is persistent from here on, not re-derived every tick. No participation cap
-                # here -- DISCOVERY_CONCURRENCY throttles EXECUTION below, not slice assignment.
-                chunks = pool_manager.partition_dates(dates, len(scout_ids))
-                state.remaining_by_scout = dict(zip(scout_ids, chunks))
-            concurrency = int(self._effective_booking_setting(db, bk, "DISCOVERY_CONCURRENCY", 5))
-            free = max(0, concurrency - len(state.busy_scouts))
-            eligible = [sid for sid in available if state.remaining_by_scout.get(sid)][:free]
-            tasks = {sid: state.remaining_by_scout[sid] for sid in eligible}
-            state.busy_scouts.update(tasks)
-
-        # Shared gettime cache (storm-auto's proven _gettime_cache pattern): if any scout in this
-        # booking already reported a still-fresh gettime fetch, hand it to every scout getting a
-        # discover command this tick instead of letting each independently re-fetch -- "in 300s only
-        # one gettime fetch will be done" (operator spec). Absent when nothing's cached yet (first
-        # round) or the cache has gone stale -- those scouts just fetch fresh as before.
+        # Shared gettime cache (storm-auto's proven _gettime_cache pattern): if a scout already
+        # reported a still-fresh gettime fetch, hand it to this round instead of re-fetching -- "in
+        # 300s only one gettime fetch will be done" (operator spec). Absent on the first round or once
+        # stale, in which case the scout fetches fresh.
         cached_special_days = None
-        if self._event_hub is not None and tasks:
+        if self._event_hub is not None:
             cache_secs = float(self._effective_booking_setting(db, bk, "GETTIME_CACHE_SECS", 300.0))
             cached_special_days = self._event_hub.get_gettime_cache(bk.id, cache_secs)
 
-        for worker_id, chunk in tasks.items():
-            if cached_special_days is not None:
-                self._bus.send_command(worker_id, "discover", dates=chunk, special_days=cached_special_days)
-            else:
-                self._bus.send_command(worker_id, "discover", dates=chunk)
+        if cached_special_days is not None:
+            self._bus.send_command(chosen, "discover", dates=dates, special_days=cached_special_days)
+        else:
+            self._bus.send_command(chosen, "discover", dates=dates)
 
     def _maybe_prewarm(self, db, bk: M.Booking, now: datetime) -> None:
         """Tell holding workers to re-warm shortly before a SCHEDULED slot-open.
@@ -1019,7 +1022,7 @@ class Scheduler:
         key = notified_key(bk.id, "prewarm")
         holding = db.scalars(select(M.Worker).where(
             M.Worker.booking_id == bk.id, M.Worker.status == WorkerStatus.RUNNING,
-            M.Worker.substate == WorkerSubstate.HOLDING)).all()
+            M.Worker.substate == WorkerSubstate.KEEPING)).all()
         sent = 0
         for w in holding:
             if self._redis is not None and self._redis.sismember(key, w.id):
@@ -1112,7 +1115,7 @@ class Scheduler:
 
     # ── assignment ─────────────────────────────────────────────────────────────
     def _assign_slots(self, db, bk: M.Booking) -> None:
-        """Same Phase F2 dedup as _drive_scouts: a HOLDING worker that was already sent an `assign`
+        """Same Phase F2 dedup as _drive_scouts: a KEEPING worker that was already sent an `assign`
         it hasn't processed yet (DB substate lags the worker's own real-time progress by up to one
         event round-trip) must never be handed a second, different slot in the meantime.
 
@@ -1184,7 +1187,7 @@ class Scheduler:
         holding = db.scalars(select(M.Worker).where(
             M.Worker.booking_id == bk.id, M.Worker.role == WorkerRole.APPLY,
             M.Worker.status == WorkerStatus.RUNNING,
-            M.Worker.substate == WorkerSubstate.HOLDING,
+            M.Worker.substate == WorkerSubstate.KEEPING,
             # A worker whose re-warm failed is holding but cannot book -- handing it a lease just
             # burns the slot's capacity on a guaranteed bounce. See NOT_BOOKABLE_PREFIX.
             or_(M.Worker.substate_detail.is_(None),
@@ -1195,7 +1198,7 @@ class Scheduler:
         # ONE active lease per worker (Phase F2's enforce_single_lease invariant, which was built
         # and unit-tested and then called from nowhere). Confirmed live 2026-08-14 on booking Test2:
         # ERNESTO PIRES alone accumulated 120 active leases -- 5 per slot across all 24 slots, the
-        # entire pool -- because a HOLDING worker with no pending command is re-assignable on EVERY
+        # entire pool -- because a KEEPING worker with no pending command is re-assignable on EVERY
         # 5s tick and nothing checked whether it already held one. Once the pool was consumed every
         # slot read LEASED, `avail` came back empty, and NO worker could be assigned again: the
         # booking deadlocked with one worker owning everything and nobody applying.

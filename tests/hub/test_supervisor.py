@@ -6,11 +6,12 @@ as dead even though they were perfectly healthy. Uses a real subprocess whose ar
 http.server, so this needs no apps.worker/Redis machinery) to exercise the actual /proc-scan fallback
 against a real, "foreign" (not-spawned-by-this-instance) process.
 """
+import os
 import subprocess
 import sys
 import time
 
-from apps.hub.supervisor import Supervisor, _find_pid_by_cmdline
+from apps.hub.supervisor import Supervisor, _alive, _find_pid_by_cmdline
 
 
 def _spawn_foreign(key: str) -> subprocess.Popen:
@@ -143,3 +144,106 @@ def test_worker_output_is_captured_to_a_log_file(tmp_path, monkeypatch):
         time.sleep(0.05)
     body = (tmp_path / "worker-w-abc.log").read_text()
     assert "apps.worker" in body and "w-abc" in body   # echo wrote the argv we passed
+
+
+# ── zombie reaping (confirmed live 2026-09-10: 13 accumulated) ────────────────────────────────
+# A worker that finishes ON ITS OWN (books, fails, crashes -- anything other than an explicit
+# stop() call) never went through the only code path that reaped a child (stop()'s proc.wait()).
+# These spawn a REAL child via Supervisor._spawn_module, unlike the reconcile-based tests above --
+# that makes THIS test process the real OS parent, exactly like production where the Hub process
+# is the real parent, so os.kill(pid, 0)'s zombie blind spot actually reproduces here.
+def _spawn_own_fast_exit(monkeypatch, key="z1"):
+    import apps.hub.supervisor as sup_mod
+    monkeypatch.setattr(sup_mod.sys, "executable", "/bin/echo")
+    s = sup_mod.Supervisor("redis://localhost:6379/0")
+    pid = s._spawn_module(key, "apps.worker")
+    return s, pid
+
+
+def _is_zombie(pid: int) -> bool:
+    with open(f"/proc/{pid}/status") as f:
+        return any(ln.startswith("State:") and "Z" in ln.split()[1] for ln in f)
+
+
+def test_alive_returns_false_for_an_unreaped_zombie(monkeypatch, tmp_path):
+    import apps.hub.supervisor as sup_mod
+    monkeypatch.setattr(sup_mod, "_LOG_DIR", tmp_path)
+    s, pid = _spawn_own_fast_exit(monkeypatch)
+    deadline = time.time() + 5   # /bin/echo exits almost instantly; wait for it to become Z
+    while not _is_zombie(pid) and time.time() < deadline:
+        time.sleep(0.05)
+    assert _is_zombie(pid), "child never reached zombie state -- test setup is unreliable"
+    assert _alive(pid) is False
+    os.waitpid(pid, 0)   # clean up -- this test process is the real parent
+
+
+def test_running_ids_no_longer_reports_a_naturally_finished_worker(monkeypatch, tmp_path):
+    """The actual regression pin: before this fix, a worker that exited on its own (never
+    stop()-ed) stayed in running_ids() forever, so the scheduler's dead-worker reaper could never
+    see it was gone."""
+    import apps.hub.supervisor as sup_mod
+    monkeypatch.setattr(sup_mod, "_LOG_DIR", tmp_path)
+    s, pid = _spawn_own_fast_exit(monkeypatch, key="z2")
+    deadline = time.time() + 5
+    while "z2" in s.running_ids() and time.time() < deadline:
+        time.sleep(0.05)
+    assert "z2" not in s.running_ids()
+    assert s.is_running("z2") is False
+
+
+def test_reap_finished_removes_the_popen_reference_after_natural_exit(monkeypatch, tmp_path):
+    import apps.hub.supervisor as sup_mod
+    monkeypatch.setattr(sup_mod, "_LOG_DIR", tmp_path)
+    s, pid = _spawn_own_fast_exit(monkeypatch, key="z3")
+    assert "z3" in s._procs
+    deadline = time.time() + 5
+    while "z3" in s._procs and time.time() < deadline:
+        s._reap_finished()
+        time.sleep(0.05)
+    assert "z3" not in s._procs   # reaped -- no lingering Popen/zombie reference
+
+
+def test_spawned_workers_get_unbuffered_stdout():
+    """A worker's log file is its ONLY diagnostic channel for the vendored engine's output -- the
+    portal's own words appear nowhere else (see _spawn_module's comment). Block-buffered stdout
+    silently withheld that for exactly the window in which it mattered.
+
+    MEASURED 2026-09-16, mid-run, while diagnosing five workers parked at LOGGED_IN: four of the
+    five log files held only the 204-byte launch banner after 12 minutes. The fifth was readable
+    only because it had overflowed the ~8KB buffer -- and that one carried the actual answer (the
+    portal's 'try again later' refusal). Direct A/B of the two spawn environments: 0 bytes on disk
+    after 5s buffered, 108 bytes unbuffered.
+
+    The sink is opened with buffering=0, but that covers only the PARENT's writes; the child's
+    stdout is a pipe-to-file, which CPython block-buffers whenever it is not a tty.
+
+    Asserts on the env actually handed to Popen, not on the source text -- a source-string check
+    passes just as happily against a comment that merely mentions the variable.
+    """
+    from apps.hub import supervisor as sup
+
+    captured = {}
+
+    class _FakeProc:
+        pid = 4242
+
+        def poll(self):
+            return None
+
+    def _spy(argv, **kw):
+        captured.update(kw)
+        return _FakeProc()
+
+    orig = sup.subprocess.Popen
+    sup.subprocess.Popen = _spy
+    try:
+        s = sup.Supervisor.__new__(sup.Supervisor)
+        s._procs, s._pids = {}, {}
+        s.redis_url = "redis://localhost:6379/0"
+        s._reap_finished = lambda: None
+        s._spawn_module("w-test-unbuffered", "apps.worker")
+    finally:
+        sup.subprocess.Popen = orig
+
+    assert captured["env"].get("PYTHONUNBUFFERED") == "1", (
+        "worker stdout must be unbuffered or its diagnostics are invisible while a run is live")

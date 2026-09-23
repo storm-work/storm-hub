@@ -225,7 +225,7 @@ def test_stop_worker_clears_the_in_flight_substate(client):
     bid, wid = _bk_with_worker(client, h)
     client.post(f"/bookings/{bid}/start", headers=h)
     _await_status(client, wid, WorkerStatus.RUNNING)
-    _force(client, wid, substate=WorkerSubstate.HOLDING)
+    _force(client, wid, substate=WorkerSubstate.KEEPING)
 
     client.post(f"/workers/{wid}/stop", headers=h)
 
@@ -253,7 +253,7 @@ def test_start_booking_requeue_clears_a_stale_substate(client):
     client.post(f"/bookings/{bid}/start", headers=h)
     _await_status(client, wid, WorkerStatus.RUNNING)
     client.post(f"/workers/{wid}/stop", headers=h)
-    _force(client, wid, status=WorkerStatus.FAILED, substate=WorkerSubstate.HOLDING)
+    _force(client, wid, status=WorkerStatus.FAILED, substate=WorkerSubstate.KEEPING)
 
     client.post(f"/bookings/{bid}/start", headers=h)
     _await_status(client, wid, WorkerStatus.RUNNING)   # requeued READY, then launched
@@ -476,12 +476,12 @@ def test_patch_settings_merges_instead_of_replacing(client):
     }, headers=h).json()["id"]
 
     r = client.patch(f"/bookings/{bid}/settings",
-                     json={"PROXY_PROVIDER": "soax", "HOLD_SWAP_AFTER_WARMUP": True}, headers=h)
+                     json={"PROXY_PROVIDER": "soax", "HOLD_SWAP_AFTER_LOGIN": True}, headers=h)
     assert r.status_code == 200
     got = r.json()["settings_json"]
     assert got["CAL_START_DATE"] == "2026-09-01"     # untouched by an unrelated panel
     assert got["CAL_END_DATE"] == "2026-09-20"
-    assert got["PROXY_PROVIDER"] == "soax" and got["HOLD_SWAP_AFTER_WARMUP"] is True
+    assert got["PROXY_PROVIDER"] == "soax" and got["HOLD_SWAP_AFTER_LOGIN"] is True
 
 
 def test_put_settings_still_replaces_wholesale(client):

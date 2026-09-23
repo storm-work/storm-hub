@@ -96,6 +96,18 @@ class IdentityOut(BaseModel):
     # panel that would have offered identities held by a stopped booking.) None means free.
     allocated_booking_id: str | None = None
     allocated_booking_name: str | None = None
+    # How many of this identity's sub-accounts are past the portal's email-verification step, i.e.
+    # could actually attempt a login (libs.domain.enums.READY_SUB_ACCOUNT_STATUSES). Computed by
+    # list_identities, never stored.
+    #
+    # This field exists because the attach panel used to answer that question CLIENT-SIDE, off
+    # `status == "active"` -- which per IdentityStatus's own definition only means ">=1 sub-account
+    # row exists", and gen_subaccounts_bulk sets it the instant sub-accounts are generated. So
+    # identities whose sub-accounts were all still NEW/REGISTERED were offered as attachable. The
+    # rule that decides this belongs on the server, next to the launch gate that enforces it, not
+    # re-derived in JSX from a status the server happens to expose. 0 means "nothing to log in with
+    # yet"; the launch gate 409s on exactly that condition.
+    ready_sub_accounts: int = 0
 
     model_config = {"from_attributes": True}
 
@@ -159,6 +171,10 @@ class BookingOut(BaseModel):
     slot_open_at: datetime | None = None
     settings_json: dict = Field(default_factory=dict)
     created_at: datetime | None = None
+    # Visibility flag, orthogonal to `status` -- see the Booking model. The dashboard hides archived
+    # bookings by default and needs this to render the Unarchive action, so it must be surfaced:
+    # a column written but never returned is the exact regression called out just below.
+    archived_at: datetime | None = None
     # Regression: these three DB columns existed and were written correctly, but were never
     # returned here -- the dashboard's Booking Overview panel read booking.slot_open_fired_at/
     # slot_found_fired_at expecting a real signal-fire display and silently got `undefined` every
@@ -202,8 +218,14 @@ class ProxyOut(BaseModel):
     # rotating (default) = session template, health never excludes it from selection (D19).
     # static = a finite resource; health DOES exclude it (Phase 3, libs/proxies/lease.py).
     resource_type: str = "rotating"
+    pool_name: str | None = None
     endpoint: str
     active: bool
+    # Tier 2 -- portal reachability. Separate from is_healthy/health (tier 1) on purpose; see the
+    # Proxy model. NULL means never portal-checked, which is NOT the same as "failed".
+    portal_ok: bool | None = None
+    portal_health: str | None = None
+    checked_at: datetime | None = None
     health: str | None = None
     # Surfaced so the Proxies page can show WHAT is condemned, not just how many. Whether a False
     # here actually removes the proxy from selection now depends on resource_type: never, for
@@ -222,6 +244,11 @@ class ProxyCreate(BaseModel):
     endpoint: str
     credentials_ref: str | None = None
     max_sessions: int = 2
+    # Named ISP pool. Present on BOTH create and import deliberately: a schema that accepts the
+    # field on one path and silently drops it on the other is the delivery gap this project keeps
+    # hitting -- the row is created, looks right in the table, and is then invisible to every
+    # booking that assigned the pool.
+    pool_name: str | None = None
 
 
 class ProxyImport(BaseModel):
@@ -229,7 +256,51 @@ class ProxyImport(BaseModel):
     kind: str = "mobile"
     resource_type: Literal["rotating", "static"] = "rotating"
     max_sessions: int = 2
+    # Named ISP pool to import into. Blank/None = unnamed, preserving the pre-2026-09-16 behaviour
+    # for any caller that does not care. A name that does not exist yet simply creates the pool --
+    # there is no separate create step, because a pool IS the set of rows carrying the name.
+    pool_name: str | None = None
     text: str                    # newline-separated proxy lines
+
+
+class ProxyHealthCheck(BaseModel):
+    ids: list[str]
+    # Run tier 2 (browser -> portal) as well as tier 1 (raw -> neutral url). Off by default: tier 2
+    # costs ~20-25s of Chromium per proxy against ~1s for tier 1, and tier 1 alone answers the
+    # question that matters for pool hygiene ("is this proxy dead").
+    portal: bool = False
+
+
+class ProxyBulkUpdate(BaseModel):
+    ids: list[str]
+    # Only the fields that are safe to change in bulk on a live pool. Credentials/endpoint are
+    # deliberately absent: those identify the resource, and editing them in bulk would silently
+    # repoint leases that workers are currently holding.
+    max_sessions: int | None = None
+    pool_name: str | None = None
+
+
+class ProxyBulkDelete(BaseModel):
+    ids: list[str]
+    # Delete rows whose TIER 1 has not actually failed. Off by default, and the refusal is the
+    # point: an ISP proxy is a purchased, individually-owned IP, and tier 2 failing means the
+    # PORTAL was unreachable from it -- which on 2026-08-28 was true of 4,489 perfectly good
+    # proxies at once. Without this gate a portal outage would present the whole pool as garbage.
+    force: bool = False
+
+
+class BlindApplyRequest(BaseModel):
+    """Seed the slot pool with a (date x period) grid for blind apply -- see libs/domain/blind.py.
+
+    Both lists default from the booking: dates from the CAL window, periods from the posto's proven
+    set. The operator normally narrows `dates` to what they actually saw on the portal's calendar.
+    """
+    dates: list[str] | str | None = None
+    periods: list[int] | str | None = None
+    # Seed even though discovery has AVAILABLE slots. Off by default: blind apply is for when the
+    # system sees nothing and the operator sees something, and seeding on top of real finds would
+    # dilute the pool with phantoms the fleet then spends attempts on.
+    force: bool = False
 
 
 class IdentityImport(BaseModel):
@@ -397,3 +468,11 @@ class IdentityBulkDelete(BaseModel):
 class IdentityBulkDeleteResult(BaseModel):
     deleted: list[str] = Field(default_factory=list)
     refused: dict[str, str] = Field(default_factory=dict)   # identity_id -> why
+
+
+class IdentityBulkPriority(BaseModel):
+    """Bulk override of the attach-panel selection preference. See libs/domain/priority.py for the
+    named levels (HIGH=200, NORMAL=100, LOW=0) -- any int is accepted, matching the single-identity
+    PATCH's own priority field."""
+    identity_ids: list[str]
+    priority: int

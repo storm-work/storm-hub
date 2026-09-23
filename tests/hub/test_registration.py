@@ -37,6 +37,19 @@ def client():
     app.dependency_overrides.clear()
 
 
+# Registration MINTS rotating proxies since 2026-09-17 (D39/D40), so these runs need pool
+# credentials exactly as a worker launch does. Fake values via monkeypatch, because tests/conftest.py
+# scrubs the ambient ones -- the suite must not depend on the developer's .env.
+@pytest.fixture(autouse=True)
+def _pool_credentials(monkeypatch):
+    monkeypatch.setenv("SOAX_ROTATING_PACKAGE", "352438")
+    monkeypatch.setenv("SOAX_ROTATING_PASSWORD", "test-rot-pw")
+    monkeypatch.setenv("SOAX_MOBILE_PACKAGE", "350716")
+    monkeypatch.setenv("SOAX_MOBILE_PASSWORD", "test-mob-pw")
+    monkeypatch.setenv("WEBSHARE_PREFIX", "sodade2026")
+    monkeypatch.setenv("WEBSHARE_PASSWORD", "test-ws-pw")
+
+
 def _op_headers(c, username="admin", password="pw"):
     c.post("/auth/bootstrap", json={"username": username, "password": password})
     r = c.post("/auth/login", json={"username": username, "password": password, "purpose": "operate"})
@@ -140,10 +153,23 @@ def test_retired_account_excluded_from_live_ranking(client):
     import apps.hub.main as hub_main
     from libs.db import models as M
 
+    from libs.domain.enums import SubAccountStatus
+    from sqlalchemy import select
+
     c, TestSession = client
     h = _op_headers(c)
     iid, subs = _make_identity_with_subs(c, h, n=2)
     retire_id = subs[0]["id"]
+    # Verify BOTH first: the ranking only ever considers verified-or-better accounts, so leaving
+    # them NEW would make this test pass for the wrong reason (nothing ranked, retired trivially
+    # absent). Verified-then-retired is the case the safety property is actually about.
+    db = TestSession()
+    try:
+        for sa in db.scalars(select(M.SubAccount).where(M.SubAccount.identity_id == iid)).all():
+            sa.status = SubAccountStatus.VERIFIED
+        db.commit()
+    finally:
+        db.close()
     c.post("/sub-accounts/retire", json={"sub_account_ids": [retire_id]}, headers=h)
 
     db = TestSession()
@@ -179,14 +205,19 @@ def test_run_registration_rejects_without_capsolver_keys(client):
     assert "CAPSOLVER" in r.json()["detail"]
 
 
-def test_run_registration_rejects_without_proxies(client):
+def test_run_registration_rejects_when_the_rotating_pool_is_unconfigured(client, monkeypatch):
+    """Was "rejects without proxies", meaning no DB rows. Rotating pools have no rows since
+    ci000droprot -- "unavailable" now means the pool's credentials are not configured, and the 409
+    has to name the env var so the operator knows what to set rather than hunting for proxies that
+    were never supposed to exist."""
     c, _ = client
     h = _op_headers(c)
+    monkeypatch.delenv("SOAX_ROTATING_PASSWORD", raising=False)
     _iid, subs = _make_identity_with_subs(c, h, n=1)
     c.put("/settings/global", json={"values": {"CAPSOLVER_KEYS": "key1"}}, headers=h)
     r = c.post("/registration/run", json={"sub_account_ids": [subs[0]["id"]]}, headers=h)
     assert r.status_code == 409
-    assert "proxies" in r.json()["detail"]
+    assert "SOAX_ROTATING_PASSWORD" in r.json()["detail"]
 
 
 def test_run_registration_creates_jobs_and_spawns(client):
@@ -252,7 +283,11 @@ def test_run_registration_sends_proxy_id_alongside_url(client, monkeypatch):
     the registrar only ever received bare proxy URL strings, with no DB id to report back. The launch
     payload must carry {id, url} pairs so apps/registrar can echo which proxy row it used in reg_result,
     and events.py's _persist_registration_result can attribute it on the job (see the paired test
-    below)."""
+    below).
+
+    Pinned to kind='static' since 2026-09-17: a ROW id only exists for a static/ISP proxy. Rotating
+    proxies are minted per run and have no row, so their entries carry id=None -- asserted by
+    test_registration_mints_rotating_proxies_instead_of_querying_rows below."""
     c, _ = client
     h = _op_headers(c)
     iid = c.post("/identities", json={"full_name": "Ana Silva", "type": "test"}, headers=h).json()["id"]
@@ -273,8 +308,8 @@ def test_run_registration_sends_proxy_id_alongside_url(client, monkeypatch):
 
     monkeypatch.setattr(hub_main._bus, "send_command", _spy)
 
-    r = c.post("/registration/run", json={"sub_account_ids": [sid]}, headers=h)
-    assert r.status_code == 200
+    r = c.post("/registration/run", json={"sub_account_ids": [sid], "kind": "static"}, headers=h)
+    assert r.status_code == 200, r.text
     assert captured["proxies"] == [{"id": pid, "url": "http://1.2.3.4:5000"}]
 
 
@@ -501,14 +536,15 @@ def test_registration_selects_proxies_by_provider_kind_and_geo(client):
     c.post("/identities/gen-subaccounts", json={"identity_ids": [iid], "count": 1}, headers=h)
     sid = c.get("/sub-accounts", headers=h).json()[0]["id"]
 
-    # a provider with no matching kind is refused, and says so
+    # ROW SELECTION now applies to STATIC pools only -- a rotating kind is minted and never
+    # consults the table, so these refusals are asserted with kind='static'.
     r = c.post("/registration/run",
-                    json={"sub_account_ids": [sid], "provider": "soax", "kind": "mobile"}, headers=h)
-    assert r.status_code == 409 and "kind=mobile" in r.json()["detail"]
+                    json={"sub_account_ids": [sid], "provider": "soax", "kind": "static"}, headers=h)
+    assert r.status_code == 409 and "kind=static" in r.json()["detail"]
 
     # a geo with no members is refused too
     r2 = c.post("/registration/run",
-                     json={"sub_account_ids": [sid], "provider": "soax_mobile", "kind": "mobile",
+                     json={"sub_account_ids": [sid], "provider": "soax_mobile", "kind": "static",
                            "geos": "PT"}, headers=h)
     assert r2.status_code == 409 and "geo=PT" in r2.json()["detail"]
 
@@ -565,3 +601,50 @@ def test_other_failures_are_not_treated_as_recaptcha():
     assert not is_recaptcha_rejection("error", "Foi encontrado um erro ao executar a operação.")
     assert not is_recaptcha_rejection("", "")
     assert not is_recaptcha_rejection("already_exists", "account exists")
+
+
+def test_registration_mints_rotating_proxies_instead_of_querying_rows(client, monkeypatch):
+    """THE 2026-09-17 FAILURE. Registration was the last path still selecting ROTATING proxies from
+    DB rows, and ci000droprot deleted those rows -- so it failed with
+
+        409: no active healthy soax proxies available (kind=rotating)
+
+    against a pool that was working perfectly for every worker on the host. Workers have minted
+    their own since 2026-09-15; registration now does too.
+
+    Asserts the three properties that matter: it does not consult the table (none exists here),
+    every entry is a real minted credential, and the exits are DISTINCT -- apps/registrar
+    round-robins this list with itertools.cycle, so duplicates would put concurrent registrations
+    on the same IP behind the same reCAPTCHA."""
+    c, _ = client
+    h = _op_headers(c)
+    iid = c.post("/identities", json={"full_name": "Mint One", "type": "test"},
+                 headers=h).json()["id"]
+    c.post("/identities/gen-subaccounts", json={"identity_ids": [iid], "count": 1}, headers=h)
+    sid = next(s["id"] for s in c.get("/sub-accounts", headers=h).json() if s["identity_id"] == iid)
+    c.put("/settings/global", json={"values": {"CAPSOLVER_KEYS": "key1"}}, headers=h)
+
+    assert c.get("/proxies?limit=10", headers=h).json() == [], "no rows -- the point of the test"
+
+    import apps.hub.main as hub_main
+    captured = {}
+    orig_send = hub_main._bus.send_command
+
+    def _spy(worker_id, type, **payload):
+        if type == "launch":
+            captured.update(payload)
+        return orig_send(worker_id, type, **payload)
+
+    monkeypatch.setattr(hub_main._bus, "send_command", _spy)
+
+    r = c.post("/registration/run",
+               json={"sub_account_ids": [sid], "provider": "soax", "kind": "rotating",
+                     "concurrency": 4}, headers=h)
+    assert r.status_code == 200, r.text
+
+    proxies = captured.get("proxies") or []
+    assert len(proxies) >= 4, f"one exit per concurrent slot expected, got {len(proxies)}"
+    assert all(p["id"] is None for p in proxies), "a minted proxy has no DB row"
+    assert all(p["url"].startswith("http://package-352438-") for p in proxies), proxies[:1]
+    assert all(p["url"].endswith("@proxy.soax.com:5000") for p in proxies), proxies[:1]
+    assert len({p["url"] for p in proxies}) == len(proxies), "exits must be distinct"

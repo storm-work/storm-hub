@@ -218,7 +218,7 @@ class EventHub:
         phase -- PROXY_PROVIDER/PROXY_KIND (the same settings _do_launch_worker's phase-1 lease
         uses) during "warmup", HOLD_PROXY_PROVIDER/HOLD_PROXY_KIND (its phase-2 lease settings)
         during "hold" -- with identical provider/kind/geo selection whether or not
-        HOLD_SWAP_AFTER_WARMUP is actually on (LiveEngineOps.do_swap() flips the worker's tracked
+        HOLD_SWAP_AFTER_LOGIN is actually on (LiveEngineOps.do_swap() flips the worker's tracked
         phase to "hold" unconditionally, per the operator's explicit requirement: "it will not be
         different when swap is off"). The worker process is deliberately DB-less (apps/worker/
         __main__.py's own constraint), so it can't lease a row itself -- this round-trips through the
@@ -228,7 +228,7 @@ class EventHub:
 
         Phase 5: settings resolution now includes the WORKER layer (matching _do_launch_worker), and
         a "hold" request additionally requires `resource_type='static'` on the lease whenever the
-        resolved HOLD_SWAP_AFTER_WARMUP is on -- mirroring _do_launch_worker's own launch-time
+        resolved HOLD_SWAP_AFTER_LOGIN is on -- mirroring _do_launch_worker's own launch-time
         requirement exactly, so the guarantee "the post-swap pool is static" survives every
         subsequent rotation, not just the worker's first hold-proxy assignment. No rotating fallback:
         if no static candidate exists, the request fails cleanly via `proxy_unavailable` (below) --
@@ -260,7 +260,8 @@ class EventHub:
 
         from .settings_store import get_global
 
-        hc = health_check if health_check is not None else check_proxy
+        # `hc` is resolved per-request BELOW, once the pool `kind` is known -- see the _static_pool
+        # gate at the lease call. Injected health_checks (tests) still win outright.
         # Tier 1 only when tier 2 is the real browser probe: a caller injecting a fake health_check
         # is describing a fake environment and must not get a real network call underneath it.
         _quick_screen = None      # DISABLED -- see lease_proxy's TIER 1 comment (it poisons the exit)
@@ -288,22 +289,58 @@ class EventHub:
             # rotation can silently hand back a rotating proxy for a pool that was static-only at
             # launch, defeating the guarantee _do_launch_worker enforces at the very first lease.
             # Matches _do_launch_worker's own gate (main.py) exactly.
-            hold_required = bool(eff.get("HOLD_SWAP_AFTER_WARMUP", False))
+            hold_required = bool(eff.get("HOLD_SWAP_AFTER_LOGIN", False))
             if phase == "hold":
                 provider = str(eff.get("HOLD_PROXY_PROVIDER", "soax"))
                 kind = eff.get("HOLD_PROXY_KIND") or None
                 geo_setting = eff.get("HOLD_PROXY_GEOS")
+                pool_setting = eff.get("HOLD_PROXY_POOLS")
                 resource_type = "static" if hold_required else None
             else:
                 provider = str(eff.get("PROXY_PROVIDER", "soax"))
                 kind = eff.get("PROXY_KIND") or None
                 geo_setting = eff.get("PROXY_GEOS")
+                pool_setting = eff.get("PROXY_POOLS")
                 resource_type = None
             # A rotation must honour the same geo restriction as the original lease -- otherwise the
             # first proxy failure quietly drops the worker back into the full pool, and the geos
             # that clear the login wall stop being the ones it uses.
-            from apps.hub.main import _geos
+            from apps.hub.main import _geos, _pools, _static_pool
             geos = _geos(geo_setting)
+            # Same reasoning as geos directly above: a rotation must stay inside the NAMED ISP pools
+            # the booking was assigned. Without this a worker that loses its static exit would be
+            # re-leased out of some other booking's purchase -- and an ISP proxy is a finite,
+            # individually-owned IP, so that is a real conflict, not just untidy accounting.
+            pool_names = _pools(pool_setting)
+
+            # STATIC ONLY (2026-09-15). A ROTATING pool has nothing to assign: the session id is a
+            # string the worker mints itself (libs/proxies/rotating.py), so a worker asking the Hub
+            # for one is asking for something that no longer exists on this side. Answer honestly
+            # rather than silently minting here -- a Hub-side mint would put the round-trip straight
+            # back, and the round-trip is what this change removes.
+            #
+            # WHY IT HAD TO GO, measured on booking 0911: worker 59df999b took 46s / 97s / 124s
+            # between emitting proxy_request and getting a usable exit. Workers emitted ~12.7
+            # requests/min against a 4-thread executor whose handler ran a ~25s browser probe per
+            # candidate -- ~2.6x oversubscribed, so every rotation got slower, and each slow
+            # rotation made a worker roll MORE exits and emit more requests. A feedback loop, on top
+            # of an already-degraded portal, right through slot-open.
+            # Two independent ways a request is legitimately STATIC, and both must pass the gate:
+            #   - `kind` names a static pool (PROXY_KIND / HOLD_PROXY_KIND = static|isp), or
+            #   - `resource_type == "static"`, which the hold phase sets from HOLD_SWAP_AFTER_LOGIN
+            #     REGARDLESS of kind -- a row can legitimately be kind='rotating' with
+            #     resource_type='static' (that is exactly what the static hold pool looks like, and
+            #     what test_handle_proxy_request_hold_succeeds_and_returns_static_when_available
+            #     seeds). Gating on `kind` alone would have refused every real static hold
+            #     assignment -- caught by that test.
+            if resource_type != "static" and not _static_pool(kind):
+                bus.send_command(
+                    worker_id, "proxy_unavailable",
+                    reason=(f"{provider}/{kind or 'rotating'} is a rotating pool -- workers mint "
+                            "their own session ids now (roll_sticky_session); the Hub assigns "
+                            "STATIC/ISP proxies only"))
+                return
+            hc = health_check if health_check is not None else check_proxy
 
             old_q = select(M.ProxyLease).join(M.Proxy, M.ProxyLease.proxy_id == M.Proxy.id).where(
                 M.ProxyLease.worker_id == worker_id, M.ProxyLease.released_at.is_(None),
@@ -317,12 +354,13 @@ class EventHub:
             try:
                 proxy, url = lease_proxy(db, worker_id, provider=provider, kind=kind,
                                          exclude_ids=old_proxy_ids, health_check=hc, quick_screen=_quick_screen,
-                                         geos=geos, resource_type=resource_type)
+                                         geos=geos, pool_names=pool_names,
+                                         resource_type=resource_type)
             except ProxyLeaseError:
                 try:
                     proxy, url = lease_proxy(db, worker_id, provider=provider, kind=kind,
                                              health_check=hc, quick_screen=_quick_screen, geos=geos,
-                                             resource_type=resource_type)
+                                             pool_names=pool_names, resource_type=resource_type)
                 except ProxyLeaseError as e:
                     detail = str(e)
                     if resource_type:
@@ -421,7 +459,7 @@ class EventHub:
         Without this a worker that keeps its warm session after a bounce (phases.py's apply loop)
         would also keep the lease, so _assign_slots' one-active-lease rule would never hand it
         another slot -- it would sit warm and idle until SLOT_LEASE_TTL reclaimed it minutes later."""
-        from sqlalchemy import select
+        from sqlalchemy import func, select
 
         from libs.domain.enums import SlotLeaseOutcome, SlotStatus
         db = SessionLocal()
@@ -441,9 +479,41 @@ class EventHub:
             for s in db.scalars(select(M.Slot).where(M.Slot.id.in_(slot_ids))).all():
                 if s.status == SlotStatus.LEASED:
                     s.status = SlotStatus.AVAILABLE   # freed a unit -- bookable again
+                # BLIND SLOT RETIREMENT. A discovered slot retires through the scouts' miss-count
+                # (dates_reported); a blind slot was never discovered, so nothing would ever retire
+                # it -- it would be reassigned and bounced off forever. Each BOUNCED release counts
+                # against it here, and past BLIND_MAX_BOUNCES it is CLOSED. form_stale/session
+                # releases do not count: those are about our session, not the combination.
+                if getattr(s, "source", "scout") == "blind" and reason not in ("form_stale", "session"):
+                    # A BOOKING IS PROOF THE COMBINATION IS REAL, so a bounce after one must never
+                    # retire it. Measured on Test 0919 (2026-09-19): 10-12 p3 booked at 23:23:46,
+                    # then three racing workers hit its remaining capacity, bounced, and drove
+                    # miss_count to 3 -- CLOSING a genuinely bookable slot mid-run. It cost nothing
+                    # there (capacity ~3, the booking already landed), but on a higher-capacity
+                    # posto with a fleet larger than the capacity it would retire real inventory
+                    # while units are still open. The miss count is meant to catch PHANTOM combos;
+                    # a slot that has produced a real appointment is by definition not one.
+                    already_booked = db.scalar(select(func.count()).select_from(M.BookedAppointment)
+                                               .where(M.BookedAppointment.slot_id == s.id)) or 0
+                    if already_booked:
+                        continue
+                    s.miss_count = (s.miss_count or 0) + 1
+                    limit = self._blind_max_bounces(db, s.booking_id)
+                    if limit > 0 and s.miss_count >= limit and s.status != SlotStatus.CLOSED:
+                        s.status = SlotStatus.CLOSED
+                        logger.info("blind slot %s %s/p%s CLOSED after %d bounce(s)",
+                                    s.id, s.date, s.period, s.miss_count)
             db.commit()
         finally:
             db.close()
+
+    @staticmethod
+    def _blind_max_bounces(db, booking_id: str) -> int:
+        from apps.hub.main import _resolve_booking_setting
+        bk = db.get(M.Booking, booking_id)
+        if bk is None:
+            return 3
+        return int(_resolve_booking_setting(db, bk, "BLIND_MAX_BOUNCES", 3) or 0)
 
     def _persist_booking(self, worker_id: str, slot: dict | None,
                          pdf_path: str | None = None) -> None:

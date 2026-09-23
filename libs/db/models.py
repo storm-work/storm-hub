@@ -63,6 +63,18 @@ class OpsHandoverRequest(Base, PKMixin, TimestampMixin):
     )
 
 
+class ExtraSessionRequest(Base, PKMixin, TimestampMixin):
+    """A viewer's request for a second concurrent VIEW session, past the 1-active-session-per-
+    viewer cap (apps/hub/auth.py's open_session()). Unlike OpsHandoverRequest, granting this does
+    NOT end any existing session -- the point is two concurrent ACTIVE sessions, not a transfer."""
+    __tablename__ = "extra_session_requests"
+    paused_session_id: Mapped[str] = mapped_column(ForeignKey("user_sessions.id"), nullable=False)
+    requester_user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False)
+    status: Mapped[E.HandoverStatus] = mapped_column(
+        _enum(E.HandoverStatus), nullable=False, default=E.HandoverStatus.PENDING
+    )
+
+
 # ── Identities & sub-accounts ─────────────────────────────────────────────────
 class Identity(Base, PKMixin, TimestampMixin):
     __tablename__ = "identities"
@@ -156,6 +168,23 @@ class Proxy(Base, PKMixin, TimestampMixin):
     # by geo (DE 23.7% / IT 23.4% ... CZ 2.9%, measured over 1392 real attempts), so this is the
     # single highest-leverage selector on the pool. NULL = unknown, never excluded by a filter.
     geo: Mapped[str | None] = mapped_column(String(8))
+    # Named ISP pool this row belongs to (migration cj000). One purchase = one name, e.g.
+    # "thordata-oct". NULL = unnamed, which is what every pre-cj000 row is and what a pool filter
+    # treats as belonging to no named pool. A pool is a NAME, not a table: importing under a new
+    # name creates the pool, importing under an existing one appends to it -- see the migration for
+    # why that beat a proxy_pools table. Meaningful only for resource_type='static'; rotating
+    # proxies have had no rows since ci000droprot.
+    pool_name: Mapped[str | None] = mapped_column(String(64), index=True)
+    # TIER 2 (migration ck000): can this IP reach the PORTAL? Diagnostic only -- deliberately not
+    # `is_healthy`, which is tier 1 (can the proxy carry traffic at all, probed against a neutral
+    # url) and is the only tier that gates selection or deletion. Keeping them apart is the
+    # 2026-08-28 lesson: 4,489 rows were condemned by a throttling portal and connected 20/20 when
+    # re-probed neutrally. NULL = never portal-checked.
+    portal_ok: Mapped[bool | None] = mapped_column(Boolean)
+    portal_health: Mapped[str | None] = mapped_column(String(160))
+    # When either tier last ran. NOT last_used_at -- that is the lease cursor, and stamping it from
+    # a manual probe would silently reorder the pool as a side effect of inspecting it.
+    checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class ProxyLease(Base, PKMixin, TimestampMixin):
@@ -184,6 +213,11 @@ class Booking(Base, PKMixin, TimestampMixin):
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     slot_open_fired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     slot_found_fired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Visibility only (migration cl000). Deliberately NOT a BookingStatus value: `status` records
+    # how the booking ENDED (COMPLETED with appointments reads very differently from STOPPED), and
+    # that is precisely what an operator browsing old runs wants to see. Archiving must hide a
+    # booking without rewriting its outcome. NULL = not archived.
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class BookingIdentity(Base, PKMixin):
@@ -264,6 +298,10 @@ class Slot(Base, PKMixin, TimestampMixin):
     )
     capacity_estimate: Mapped[int | None] = mapped_column(Integer)
     miss_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    # 'scout' = discovered by a scout's scan. 'blind' = operator-seeded for blind apply (migration
+    # cm000): a (date, period) the operator believes is open but discovery could not confirm. The
+    # apply machinery treats the two differently in three places -- see the migration's docstring.
+    source: Mapped[str] = mapped_column(String(16), default="scout", nullable=False)
     discovered_by: Mapped[str | None] = mapped_column(String(36))
     first_seen: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_seen: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

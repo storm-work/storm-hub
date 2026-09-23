@@ -60,9 +60,21 @@ def kill_tree(pid: int, *, grace: float = 5.0) -> None:
 def _alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
-        return True
     except (ProcessLookupError, PermissionError):
         return False
+    # os.kill(pid, 0) succeeds for a ZOMBIE too -- the PID slot exists until something wait()s on
+    # it. CONFIRMED LIVE 2026-09-10: 13 worker zombies had accumulated under the Hub's own PID,
+    # every one still reporting "alive" here, which made them invisible to running_ids()/
+    # is_running() and therefore to the scheduler's dead-worker reaper (_reap_dead_workers skips
+    # anything running_ids() claims is alive). Read /proc directly to tell a genuinely running
+    # process from an unreaped corpse.
+    try:
+        for line in Path(f"/proc/{pid}/status").read_text().splitlines():
+            if line.startswith("State:"):
+                return "Z" not in line.split()[1]
+    except OSError:
+        pass   # /proc unavailable or raced with the process exiting -- fail open, matches kill(0)
+    return True
 
 
 def _find_pid_by_cmdline(module: str, key: str) -> int | None:
@@ -117,6 +129,20 @@ class Supervisor:
         self._procs: dict[str, subprocess.Popen] = {}
         self._pids: dict[str, int] = {}
 
+    def _reap_finished(self) -> None:
+        """Non-blocking reap of any of THIS instance's own children that have already exited on
+        their own (never went through stop()) -- Popen.poll() calls waitpid(WNOHANG) internally
+        and permanently records the exit code once it succeeds, so this costs nothing when
+        nothing has exited and is safe to call as often as we like. Without it, a worker that
+        finishes naturally (books, fails, crashes -- anything other than an explicit stop() call)
+        leaked as a zombie forever; CONFIRMED LIVE 2026-09-10, 13 had accumulated. A pid known
+        only via reconcile() (self._pids but no self._procs entry) has no Popen here and isn't
+        this instance's to reap -- its real parent (or init) owns that, matching stop()'s own
+        existing distinction between owned and merely-tracked processes."""
+        for key, proc in list(self._procs.items()):
+            if proc.poll() is not None:
+                del self._procs[key]
+
     def spawn(self, worker_id: str) -> int:
         """Start the worker subprocess (idempotent — a live one is left running)."""
         return self._spawn_module(worker_id, "apps.worker")
@@ -127,10 +153,22 @@ class Supervisor:
         return self._spawn_module(run_id, "apps.registrar")
 
     def _spawn_module(self, key: str, module: str) -> int:
+        self._reap_finished()
         existing_pid = self._pids.get(key)
         if existing_pid is not None and _alive(existing_pid):
             return existing_pid
-        env = {**os.environ, "REDIS_URL": self.redis_url}
+        # PYTHONUNBUFFERED: the sink below is opened with buffering=0, but that only makes the
+        # PARENT's writes unbuffered -- the CHILD's stdout is a pipe-to-file, which CPython
+        # block-buffers at 4-8KB when it is not a tty. So a worker's diagnostics stayed invisible
+        # until it happened to produce 8KB of them.
+        #
+        # Measured on the 2026-09-16 run while diagnosing why five workers were parked at
+        # LOGGED_IN: four of the five logs held only the 204-byte launch banner after 12 minutes,
+        # and the fifth was readable ONLY because it had overflowed the buffer at ~12KB -- and that
+        # one turned out to carry the actual answer (the portal's own "try again later" refusal).
+        # The diagnostic value of these files is exactly the point of writing them (see the comment
+        # below), and buffering silently withheld it for the whole window in which it was useful.
+        env = {**os.environ, "REDIS_URL": self.redis_url, "PYTHONUNBUFFERED": "1"}
         # Worker stdout/stderr used to go to DEVNULL, which threw away every diagnostic the VENDORED
         # engine prints -- and those are the only place some of the portal's own words appear. When
         # browser_login bounces, session.py prints `[session] auth-redirect error: <the portal's own
@@ -204,10 +242,15 @@ class Supervisor:
         return True
 
     def is_running(self, worker_id: str) -> bool:
+        self._reap_finished()
         pid = self._pids.get(worker_id)
         return pid is not None and _alive(pid)
 
     def running_ids(self) -> list[str]:
+        # Called every scheduler tick (Scheduler._reap_dead_workers) -- this is where an own child
+        # that finished naturally actually gets reaped in steady-state production use, piggybacking
+        # on a cadence that already exists rather than adding a new one.
+        self._reap_finished()
         return [wid for wid, pid in self._pids.items() if _alive(pid)]
 
     def shutdown_all(self) -> None:

@@ -87,18 +87,16 @@ class ParsedIdentity:
     sub_accounts: list[ParsedSubAccount] = field(default_factory=list)
 
 
-# Nationality label -> ISO-ish code (extend as needed). Falls back to the raw value uppercased.
-_NATIONALITY_MAP = {
-    "CABO-VERDIANA": "CPV", "CABO VERDIANA": "CPV", "CAPE VERDEAN": "CPV",
-    "SENEGALAISE": "SEN", "SENEGALESE": "SEN",
-    "PORTUGUESA": "PRT", "BRASILEIRA": "BRA",
-}
+# Nationality demonym -> ISO alpha-3 lives in libs/domain/nationality.py now (the old five-entry map
+# with a truncating fallback silently stored `GUINEENS`/`GUINÉENN`/`GHANAIAN` as codes and failed
+# 100% of those registrations -- 2026-09-19). _map_nationality is kept as a thin wrapper only so the
+# tests that import it still resolve; the labeled/CSV parsers below now record a real error instead
+# of laundering an unknown value into a truncated code.
+from libs.domain.nationality import to_iso3
 
 
 def _map_nationality(v: str | None) -> str | None:
-    if not v:
-        return None
-    return _NATIONALITY_MAP.get(v.strip().upper(), v.strip().upper()[:8])
+    return to_iso3(v)[0]
 
 
 def _normalize_dob(v: str | None) -> str | None:
@@ -111,6 +109,39 @@ def _normalize_dob(v: str | None) -> str | None:
         d, mo, y = m.groups()
         return f"{y}-{mo}-{d}"
     return v
+
+
+# Real identities are REGISTERED and then BOOK a real appointment, so every field the portal's
+# registration form takes must be present and well-formed at import. The registrar silently defaults
+# a missing field (gender -> "M", bday -> "1985/01/01", nationality -> "PRT", traveldoc -> ""),
+# which then lands on a REAL person's appointment PDF -- a wrong birthdate on a government booking is
+# worse than a skipped row. Operator decision 2026-09-19: do not admit an incomplete real identity;
+# report the row instead. Test identities are synthetic (gen-test) and exempt.
+_ISO_DOB = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _validate_real_identity(pi: "ParsedIdentity") -> list[str]:
+    """Missing/invalid required fields for a REAL identity, as a list of human-readable reasons.
+    Empty list = complete. `nationality` is validated at its own call site (to_iso3), so a row that
+    reaches here already has a resolved code or was skipped."""
+    if pi.type != "real":
+        return []
+    missing = []
+    if not (pi.full_name or "").strip():
+        missing.append("name")
+    if not (pi.passport_no or "").strip():
+        missing.append("passport number")
+    if not (pi.birthdate or "").strip():
+        missing.append("date of birth")
+    elif not _ISO_DOB.match(pi.birthdate.strip()):
+        # _normalize_dob already turned DD-MM-YYYY into ISO; anything still non-ISO is unparseable
+        # OCR (e.g. "3O-11-2OO9" with letter O for zero) and would be sent to the portal verbatim.
+        missing.append(f"date of birth is not a valid date ({pi.birthdate!r})")
+    if not (pi.gender or "").strip():
+        missing.append("gender")
+    if not (pi.nationality or "").strip():
+        missing.append("nationality")
+    return missing
 
 
 def parse_identities_labeled(text: str, *, default_type: str = "real") -> tuple[list[ParsedIdentity], list[str]]:
@@ -143,14 +174,27 @@ def parse_identities_labeled(text: str, *, default_type: str = "real") -> tuple[
             continue
         name = " ".join(x for x in (first, last) if x)
         passport = fields.get("passport number")
-        out.append(ParsedIdentity(
+        nat_code, nat_err = to_iso3(fields.get("nationality"))
+        if nat_err:
+            # Name the person, not the row number -- an OCR batch has no stable row order and the
+            # operator's next action is to look up that passport. A wrong code fails every
+            # registration for this identity (measured), so this is a hard skip, not a warning.
+            errors.append(f"{name}: {nat_err} -- SKIPPED")
+            continue
+        pi = ParsedIdentity(
             full_name=name,
             type=default_type,
             birthdate=_normalize_dob(fields.get("date of birth")),
             passport_no=passport or None,
             gender=(fields.get("gender") or None),
-            nationality=_map_nationality(fields.get("nationality")),
-        ))
+            nationality=nat_code,
+        )
+        incomplete = _validate_real_identity(pi)
+        if incomplete:
+            errors.append(f"{name} ({passport or 'no passport'}): missing/invalid "
+                          f"{', '.join(incomplete)} -- SKIPPED")
+            continue
+        out.append(pi)
     if not out:
         errors.append("no labeled identity records found")
     return out, errors
@@ -203,13 +247,17 @@ def parse_identities_csv(text: str, *, default_type: str = "test") -> tuple[list
         if typ not in ("test", "real"):
             typ = default_type
         if ident_key not in groups:
+            nat_code, nat_err = to_iso3(_first(row, "nationality"))
+            if nat_err:
+                errors.append(f"row {i} ({name}): {nat_err} -- SKIPPED")
+                continue
             groups[ident_key] = ParsedIdentity(
                 full_name=name,
                 type=typ,
-                birthdate=_first(row, "birthdate", "bd"),
+                birthdate=_normalize_dob(_first(row, "birthdate", "bd")),
                 passport_no=_first(row, "passport_no", "traveldoc", "passport"),
                 gender=_first(row, "gender"),
-                nationality=_first(row, "nationality"),
+                nationality=nat_code,
             )
             order.append(ident_key)
         username = _first(row, "username", "user")
@@ -221,4 +269,16 @@ def parse_identities_csv(text: str, *, default_type: str = "test") -> tuple[list
                 email_pass=_first(row, "email_pass", "emailpass"),
                 status=(_first(row, "status") or "new"),
             ))
-    return [groups[k] for k in order], errors
+    # Validate AFTER grouping: a real identity's fields come from its first row, but sub-account
+    # rows can follow, so an incomplete real identity is skipped-and-reported here rather than at
+    # creation (skipping mid-stream would orphan its later sub-account rows into a fresh group).
+    out = []
+    for k in order:
+        pi = groups[k]
+        incomplete = _validate_real_identity(pi)
+        if incomplete:
+            errors.append(f"{pi.full_name} ({pi.passport_no or 'no passport'}): missing/invalid "
+                          f"{', '.join(incomplete)} -- SKIPPED")
+            continue
+        out.append(pi)
+    return out, errors

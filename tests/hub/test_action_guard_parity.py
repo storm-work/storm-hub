@@ -232,6 +232,9 @@ def test_clear_checkpoint_404s_on_an_unknown_worker(client):
     assert client.delete("/workers/does-not-exist/checkpoint", headers=h).status_code == 404
 
 
+from pathlib import Path
+
+
 # ── an API path must 404, never fall through to the SPA (2026-08-21) ────────
 def test_unknown_api_path_404s_instead_of_serving_the_dashboard(client):
     """The SPA catch-all is GET-only, so an API route the server does not have answered
@@ -253,6 +256,37 @@ def test_a_real_spa_route_still_serves_the_dashboard(client):
     assert r.status_code in (200, 404)      # 200 with dist built, 404 when it is not
     if r.status_code == 200:
         assert "<" in r.text                # index.html, not JSON
+
+
+def test_the_spa_fallback_cannot_be_walked_out_of_the_dist_directory():
+    """CONFIRMED REACHABLE BY PATH MATH 2026-09-16: the fallback joined an attacker-controlled path
+    onto _DIST and served the result with no containment check --
+
+        (_DIST / "../../../.env").resolve() == <repo>/.env      # is_file() -> True
+
+    -- so any "../" arriving in `full_path` served an arbitrary readable file: .env (DATABASE_URL,
+    SOAX_PASSWORD, WEBSHARE_PASSWORD), .git/config, anything the process can read. This Hub is
+    internet-facing and actively scanned; the journal for 2026-09-16 alone shows GET /.env and
+    GET /.git/config from three external IPs. Those were harmless -- no traversal, so index.html
+    came back -- but they are the probe that precedes the real attempt.
+
+    CALLED DIRECTLY, not through TestClient, and that is the point. Routing the probe through the
+    client passes with the fix REVERTED, because httpx normalises "../" out of the URL before it is
+    sent -- so a client-driven test proves nothing about this code. (It is also why the bug is not
+    trivially exploitable: nginx and most clients normalise too. It is reachable by anything that
+    does not, which is not a property this process may assume of whatever sits in front of it.)
+    Verified by neutralisation: revert the containment check and this test fails."""
+    from apps.hub.main import _DIST, _spa_fallback
+
+    # No dependence on a real secret existing: the property IS containment, and asserting it
+    # directly holds in any checkout. (An earlier version gated on .env being present and silently
+    # SKIPPED -- a green tick that tested nothing.)
+    for probe in ("../../../.env", "assets/../../../.env", "../" * 8 + "etc/passwd"):
+        resp = _spa_fallback(probe)
+        served = Path(resp.path).resolve()
+        assert served.is_relative_to(_DIST.resolve()), (
+            f"traversal escaped dist: {probe!r} served {served}")
+        assert served.name == "index.html", f"{probe!r} served {served.name}, expected index.html"
 
 
 def test_every_api_prefix_is_derived_from_the_router():

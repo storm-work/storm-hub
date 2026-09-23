@@ -256,6 +256,117 @@ def test_slot_released_frees_the_lease_and_reopens_the_slot(slots_db):
     db.close()
 
 
+def test_a_booked_blind_slot_is_never_retired_by_later_bounces(slots_db):
+    """CONFIRMED LIVE Test 0919 (2026-09-19): blind slot 10-12 p3 booked at 23:23:46, then three
+    racing workers hit its remaining capacity, bounced, and drove miss_count to BLIND_MAX_BOUNCES --
+    CLOSING a genuinely bookable slot. A booking is proof the combination is real, so a bounce after
+    one must not count. Harmless there (the booking already landed), but on a higher-capacity posto
+    it would retire real inventory while units are still open."""
+    from sqlalchemy import select
+
+    import apps.hub.events as ev
+    from libs.db import models as M
+    from libs.domain.enums import SlotStatus
+
+    bid, wid = _seed_scout(slots_db)
+    db = slots_db()
+    iid = db.scalar(select(M.Worker.identity_id).where(M.Worker.id == wid))
+    slot = M.Slot(booking_id=bid, posto_id="2032", date="2026-10-12", period=3,
+                  status=SlotStatus.LEASED, source="blind")
+    db.add(slot); db.commit(); sid = slot.id
+    # A real appointment already landed on this slot.
+    sa = M.SubAccount(identity_id=iid, username="u", password="p", status="verified")
+    db.add(sa); db.flush()
+    db.add(M.BookedAppointment(booking_id=bid, identity_id=iid, sub_account_id=sa.id, slot_id=sid))
+    db.commit(); db.close()
+
+    hub = ev.EventHub.__new__(ev.EventHub)
+    for _ in range(5):                        # far past BLIND_MAX_BOUNCES
+        db = slots_db()
+        db.get(M.Slot, sid).status = SlotStatus.LEASED
+        db.add(M.SlotLease(slot_id=sid, worker_id=wid)); db.commit(); db.close()
+        hub._release_slot_lease(wid, {"date": "2026-10-12", "period": 3}, reason="bounce")
+
+    db = slots_db()
+    s = db.get(M.Slot, sid)
+    assert s.status != SlotStatus.CLOSED, "a slot that has booked must never be retired by bounces"
+    assert s.miss_count == 0, "bounces after a booking must not even be counted"
+    db.close()
+
+
+def test_a_blind_slot_retires_after_blind_max_bounces(slots_db):
+    """THE SEAM for blind apply in events (2026-09-18). A discovered slot retires through the
+    scouts' miss count (dates_reported). A blind slot was never discovered, so nothing would ever
+    retire it -- it would be reassigned and bounced off forever. Each BOUNCED release counts
+    against it; at BLIND_MAX_BOUNCES (default 3) it is CLOSED. A form_stale release does NOT count:
+    that is about our session, not the combination."""
+    from sqlalchemy import select
+
+    import apps.hub.events as ev
+    from libs.db import models as M
+    from libs.domain.enums import SlotStatus
+
+    bid, wid = _seed_scout(slots_db)
+    db = slots_db()
+    slot = M.Slot(booking_id=bid, posto_id="5084", date="2026-10-13", period=4,
+                  status=SlotStatus.LEASED, source="blind")
+    db.add(slot); db.commit()
+    sid = slot.id
+    db.close()
+
+    hub = ev.EventHub.__new__(ev.EventHub)
+    for i in range(3):
+        db = slots_db()
+        s = db.get(M.Slot, sid); s.status = SlotStatus.LEASED
+        db.add(M.SlotLease(slot_id=sid, worker_id=wid)); db.commit(); db.close()
+        # the 2nd release is form_stale -- must not count
+        hub._release_slot_lease(wid, {"date": "2026-10-13", "period": 4},
+                                reason="form_stale" if i == 1 else "bounce")
+        db = slots_db()
+        s = db.get(M.Slot, sid)
+        if i < 2:
+            assert s.status == SlotStatus.AVAILABLE, f"after release {i}: not yet retired"
+        db.close()
+
+    db = slots_db()
+    s = db.get(M.Slot, sid)
+    assert s.miss_count == 2, "two BOUNCED releases counted; the form_stale one did not"
+    assert s.status == SlotStatus.AVAILABLE, "2 < BLIND_MAX_BOUNCES(3): still alive"
+    s.status = SlotStatus.LEASED
+    db.add(M.SlotLease(slot_id=sid, worker_id=wid)); db.commit(); db.close()
+
+    hub._release_slot_lease(wid, {"date": "2026-10-13", "period": 4}, reason="bounce")
+    db = slots_db()
+    assert db.get(M.Slot, sid).status == SlotStatus.CLOSED, "third bounce retires the combination"
+    db.close()
+
+
+def test_a_discovered_slot_is_never_retired_by_bounces(slots_db):
+    """Control: the blind retirement must not leak onto discovered slots, which retire only via
+    the scouts' miss count."""
+    from sqlalchemy import select
+
+    import apps.hub.events as ev
+    from libs.db import models as M
+    from libs.domain.enums import SlotStatus
+
+    bid, wid = _seed_scout(slots_db)
+    db = slots_db()
+    slot = M.Slot(booking_id=bid, posto_id="5084", date="2026-10-13", period=4,
+                  status=SlotStatus.LEASED, source="scout")
+    db.add(slot); db.commit(); sid = slot.id; db.close()
+    hub = ev.EventHub.__new__(ev.EventHub)
+    for _ in range(5):
+        db = slots_db()
+        db.get(M.Slot, sid).status = SlotStatus.LEASED
+        db.add(M.SlotLease(slot_id=sid, worker_id=wid)); db.commit(); db.close()
+        hub._release_slot_lease(wid, {"date": "2026-10-13", "period": 4}, reason="bounce")
+    db = slots_db()
+    s = db.get(M.Slot, sid)
+    assert s.status == SlotStatus.AVAILABLE and s.miss_count == 0
+    db.close()
+
+
 def test_form_stale_release_is_recorded_distinctly_from_a_bounce(slots_db):
     """storm-auto's two-tier release (slot_manager.release(lease, "form_stale") vs "bounce"): a
     form_stale means OUR form-state expired, so it must never count against the slot -- neither

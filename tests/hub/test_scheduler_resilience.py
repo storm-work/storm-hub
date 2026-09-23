@@ -375,7 +375,7 @@ def test_maybe_self_scout_triggers_when_no_scouts_alive(db):
     sched = _scheduler(bus=bus)
     bk = _make_booking(db)
     ident = _make_identity(db)
-    apply_w = _make_worker(db, bk, ident, role=WorkerRole.APPLY, substate=WorkerSubstate.HOLDING)
+    apply_w = _make_worker(db, bk, ident, role=WorkerRole.APPLY, substate=WorkerSubstate.KEEPING)
 
     sched._maybe_self_scout(db, bk, NOW)
 
@@ -395,8 +395,8 @@ def test_maybe_self_scout_does_nothing_when_scout_alive(db):
     bk = _make_booking(db)
     ident = _make_identity(db)
     _make_worker(db, bk, ident, role=WorkerRole.SCOUT, status=WorkerStatus.RUNNING,
-                 substate=WorkerSubstate.HOLDING)
-    _make_worker(db, bk, ident, role=WorkerRole.APPLY, substate=WorkerSubstate.HOLDING)
+                 substate=WorkerSubstate.KEEPING)
+    _make_worker(db, bk, ident, role=WorkerRole.APPLY, substate=WorkerSubstate.KEEPING)
 
     sched._maybe_self_scout(db, bk, NOW)
 
@@ -415,7 +415,7 @@ def test_a_scout_with_no_substate_yet_does_not_suppress_the_fallback(db):
     bk = _make_booking(db)
     ident = _make_identity(db)
     _make_worker(db, bk, ident, role=WorkerRole.SCOUT, status=WorkerStatus.RUNNING, substate=None)
-    _make_worker(db, bk, ident, role=WorkerRole.APPLY, substate=WorkerSubstate.HOLDING)
+    _make_worker(db, bk, ident, role=WorkerRole.APPLY, substate=WorkerSubstate.KEEPING)
 
     sched._maybe_self_scout(db, bk, NOW)
 
@@ -427,7 +427,7 @@ def test_maybe_self_scout_throttled(db):
     sched = _scheduler(bus=bus)
     bk = _make_booking(db)
     ident = _make_identity(db)
-    _make_worker(db, bk, ident, role=WorkerRole.APPLY, substate=WorkerSubstate.HOLDING)
+    _make_worker(db, bk, ident, role=WorkerRole.APPLY, substate=WorkerSubstate.KEEPING)
 
     sched._maybe_self_scout(db, bk, NOW)
     first_len = len(bus.sent)
@@ -449,7 +449,7 @@ def test_maybe_self_scout_skips_while_found_slots_are_still_there(db):
     ident = _make_identity(db)
     db.add(M.Slot(booking_id=bk.id, posto_id="5084", date="2026-09-14", period=3,
                   status=SlotStatus.AVAILABLE))
-    _make_worker(db, bk, ident, role=WorkerRole.APPLY, substate=WorkerSubstate.HOLDING)
+    _make_worker(db, bk, ident, role=WorkerRole.APPLY, substate=WorkerSubstate.KEEPING)
     db.commit()
 
     sched._maybe_self_scout(db, bk, NOW)
@@ -560,7 +560,9 @@ def test_fire_slot_found_only_fires_once(db):
     assert bk.slot_found_fired_at.replace(tzinfo=None) == expected   # unchanged, not re-stamped
 
 
-def test_drive_scouts_single_mode_picks_one_scout_at_a_time(db):
+def test_drive_scouts_dispatches_one_scout_per_round(db):
+    """Rotation model: one scout at a time runs a FULL-range round. A single tick dispatches exactly
+    one discover command, and while that round is in flight no other scout is dispatched."""
     bus = _FakeBus()
     sched = _scheduler(bus=bus)
     bk = _make_booking(db)
@@ -569,24 +571,29 @@ def test_drive_scouts_single_mode_picks_one_scout_at_a_time(db):
     s2 = _make_worker(db, bk, ident, role=WorkerRole.SCOUT)
 
     sched._drive_scouts(db, bk, sample_dates=["2026-08-18", "2026-08-19"])
+    sends = [(wid, p) for wid, t, p in bus.sent if t == "discover"]
+    assert len(sends) == 1 and sends[0][0] in (s1.id, s2.id)
+    # the whole window goes every round -- full discovery per scout, not a slice
+    assert sends[0][1]["dates"] == ["2026-08-18", "2026-08-19"]
 
-    discover_sends = [(wid, p) for wid, t, p in bus.sent if t == "discover"]
-    assert len(discover_sends) == 1   # SINGLE mode: only one scout gets a task this tick
-    assert discover_sends[0][0] in (s1.id, s2.id)
+    # next tick, the first round still in flight (no report drained) -> nothing new dispatched
+    bus.sent.clear()
+    sched._drive_scouts(db, bk, sample_dates=["2026-08-18", "2026-08-19"])
+    assert bus.sent == []
 
 
-def test_drive_scouts_split_mode_after_slot_found(db):
+def test_drive_scouts_runs_the_same_before_and_after_slot_found(db):
+    """There is no slot-found phase transition any more -- the rotation is identical throughout."""
     bus = _FakeBus()
     sched = _scheduler(bus=bus)
     bk = _make_booking(db, slot_found_fired_at=NOW)
     ident = _make_identity(db)
-    s1 = _make_worker(db, bk, ident, role=WorkerRole.SCOUT)
-    s2 = _make_worker(db, bk, ident, role=WorkerRole.SCOUT)
+    _make_worker(db, bk, ident, role=WorkerRole.SCOUT)
+    _make_worker(db, bk, ident, role=WorkerRole.SCOUT)
 
     sched._drive_scouts(db, bk, sample_dates=["d1", "d2", "d3", "d4"])
-
-    discover_sends = [wid for wid, t, p in bus.sent if t == "discover"]
-    assert set(discover_sends) == {s1.id, s2.id}   # SPLIT mode: both scouts get a chunk
+    sends = [wid for wid, t, p in bus.sent if t == "discover"]
+    assert len(sends) == 1   # still one-at-a-time, not a fan-out split
 
 
 def test_drive_scouts_noop_with_no_scouts(db):
@@ -612,120 +619,60 @@ def test_drive_scouts_skips_scout_with_outstanding_command(db):
     assert bus.sent == []
 
 
-def test_drive_scouts_split_mode_never_benches_a_scout(db):
-    """Corrected 2026-08-14: DISCOVERY_MAX_PARALLEL was briefly wired as a hard SPLIT-mode cap
-    (2026-08-13), which the operator clarified was wrong -- split mode gives EVERY scout a
-    persistent slice, no matter how many there are; only EXECUTION is throttled
-    (DISCOVERY_CONCURRENCY), never participation."""
+def test_drive_scouts_rotates_and_a_failed_round_advances_immediately(db):
+    """A FAILED round (all-'failed' / empty report) frees the scout and advances the rotation to the
+    next scout with NO MIN wait -- a bad session never stalls the fleet."""
     bus = _FakeBus()
-    sched = _scheduler(bus=bus)
-    bk = _make_booking(db, slot_found_fired_at=NOW, settings_json={"DISCOVERY_MAX_PARALLEL": 2})
+    hub = _FakeEventHub()
+    sched = _scheduler(bus=bus, event_hub=hub)
+    bk = _make_booking(db, settings_json={"DISCOVERY_MIN_INTERVAL": 30.0})
     ident = _make_identity(db)
     s1 = _make_worker(db, bk, ident, role=WorkerRole.SCOUT)
     s2 = _make_worker(db, bk, ident, role=WorkerRole.SCOUT)
-    s3 = _make_worker(db, bk, ident, role=WorkerRole.SCOUT)
-
-    sched._drive_scouts(db, bk, sample_dates=["d1", "d2", "d3", "d4"])
-
-    state = sched._scout_pools[bk.id]
-    assert set(state.remaining_by_scout) == {s1.id, s2.id, s3.id}   # nobody benched
-
-
-def test_drive_scouts_split_mode_concurrency_window_throttles_execution(db):
-    """DISCOVERY_CONCURRENCY (not DISCOVERY_MAX_PARALLEL) throttles how many scouts may have a
-    discover round in flight at once -- every scout still gets a persistent slice, but only up to
-    the concurrency window is actually SENT a task this tick."""
-    bus = _FakeBus()
-    sched = _scheduler(bus=bus)
-    bk = _make_booking(db, slot_found_fired_at=NOW, settings_json={"DISCOVERY_CONCURRENCY": 2})
-    ident = _make_identity(db)
-    s1 = _make_worker(db, bk, ident, role=WorkerRole.SCOUT)
-    s2 = _make_worker(db, bk, ident, role=WorkerRole.SCOUT)
-    s3 = _make_worker(db, bk, ident, role=WorkerRole.SCOUT)
-
-    sched._drive_scouts(db, bk, sample_dates=["d1", "d2", "d3", "d4"])
-
-    state = sched._scout_pools[bk.id]
-    assert set(state.remaining_by_scout) == {s1.id, s2.id, s3.id}   # everyone has a slice
-    discover_sends = {wid for wid, t, p in bus.sent if t == "discover"}
-    assert len(discover_sends) == 2   # but only the concurrency window actually got sent a round
-    assert discover_sends <= {s1.id, s2.id, s3.id}
-    assert state.busy_scouts == discover_sends
-
-
-def test_drive_scouts_single_mode_awaken_limit_caps_rotation_pool(db):
-    """DISCOVERY_MAX_PARALLEL's corrected meaning: SINGLE mode's awaken-scout-limit. Only up to the
-    limit are ever probed; the rest stay parked."""
-    bus = _FakeBus()
-    sched = _scheduler(bus=bus)
-    bk = _make_booking(db, settings_json={"DISCOVERY_MAX_PARALLEL": 2})
-    ident = _make_identity(db)
-    s1 = _make_worker(db, bk, ident, role=WorkerRole.SCOUT)
-    s2 = _make_worker(db, bk, ident, role=WorkerRole.SCOUT)
-    s3 = _make_worker(db, bk, ident, role=WorkerRole.SCOUT)
 
     sched._drive_scouts(db, bk, sample_dates=["d1"])
+    first = [wid for wid, t, p in bus.sent if t == "discover"]
+    assert len(first) == 1
+    inflight = first[0]
 
-    state = sched._scout_pools[bk.id]
-    assert len(state.awakened_scouts) == 2
-    assert set(state.awakened_scouts) <= {s1.id, s2.id, s3.id}
-    discover_sends = {wid for wid, t, p in bus.sent if t == "discover"}
-    assert discover_sends <= set(state.awakened_scouts)
+    # that round comes back FAILED -> next tick immediately dispatches the OTHER scout, no pacing
+    hub.dates_reported[inflight] = [[{"date": "d1", "outcome": "failed"}]]
+    bus.sent.clear()
+    sched._drive_scouts(db, bk, sample_dates=["d1"])
+    second = [wid for wid, t, p in bus.sent if t == "discover"]
+    assert len(second) == 1 and second[0] != inflight   # advanced, immediately
 
 
-def test_drive_scouts_single_mode_paces_by_interval_not_scheduler_tick(db):
-    """SINGLE_MODE_INTERVAL must gate successive probes fleet-wide -- not fire on every 5s
-    scheduler tick."""
+def test_drive_scouts_paces_real_rounds_by_min_interval(db):
+    """A REAL round (portal reached, even 'empty') holds the next dispatch until DISCOVERY_MIN_INTERVAL
+    has elapsed -- pacing real portal traffic, not the 5s scheduler tick."""
     bus = _FakeBus()
-    sched = _scheduler(bus=bus)
-    bk = _make_booking(db, settings_json={"SINGLE_MODE_INTERVAL": 30.0})
+    hub = _FakeEventHub()
+    sched = _scheduler(bus=bus, event_hub=hub)
+    bk = _make_booking(db, settings_json={"DISCOVERY_MIN_INTERVAL": 30.0})
     ident = _make_identity(db)
     _make_worker(db, bk, ident, role=WorkerRole.SCOUT)
     _make_worker(db, bk, ident, role=WorkerRole.SCOUT)
 
     sched._drive_scouts(db, bk, sample_dates=["d1"])
-    assert len([1 for _, t, _ in bus.sent if t == "discover"]) == 1
+    inflight = [wid for wid, t, p in bus.sent if t == "discover"][0]
+
+    # a REAL round (portal said 'empty') completes -> the interval gate now applies
+    hub.dates_reported[inflight] = [[{"date": "d1", "outcome": "empty"}]]
     bus.sent.clear()
-
-    # immediately again -- must NOT send another probe, the interval hasn't elapsed
     sched._drive_scouts(db, bk, sample_dates=["d1"])
-    assert bus.sent == []
+    assert bus.sent == []   # inside the interval -- must wait
 
-    # simulate the interval having elapsed
-    sched._scout_pools[bk.id].last_single_probe_at -= 31.0
+    # simulate the interval having elapsed, then it dispatches the next scout
+    sched._scout_pools[bk.id].last_real_probe_at -= 31.0
     sched._drive_scouts(db, bk, sample_dates=["d1"])
     assert len([1 for _, t, _ in bus.sent if t == "discover"]) == 1
-
-
-def test_drive_scouts_split_mode_slice_is_persistent_across_ticks(db):
-    """A scout's date range must NOT be re-partitioned from scratch every tick -- it keeps
-    re-polling its own persistent slice (poll_gap-spaced) until pruned or redistributed. Confirmed
-    this was previously broken: every tick re-split the FULL, unpruned range across whichever
-    scouts looked available, so pruning/dead-scout-redistribution were structurally unreachable."""
-    bus = _FakeBus()
-    sched = _scheduler(bus=bus)
-    bk = _make_booking(db, slot_found_fired_at=NOW)
-    ident = _make_identity(db)
-    s1 = _make_worker(db, bk, ident, role=WorkerRole.SCOUT)
-    s2 = _make_worker(db, bk, ident, role=WorkerRole.SCOUT)
-
-    sched._drive_scouts(db, bk, sample_dates=["d1", "d2", "d3", "d4"])
-    first_slices = dict(sched._scout_pools[bk.id].remaining_by_scout)
-    bus.sent.clear()
-
-    # A DIFFERENT sample_dates on the next tick must be ignored for slice assignment -- the
-    # scout's OWN persistent slice is what gets re-sent, not a fresh split of the new range.
-    sched._drive_scouts(db, bk, sample_dates=["x1", "x2"])
-
-    second_sends = {wid: chunk for wid, t, p in bus.sent if t == "discover" for chunk in [p["dates"]]}
-    assert second_sends == first_slices
-    assert sched._scout_pools[bk.id].remaining_by_scout == first_slices
 
 
 def test_drive_scouts_includes_cached_special_days_in_discover_payload(db):
     """Shared gettime cache (storm-auto's proven _gettime_cache pattern): when the Hub already has a
-    fresh cached fetch for this booking, every discover command sent this tick carries it -- so the
-    scout can skip its own gettime fetch entirely."""
+    fresh cached fetch for this booking, the discover round sent this tick carries it -- so the scout
+    can skip its own gettime fetch entirely."""
     bus = _FakeBus()
     event_hub = _FakeEventHub()
     cached = {"2026": {"8": [15, 16]}}
@@ -739,7 +686,7 @@ def test_drive_scouts_includes_cached_special_days_in_discover_payload(db):
     sched._drive_scouts(db, bk, sample_dates=["2026-08-18", "2026-08-19"])
 
     discover_sends = [(wid, p) for wid, t, p in bus.sent if t == "discover"]
-    assert discover_sends   # SINGLE mode still only sends to one scout, but it must carry the cache
+    assert discover_sends
     for _wid, payload in discover_sends:
         assert payload.get("special_days") == cached
 
@@ -760,62 +707,6 @@ def test_drive_scouts_omits_special_days_when_nothing_cached(db):
         assert "special_days" not in payload
 
 
-def test_drive_scouts_prunes_empty_dates_from_dates_reported(db):
-    """dates_reported outcomes buffered on EventHub must get drained into the scout's own slice,
-    retiring confirmed-empty dates (never 'failed'/unknown ones -- bug fix #6). Overrides
-    DATE_RETIRE_AFTER_MISSES to 1 to keep this test about the WIRING (drain -> on_dates_reported ->
-    prune), not the multi-strike counting itself (covered directly in test_orchestration.py)."""
-    bus = _FakeBus()
-    hub = _FakeEventHub()
-    sched = _scheduler(bus=bus, event_hub=hub)
-    bk = _make_booking(db, slot_found_fired_at=NOW, settings_json={"DATE_RETIRE_AFTER_MISSES": 1})
-    ident = _make_identity(db)
-    s1 = _make_worker(db, bk, ident, role=WorkerRole.SCOUT)
-
-    sched._drive_scouts(db, bk, sample_dates=["d1", "d2", "d3"])
-    assert sorted(sched._scout_pools[bk.id].remaining_by_scout[s1.id]) == ["d1", "d2", "d3"]
-
-    hub.dates_reported[s1.id] = [[
-        {"date": "d1", "outcome": "empty"},
-        {"date": "d2", "outcome": "failed"},
-        {"date": "d3", "outcome": "found"},
-    ]]
-    bus.sent.clear()
-    sched._drive_scouts(db, bk, sample_dates=["d1", "d2", "d3"])
-
-    assert sorted(sched._scout_pools[bk.id].remaining_by_scout[s1.id]) == ["d2", "d3"]   # d1 pruned
-    assert hub.dates_reported.get(s1.id, []) == []   # drained
-
-
-def test_drive_scouts_redistributes_dead_scouts_slice(db):
-    """"if one scout failed then replace it with another available one" -- a scout that dies while
-    holding a persistent slice must have its remaining dates picked up by a surviving/spare scout,
-    not lost."""
-    bus = _FakeBus()
-    sched = _scheduler(bus=bus)
-    bk = _make_booking(db, slot_found_fired_at=NOW)
-    ident = _make_identity(db)
-    s1 = _make_worker(db, bk, ident, role=WorkerRole.SCOUT)
-    s2 = _make_worker(db, bk, ident, role=WorkerRole.SCOUT)
-
-    sched._drive_scouts(db, bk, sample_dates=["d1", "d2", "d3", "d4"])
-    state = sched._scout_pools[bk.id]
-    assert set(state.remaining_by_scout) == {s1.id, s2.id}
-
-    # s1 dies (no longer RUNNING) -- a fresh, previously-idle spare scout s3 shows up as its
-    # available replacement.
-    s1.status = WorkerStatus.FAILED
-    db.commit()
-    s3 = _make_worker(db, bk, ident, role=WorkerRole.SCOUT)
-
-    sched._drive_scouts(db, bk, sample_dates=["d1", "d2", "d3", "d4"])
-    state = sched._scout_pools[bk.id]
-
-    assert s1.id not in state.remaining_by_scout
-    all_remaining_dates = sorted(sum(state.remaining_by_scout.values(), []))
-    assert all_remaining_dates == ["d1", "d2", "d3", "d4"]   # nothing lost
-
-
 # ── status/substate coherence on the reap paths (review batch 2026-08-14) ─────
 def test_reap_paths_clear_the_in_flight_substate(db):
     """The reapers wrote only `status`, so a worker killed mid-hold read `status=failed,
@@ -825,7 +716,7 @@ def test_reap_paths_clear_the_in_flight_substate(db):
     sched = _scheduler(supervisor=sup, event_hub=hub, bus=_FakeBus())
     bk = _make_booking(db)
     ident = _make_identity(db)
-    w = _make_worker(db, bk, ident, substate=WorkerSubstate.HOLDING)
+    w = _make_worker(db, bk, ident, substate=WorkerSubstate.KEEPING)
     hub._rates[w.id] = 99.0   # trip the runaway breaker
 
     sched._reap_runaway_workers(db, NOW)
@@ -943,7 +834,7 @@ def test_assign_slots_skips_worker_with_outstanding_command(db):
     sched = _scheduler(bus=bus)
     bk = _make_booking(db)
     ident = _make_identity(db)
-    w = _make_worker(db, bk, ident, role=WorkerRole.APPLY, substate=WorkerSubstate.HOLDING)
+    w = _make_worker(db, bk, ident, role=WorkerRole.APPLY, substate=WorkerSubstate.KEEPING)
     bus.pending.add(w.id)
     db.add(M.Slot(booking_id=bk.id, posto_id="5084", date="2026-08-18", period=4,
                   status=SlotStatus.AVAILABLE))
@@ -965,9 +856,9 @@ def test_assign_slots_multi_capacity_fills_one_slot_before_the_next(db):
     sched = _scheduler(bus=bus)
     bk = _make_booking(db, settings_json={"SLOT_CAPACITY_PER_PERIOD": "2"})
     ident = _make_identity(db)
-    w1 = _make_worker(db, bk, ident, role=WorkerRole.APPLY, substate=WorkerSubstate.HOLDING)
-    w2 = _make_worker(db, bk, ident, role=WorkerRole.APPLY, substate=WorkerSubstate.HOLDING)
-    w3 = _make_worker(db, bk, ident, role=WorkerRole.APPLY, substate=WorkerSubstate.HOLDING)
+    w1 = _make_worker(db, bk, ident, role=WorkerRole.APPLY, substate=WorkerSubstate.KEEPING)
+    w2 = _make_worker(db, bk, ident, role=WorkerRole.APPLY, substate=WorkerSubstate.KEEPING)
+    w3 = _make_worker(db, bk, ident, role=WorkerRole.APPLY, substate=WorkerSubstate.KEEPING)
     slot = M.Slot(booking_id=bk.id, posto_id="5084", date="2026-08-18", period=4,
                   status=SlotStatus.AVAILABLE)
     db.add(slot)
@@ -991,8 +882,8 @@ def test_assign_slots_respects_already_active_leases_when_computing_remaining_ca
     sched = _scheduler(bus=bus)
     bk = _make_booking(db, settings_json={"SLOT_CAPACITY_PER_PERIOD": "2"})
     ident = _make_identity(db)
-    w1 = _make_worker(db, bk, ident, role=WorkerRole.APPLY, substate=WorkerSubstate.HOLDING)
-    w2 = _make_worker(db, bk, ident, role=WorkerRole.APPLY, substate=WorkerSubstate.HOLDING)
+    w1 = _make_worker(db, bk, ident, role=WorkerRole.APPLY, substate=WorkerSubstate.KEEPING)
+    w2 = _make_worker(db, bk, ident, role=WorkerRole.APPLY, substate=WorkerSubstate.KEEPING)
     slot = M.Slot(booking_id=bk.id, posto_id="5084", date="2026-08-18", period=4,
                   status=SlotStatus.AVAILABLE)
     db.add(slot)
@@ -1013,11 +904,23 @@ def test_drive_scouts_uses_the_bookings_own_calendar_window(db):
     """Confirmed live 2026-08-14: _drive_scouts hardcoded start=""/end=""/num_days=20, so
     CAL_START_DATE/CAL_END_DATE/CAL_NUM_DAYS -- set per booking, validated by the resolver, parsed
     into EngineConfig.discovery -- were read by nothing on this path. A booking configured for
-    2026-09-01..09-20 discovered 2026-08-28..09-11 instead."""
+    2026-09-01..09-20 discovered 2026-08-28..09-11 instead.
+
+    The window is computed RELATIVE TO TODAY rather than hardcoded. It was originally pinned to
+    2026-09-01..09-04, which silently became a time bomb: default_date_window clamps the window to
+    `today`, so once that end date fell into the past the window came back empty, no discover
+    command was sent, and the test failed on a date boundary rather than on any real regression --
+    which it duly did from 2026-09-05, masking this assertion for every run after that."""
+    from datetime import date, timedelta
+
     bus = _FakeBus()
     sched = _scheduler(bus=bus)
-    bk = _make_booking(db, settings_json={"CAL_START_DATE": "2026-09-01",
-                                          "CAL_END_DATE": "2026-09-04",
+    # +7/+10 days out: comfortably future (so nothing is clamped away) and inside the 20-weekday
+    # default, so the CAL_START/END bounds -- not CAL_NUM_DAYS -- are what constrain the result.
+    start = (date.today() + timedelta(days=7)).isoformat()
+    end = (date.today() + timedelta(days=10)).isoformat()
+    bk = _make_booking(db, settings_json={"CAL_START_DATE": start,
+                                          "CAL_END_DATE": end,
                                           "CAL_NUM_DAYS": 20})
     ident = _make_identity(db)
     _make_worker(db, bk, ident, role=WorkerRole.SCOUT)
@@ -1027,8 +930,8 @@ def test_drive_scouts_uses_the_bookings_own_calendar_window(db):
     sent = [p["dates"] for _wid, t, p in bus.sent if t == "discover"]
     assert sent, "no discover command was sent"
     dates = sent[0]
-    assert min(dates) >= "2026-09-01"
-    assert max(dates) <= "2026-09-04"
+    assert min(dates) >= start
+    assert max(dates) <= end
 
 
 def test_drive_scouts_falls_back_to_a_default_window_when_unset(db):
@@ -1055,7 +958,7 @@ def test_assign_slots_never_gives_a_worker_a_second_active_lease(db):
     sched = _scheduler(bus=bus)
     bk = _make_booking(db, settings_json={"SLOT_CAPACITY_PER_PERIOD": "5"})
     ident = _make_identity(db)
-    w = _make_worker(db, bk, ident, role=WorkerRole.APPLY, substate=WorkerSubstate.HOLDING)
+    w = _make_worker(db, bk, ident, role=WorkerRole.APPLY, substate=WorkerSubstate.KEEPING)
     for period in (1, 2, 3):
         db.add(M.Slot(booking_id=bk.id, posto_id="5084", date="2026-09-01", period=period,
                       status=SlotStatus.AVAILABLE))
@@ -1092,7 +995,7 @@ def test_reclaim_expires_a_lease_the_holder_never_converted(db):
     sched = _scheduler(bus=_FakeBus())
     bk = _make_booking(db, settings_json={"SLOT_LEASE_TTL": 180.0, "SLOT_CAPACITY_PER_PERIOD": "1"})
     ident = _make_identity(db)
-    w = _make_worker(db, bk, ident, role=WorkerRole.APPLY, substate=WorkerSubstate.HOLDING)
+    w = _make_worker(db, bk, ident, role=WorkerRole.APPLY, substate=WorkerSubstate.KEEPING)
     slot = M.Slot(booking_id=bk.id, posto_id="5084", date="2026-09-01", period=1,
                   status=SlotStatus.LEASED)
     db.add(slot); db.commit()
@@ -1124,45 +1027,18 @@ def test_reclaim_never_touches_a_worker_that_is_actually_applying(db):
     assert len(db.scalars(select(M.SlotLease).where(M.SlotLease.released_at.is_(None))).all()) == 1
 
 
-def test_drive_scouts_does_not_retire_dates_before_slot_found(db):
-    """End-to-end phase scoping: during the slot-open phase the portal has not released its slots,
-    so every date reports empty -- and none of it may count toward retirement. Before this was
-    scoped, three single-mode rounds at the default threshold retired the entire window the moment
-    split mode began."""
-    bus = _FakeBus()
-    hub = _FakeEventHub()
-    sched = _scheduler(bus=bus, event_hub=hub)
-    bk = _make_booking(db, settings_json={"DATE_RETIRE_AFTER_MISSES": 1})   # NO slot_found_fired_at
-    ident = _make_identity(db)
-    s1 = _make_worker(db, bk, ident, role=WorkerRole.SCOUT)
-
-    for _ in range(4):
-        hub.dates_reported[s1.id] = [[{"date": d, "outcome": "empty"} for d in ("d1", "d2", "d3")]]
-        sched._drive_scouts(db, bk, sample_dates=["d1", "d2", "d3"])
-
-    state = sched._scout_pools[bk.id]
-    assert state.mode == "single"
-    assert state.date_miss_counts == {}          # nothing accrued in the slot-open phase
-
-    # now slots are found -- the full range must still be available to scan
-    bk.slot_found_fired_at = NOW
-    db.commit()
-    sched._drive_scouts(db, bk, sample_dates=["d1", "d2", "d3"])
-    assert sorted(sum(sched._scout_pools[bk.id].remaining_by_scout.values(), [])) == ["d1", "d2", "d3"]
-
-
 # ── false-slot-FOUND revert (operator spec 2026-08-14) ────────────────────────
 # "even when there are some slots found - but they may be false positive. so if applying keeps being
 # failed then regard the slots as false, and revert to hold phase. wipe out the slots and slot-found
 # signal state, then make scouts to be at slot-open phase."
-def _bounced_pool(db, bk, worker, *, n_bounces, since):
+def _bounced_pool(db, bk, worker, *, n_bounces, since, source="scout"):
     """A slot pool whose leases all came back BOUNCED after slot_found fired."""
     from libs.domain.enums import SlotLeaseOutcome
     slots = []
     for i in range(max(1, n_bounces)):
         # (date, period) must stay unique -- slots has a UNIQUE(booking_id, date, period)
         s = M.Slot(booking_id=bk.id, posto_id="5084", date=f"2026-09-{i // 4 + 1:02d}",
-                   period=i % 4 + 1, status=SlotStatus.AVAILABLE)
+                   period=i % 4 + 1, status=SlotStatus.AVAILABLE, source=source)
         db.add(s); slots.append(s)
     db.commit()
     for i in range(n_bounces):
@@ -1203,6 +1079,70 @@ def test_false_slot_found_wipes_the_pool_and_returns_scouts_to_the_slot_open_pha
     assert bk.status == BookingStatus.RUNNING
     assert redis.smembers(notified_key(bk.id, "slot_open")) == set()
     assert bk.id not in sched._scout_pools          # back to cheap single-mode polling
+
+
+def test_false_slot_revert_ignores_bounces_off_blind_slots(db):
+    """THE SEAM for blind apply in the scheduler (2026-09-18). An operator-seeded grid is mostly
+    phantom BY CONSTRUCTION -- 9 combinations, maybe 2 real -- so bouncing off it is expected, not
+    evidence the pool is false. Counted, a single sweep would hit the default limit of 12 and wipe
+    the whole pool, ending blind apply after one pass. Blind slots retire individually via
+    BLIND_MAX_BOUNCES instead."""
+    import fakeredis
+    from libs.bus.names import notified_key
+    from libs.engine import orchestration as orch
+
+    bus = _FakeBus()
+    redis = fakeredis.FakeStrictRedis(decode_responses=True)
+    sched = _scheduler(bus=bus, redis_client=redis)
+    found_at = NOW - timedelta(minutes=10)
+    bk = _make_booking(db, slot_open_fired_at=NOW - timedelta(minutes=30),
+                       slot_found_fired_at=found_at,
+                       settings_json={"FALSE_SLOT_BOUNCE_LIMIT": 5})
+    ident = _make_identity(db)
+    w = _make_worker(db, bk, ident, role=WorkerRole.SCOUT)
+    _bounced_pool(db, bk, w, n_bounces=9, since=found_at, source="blind")   # well past the limit
+    redis.sadd(notified_key(bk.id, "slot_found"), w.id)
+    sched._scout_pools[bk.id] = orch.ScoutPoolState()
+
+    assert sched._maybe_revert_false_slot_found(db, bk, NOW) is False
+    assert bk.slot_found_fired_at is not None, "blind bounces must not revert slot-found"
+    assert {s.status for s in db.scalars(select(M.Slot)).all()} == {SlotStatus.AVAILABLE}
+
+
+def test_seeding_blind_slots_disables_the_false_slot_revert(db):
+    """THE scout->fail->blind interaction (operator question 2026-09-20). Scouts find a few
+    mostly-phantom slots, apply workers bounce them PAST the limit, the operator then seeds a blind
+    grid. The revert is tripped by the ORIGINAL discovered bounces -- but its step-1 wipe closes
+    every AVAILABLE/LEASED slot regardless of source, so without this guard it would destroy the
+    freshly-seeded blind grid, clear slot-found, and inactivate the fleet the operator just pointed
+    at it. Once blind slots exist the operator owns the pool: the automatic revert must stand down."""
+    import fakeredis
+    from libs.bus.names import notified_key
+    from libs.engine import orchestration as orch
+
+    bus = _FakeBus()
+    redis = fakeredis.FakeStrictRedis(decode_responses=True)
+    sched = _scheduler(bus=bus, redis_client=redis)
+    found_at = NOW - timedelta(minutes=10)
+    bk = _make_booking(db, slot_open_fired_at=NOW - timedelta(minutes=30),
+                       slot_found_fired_at=found_at, settings_json={"FALSE_SLOT_BOUNCE_LIMIT": 5})
+    ident = _make_identity(db)
+    w = _make_worker(db, bk, ident, role=WorkerRole.SCOUT)
+    # DISCOVERED slots that bounced well past the limit -- would revert on their own.
+    _bounced_pool(db, bk, w, n_bounces=8, since=found_at, source="scout")
+    # ...but the operator has since seeded a blind grid.
+    db.add(M.Slot(booking_id=bk.id, posto_id="5084", date="2026-10-12", period=3,
+                  status=SlotStatus.AVAILABLE, source="blind"))
+    db.commit()
+    sched._scout_pools[bk.id] = orch.ScoutPoolState()
+
+    assert sched._maybe_revert_false_slot_found(db, bk, NOW) is False, "blind slots must veto the revert"
+    assert bk.slot_found_fired_at is not None
+    # the blind slot is untouched, and the discovered slots are NOT wiped either (no revert ran)
+    statuses = {s.source: s.status for s in db.scalars(select(M.Slot).where(M.Slot.booking_id == bk.id)).all()}
+    assert statuses["blind"] == SlotStatus.AVAILABLE
+    assert SlotStatus.CLOSED not in statuses.values()
+    assert (w.id, "signal", {"name": "inactivate"}) not in bus.sent
 
 
 def test_false_slot_found_does_not_fire_below_the_bounce_limit(db):
@@ -1691,7 +1631,7 @@ def test_prewarm_fires_inside_the_lead_window_only():
     bk.slot_open_at = NOW + timedelta(seconds=600)     # well outside a 120s lead
     bk.settings_json = {"PREWARM_BEFORE_SLOT_OPEN": 120.0}
     w = _make_worker(db, bk, _make_identity(db), status=WorkerStatus.RUNNING)
-    w.substate = WorkerSubstate.HOLDING
+    w.substate = WorkerSubstate.KEEPING
     db.commit()
 
     sched = _prewarm_sched(r, bus)
@@ -1716,7 +1656,7 @@ def test_prewarm_is_sent_once_per_worker():
     bk = _make_booking(db)
     bk.slot_open_at = NOW + timedelta(seconds=60)
     w = _make_worker(db, bk, _make_identity(db), status=WorkerStatus.RUNNING)
-    w.substate = WorkerSubstate.HOLDING
+    w.substate = WorkerSubstate.KEEPING
     db.commit()
 
     sched = _prewarm_sched(r, bus)
@@ -1738,7 +1678,7 @@ def test_prewarm_skips_a_booking_whose_slot_open_already_fired():
     bk.slot_open_at = NOW + timedelta(seconds=60)
     bk.slot_open_fired_at = NOW
     w = _make_worker(db, bk, _make_identity(db), status=WorkerStatus.RUNNING)
-    w.substate = WorkerSubstate.HOLDING
+    w.substate = WorkerSubstate.KEEPING
     db.commit()
 
     _prewarm_sched(r, bus)._maybe_prewarm(db, bk, NOW)
@@ -1758,7 +1698,7 @@ def test_prewarm_needs_a_scheduled_time_to_act_on():
     bk = _make_booking(db)
     bk.slot_open_at = None
     w = _make_worker(db, bk, _make_identity(db), status=WorkerStatus.RUNNING)
-    w.substate = WorkerSubstate.HOLDING
+    w.substate = WorkerSubstate.KEEPING
     db.commit()
 
     _prewarm_sched(r, bus)._maybe_prewarm(db, bk, NOW)
@@ -1778,7 +1718,7 @@ def test_prewarm_can_be_disabled_with_zero():
     bk.slot_open_at = NOW + timedelta(seconds=10)
     bk.settings_json = {"PREWARM_BEFORE_SLOT_OPEN": 0.0}
     w = _make_worker(db, bk, _make_identity(db), status=WorkerStatus.RUNNING)
-    w.substate = WorkerSubstate.HOLDING
+    w.substate = WorkerSubstate.KEEPING
     db.commit()
 
     _prewarm_sched(r, bus)._maybe_prewarm(db, bk, NOW)
@@ -1800,9 +1740,9 @@ def test_assign_skips_a_holding_worker_marked_not_bookable(db):
     bk = _make_booking(db)
     bk.status = BookingStatus.RUNNING
     good = _make_worker(db, bk, _make_identity(db), status=WorkerStatus.RUNNING,
-                        role=WorkerRole.APPLY, substate=WorkerSubstate.HOLDING)
+                        role=WorkerRole.APPLY, substate=WorkerSubstate.KEEPING)
     bad = _make_worker(db, bk, _make_identity(db), status=WorkerStatus.RUNNING,
-                       role=WorkerRole.APPLY, substate=WorkerSubstate.HOLDING)
+                       role=WorkerRole.APPLY, substate=WorkerSubstate.KEEPING)
     bad.substate_detail = f"{NOT_BOOKABLE_PREFIX} form-state lapsed, re-warm failed x3"
     db.add(M.Slot(booking_id=bk.id, posto_id="5084", date="2026-08-18", period=4,
                   status=SlotStatus.AVAILABLE))
@@ -1823,7 +1763,7 @@ def test_a_healthy_holding_worker_with_a_detail_is_still_assignable(db):
     bk = _make_booking(db)
     bk.status = BookingStatus.RUNNING
     w = _make_worker(db, bk, _make_identity(db), status=WorkerStatus.RUNNING,
-                     role=WorkerRole.APPLY, substate=WorkerSubstate.HOLDING)
+                     role=WorkerRole.APPLY, substate=WorkerSubstate.KEEPING)
     w.substate_detail = "re-warm restored the schedule form"
     db.add(M.Slot(booking_id=bk.id, posto_id="5084", date="2026-08-18", period=4,
                   status=SlotStatus.AVAILABLE))
@@ -2136,7 +2076,7 @@ def test_a_slot_that_just_went_form_stale_is_offered_last(db):
     sched = _scheduler(bus=bus)
     bk = _make_booking(db)
     ident = _make_identity(db)
-    w = _make_worker(db, bk, ident, role=WorkerRole.APPLY, substate=WorkerSubstate.HOLDING)
+    w = _make_worker(db, bk, ident, role=WorkerRole.APPLY, substate=WorkerSubstate.KEEPING)
     # first by date/period -- the one the old ordering handed back every single time
     first = M.Slot(booking_id=bk.id, posto_id="5084", date="2026-08-28", period=3,
                    status=SlotStatus.AVAILABLE)
@@ -2162,7 +2102,7 @@ def test_form_stale_ordering_does_not_retire_or_penalise_the_slot(db):
     sched = _scheduler(bus=bus)
     bk = _make_booking(db)
     ident = _make_identity(db)
-    w = _make_worker(db, bk, ident, role=WorkerRole.APPLY, substate=WorkerSubstate.HOLDING)
+    w = _make_worker(db, bk, ident, role=WorkerRole.APPLY, substate=WorkerSubstate.KEEPING)
     s = M.Slot(booking_id=bk.id, posto_id="5084", date="2026-08-28", period=3,
                status=SlotStatus.AVAILABLE, miss_count=0)
     db.add(s); db.commit()
@@ -2182,7 +2122,7 @@ def test_a_single_stale_slot_is_still_offered(db):
     sched = _scheduler(bus=bus)
     bk = _make_booking(db)
     ident = _make_identity(db)
-    w = _make_worker(db, bk, ident, role=WorkerRole.APPLY, substate=WorkerSubstate.HOLDING)
+    w = _make_worker(db, bk, ident, role=WorkerRole.APPLY, substate=WorkerSubstate.KEEPING)
     only = M.Slot(booking_id=bk.id, posto_id="5084", date="2026-08-28", period=3,
                   status=SlotStatus.AVAILABLE)
     db.add(only); db.commit()
@@ -2211,7 +2151,7 @@ def test_a_scout_stuck_in_login_does_not_suppress_the_fallback(db):
     scout = _make_worker(db, bk, ident, role=WorkerRole.SCOUT, substate=WorkerSubstate.LOGGING_IN)
     scout.status = WorkerStatus.RUNNING
     applier = _make_worker(db, bk, _make_identity(db), role=WorkerRole.APPLY,
-                           substate=WorkerSubstate.HOLDING)
+                           substate=WorkerSubstate.KEEPING)
     db.commit()
 
     assert _scout_is_actually_scouting(scout) is False, \
@@ -2229,7 +2169,7 @@ def test_a_scout_that_is_past_login_still_suppresses_the_fallback(db):
     from apps.hub.scheduler import _scout_is_actually_scouting
     from libs.domain.enums import WorkerSubstate as S
     ident_bk = _make_booking(db)
-    for sub in (S.LOGGED_IN, S.WARMING_UP, S.WARMED, S.HOLDING, S.DISCOVERING, S.POLLING):
+    for sub in (S.LOGGED_IN, S.WARMING_UP, S.WARMED, S.KEEPING, S.DISCOVERING, S.POLLING):
         w = _make_worker(db, ident_bk, _make_identity(db), role=WorkerRole.SCOUT, substate=sub)
         w.status = WorkerStatus.RUNNING
         assert _scout_is_actually_scouting(w) is True, f"{sub} should count as scouting"
@@ -2265,7 +2205,7 @@ def _self_scout_case(db, bus, *, slot_statuses, fired=True):
         db.add(M.Slot(booking_id=bk.id, posto_id="5084", date=f"2026-09-1{i}",
                       period=3, status=st))
     _make_worker(db, bk, _make_identity(db), role=WorkerRole.APPLY,
-                 substate=WorkerSubstate.HOLDING)
+                 substate=WorkerSubstate.KEEPING)
     db.commit()
     sched._maybe_self_scout(db, bk, NOW)
     return [p for _w, t, p in bus.sent if t == "assign" and p.get("scouts_invalid")]
@@ -2303,3 +2243,69 @@ def test_a_taken_slot_is_not_inventory(db):
     """TAKEN is an exclusive-mode booking already made -- nothing can be applied to it."""
     fired = _self_scout_case(db, _FakeBus(), slot_statuses=[SlotStatus.TAKEN])
     assert fired, "a booked-out slot was counted as applyable inventory"
+
+
+# ── BLIND_APPLY_MODE: seed-before-start, discovery-free run (operator 2026-09-21) ────────────
+def test_blind_mode_fires_slot_open_on_start_without_a_timer(db):
+    """The operator's intended flow: seed the grid before starting, and on start the signals fire
+    themselves. A blind-mode booking that is WARMING with slot-open NOT yet fired must have it
+    fired by the tick immediately -- no slot_open_at timer -- so it reaches RUNNING and slot-found
+    can fire off the seeded pool."""
+    fired = []
+    sched = _scheduler(on_slot_open=lambda db, bk: fired.append(bk.id))
+    bk = _make_booking(db, slot_open_at=None, settings_json={"BLIND_APPLY_MODE": True})
+    bk.status = BookingStatus.WARMING
+    db.commit()
+    assert sched._is_blind_mode(db, bk) is True
+
+    sched._SessionLocal = lambda: _SingletonSession(db)
+    sched._tick_once()
+    assert bk.slot_open_fired_at is not None, "blind mode must fire slot-open on start"
+    assert fired == [bk.id]
+
+
+def test_blind_mode_assigns_and_drives_scouts_but_skips_phantom_reverts(db, monkeypatch):
+    """Blind mode SUPPLEMENTS discovery. A RUNNING blind booking assigns the seeded pool AND keeps
+    the scout fleet discovering (a booking may carry scouts alongside a seed -- "0921-3059"), and
+    still delivers the signals via _latch_signals. It skips ONLY the machinery that would harm a
+    seeded pool: _maybe_inactivate_slot_open, _maybe_revert_false_slot_found (both judge a DISCOVERED
+    pool phantom) and _maybe_self_scout (turns apply workers into discoverers off the seed)."""
+    sched = _scheduler()
+    bk = _make_booking(db, slot_open_fired_at=NOW, slot_found_fired_at=NOW,
+                       settings_json={"BLIND_APPLY_MODE": True})   # _make_booking defaults RUNNING
+    called = {"assign": 0, "scouts": 0, "self_scout": 0, "inactivate": 0, "revert": 0, "latch": 0}
+    monkeypatch.setattr(sched, "_assign_slots", lambda *a: called.__setitem__("assign", called["assign"] + 1))
+    monkeypatch.setattr(sched, "_drive_scouts", lambda *a, **k: called.__setitem__("scouts", called["scouts"] + 1))
+    monkeypatch.setattr(sched, "_maybe_self_scout", lambda *a: called.__setitem__("self_scout", called["self_scout"] + 1))
+    monkeypatch.setattr(sched, "_maybe_inactivate_slot_open", lambda *a: called.__setitem__("inactivate", called["inactivate"] + 1) or False)
+    monkeypatch.setattr(sched, "_maybe_revert_false_slot_found", lambda *a: called.__setitem__("revert", called["revert"] + 1) or False)
+    monkeypatch.setattr(sched, "_latch_signals", lambda *a: called.__setitem__("latch", called["latch"] + 1))
+    monkeypatch.setattr(sched, "_hold_respawn", lambda *a: None)
+    monkeypatch.setattr(sched, "_reclaim_stale_slot_leases", lambda *a: None)
+    monkeypatch.setattr(sched, "_fire_slot_found_if_new", lambda *a: None)
+    monkeypatch.setattr(sched, "_maybe_complete_booking", lambda *a: False)
+    monkeypatch.setattr(sched, "_settings_timeout_hours", lambda *a: 0)
+    sched._SessionLocal = lambda: _SingletonSession(db)
+
+    sched._tick_once()
+    assert called["assign"] == 1, "the seeded pool must be assigned"
+    # THE regression this locks in: blind mode must still DRIVE SCOUTS. Skipping it left a hybrid
+    # booking's scouts idle (confirmed live "0921-3059": 7 scouts warmed, awaiting a discover task
+    # that never came). _drive_scouts is a clean no-op without scouts, so pure-blind is unaffected.
+    assert called["scouts"] == 1, "blind mode must still drive the scout fleet"
+    # ...but NOT the seed-hostile machinery: self-scout (apply workers must work the seed) and the
+    # two phantom judgments (which would retire an operator-seeded pool).
+    assert called["self_scout"] == 0, "blind mode must not turn apply workers into self-scouts"
+    assert called["inactivate"] == 0 and called["revert"] == 0, "no phantom-revert machinery in blind mode"
+    # _latch_signals is the only per-tick delivery of slot_open/slot_found to a worker that reached
+    # KEEPING after the broadcast; without it they hold a leased slot and block in await_slot_open()
+    # forever (confirmed live "0921-3059").
+    assert called["latch"] == 1, "blind mode must still deliver the signals via _latch_signals"
+
+
+class _SingletonSession:
+    """Hand the scheduler tick the SAME db session the test built, and no-op its close()."""
+    def __init__(self, db): self._db = db
+    def __call__(self): return self
+    def __getattr__(self, n): return getattr(self._db, n)
+    def close(self): pass

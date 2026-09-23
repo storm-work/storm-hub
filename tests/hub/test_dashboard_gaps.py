@@ -306,17 +306,22 @@ def test_handle_proxy_request_leases_from_pool_matching_phase(client):
     try:
         bk = db.get(M.Booking, bid)
         bk.settings_json = {
-            **bk.settings_json, "PROXY_PROVIDER": "soax", "PROXY_KIND": "rotating",
+            # BOTH pools are static/ISP since 2026-09-15: a rotating pool is self-minted by the
+            # worker and never reaches this handler, so "the pool matching the phase" is only a
+            # meaningful question between two STATIC pools now. The property under test -- answer
+            # from the phase's own pool, release that pool's old lease, leave the other pool's
+            # lease alone -- is unchanged.
+            **bk.settings_json, "PROXY_PROVIDER": "soax", "PROXY_KIND": "isp",
             "HOLD_PROXY_PROVIDER": "soax", "HOLD_PROXY_KIND": "static",
         }
-        db.add(M.Proxy(id="px-warm-old", provider="soax", kind="rotating", endpoint="h:1",
-                       credentials_ref="u:p", max_sessions=5))
-        db.add(M.Proxy(id="px-warm-new", provider="soax", kind="rotating", endpoint="h:2",
-                       credentials_ref="u:p", max_sessions=5))
+        db.add(M.Proxy(id="px-warm-old", provider="soax", kind="isp", endpoint="h:1",
+                       credentials_ref="u:p", max_sessions=5, resource_type="static"))
+        db.add(M.Proxy(id="px-warm-new", provider="soax", kind="isp", endpoint="h:2",
+                       credentials_ref="u:p", max_sessions=5, resource_type="static"))
         db.add(M.Proxy(id="px-hold", provider="soax", kind="static", endpoint="h:3",
-                       credentials_ref="u:p", max_sessions=5))
+                       credentials_ref="u:p", max_sessions=5, resource_type="static"))
         db.commit()
-        lease_proxy(db, wid, "soax", kind="rotating")   # the worker's existing warmup-pool lease
+        lease_proxy(db, wid, "soax", kind="isp")        # the worker's existing warmup-pool lease
         lease_proxy(db, wid, "soax", kind="static")     # a pre-existing hold-pool lease -- untouched
     finally:
         db.close()
@@ -363,6 +368,10 @@ def test_handle_proxy_request_sends_unavailable_when_pool_exhausted(client):
     bid = c.post("/bookings", json={"name": "b", "type": "test", "posto_id": "2032"}, headers=h).json()["id"]
     wid = c.post(f"/bookings/{bid}/identities",
                  json={"identity_id": iid, "assigned_role": "apply"}, headers=h).json()["id"]
+    # HOLD_PROXY_KIND must name a STATIC pool for the request to reach the lease at all (a rotating
+    # pool is refused up front since 2026-09-15) -- exhaustion is the property under test here, not
+    # the rotating refusal, which has its own test.
+    c.patch(f"/bookings/{bid}/settings", json={"HOLD_PROXY_KIND": "static"}, headers=h)
 
     class _FakeBus:
         def __init__(self):
@@ -379,6 +388,8 @@ def test_handle_proxy_request_sends_unavailable_when_pool_exhausted(client):
     bus = _FakeBus()
     try:
         hub = events_mod.EventHub.__new__(events_mod.EventHub)
+        # HOLD_PROXY_KIND must name a static pool for the request to reach the lease at all
+        # (rotating pools are refused up front since 2026-09-15); exhaustion is what we want here.
         hub._handle_proxy_request(wid, "hold", bus, health_check=lambda url: (True, "ok"))
         # no proxies seeded at all -- pool exhausted regardless of health_check (never even called)
     finally:
@@ -449,14 +460,14 @@ def test_handle_proxy_request_uses_worker_layer_override_same_as_launch(client):
     found (events.py's layers dict never included L.WORKER)."""
     sent, _, wid = _seed_and_call_proxy_request(
         client,
-        booking_settings={"PROXY_PROVIDER": "soax"},
+        booking_settings={"PROXY_PROVIDER": "soax", "PROXY_KIND": "static"},
         worker_settings={"PROXY_PROVIDER": "webshare"},
         phase="warmup",
         proxies=[
-            dict(id="px-soax", provider="soax", kind="rotating", endpoint="soax:1",
-                credentials_ref="u:p", max_sessions=5),
-            dict(id="px-webshare", provider="webshare", kind="rotating", endpoint="webshare:1",
-                credentials_ref="u:p", max_sessions=5),
+            dict(id="px-soax", provider="soax", kind="static", endpoint="soax:1",
+                credentials_ref="u:p", max_sessions=5, resource_type="static"),
+            dict(id="px-webshare", provider="webshare", kind="static", endpoint="webshare:1",
+                credentials_ref="u:p", max_sessions=5, resource_type="static"),
         ],
     )
     assert len(sent) == 1
@@ -468,12 +479,12 @@ def test_handle_proxy_request_uses_worker_layer_override_same_as_launch(client):
 
 
 def test_handle_proxy_request_hold_rejects_rotating_when_static_required(client):
-    """Invariant B / F: HOLD_SWAP_AFTER_WARMUP is on, so the resolved hold configuration requires
+    """Invariant B / F: HOLD_SWAP_AFTER_LOGIN is on, so the resolved hold configuration requires
     resource_type='static' -- and no static row exists, only a rotating one. The rotation must fail
     cleanly (proxy_unavailable), and must NEVER return the rotating candidate as a fallback."""
     sent, TestSession, wid = _seed_and_call_proxy_request(
         client,
-        booking_settings={"HOLD_PROXY_PROVIDER": "soax", "HOLD_SWAP_AFTER_WARMUP": True},
+        booking_settings={"HOLD_PROXY_PROVIDER": "soax", "HOLD_SWAP_AFTER_LOGIN": True},
         phase="hold",
         proxies=[
             dict(id="px-rotating", provider="soax", kind="rotating", endpoint="soax:1",
@@ -500,7 +511,7 @@ def test_handle_proxy_request_hold_succeeds_and_returns_static_when_available(cl
     the rotating one, even though nothing about score/LRU ordering favors either."""
     sent, _, wid = _seed_and_call_proxy_request(
         client,
-        booking_settings={"HOLD_PROXY_PROVIDER": "soax", "HOLD_SWAP_AFTER_WARMUP": True},
+        booking_settings={"HOLD_PROXY_PROVIDER": "soax", "HOLD_SWAP_AFTER_LOGIN": True},
         phase="hold",
         proxies=[
             dict(id="px-rotating", provider="soax", kind="rotating", endpoint="rot:1",
@@ -516,12 +527,16 @@ def test_handle_proxy_request_hold_succeeds_and_returns_static_when_available(cl
     assert payload["resource_type"] == "static"
 
 
-def test_handle_proxy_request_warmup_never_requires_static(client):
-    """Sanity boundary: HOLD_SWAP_AFTER_WARMUP being on must not leak a static requirement into the
-    UNRELATED warmup-phase (PROXY_PROVIDER) pool -- only "hold" is ever static-constrained."""
+def test_handle_proxy_request_refuses_a_rotating_pool_and_says_why(client):
+    """REPLACES test_handle_proxy_request_warmup_never_requires_static, whose premise (the Hub
+    assigns warm-phase ROTATING proxies) stopped being true on 2026-09-15.
+
+    A rotating pool has nothing to assign: the session id is a string the worker mints itself. The
+    Hub must say so rather than silently minting one here -- a Hub-side mint would put back exactly
+    the round-trip this change removed (measured 46-124s per rotation on booking 0911)."""
     sent, _, wid = _seed_and_call_proxy_request(
         client,
-        booking_settings={"PROXY_PROVIDER": "soax", "HOLD_SWAP_AFTER_WARMUP": True},
+        booking_settings={"PROXY_PROVIDER": "soax", "PROXY_KIND": "rotating"},
         phase="warmup",
         proxies=[
             dict(id="px-rotating", provider="soax", kind="rotating", endpoint="rot:1",
@@ -529,9 +544,9 @@ def test_handle_proxy_request_warmup_never_requires_static(client):
         ],
     )
     assert len(sent) == 1
-    worker_id, typ, payload = sent[0]
-    assert typ == "proxy_assigned"
-    assert payload["proxy"].endswith("rot:1")
+    _worker_id, typ, payload = sent[0]
+    assert typ == "proxy_unavailable"
+    assert "mint" in payload["reason"] and "STATIC" in payload["reason"]
 
 
 def test_persist_booked_pdf_creates_artifact_and_appointment(client, tmp_path):
