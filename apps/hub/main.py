@@ -2207,10 +2207,27 @@ def update_template(template_id: str, body: TemplateCreate, db: Session = Depend
 @app.delete("/templates/{template_id}", status_code=204)
 def delete_template(template_id: str, db: Session = Depends(get_db),
                     _op: Principal = Depends(require_operator)) -> None:
+    # FK-safe delete. workers.template_id and template_versions.template_id both reference this row
+    # with ON DELETE NO ACTION, so a bare db.delete(tpl) on a template that was ever launched raises
+    # an IntegrityError that surfaced as a plain-text "Internal Server Error" 500 -- which the
+    # dashboard tried to JSON.parse ("Unexpected token 'I'..."), so the Delete button silently failed
+    # for every used template (confirmed 2026-09-23). Same class as the Detach FK bug: clear the
+    # references first. workers.template_id is provenance (settings are resolved into each worker at
+    # launch), so null it and KEEP the worker history; template_versions are the template's own
+    # snapshots, so delete them with it.
     tpl = db.get(M.WorkerTemplate, template_id)
-    if tpl:
+    if not tpl:
+        return
+    try:
+        db.query(M.Worker).filter(M.Worker.template_id == template_id).update(
+            {M.Worker.template_id: None}, synchronize_session=False)
+        db.query(M.TemplateVersion).filter(M.TemplateVersion.template_id == template_id).delete(
+            synchronize_session=False)
         db.delete(tpl)
         db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(409, f"could not delete template: {e}")
 
 
 # ── Editable configs (form_defaults, quest_steps) ─────────────────────────────
