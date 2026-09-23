@@ -170,3 +170,15 @@ def test_keeping_to_warming_up_is_a_legal_transition():
 
     assert S.WARMING_UP in WORKER_SUBSTATE_TRANSITIONS[S.KEEPING]
     assert S.KEEPING in WORKER_SUBSTATE_TRANSITIONS[S.LOGGED_IN]
+
+
+def test_warmed_to_applying_is_legal():
+    """A WARMED apply worker handed a slot enters _run_apply, which goes straight to APPLYING. This
+    was missing from WARMED's transitions, so `warmed -> applying` raised IllegalTransition and
+    CRASHED the worker (41 crashes on 'Prev 0923-3018', warmed workers dying instead of booking).
+    KEEPING/POLLING/DISCOVERING all reach APPLYING; WARMED must too."""
+    from libs.domain.enums import WorkerSubstate as S
+    from libs.domain.state_machines import WORKER_SUBSTATE_TRANSITIONS, worker_substate_transition
+
+    assert S.APPLYING in WORKER_SUBSTATE_TRANSITIONS[S.WARMED]
+    worker_substate_transition(S.WARMED, S.APPLYING)   # must not raise

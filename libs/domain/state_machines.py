@@ -164,8 +164,14 @@ WORKER_SUBSTATE_TRANSITIONS = {
     # be a lie about a session that is still alive.
     WorkerSubstate.WARMING_UP:  frozenset({WorkerSubstate.WARMED, WorkerSubstate.WARMING_UP,
                                            WorkerSubstate.KEEPING, WorkerSubstate.FAILED}),
+    # APPLYING added 2026-09-23: a WARMED apply worker handed a slot enters _run_apply, which goes
+    # straight to APPLYING -- but WARMED could only reach KEEPING/DISCOVERING, so `warmed ->
+    # applying` raised IllegalTransition and CRASHED the worker (41 crashes on 'Prev 0923-3018',
+    # warmed workers dying instead of booking). A warm authed session applying is exactly as valid
+    # as a keeping/polling/discovering one doing so -- all three already list APPLYING.
     WorkerSubstate.WARMED:      frozenset({WorkerSubstate.SWAPPED, WorkerSubstate.KEEPING,
-                                           WorkerSubstate.DISCOVERING, WorkerSubstate.FAILED}),
+                                           WorkerSubstate.DISCOVERING, WorkerSubstate.APPLYING,
+                                           WorkerSubstate.FAILED}),
     WorkerSubstate.SWAPPED:     frozenset({WorkerSubstate.KEEPING, WorkerSubstate.DISCOVERING,
                                            WorkerSubstate.FAILED}),
     # HOLDING -> LOGGING_IN added 2026-08-14: a held worker whose apply bounced to the questionnaire

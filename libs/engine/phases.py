@@ -50,10 +50,6 @@ INACTIVATE = object()
 # constant rather than a setting: it is a back-off shape, not an operator knob, and every unit of it
 # is a poll_gap() carrying the enforced minimum floor.
 _PARK_POLL_GAPS = 3
-# Poll gaps a worker will wait out a tripped booking breaker before giving up. The
-# breaker's own cooldown is 120s, so this is deliberately several cooldowns' worth:
-# the point is to outlast the outage, not to sample it once.
-_BREAKER_WAIT_GAPS = 40
 
 
 def _flatten_found(results: list[dict]) -> list[dict]:
@@ -73,8 +69,8 @@ class EngineOps(Protocol):
 
     # ── shared warm-up ────────────────────────────────────────────────────────
     def do_login(self) -> bool: ...
-    # True when the last do_login() refused because the BOOKING'S circuit breaker is tripped --
-    # "the portal is refusing everyone, come back later", which is not a verdict on this worker.
+    # Legacy stub, always False since the booking breaker was removed 2026-09-23. Kept so _warmup's
+    # getattr(ops, "breaker_tripped") still resolves to a callable across the Protocol's test doubles.
     def breaker_tripped(self) -> bool: ...
     def do_warmup(self) -> bool: ...
     # Whether the booking form-state anchor (posto_pdf) is currently established. Warmup is
@@ -177,8 +173,8 @@ class PhaseMachine:
         # A SLOW portal is not a broken session, and a re-login cannot make the portal faster --
         # it just spends a CAPTCHA solve and a slice of the sub-account rate limit, which is already
         # the binding constraint, to arrive back at the same slow portal. Keep re-warming instead;
-        # the booking-wide breaker (fed by ops_live's _note_portal) is what backs the fleet off when
-        # slowness turns out to be systemic rather than this worker's bad luck.
+        # systemic slowness is now surfaced to the operator via PortalLiveness (the booking-wide
+        # breaker that used to back the fleet off was removed 2026-09-23).
         kind = getattr(self.ops, "warmup_failure_kind", lambda: "unknown")()
         if kind == "slow":
             self._to(WorkerSubstate.KEEPING,
@@ -207,49 +203,13 @@ class PhaseMachine:
     # mode that explicitly wants to stop once warmed and report that state.
     def _warmup(self) -> PhaseResult | None:
         self._to(WorkerSubstate.LOGGING_IN)
-        # A TRIPPED BREAKER MEANS WAIT, NOT DIE.
-        #
-        # do_login() refuses outright while the booking's breaker is tripped, and that refusal used
-        # to be indistinguishable from a real login failure -- so the worker terminated, hold-respawn
-        # relaunched it, the new process hit the same tripped breaker, and it terminated again.
-        # MEASURED on the 2026-09-02 17:15 run of "Test 0901": worker 0c255d40 made 65 process
-        # starts, and 55 of them died on "booking breaker is tripped" WITHOUT ISSUING A SINGLE
-        # REQUEST. Two workers burned 102 process starts between them this way.
-        #
-        # The breaker's entire purpose is "back off and come back later"; answering it by dying and
-        # being resurrected every ~30s is the opposite, and it costs a process start, a proxy lease
-        # and a Hub scheduling round each time. Waiting costs nothing scarce -- the cooldown is
-        # bounded (BREAKER_COOLDOWN, 120s) and is_tripped() clears itself when it elapses.
-        waits = 0
-        while not self.ops.do_login():
-            # getattr, not a bare call: EngineOps is a Protocol with many test doubles and
-            # partial implementations, and an ops object that cannot answer the question has by
-            # definition no breaker -- so it must keep the original behaviour (fail immediately)
-            # rather than crash. Failing closed here would turn a missing method into a worker that
-            # waits 40 poll gaps on every genuine login failure.
-            _tripped = getattr(self.ops, "breaker_tripped", None)
-            if not (callable(_tripped) and _tripped()):
-                return self._fail("login")          # a real login failure, unchanged
-            if self.ops.is_stopped():
-                return PhaseResult("stopped", self._sub, "stopped while the breaker was tripped",
-                                   self.visited)
-            waits += 1
-            if waits > _BREAKER_WAIT_GAPS:
-                # Still refusing after a full budget of poll gaps. Fail out so the operator sees it
-                # and the supervisor's own respawn accounting applies -- an unbounded wait would
-                # just move the invisible-worker problem somewhere else.
-                return self._fail("login")
-            # Stays in LOGGING_IN (a legal self-transition) rather than moving to KEEPING: this
-            # worker has NOT authenticated, and KEEPING means an AUTHENTICATED session is being kept
-            # alive (renamed from HOLDING 2026-09-11 to say that out loud -- it has never meant a
-            # WARMED session, and since the auth-only keepalive consolidation it cannot: warmup is
-            # deferred to the slot-open/slot-found signal, so a KEEPING worker is by definition not
-            # yet warmed).
-            # The state machine rejects logging_in -> holding for exactly that reason, and it is
-            # right to -- the detail carries the "why", the substate keeps telling the truth.
-            self._to(WorkerSubstate.LOGGING_IN,
-                     detail=f"waiting out the booking breaker ({waits}/{_BREAKER_WAIT_GAPS})")
-            self.ops.poll_gap()
+        # The booking breaker was REMOVED 2026-09-23, so a failed do_login() is always a real login
+        # failure now -- there is no "the fleet is gated, wait" case any more. (do_login handles a
+        # 'try again later' throttle per-worker with exit rolls, and a maintenance page by backing
+        # THIS worker off; neither freezes the fleet.) breaker_tripped() survives as a stub that
+        # always returns False, so this stays a plain fail-on-failure.
+        if not self.ops.do_login():
+            return self._fail("login")
         self._to(WorkerSubstate.LOGGED_IN)
         if self.cfg.warmup_only:
             self._to(WorkerSubstate.WARMING_UP)
@@ -272,8 +232,8 @@ class PhaseMachine:
         prior round already did it -- skip, no redundant work; or nothing did -- do it now, right
         when it's actually needed). Returns a terminal PhaseResult on failure, None on success/
         already-warmed, matching _warmup()'s own None-means-continue convention."""
-        # getattr, not a bare call -- same reason as _warmup's breaker_tripped probe below: EngineOps
-        # is a Protocol with many partial test doubles. An ops that cannot answer "am I warmed" has
+        # getattr, not a bare call -- EngineOps is a Protocol with many partial test doubles, so we
+        # probe defensively. An ops that cannot answer "am I warmed" has
         # no anchor concept at all, so it keeps its pre-existing behaviour (this step is a no-op for
         # it) rather than crashing or being forced through a warmup it never modelled.
         _warmed = getattr(self.ops, "is_warmed", None)

@@ -83,6 +83,15 @@ RETIRED_SETTINGS = frozenset({
     # booking still carrying a stored value doesn't crash resolve() on the per-tick path.
     "DISCOVERY_MODE", "DISCOVERY_CONCURRENCY", "DISCOVERY_MAX_PARALLEL",
     "SINGLE_MODE_INTERVAL", "DATE_RETIRE_ENABLED", "DATE_RETIRE_AFTER_MISSES",
+    # The booking-wide circuit breaker was REMOVED 2026-09-23. It gated the whole fleet (do_login/
+    # do_apply refused while tripped) and did more harm than good: a normal post-restart throttle
+    # burst tripped it, froze every worker ("waiting out the booking breaker"), and oscillated
+    # (trip -> all wait -> all retry together -> re-trip), starving discovery and apply. Portal-down
+    # is now SHOWN to the operator via PortalLiveness (portal_liveness_key) instead of freezing the
+    # fleet, and a worker that hits the maintenance page backs off on its own (MAINTENANCE_BACKOFF).
+    "BREAKER_TRIP_THRESHOLD", "BREAKER_COOLDOWN",
+    "BREAKER_BUSY_DISTINCT_ACCOUNTS", "BREAKER_BUSY_WINDOW",
+    "BREAKER_MAINT_DISTINCT_ACCOUNTS", "BREAKER_MAINT_WINDOW",
 })
 
 
@@ -497,32 +506,13 @@ _BOOKING = [
        "Stop the booking after this many confirmed appointments. 0 = unlimited."),
     _s("BOOKING_TIMEOUT_HOURS", L.BOOKING, float, 48.0, group="guards",
        note="hard stop for the whole booking; replaces the removed per-worker hold timeout"),
-    _s("BREAKER_TRIP_THRESHOLD", L.BOOKING, int, 5, group="guards",
-       note="consecutive ALREADY-fleet-level portal-down signals (degraded window, transport "
-            "failure) before RedisBreaker trips. The login 'try again later' throttle does NOT feed "
-            "this -- it uses BREAKER_BUSY_DISTINCT_ACCOUNTS instead."),
-    _s("BREAKER_COOLDOWN", L.BOOKING, float, 120.0, group="guards", min_value=1.0,
-       note=
-       "Seconds the whole booking backs off once the breaker trips. Fleet-wide on purpose: it "
-       "trips only on evidence the portal is refusing EVERYONE (maintenance page, or several "
-       "different sub-accounts throttled), so one worker retrying does not help and 80 retrying "
-       "makes it worse."),
-    # DISTINCT-SUB-ACCOUNT trip evidence (2026-09-23). The 'try again later' login throttle is
-    # ambiguous -- an account-level block returns it from every exit -- so it must NOT trip the
-    # fleet breaker on its own. It trips only once this many DIFFERENT sub-accounts hit it inside
-    # the window, which a single blocked account cannot fake. A success anywhere clears the tally.
-    _s("BREAKER_BUSY_DISTINCT_ACCOUNTS", L.BOOKING, int, 4, group="guards", min_value=1,
-       note="distinct sub-accounts that must hit the 'try again later' throttle before the fleet "
-            "breaker trips (proves it is portal-wide, not one blocked account)"),
-    _s("BREAKER_BUSY_WINDOW", L.BOOKING, float, 180.0, group="guards", min_value=1.0,
-       note="seconds the distinct-account throttle tally is kept before it expires"),
-    # The maintenance page is unambiguous (down for everyone), so it trips fast on a low threshold;
-    # still >1 so one worker misreading a body cannot down the whole fleet.
-    _s("BREAKER_MAINT_DISTINCT_ACCOUNTS", L.BOOKING, int, 2, group="guards", min_value=1,
-       note="distinct sub-accounts that must see the maintenance / 'Serviço Indisponível' page "
-            "before the fleet breaker trips (fast, because the portal is explicitly down)"),
-    _s("BREAKER_MAINT_WINDOW", L.BOOKING, float, 300.0, group="guards", min_value=1.0,
-       note="seconds the distinct-account maintenance tally is kept before it expires"),
+    # Per-worker backoff after the portal's maintenance page (replaces the removed fleet breaker):
+    # a worker that hits 'Serviço Indisponível' waits this many seconds on its OWN before retrying,
+    # so it stops burning sub-accounts against a down portal without freezing the whole fleet.
+    _s("MAINTENANCE_BACKOFF", L.BOOKING, float, 60.0, group="guards", min_value=0.0,
+       note="seconds a worker backs off after seeing the portal maintenance page (per-worker, not "
+            "fleet-wide -- the booking breaker was removed 2026-09-23; portal state is shown on the "
+            "dashboard via PortalLiveness instead)"),
     # Consecutive apply bounces before re-warming IN PLACE and trying again (operator, 2026-08-21).
     # Two failures in a row is far more likely a stale server-side form anchor than two genuinely
     # taken slots -- and a re-warm is ~38s against a re-login's CAPTCHA solve and sub-account spend.

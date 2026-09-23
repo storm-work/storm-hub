@@ -2394,43 +2394,32 @@ def test_a_rejected_gettime_says_why_instead_of_returning_silently():
     assert any("scanned NOTHING" in m and "waf_challenge" in m for m in logged), logged
 
 
-# ── a portal refusal at login is fleet-wide news (2026-08-24) ───────────────
-class _Breaker:
-    def __init__(self): self.down = 0; self.busy = 0; self.maint = 0; self.ok = 0; self.tripped = False
-    def is_tripped(self): return self.tripped
-    def record_portal_down(self): self.down += 1
-    def record_portal_busy(self, sub_account_id=None): self.busy += 1
-    def record_maintenance(self, sub_account_id=None): self.maint += 1
-    def record_success(self): self.ok += 1
+# ── portal-refusal detection (the fleet breaker that used to consume it was removed 2026-09-23) ──
+class _RecordingLiveness:
+    """Stand-in for PortalLiveness: records the two facts workers report, never gates."""
+    def __init__(self): self.alive = 0; self.down = 0; self.down_accts = []
+    def record_alive(self): self.alive += 1
+    def record_down(self, sub_account_id=""): self.down += 1; self.down_accts.append(sub_account_id)
+    def state(self): return {"state": "down" if self.down else "alive"}
 
 
-def test_the_portals_try_again_later_page_is_reported_to_the_breaker():
-    """265 of 266 refusals landed at login, and every worker retried independently -- 341 attempts
-    for 30 sessions. Retrying harder cannot help: the CAPTCHA solves and the token is accepted, the
-    portal simply declines to serve us."""
+def test_the_portals_try_again_later_page_is_detected():
+    """The throttle page detection is unchanged; only what consumes it changed (it no longer feeds a
+    fleet breaker -- that was removed -- it is handled per-worker with exit rolls)."""
     from apps.worker.ops_live import _is_portal_busy
 
     assert _is_portal_busy("Não foi possível de momento concretizar o seu pedido")
     assert _is_portal_busy("We were unable to complete your request at this time")
 
 
-def test_a_credential_rejection_is_not_reported_as_portal_down():
-    """Guard rail: the breaker gates the whole booking, so only the portal's own unwillingness may
-    trip it -- never a verdict about one account."""
+def test_a_credential_rejection_is_not_a_portal_refusal():
+    """Guard rail: a verdict about one account (bad creds, reCAPTCHA, a WAF challenge) is NOT the
+    portal's 'try again later' refusal."""
     from apps.worker.ops_live import _is_portal_busy
 
     assert _is_portal_busy("login_failed_auth_redirect") is False
     assert _is_portal_busy("Por favor, confirma o reCAPTCHA.") is False
     assert _is_portal_busy("datadome_challenge_on_post") is False
-
-
-def test_a_tripped_breaker_stops_do_login_before_it_spends_anything():
-    ops = _make_ops(emit=lambda t, **p: None)
-    ops._log = lambda *a, **k: None
-    b = _Breaker(); b.tripped = True
-    ops._breaker = b
-    assert ops.do_login() is False
-    assert b.down == 0, "a tripped breaker must short-circuit, not re-report"
 
 
 # ── the portal's 2-failure reCAPTCHA block (2026-08-24) ─────────────────────
@@ -3414,15 +3403,6 @@ _BUSY_BODY = ('{"type":"error","description":"N\\u00e3o foi poss\\u00edvel de mo
               'o seu pedido. Por favor tente mais tarde."}')
 
 
-class _RecordingBreaker:
-    def __init__(self): self.downs = 0; self.busy = 0; self.maint = 0; self.successes = 0
-    def is_tripped(self): return False
-    def record_portal_down(self): self.downs += 1
-    def record_portal_busy(self, sub_account_id=None): self.busy += 1
-    def record_maintenance(self, sub_account_id=None): self.maint += 1
-    def record_success(self): self.successes += 1
-
-
 def _busy_login_ops(monkeypatch, calls, *, busy_rolls=3, sticky=2):
     import apps.worker.ops_live as ops_live_mod
 
@@ -3435,25 +3415,24 @@ def _busy_login_ops(monkeypatch, calls, *, busy_rolls=3, sticky=2):
     ops = _make_ops(cfg=_cfg(STICKY_RETRY_MAX=sticky, LOGIN_TRANSIENT_RETRY_MAX=0,
                              LOGIN_PORTAL_BUSY_ROLLS=busy_rolls))
     ops._backoff = lambda n: None
+    ops._backoff_seconds = lambda s: None
     ops._request_proxy_rotation = lambda phase=None: None
-    ops._breaker = _RecordingBreaker()
+    ops._liveness = _RecordingLiveness()
     rolls = []
     ops._roll_exit = lambda why="": rolls.append(why) or True
     return ops, rolls
 
 
 def _busy_rolls(rolls):
-    """Only the rolls the PORTAL-BUSY budget is responsible for.
-
-    Since 2026-09-15 every login retry round past the first also rolls the exit locally (it used to
-    ask the Hub for another pooled row instead -- same effect on the exit, different mechanism), so
-    counting every _roll_exit call would conflate the two. What LOGIN_PORTAL_BUSY_ROLLS bounds, and
-    what these tests are about, is how many different exits are tried BEFORE the fleet-wide breaker
-    is told the portal is refusing everyone."""
+    """Only the rolls the PORTAL-BUSY budget is responsible for. Since 2026-09-15 every login retry
+    round past the first also rolls the exit locally, so counting every _roll_exit call would
+    conflate the two. What LOGIN_PORTAL_BUSY_ROLLS bounds is how many different exits a 'try again
+    later' throttle tries before giving up -- now a purely per-worker action (the fleet breaker that
+    used to consume it was removed 2026-09-23)."""
     return [w for w in rolls if str(w).startswith("portal busy")]
 
 
-def test_a_busy_page_rolls_the_exit_before_the_fleet_is_told_anything(monkeypatch):
+def test_a_busy_page_rolls_the_exit_and_touches_no_fleet_gate(monkeypatch):
     calls = {"n": 0}
     ops, rolls = _busy_login_ops(monkeypatch, calls, busy_rolls=3)
 
@@ -3461,11 +3440,8 @@ def test_a_busy_page_rolls_the_exit_before_the_fleet_is_told_anything(monkeypatc
 
     assert len(_busy_rolls(rolls)) == 3, \
         f"the refusal was blamed on the portal without trying another exit: {rolls}"
-    assert ops._breaker.busy == 2, (
-        "the throttle should reach the breaker's DISTINCT-ACCOUNT evidence only after 3 different "
-        f"exits refused -- then once per remaining sticky attempt (got {ops._breaker.busy})")
-    assert ops._breaker.downs == 0, \
-        "a login throttle must NOT feed the consecutive portal-down path any more"
+    assert ops._liveness.down == 0, \
+        "a login throttle must NOT mark the portal down -- it says nothing about portal liveness"
 
 
 def test_a_busy_page_is_not_charged_to_the_sub_account_while_rolling(monkeypatch):
@@ -3481,29 +3457,28 @@ def test_a_busy_page_is_not_charged_to_the_sub_account_while_rolling(monkeypatch
         f"expected 3 uncharged rolls + 2 charged sticky attempts, got {calls['n']}"
 
 
-def test_rolling_is_bounded_so_a_genuine_outage_still_reaches_the_fleet(monkeypatch):
-    """The 2026-08-23 finding stands: when the portal really is refusing everyone, the fleet must
-    back off together rather than each worker grinding alone. Rolling only delays that until it is
-    established, and setting the budget to 0 restores the original straight-to-breaker behaviour."""
+def test_a_busy_budget_of_zero_rolls_nothing_and_still_marks_no_portal_down(monkeypatch):
+    """With the roll budget at 0 the throttle just counts as the attempt -- and it never marks the
+    portal down (that would be false: a throttled account is refused from every exit while others
+    log in fine). The fleet-wide backoff this used to trigger was removed 2026-09-23."""
     calls = {"n": 0}
     ops, rolls = _busy_login_ops(monkeypatch, calls, busy_rolls=0)
 
     ops._sticky_login_attempts(ops.cfg.login.sticky_retry_max)
 
-    assert _busy_rolls(rolls) == [], \
-        f"with the budget at 0 no BUSY roll should be attempted (got {rolls})"
-    assert ops._breaker.busy > 0, "a genuine outage never reached the breaker's throttle evidence"
+    assert _busy_rolls(rolls) == [], f"with the budget at 0 no BUSY roll should be attempted (got {rolls})"
+    assert ops._liveness.down == 0, "a throttle must never mark the portal down"
 
 
 _MAINT_BODY = ('{"type":"error","description":"Servi\\u00e7o em manuten\\u00e7\\u00e3o. '
               'Tente novamente mais tarde."}')
 
 
-def test_the_maintenance_page_does_NOT_roll_and_feeds_the_maintenance_evidence(monkeypatch):
+def test_the_maintenance_page_marks_the_portal_down_and_does_NOT_roll(monkeypatch):
     """Unlike the throttle, the maintenance page is down-for-everyone: rolling exits or rotating
     sub-accounts against it only burns the pool (booking 'Test 2032': 154 refusals, 13 accounts).
-    So the login path must NOT roll on it, must NOT spend a sticky attempt, and must feed the
-    maintenance evidence (not the throttle or consecutive-down paths)."""
+    So the login path must NOT roll on it, must NOT spend a sticky attempt, must mark the portal
+    DOWN on PortalLiveness (for the dashboard) and back this worker off on its own."""
     import apps.worker.ops_live as ops_live_mod
 
     calls = {"n": 0}
@@ -3514,8 +3489,10 @@ def test_the_maintenance_page_does_NOT_roll_and_feeds_the_maintenance_evidence(m
     monkeypatch.setattr(ops_live_mod, "get_session", lambda **kw: _AlwaysMaint())
     ops = _make_ops(cfg=_cfg(STICKY_RETRY_MAX=2, LOGIN_TRANSIENT_RETRY_MAX=0, LOGIN_PORTAL_BUSY_ROLLS=3))
     ops._backoff = lambda n: None
+    backoffs = []
+    ops._backoff_seconds = lambda s: backoffs.append(s)
     ops._request_proxy_rotation = lambda phase=None: None
-    ops._breaker = _RecordingBreaker()
+    ops._liveness = _RecordingLiveness()
     rolls = []
     ops._roll_exit = lambda why="": rolls.append(why) or True
 
@@ -3523,8 +3500,8 @@ def test_the_maintenance_page_does_NOT_roll_and_feeds_the_maintenance_evidence(m
     assert ok is False
     assert calls["n"] == 1, f"maintenance must stop after ONE attempt, not grind (got {calls['n']})"
     assert rolls == [], f"must not roll the exit against a down portal (got {rolls})"
-    assert ops._breaker.maint == 1, "maintenance page must feed the maintenance evidence"
-    assert ops._breaker.busy == 0 and ops._breaker.downs == 0,         "maintenance must NOT feed the throttle or consecutive-down paths"
+    assert ops._liveness.down == 1, "maintenance page must mark the portal DOWN on PortalLiveness"
+    assert backoffs and backoffs[0] > 0, "the worker must back off on its own after maintenance"
     assert ops._saw_maintenance is True, "the flag that makes _fresh_login abandon rotation"
 
 

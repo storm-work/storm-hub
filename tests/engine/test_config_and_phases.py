@@ -679,87 +679,31 @@ def test_a_round_that_reported_nothing_does_not_itself_trigger_a_rebuild():
     assert ops.reported_dates == [], "a round that reported nothing still wrote to the pool"
 
 
-# ── a tripped breaker means wait, not die (2026-09-02) ────────────────────────────────────────
-# do_login() refuses while the booking's breaker is tripped, and that refusal was indistinguishable
-# from a real login failure -- so the worker terminated, hold-respawn relaunched it into the same
-# tripped breaker, and it terminated again. MEASURED on the 17:15 run of "Test 0901": worker
-# 0c255d40 made 65 process starts and 55 of them died on "breaker is tripped" WITHOUT ISSUING A
-# SINGLE REQUEST; two workers burned 102 process starts between them this way.
+# ── a login failure fails immediately (the booking breaker was REMOVED 2026-09-23) ─────────────
+# The breaker used to make _warmup WAIT on a failed do_login ("the fleet is gated, come back
+# later"). That gate did more harm than good (froze the fleet on a normal throttle burst and
+# oscillated), so it was removed: a failed do_login is now always a real login failure and the
+# worker fails immediately. breaker_tripped() survives as a False stub, so this is the only path.
 
-class _BreakerOps(SimEngineOps):
-    """Refuses login while `tripped_for` calls remain, reporting it as the breaker (not a failure)."""
-    def __init__(self, *a, tripped_for=3, then_ok=True, **kw):
+class _FailLoginOps(SimEngineOps):
+    """Login always fails."""
+    def __init__(self, *a, **kw):
         super().__init__(*a, **kw)
-        self.tripped_for = tripped_for
-        self.then_ok = then_ok
         self.login_calls = 0
-        self._refused_by_breaker = False
-
-    def breaker_tripped(self) -> bool:
-        # Reports why the LAST do_login refused -- not the breaker's state now. Reading it live is
-        # wrong in the same way the production bug was: by the time phases.py asks, the refusal has
-        # already happened, and the answer must describe that refusal.
-        return self._refused_by_breaker
 
     def do_login(self) -> bool:
         self.login_calls += 1
-        if self.tripped_for > 0:
-            self.tripped_for -= 1
-            self._refused_by_breaker = True
-            return False
-        self._refused_by_breaker = False
-        return super().do_login() if self.then_ok else False
+        return False
 
 
-def test_a_worker_waits_out_a_tripped_breaker_instead_of_dying():
-    ops = _BreakerOps(tripped_for=3, discover_tasks=[["d1"]],
-                      discover_outcomes={"d1": {"outcome": "empty"}})
-    res = PhaseMachine(_cfg(ROLE="scout"), ops).run()
-
-    assert ops.login_calls == 4, \
-        f"should have retried through the 3 tripped gaps and then logged in (got {ops.login_calls})"
-    assert res.outcome != "failed", \
-        "the worker died on a breaker that was telling it to come back later"
-    assert ops.logins == 1, "it should have logged in exactly once, after the breaker cleared"
-
-
-def test_a_real_login_failure_still_fails_immediately():
-    """The distinction is the whole point: a genuine login failure must NOT be waited out, or a
-    dead sub-account would hold a proxy lease for 40 poll gaps."""
-    ops = _BreakerOps(tripped_for=0, then_ok=False, discover_tasks=[["d1"]], discover_outcomes={})
-    ops.breaker_tripped = lambda: False
+def test_a_login_failure_fails_immediately_without_waiting():
+    """A genuine login failure must NOT be waited out (there is no gate to wait on any more), or a
+    dead sub-account would hold a proxy lease pointlessly."""
+    ops = _FailLoginOps(discover_tasks=[["d1"]], discover_outcomes={})
     res = PhaseMachine(_cfg(ROLE="scout"), ops).run()
 
     assert res.outcome == "failed" and res.detail == "login"
-    assert ops.login_calls == 1, f"a real failure was retried {ops.login_calls} times"
-
-
-def test_waiting_for_the_breaker_is_bounded():
-    """An unbounded wait would just move the invisible-worker problem instead of fixing it."""
-    from libs.engine.phases import _BREAKER_WAIT_GAPS
-    # stop_after_polls=None: the simulator otherwise declares itself stopped after 8 poll gaps,
-    # which would end the run before the wait budget is anywhere near exhausted.
-    ops = _BreakerOps(tripped_for=10**6, stop_after_polls=None,
-                      discover_tasks=[["d1"]], discover_outcomes={})
-    res = PhaseMachine(_cfg(ROLE="scout"), ops).run()
-
-    assert res.outcome == "failed"
-    assert ops.login_calls == _BREAKER_WAIT_GAPS + 1, \
-        f"waited {ops.login_calls} times, expected the budget of {_BREAKER_WAIT_GAPS} + 1"
-
-
-def test_a_stop_during_the_breaker_wait_is_honoured_as_stopped():
-    """`stopped` must never be reported as `failed` -- hold-respawn relaunches failures, which
-    would undo the operator's stop."""
-    ops = _BreakerOps(tripped_for=10**6, discover_tasks=[["d1"]], discover_outcomes={})
-    calls = {"n": 0}
-    def _stopped():
-        calls["n"] += 1
-        return calls["n"] >= 2
-    ops.is_stopped = _stopped
-    res = PhaseMachine(_cfg(ROLE="scout"), ops).run()
-
-    assert res.outcome == "stopped", f"a stop during the breaker wait reported {res.outcome!r}"
+    assert ops.login_calls == 1, f"a login failure was retried {ops.login_calls} times, expected 1"
 
 
 # ── the ladder must skip a rung it is known not to fix (2026-09-02) ───────────────────────────

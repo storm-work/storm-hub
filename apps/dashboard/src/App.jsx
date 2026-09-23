@@ -315,6 +315,43 @@ function useList(path, { pollMs = 0 } = {}) {
   return { rows, err, reload };
 }
 
+// Like useList but for an endpoint that returns a single object (e.g. portal liveness).
+function useOne(path, { pollMs = 0 } = {}) {
+  const [data, setData] = useState(null);
+  useEffect(() => {
+    if (!path) { setData(null); return undefined; }
+    const reload = () => api(path).then(setData).catch(() => {});
+    reload();
+    if (!pollMs) return undefined;
+    const t = setInterval(reload, pollMs);
+    return () => clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [path, pollMs]);
+  return data;
+}
+
+// Portal liveness pill for the booking header. state() from PortalLiveness: alive / down / unknown.
+function PortalBadge({ portal }) {
+  if (!portal) return null;
+  const st = portal.state || "unknown";
+  const since = portal.since ? new Date(portal.since * 1000).toISOString().slice(11, 19) + "Z" : null;
+  const meta = {
+    alive: { cls: "ok", label: "portal alive", color: "#3fb950" },
+    down: { cls: "err", label: "portal DOWN", color: "#f85149" },
+    unknown: { cls: "", label: "portal ?", color: "#8b949e" },
+  }[st] || { cls: "", label: "portal ?", color: "#8b949e" };
+  const tip = st === "down"
+    ? `Portal served its maintenance page${portal.down_accounts ? ` (${portal.down_accounts} accounts)` : ""}${since ? ` since ${since}` : ""}. Shown, not gated -- workers back off individually.`
+    : st === "alive" ? `A worker reached the portal normally${since ? ` at ${since}` : ""}.`
+    : "No worker has reached the portal yet.";
+  return (
+    <span className={`pill ${meta.cls}`} title={tip} style={{ display: "inline-flex", alignItems: "center", gap: 5 }}>
+      <span style={{ width: 8, height: 8, borderRadius: "50%", background: meta.color, display: "inline-block" }} />
+      {meta.label}{st === "down" && since ? ` @${since}` : ""}
+    </span>
+  );
+}
+
 function Bookings({ me, events, setLeftPanel, setRightPanel }) {
   // Archived bookings are hidden server-side by default; the toggle asks for them explicitly.
   // Filtering server-side rather than fetching everything and hiding in the browser keeps the
@@ -609,6 +646,10 @@ function BookingRunSummary({ workers, events }) {
 
 function BookingOverview({ me, booking, events, workers, onBookingChanged, onDeleted, onSelectBooking }) {
   const op = me.is_operating;
+  // Portal liveness (alive/down/unknown) -- what workers report about the portal itself. Replaced
+  // the booking breaker (removed 2026-09-23): the portal's state is SHOWN here, not acted on by
+  // freezing the fleet. Polled independently so a down portal surfaces within a few seconds.
+  const portal = useOne(booking ? `/bookings/${booking.id}/portal` : null, { pollMs: 5000 });
   const [msg, setMsg] = useState("");
   const [editing, setEditing] = useState(false);
   const [edit, setEdit] = useState(() => ({
@@ -844,8 +885,9 @@ function BookingOverview({ me, booking, events, workers, onBookingChanged, onDel
         </button>
         <button className="btn ghost" disabled={!op} onClick={deleteBooking} title="permanently delete this booking and everything on it">🗑 Delete</button>
       </div>
-      <div className="row muted" style={{ fontSize: 13, marginBottom: 6, gap: 14, flexWrap: "wrap" }}>
+      <div className="row muted" style={{ fontSize: 13, marginBottom: 6, gap: 14, flexWrap: "wrap", alignItems: "center" }}>
         <span>status: <b>{booking.status}</b></span>
+        <PortalBadge portal={portal} />
         {booking.warmup_start_at && <span>warmup (scheduled)@{(booking.warmup_start_at || "").slice(0, 16).replace("T", " ")}Z</span>}
         {booking.slot_open_at && <span>slot-open (scheduled)@{(booking.slot_open_at || "").slice(0, 16).replace("T", " ")}Z</span>}
       </div>

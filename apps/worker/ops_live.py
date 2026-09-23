@@ -37,7 +37,7 @@ from enum import Enum
 from urllib.parse import urlencode
 from datetime import date
 
-from libs.bus.breaker import RedisBreaker
+from libs.bus.portal_liveness import PortalLiveness
 from libs.bus.semaphore import RedisSemaphore
 from libs.engine import checkpoint as ckpt
 from libs.engine.config import EngineConfig
@@ -214,9 +214,10 @@ _PORTAL_BUSY_MARKERS = (
 # coexisted with 4 successful logins in one bucket). The maintenance page is unambiguous: the portal
 # is explicitly down for EVERYONE, saying nothing about our session, proxy or account. Rolling exits
 # or rotating sub-accounts against it only burns the pool (booking "Test 2032": 154 refusals across
-# 13 sub-accounts and 99 rotations). So the two now route differently -- maintenance trips the fleet
-# breaker FAST via record_maintenance(); the throttle only trips it once several DISTINCT accounts
-# agree, via record_portal_busy(). Accent-stripped variants included because the portal serves both.
+# 13 sub-accounts and 99 rotations). So the two route differently -- maintenance marks the portal
+# DOWN on the dashboard (PortalLiveness.record_down) and backs THIS worker off for a cooldown, while
+# the throttle is handled purely per-worker (roll exit) and never touches liveness. Accent-stripped
+# variants included because the portal serves both.
 _MAINTENANCE_MARKERS = (
     "serviço em manutenção",
     "servico em manutencao",
@@ -636,7 +637,7 @@ class LiveEngineOps(EngineOps):
         self._login_sem: RedisSemaphore | None = None
         self._apply_sem: RedisSemaphore | None = None
         self._pool_sem: RedisSemaphore | None = None
-        self._breaker: RedisBreaker | None = None
+        self._liveness: PortalLiveness | None = None
         # Set by _sticky_login_attempts when the portal serves its maintenance page, read by
         # _fresh_login to abandon sub-account rotation (down for everyone -- see the login path).
         self._saw_maintenance: bool = False
@@ -674,15 +675,7 @@ class LiveEngineOps(EngineOps):
                     cfg.raw.get("PROXY_KIND") or None,
                     _pool_limit,
                 )
-            self._breaker = RedisBreaker(
-                redis_client, booking_id,
-                trip_threshold=int(cfg.raw.get("BREAKER_TRIP_THRESHOLD", 5)),
-                cooldown=float(cfg.raw.get("BREAKER_COOLDOWN", 120.0)),
-                busy_threshold=int(cfg.raw.get("BREAKER_BUSY_DISTINCT_ACCOUNTS", 4)),
-                busy_window=float(cfg.raw.get("BREAKER_BUSY_WINDOW", 180.0)),
-                maint_threshold=int(cfg.raw.get("BREAKER_MAINT_DISTINCT_ACCOUNTS", 2)),
-                maint_window=float(cfg.raw.get("BREAKER_MAINT_WINDOW", 300.0)),
-            )
+            self._liveness = PortalLiveness(redis_client, booking_id)
 
     # ── shared warm-up ──────────────────────────────────────────────────────────
     def discovery_needs_relogin(self) -> bool:
@@ -697,20 +690,15 @@ class LiveEngineOps(EngineOps):
         return self._slots_needs_relogin
 
     def breaker_tripped(self) -> bool:
-        """Did the last do_login() refuse because the BOOKING'S breaker is tripped?
-
-        Read by PhaseMachine._warmup to tell "the portal is refusing everyone, wait" apart from
-        "this login failed". Without that distinction a tripped breaker terminated the worker and
-        hold-respawn immediately relaunched it into the same refusal -- 55 of one worker's 65
-        process starts on the 2026-09-02 17:15 run died that way without issuing a request.
-        """
-        return bool(self._breaker is not None and self._breaker.is_tripped())
+        """Always False. The booking breaker was REMOVED 2026-09-23 -- it gated the whole fleet and
+        did more harm than good (froze all workers on a normal throttle burst, oscillated, starved
+        discovery). This stub stays only so PhaseMachine._warmup's `getattr(ops, 'breaker_tripped')`
+        keeps returning a callable that says "no gate", i.e. a failed do_login is a real login
+        failure, never a wait. Portal-down is now shown to the operator via PortalLiveness, not acted
+        on by freezing the fleet."""
+        return False
 
     def do_login(self) -> bool:
-        if self._breaker is not None and self._breaker.is_tripped():
-            self._log("do_login: booking breaker is tripped -- portal appears down, not retrying yet")
-            return False
-
         if self._login_sem is not None:
             if not self._login_sem.acquire(self.identity_id, timeout=300):
                 self._log("do_login: login concurrency gate timed out")
@@ -1223,8 +1211,8 @@ class LiveEngineOps(EngineOps):
                 # while holding an unwarmed session -- and poisoning the next checkpoint save with a
                 # stage="schedule_jsp" that isn't true.
                 self._clear_anchor()
-                if self._breaker is not None:
-                    self._breaker.record_success()
+                if self._liveness is not None:
+                    self._liveness.record_alive()      # the portal served a successful login
                 return True
             # A rejection can ALSO be infrastructure: the vendored login returns 200 with an error
             # body for "datadome_challenge_on_post" (the exit IP is flagged) and for a navigation
@@ -1267,16 +1255,18 @@ class LiveEngineOps(EngineOps):
                 # 'try again later' throttle below, this is not about our exit or our account, and
                 # every exit and every sub-account gets the same page -- so rolling exits or
                 # rotating accounts against it only burns the pool (booking "Test 2032": 154
-                # refusals across 13 accounts). Report it to the fleet breaker (distinct-account
-                # gated, trips fast) and STOP grinding: don't roll, don't spend a sticky attempt,
-                # and signal _fresh_login to abandon rotation. The breaker then gates re-entry until
-                # the portal is back.
-                if self._breaker is not None:
-                    self._breaker.record_maintenance(self.sub_account_id)
+                # refusals across 13 accounts). Record it to PortalLiveness (shown to the operator
+                # as portal=down -- NOT a gate), STOP grinding (don't roll, don't spend a sticky
+                # attempt, signal _fresh_login to abandon rotation), and back off on our OWN for a
+                # cooldown -- the per-worker replacement for the removed fleet breaker: it stops this
+                # worker burning accounts against a down portal without freezing the whole fleet.
+                if self._liveness is not None:
+                    self._liveness.record_down(self.sub_account_id)
                 self._saw_maintenance = True
-                self._log("login: portal MAINTENANCE page ('Serviço Indisponível') -- reported to "
-                          "the fleet breaker; NOT rotating exit/account (the portal is down for "
-                          "everyone), letting the booking back off")
+                self._log("login: portal MAINTENANCE page ('Serviço Indisponível') -- portal marked "
+                          "DOWN for the dashboard; NOT rotating exit/account (down for everyone), "
+                          f"backing this worker off {int(self.cfg.raw.get('MAINTENANCE_BACKOFF', 60))}s")
+                self._backoff_seconds(float(self.cfg.raw.get("MAINTENANCE_BACKOFF", 60)))
                 return False
             if _is_portal_busy(reason) and busy_rolls < max_busy_rolls:
                 busy_rolls += 1
@@ -1288,46 +1278,14 @@ class LiveEngineOps(EngineOps):
             attempt += 1
             self._log(f"login attempt {attempt}/{sticky_max} [{_proxy_label(self.warm_proxy)}"
                       f" acct={self.sub_account_id[:8]}]: rejected ({reason})")
-            # The portal DECLINING to serve us is fleet-wide information, not this worker's bad
-            # luck. MEASURED 2026-08-23: 265 of 266 "Não foi possível de momento concretizar o seu
-            # pedido" refusals landed at login, and each worker independently kept trying -- 341
-            # login attempts to produce 30 sessions. The CAPTCHA solves fine and the token is
-            # accepted, so nothing about retrying harder helps; the whole fleet should back off
-            # together and come back later.
-            #
-            # Fed to the SAME breaker the submit path already uses (its trip is consecutive-only, so
-            # an isolated refusal among successes cannot trip it). Deliberately NOT counted for a
-            # credential rejection or a reCAPTCHA verdict -- those say something about this account,
-            # not about the portal's willingness to serve anyone.
-            #
-            # CORRECTED 2026-09-02. The paragraph above is right that a refusal can be fleet-wide,
-            # and wrong that it always is -- it went straight to the fleet breaker without ever
-            # testing whether THIS EXIT was the problem. MEASURED on the 2026-09-01 23:18 run of
-            # "Test 0901": in the 23:30 bucket, ELEVEN "try again later" pages coexisted with FOUR
-            # successful logins. A page that one exit receives while another exit is logging in
-            # successfully is per-exit evidence by definition.
-            #
-            # The cost of getting that backwards is not small. record_success() is the only thing
-            # that resets the breaker's counter, and it is only reached by a login that succeeded --
-            # so once the exit pool degrades, the breaker trips, suppresses the attempts that could
-            # have found a good exit, and nothing can ever clear it. It re-opens after each 120s
-            # cooldown, is re-tripped by the next few refusals, and repeats: 145 refusals over 91
-            # minutes, ZERO successful logins after 23:37:52.
-            #
-            # So a refusal is charged to the exit first (busy_rolls above), and to the fleet only
-            # on DISTINCT-SUB-ACCOUNT evidence -- REFINED 2026-09-23. "Several different exits said
-            # the same thing" is NOT that evidence: an account-level block returns 'try again later'
-            # from every exit, so one blocked account rolling through busy_rolls exits reaches this
-            # line and, under the old record_portal_down(), pushed the fleet breaker toward tripping
-            # on its own. record_portal_busy() instead trips only once BUSY_DISTINCT_ACCOUNTS
-            # different sub-accounts have hit the throttle inside the window -- which a single
-            # blocked account cannot fake, and which is the actual "portal declining everyone"
-            # signal. A single successful login anywhere clears the accumulated set (record_success).
-            if self._breaker is not None and _is_portal_busy(reason):
-                self._breaker.record_portal_busy(self.sub_account_id)
-                self._log(f"login: 'try again later' on acct={self.sub_account_id[:8]} after "
-                          f"{busy_rolls} exit rolls -- charged to the fleet breaker's distinct-"
-                          f"account evidence (trips only if several DIFFERENT accounts agree)")
+            # A 'try again later' throttle is now handled PURELY per-worker (busy_rolls above rolls
+            # to a different exit; past the budget it just counts as this attempt). It no longer
+            # feeds any fleet-wide gate -- the booking breaker was REMOVED 2026-09-23 because that
+            # gate froze the whole fleet on a normal throttle burst and oscillated (trip -> all wait
+            # -> all retry together -> re-trip), starving discovery and apply exactly when throughput
+            # was needed. The throttle says nothing reliable about the portal's liveness either (a
+            # blocked account is throttled from every exit while other accounts log in fine), so it
+            # is NOT recorded as portal-down; only the explicit maintenance page is (see above).
             # CAPTCHA BUDGET. The portal allows this account TWO reCAPTCHA failures before blocking
             # platform access outright, and the sticky budget was happily spending both -- leaving
             # the account at the edge, where any later retry in the same window blocks it for good.
@@ -1475,6 +1433,16 @@ class LiveEngineOps(EngineOps):
                 return
             time.sleep(min(1.0, max(0.0, deadline - time.time())))
 
+    def _backoff_seconds(self, seconds: float) -> None:
+        """A fixed, stop-interruptible sleep (chunked so is_stopped() is seen within ~1s). Used for
+        the per-worker maintenance backoff that replaced the fleet breaker -- a worker that hit the
+        portal's maintenance page waits this out on its OWN rather than the whole fleet freezing."""
+        deadline = time.time() + max(0.0, seconds) * random.uniform(0.8, 1.2)
+        while time.time() < deadline:
+            if self.is_stopped():
+                return
+            time.sleep(min(1.0, max(0.0, deadline - time.time())))
+
     def do_warmup(self) -> bool:
         if self._restore_stage in ("alive", "rewarmed"):
             # CONSUMED, not just read. This short-circuit is true exactly ONCE -- for the warm-up
@@ -1560,9 +1528,9 @@ class LiveEngineOps(EngineOps):
                        portal, and the rate limit is already the binding constraint.
           unreachable  the request never landed. The proxy/session really is the problem.
 
-        Sustained slowness is also reported to the booking-wide RedisBreaker, so a degraded window
-        makes the whole fleet back off together rather than each worker independently deciding to
-        re-login into the same wall.
+        Sustained slowness used to be reported to the booking-wide breaker; that breaker was removed
+        2026-09-23 (it froze the fleet and oscillated), so a degraded window is now just logged --
+        each worker handles its own slowness (wait, don't re-login into the same wall).
         """
         self._health.observe(phase, seconds, ok=ok)
         if ok:
@@ -1590,11 +1558,10 @@ class LiveEngineOps(EngineOps):
             self._roll_exit(f"{phase} unreachable")
 
         if kind == "slow" and self._health.is_degraded():
-            # Not this worker's bad luck any more -- the window is degraded.
-            if self._breaker is not None:
-                self._breaker.record_portal_down()
-            self._log(f"portal: {self._health.slow_streak} consecutive slow failures -- "
-                      f"reporting the window as degraded so the booking backs off together")
+            # Not this worker's bad luck any more -- the window is degraded. Logged for visibility;
+            # no longer feeds a fleet gate (the breaker was removed 2026-09-23).
+            self._log(f"portal: {self._health.slow_streak} consecutive slow failures -- window "
+                      f"degraded (this worker waits; no fleet-wide backoff any more)")
         if self._emit is not None:
             self._emit("portal_health", phase=phase, kind=kind, seconds=round(seconds, 1),
                        **self._health.snapshot())
@@ -3251,8 +3218,8 @@ class LiveEngineOps(EngineOps):
             if not self._apply_sem.acquire(self.identity_id, timeout=60):
                 return "portal_unreachable"
         try:
-            if self._breaker is not None and self._breaker.is_tripped():
-                return "portal_unreachable"      # see the note above: our gate, not the slot's fault
+            # (The booking breaker's is_tripped gate here was removed 2026-09-23 -- do_apply no
+            # longer refuses fleet-wide; a down portal is shown on the dashboard, not gated.)
 
             # Re-warm only when the anchor is actually stale. This was unconditional on every
             # round, which is correct ONLY under the ~90-120s TTL it was written against -- and
@@ -3342,8 +3309,6 @@ class LiveEngineOps(EngineOps):
                 _final_url, html = self.session.browser_form_post(submit_url, body, timeout=100)
             except Exception as e:
                 self._log(f"do_apply: SubmeterVistoCriaPDF POST failed: {e}")
-                if self._breaker is not None:
-                    self._breaker.record_portal_down()
                 return "bounced"
 
             # storm-auto guards the submit response before classifying it, because a blank
@@ -3370,8 +3335,6 @@ class LiveEngineOps(EngineOps):
                        "blank page" if _blank else "DataDome interstitial")
                 self._log(f"do_apply: submit response is a {why} ({len(html or '')}B) -- the request "
                           f"never reached the portal | slot={slot} | final_url={_final_url}")
-                if self._breaker is not None:
-                    self._breaker.record_portal_down()
                 # OUR network, not the slot -- but ALSO not our session: ScheduleController had
                 # just returned 200 seconds earlier. Distinct from "session" so the caller does not
                 # tear down a demonstrably healthy login: confirmed live 2026-08-18, one dropped
@@ -3396,8 +3359,8 @@ class LiveEngineOps(EngineOps):
                     if self._emit is not None:
                         self._emit("booked", slot=slot)
                         self._emit("booked_pdf", pdf_path=self._save_pdf(pdf_body), slot=slot)
-                    if self._breaker is not None:
-                        self._breaker.record_success()
+                    if self._liveness is not None:
+                        self._liveness.record_alive()      # a booking proves the portal is up
                     return "booked"
                 # No PDF => no booking. Fall back to whatever the body markers say, so a bounce is
                 # still classified and still feeds the per-slot / false-slot counters.
@@ -3443,8 +3406,8 @@ class LiveEngineOps(EngineOps):
             except Exception as e:
                 # NEVER let PDF retrieval downgrade the outcome -- the appointment is already made.
                 self._log(f"do_apply: PDF retrieval failed (booking IS confirmed, PDF missing): {e}")
-            if self._breaker is not None:
-                self._breaker.record_success()
+            if self._liveness is not None:
+                self._liveness.record_alive()      # a booking proves the portal is up
             return "booked"
         finally:
             if self._apply_sem is not None:

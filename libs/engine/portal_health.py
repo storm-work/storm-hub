@@ -15,8 +15,9 @@ Two distinctions this module exists to draw:
                session/proxy really is the problem and rebuilding is correct.
 
 and separately, whether slowness has stopped being one worker's bad luck and become a property of
-the window. A booking whose workers are all crawling should back off TOGETHER (the shared
-RedisBreaker) rather than each independently deciding to re-login into the same wall.
+the window. (The shared RedisBreaker that used to make the fleet back off together on that signal
+was removed 2026-09-23 -- systemic slowness is now surfaced to the operator via PortalLiveness, and
+each worker handles its own slowness rather than re-logging into the same wall.)
 
 Pure and dependency-free so the decision logic is unit-testable without a browser, a portal, or a
 clock; the caller supplies durations and outcomes.

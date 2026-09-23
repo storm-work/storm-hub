@@ -35,8 +35,8 @@ def provider_semaphore_key(provider: str, kind: str | None) -> str:
     return f"sem:pool:{provider}:{kind or 'default'}"
 
 
-def breaker_key(booking_id: str) -> str:
-    return f"breaker:{booking_id}"
+def portal_liveness_key(booking_id: str) -> str:
+    return f"portal_liveness:{booking_id}"
 
 
 def respawn_key(worker_id: str) -> str:

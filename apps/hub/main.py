@@ -64,6 +64,7 @@ from .auth import (
 from libs.bus import Bus, connect
 from libs.engine import vendor_env
 from libs.bus.names import EVENT_STREAM, notified_key, respawn_key
+from libs.bus.portal_liveness import PortalLiveness
 from libs.domain.enums import WorkerRole, WorkerStatus, WorkerSubstate
 from libs.domain.settings import resolve
 
@@ -2488,6 +2489,18 @@ def get_booking(booking_id: str, db: Session = Depends(get_db),
     if not bk:
         raise HTTPException(404, "booking not found")
     return bk
+
+
+@app.get("/bookings/{booking_id}/portal")
+def get_booking_portal(booking_id: str, db: Session = Depends(get_db),
+                       _v: Principal = Depends(require_viewer)) -> dict:
+    """Portal liveness for the booking dashboard -- alive / down / unknown, derived from what the
+    workers report (a successful login/warm/booking = alive; the maintenance page = down). This
+    REPLACED the booking breaker (removed 2026-09-23): the portal's state is shown to the operator
+    instead of being acted on by freezing the fleet. Read-only."""
+    if not db.get(M.Booking, booking_id):
+        raise HTTPException(404, "booking not found")
+    return PortalLiveness(_bus.r, booking_id).state()
 
 
 @app.post("/bookings/{booking_id}/duplicate", response_model=BookingOut, status_code=201)
