@@ -154,69 +154,29 @@ def conn_url(proxy: M.Proxy, scheme: str = "http", geo: str | None = None) -> st
 # costs no Hub round-trip and no lease: rolling it is how you get off a dead exit. This is why the
 # pool's SIZE was never the constraint (see proxy-pool-size-is-not-capacity).
 
-_SOAX_SESSIONID_RE = _re.compile(r"(sessionid-)([A-Za-z0-9]+)")
+# ── rotating-credential grammar: MOVED OUT (2026-09-16) ──────────────────────────────────────
+# `roll_sticky_session` and `session_id` used to be implemented here, each carrying a hard-coded
+# if/else over both providers' username grammars. That was wrong on two counts: this module is the
+# STATIC/ISP leasing module and a rotating credential is not a leased resource, and every new
+# provider meant editing a shared branch -- the "add a case to the big switch" shape that
+# libs/proxies/providers/ now removes. The grammar lives beside the code that produces it, one
+# module per provider.
+#
+# These two names are kept as thin re-exports because they are called from worker hot paths
+# (apps/worker/ops_live.py) and from tests; the behaviour is identical, including the D2 rule that
+# an unrecognised credential comes back UNCHANGED rather than being rewritten.
 
 
 def roll_sticky_session(url: str, *, provider: str = "") -> str:
-    """Return the same proxy URL pointing at a FRESH sticky session (a different exit).
-
-    Pure and total: anything it does not recognise comes back unchanged, so a caller can always
-    use the result. Never touches the host, port, scheme or password.
-    """
-    if not url or "@" not in url:
-        return url
-    head, _, tail = url.rpartition("@")
-    scheme, _, cred = head.partition("://")
-    user, sep, pwd = cred.partition(":")
-    if not user:
-        return url
-    new_id = str(_random.randint(100000, 999999))
-
-    # soax carries the session in a `sessionid-<x>` segment.
-    if "sessionid-" in user:
-        user = _SOAX_SESSIONID_RE.sub(lambda m: m.group(1) + new_id, user, count=1)
-        return f"{scheme}://{user}{sep}{pwd}@{tail}"
-
-    # webshare grammar: {username}-{country}-{geo}-{session_id}. Replace a trailing numeric session
-    # id if there is one; otherwise append a fresh one, which is additive and always legal.
-    # ONLY roll something we recognise as a session id. Appending one blindly rewrites the
-    # USERNAME, which authenticates fine against a gateway that parses suffixes and fails outright
-    # against any proxy that does not -- an arbitrary `u` would become `u-276569` and stop
-    # authenticating. Returning unchanged lets the caller fall back to a real proxy rotation, which
-    # is the correct behaviour for a credential we cannot roll.
-    parts = user.split("-")
-    if len(parts) > 1 and parts[-1].isdigit():
-        parts[-1] = new_id
-    elif len(parts) > 1 and parts[-1].lower() == "rotate":
-        parts[-1] = new_id          # an explicitly-rotating credential becomes sticky, deliberately
-    else:
-        return url
-    return f"{scheme}://{'-'.join(parts)}{sep}{pwd}@{tail}"
+    """Deprecated alias for libs.proxies.rotating.roll_rotating_url -- see the note above."""
+    from .rotating import roll_rotating_url
+    return roll_rotating_url(url, provider=provider)
 
 
 def session_id(url: str) -> str:
-    """The sticky SESSION ID -- the only thing that identifies which exit a credential holds.
-
-    On a gateway provider the host:port is a constant (`p.webshare.io:80` for every single webshare
-    credential we own), so identifying a proxy by its endpoint identifies nothing. The session id is
-    the identity: hold it to keep the same exit, change it to get a different one.
-
-    Returns "" when there is no session id to report. Never returns any part of the password.
-    """
-    if not url or "@" not in url:
-        return ""
-    user = url.rpartition("@")[0].partition("://")[2].partition(":")[0]
-    if not user:
-        return ""
-    m = _SOAX_SESSIONID_RE.search(user)
-    if m:
-        return m.group(2)
-    parts = user.split("-")
-    if len(parts) > 1 and parts[-1].isdigit():
-        return parts[-1]
-    if len(parts) > 1 and parts[-1].lower() == "rotate":
-        return "rotate"
-    return ""
+    """Deprecated alias for libs.proxies.rotating.rotating_session_id -- see the note above."""
+    from .rotating import rotating_session_id
+    return rotating_session_id(url)
 
 
 def _active_lease_counts(db: Session) -> dict[str, int]:
@@ -229,7 +189,8 @@ def _active_lease_counts(db: Session) -> dict[str, int]:
 
 
 def _candidate_query(provider: str, kind: str | None, exclude_ids: set[str] | None,
-                     geos: set[str] | None = None, resource_type: str | None = None):
+                     geos: set[str] | None = None, resource_type: str | None = None,
+                     pool_names: set[str] | None = None):
     """Least-recently-used first -- this ordering IS the pool cursor.
 
     It used to be (score DESC, created_at ASC): fully deterministic, so every lease walked the pool
@@ -317,6 +278,16 @@ def _candidate_query(provider: str, kind: str | None, exclude_ids: set[str] | No
         q = q.where(M.Proxy.resource_type == resource_type)
     if kind:
         q = q.where(M.Proxy.kind == kind)
+    if pool_names:
+        # Named ISP pools (2026-09-16). Several pools per booking on purpose: one purchase is
+        # routinely smaller than the worker count, so capacity is the UNION of the pools assigned.
+        #
+        # Unlike the geo filter below, NULL is NOT admitted here. A NULL pool_name means "belongs to
+        # no named pool", and a booking that named its pools must not be silently handed an
+        # unrelated ad-hoc import -- these are finite, individually-owned IPs that another booking
+        # may be relying on. An empty/absent filter still means "any pool", so nothing changes for
+        # callers that do not use pools.
+        q = q.where(M.Proxy.pool_name.in_(pool_names))
     if geos:
         # NULL geo is never excluded: a filter narrows the pool, it must not silently empty it for
         # a provider whose credentials carry no country (soax).
@@ -350,7 +321,8 @@ def _claim_locked(db: Session, proxy_id: str, worker_id: str, is_pg: bool,
 def lease_proxy(db: Session, worker_id: str, provider: str, *, kind: str | None = None,
                 exclude_ids: set[str] | None = None, health_check=None,
                 max_probes: int = 5, geos: set[str] | None = None,
-                quick_screen=None, resource_type: str | None = None) -> tuple[M.Proxy, str]:
+                quick_screen=None, resource_type: str | None = None,
+                pool_names: set[str] | None = None) -> tuple[M.Proxy, str]:
     """Lease a healthy proxy of `provider` (e.g. 'soax' or 'webshare') with free capacity. Returns
     (proxy, conn_url). Raises ProxyLeaseError if the pool is exhausted. `exclude_ids` (P3, proxy
     rotation): a worker asking the Hub to ROTATE off a proxy must not just get handed the same one
@@ -363,6 +335,11 @@ def lease_proxy(db: Session, worker_id: str, provider: str, *, kind: str | None 
     scoping in `_candidate_query`, which only ever EXCLUDES an unhealthy static row from an otherwise
     mixed pool; without this explicit requirement, a mixed pool could still hand back a perfectly
     healthy ROTATING row for a request that specifically needed a static one.
+
+    `pool_names` restricts selection to those NAMED ISP pools, and a booking may name several: an
+    ISP purchase is routinely smaller than the worker count, so the usable capacity is the union of
+    the pools assigned. Empty/None means any pool. A row with no pool name is never returned for a
+    named request -- see _candidate_query.
 
     `geos` restricts selection to those exit countries (PROXY_GEOS). Login success against this
     portal varies ~8x by geo -- DE 23.7% / IT 23.4% / PT 10.8% / NL 10.6% / ES 8.1% / LU 4.9% /
@@ -398,7 +375,7 @@ def lease_proxy(db: Session, worker_id: str, provider: str, *, kind: str | None 
 
     if health_check is None:
         counts = _active_lease_counts(db)
-        q = _candidate_query(provider, kind, exclude_ids, geos, resource_type)
+        q = _candidate_query(provider, kind, exclude_ids, geos, resource_type, pool_names)
         if is_pg:
             q = q.with_for_update(skip_locked=True)
         for proxy in db.scalars(q):
@@ -408,12 +385,18 @@ def lease_proxy(db: Session, worker_id: str, provider: str, *, kind: str | None 
                 db.add(M.ProxyLease(proxy_id=proxy.id, worker_id=worker_id, leased_at=now))
                 db.commit()
                 return proxy, conn_url(proxy, geo=geo)
-        raise ProxyLeaseError(f"no free {provider} proxy available (pool exhausted)")
+        # Name the pools. With finite ISP pools this is the EXPECTED failure when the assigned
+        # pools do not cover the worker count, and the operator's next action is either to assign
+        # another pool or to buy more -- neither of which "pool exhausted" tells them.
+        raise ProxyLeaseError(
+            f"no free {provider} proxy available (pool exhausted)"
+            + (f" in pool(s) {', '.join(sorted(pool_names))}" if pool_names else "")
+            + (f" for geo(s) {', '.join(sorted(geos))}" if geos else ""))
 
     from .health import apply_result
 
     counts = _active_lease_counts(db)
-    q = _candidate_query(provider, kind, exclude_ids, geos, resource_type)   # no lock -- see docstring
+    q = _candidate_query(provider, kind, exclude_ids, geos, resource_type, pool_names)  # no lock -- see docstring
     unhealthy = 0     # candidates that FAILED their probe -- the pool-badness signal max_probes bounds
     lost_races = 0    # healthy candidates a concurrent leaser claimed first -- NOT pool badness
     probes = 0        # browser probes actually run -- the real cost ceiling
@@ -480,8 +463,9 @@ def lease_proxy(db: Session, worker_id: str, provider: str, *, kind: str | None 
     # Say WHICH of the two it was. "no healthy proxy" sent the last investigation looking at proxy
     # health for a contention bug, with the DB showing every named candidate as healthy.
     raise ProxyLeaseError(
-        f"no {provider} proxy leased after {probes} probe(s): "
-        f"{unhealthy} failed health, {lost_races} lost to a concurrent leaser "
+        f"no {provider} proxy leased after {probes} probe(s)"
+        + (f" in pool(s) {', '.join(sorted(pool_names))}" if pool_names else "")
+        + f": {unhealthy} failed health, {lost_races} lost to a concurrent leaser "
         f"({', '.join(tried_ids[:5]) or 'none eligible'})"
     )
 

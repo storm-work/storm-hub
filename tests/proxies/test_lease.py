@@ -220,6 +220,15 @@ def test_health_check_does_not_affect_a_different_kind_pool(db):
     assert db.get(M.Proxy, "rot").health is None   # never probed -- different kind
 
 
+# ── NOTE (2026-09-15): the pool these rotating tests describe no longer exists in PRODUCTION data.
+# Rotating proxies stopped being DB rows (migration ci000droprot); workers mint their own session
+# ids locally. The tests below are KEPT DELIBERATELY, against the transition plan's suggestion to
+# delete them, because `lease_proxy` and `_candidate_query` are byte-unchanged and still serve the
+# STATIC/ISP path with exactly this machinery -- pool walking, the LRU cursor, tier ordering and the
+# health-as-non-filter branch are all still live code. Deleting their only coverage because the
+# rotating CALLER went away would leave that code unguarded. What did change is the justification on
+# two of them; see those docstrings.
+
 # ── the pool cursor (operator request 2026-08-16) ─────────────────────────────────────────────
 def test_leases_walk_the_whole_pool_before_repeating_any_proxy(db):
     """_candidate_query was (score DESC, created_at ASC): fully deterministic, so every lease
@@ -295,6 +304,13 @@ def test_an_established_proxy_now_outranks_a_never_used_one(db):
     proxy. For rotating providers it is not: a row is a sticky SESSION, and one the provider has
     never established is measurably near-useless (2026-08-24: 600 never-used sessionids -> 0.5%
     healthy; 12 already-used -> 92%).
+
+    THAT MEASUREMENT IS RETRACTED (CONFIRMED_FACTS.md §16): the sweep ran the tier-1 raw probe
+    first, which poisons the exit it measures, so the 0.5%/92% split measured our own probe, not the
+    sessions. The assertion below is kept anyway because it is independently right for the pool that
+    still reaches this code -- STATIC/ISP rows, where last_used_at ordering is plain LRU across a
+    finite set of individually-owned IPs and spreading load over them is the point. Do not cite the
+    0.5%/92% figures as support for anything.
 
     So walking the fresh pool end-to-end first is not exploration, it is failing ~199 times in 200 --
     which is precisely what left a booking at zero running workers. Exploration is preserved rather
@@ -569,7 +585,12 @@ def test_an_established_session_beats_a_never_used_one_even_with_no_verdict(db):
     across all 21,600 rows. Everything then fell into a single tier ordered last_used_at NULLS
     FIRST, which puts NEVER-USED sessions FIRST -- the exact opposite of the measurement (a
     never-used sessionid is ~0.5% healthy, an already-used one ~92%). A cleared verdict loses our
-    RECORD of a session, not the session itself."""
+    RECORD of a session, not the session itself.
+
+    The 0.5%/92% figures are RETRACTED (CONFIRMED_FACTS.md §16, and see
+    test_an_established_proxy_now_outranks_a_never_used_one). The surviving justification is the
+    last sentence -- a wiped verdict must not reorder selection -- which holds for the static pool
+    that still reaches this code."""
     from datetime import datetime, timezone
 
     established = _proxy(db, endpoint="established:1")

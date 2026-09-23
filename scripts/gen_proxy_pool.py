@@ -1,6 +1,19 @@
 #!/usr/bin/env python3
 """gen_proxy_pool.py -- generate SOAX/Webshare proxy node lists for data/proxies_{provider}.txt.
 
+LEGACY for ROTATING pools as of 2026-09-15 (DECISIONS.md D39). Rotating proxies are no longer DB
+rows: workers mint their own session ids locally (libs/proxies/rotating.py, roll_sticky_session),
+and migration ci000droprot deleted the 42,600 generated rows. Do NOT regenerate and re-import a
+rotating pool as part of normal operation -- the rows would be dead weight at best, and importing
+them back would restore the Proxies-page collapse this removed.
+
+This script is kept working for exactly two reasons:
+  1. STATIC/ISP import, which is current and supported -- those rows are real finite resources and
+     the leasing/health system still serves them.
+  2. Reversing D39. The rotating rows were generated, never authored, so regenerating them here is
+     the documented undo for that decision; migration ci000droprot's downgrade() is a deliberate
+     no-op and points here.
+
 Node formats (fixed template + a per-node differentiator that yields a distinct exit IP):
   SOAX:     package-{PKG}-country-{cc}-sessionid-{16-char-random}-sessionlength-{LEN}-
             bindttl-{TTL}-opt-wb:{PASSWORD}@proxy.soax.com:5000

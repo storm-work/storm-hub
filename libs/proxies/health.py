@@ -23,6 +23,18 @@ from __future__ import annotations
 
 HOME_URL = "https://pedidodevistos.mne.gov.pt/VistosOnline/"
 
+# Tier-1's target, and it is deliberately NOT the portal. This file already records what probing the
+# portal costs: on 2026-08-28, while the portal throttled, 4,489 webshare rows flipped to
+# is_healthy=False and 73 of 120 workers never launched -- re-checked against a neutral url the
+# condemned rows connected 20/20, identical to the healthy control. "The flag was recording the
+# portal, not the proxy."
+#
+# That was survivable when the verdict only re-ordered a pool of regenerable strings. It is NOT
+# survivable now: tier-1 is what the dashboard's DELETE action keys off, and an ISP proxy is a
+# purchased, individually-owned IP. A portal outage must never be able to present a healthy pool as
+# deletable garbage.
+NEUTRAL_URL = "https://api.ipify.org/?format=json"
+
 SCORE_STEP_UP = 10.0
 SCORE_STEP_DOWN = 25.0
 SCORE_MAX = 100.0
@@ -100,6 +112,73 @@ def check_proxy(conn_url: str, timeout: float = 20.0) -> tuple[bool, str]:
                 session.close_browser()
             except Exception:
                 pass
+
+
+def connectivity_probe(conn_url: str, timeout: float = 8.0) -> tuple[bool, str]:
+    """TIER 1 -- "is this proxy alive at all". Raw request to a NEUTRAL url. `(alive, reason)`.
+
+    Distinct from quick_screen(), which asks the same question against the PORTAL as a pre-lease
+    negative filter. The difference matters exactly here: this verdict is operator-facing and is
+    what the delete action keys off, so it must describe the PROXY and nothing else. A throttling
+    portal produces timeouts, "timed out" is a dead-marker, and quick_screen would therefore report
+    a perfectly good ISP proxy as dead -- which is how 4,489 rows were condemned in one afternoon.
+
+    Answers the question a raw probe can actually answer. Per this module's own rule: a raw check
+    cannot prove an exit is GOOD, but it can prove one is DEAD -- if TCP/TLS will not establish
+    through the proxy, no browser will change that.
+    """
+    try:
+        import primp
+    except ImportError:
+        return True, "primp unavailable -- cannot run tier 1"
+    try:
+        c = primp.Client(proxy=conn_url, verify=False, follow_redirects=True, timeout=timeout)
+        r = c.get(NEUTRAL_URL)
+    except Exception as e:
+        detail = f"{e.__class__.__name__}: {e}"
+        low = detail.lower()
+        if any(m in low for m in _DEAD_MARKERS):
+            return False, f"dead: {detail[:150]}"
+        # Unrecognised errors fail OPEN, same rule as quick_screen. Failing closed on an unfamiliar
+        # error is what the 639-row false-condemnation incident was, and here it would additionally
+        # offer a working proxy up for deletion.
+        return True, f"unrecognised error, not condemning: {detail[:120]}"
+    if r.status_code >= 500:
+        # The neutral endpoint itself is having a bad day -- that is not a verdict on the proxy.
+        return True, f"neutral endpoint returned {r.status_code}; inconclusive"
+    return True, f"alive (status={r.status_code})"
+
+
+def probe_tiers(conn_url: str, *, want_portal: bool = True,
+                connectivity=None, portal=None) -> dict:
+    """Both tiers for one proxy, in the only order that is safe.
+
+    Returns {"tier1_ok", "tier1_detail", "tier2_ok", "tier2_detail", "ok"}; tier2_* are None when
+    the portal tier did not run.
+
+    TIER 2 IS SKIPPED WHEN TIER 1 FAILS -- not to save time (though it saves ~25s of Chromium per
+    dead proxy), but because a browser probe through a dead tunnel produces a portal-shaped error
+    message for a connectivity problem, which is precisely the misattribution that has repeatedly
+    sent investigations here in the wrong direction.
+
+    `ok` is TIER 1 ONLY. Tier 2 is diagnostic -- "can this IP reach the portal right now" -- and is
+    deliberately not part of the liveness verdict, because the portal's availability is not a
+    property of the proxy (see NEUTRAL_URL). Callers that persist health, and the delete action in
+    particular, must use `ok`.
+    """
+    _conn = connectivity or connectivity_probe
+    _portal = portal or check_proxy
+
+    t1_ok, t1_detail = _conn(conn_url)
+    if not t1_ok:
+        return {"tier1_ok": False, "tier1_detail": t1_detail,
+                "tier2_ok": None, "tier2_detail": None, "ok": False}
+    if not want_portal:
+        return {"tier1_ok": True, "tier1_detail": t1_detail,
+                "tier2_ok": None, "tier2_detail": None, "ok": True}
+    t2_ok, t2_detail = _portal(conn_url)
+    return {"tier1_ok": True, "tier1_detail": t1_detail,
+            "tier2_ok": t2_ok, "tier2_detail": t2_detail, "ok": True}
 
 
 def apply_result(proxy, ok: bool, detail: str) -> None:

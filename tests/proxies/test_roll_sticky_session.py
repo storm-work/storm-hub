@@ -19,11 +19,37 @@ def _user(url):
     return url.split("@")[0].split("//", 1)[1].rsplit(":", 1)[0]
 
 
+def _rolled_id(url):
+    """The trailing session segment, in the shape roll_sticky_session now mints: 16 alphanumerics.
+
+    Was `.isdigit()` until 2026-09-15. The id space widened from randint(100000, 999999) to
+    62^16 because rolling stopped being a rare recovery step against a pre-generated pool and
+    became the ONLY way a worker changes exit, fleet-wide, for a whole run -- 900k values collide
+    at roughly even odds by ~1k rolls, and two workers sharing an id share an exit silently.
+    """
+    seg = _user(url).split("-")[-1]
+    assert len(seg) == 16 and seg.isalnum(), f"not a minted session id: {seg!r}"
+    return seg
+
+
 def test_a_trailing_numeric_session_id_is_replaced():
+    """A LEGACY numeric id (the generator's `1..n`) must still be recognised and rolled -- live
+    launch payloads carry them until every worker is recycled."""
     out = roll("http://sodade2026-51:pw@p.webshare.io:80")
     u = _user(out)
     assert u.startswith("sodade2026-") and u != "sodade2026-51"
-    assert u.split("-")[-1].isdigit()
+    _rolled_id(out)
+
+
+def test_a_minted_alnum_session_id_is_replaced():
+    """The shape libs/proxies/rotating.py actually mints. Before the widening this was invisible to
+    both roll_sticky_session and session_id -- a webshare URL minted by the new path could not be
+    rolled at all, which would have left a worker stuck on a dead exit with no way off it."""
+    src = "http://sodade2026-IT-J6bah2FgYw8JcbGw:pw@p.webshare.io:80"
+    out = roll(src)
+    assert out != src
+    assert _user(out).startswith("sodade2026-IT-")   # geo survives
+    assert _rolled_id(out) != "J6bah2FgYw8JcbGw"
 
 
 def test_the_country_is_preserved_when_rolling():
@@ -45,7 +71,7 @@ def test_a_credential_with_no_session_id_is_left_ALONE():
 
 def test_an_explicitly_rotating_credential_becomes_sticky():
     # Deliberate: if we are rolling, we want ONE known exit, not a new IP per request.
-    assert _user(roll("http://sodade2026-rotate:pw@p.webshare.io:80")).split("-")[-1].isdigit()
+    _rolled_id(roll("http://sodade2026-rotate:pw@p.webshare.io:80"))
 
 
 def test_soax_sessionid_is_rolled_in_place():
