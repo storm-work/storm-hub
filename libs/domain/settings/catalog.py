@@ -498,12 +498,31 @@ _BOOKING = [
     _s("BOOKING_TIMEOUT_HOURS", L.BOOKING, float, 48.0, group="guards",
        note="hard stop for the whole booking; replaces the removed per-worker hold timeout"),
     _s("BREAKER_TRIP_THRESHOLD", L.BOOKING, int, 5, group="guards",
-       note="consecutive portal-down signals before RedisBreaker trips"),
+       note="consecutive ALREADY-fleet-level portal-down signals (degraded window, transport "
+            "failure) before RedisBreaker trips. The login 'try again later' throttle does NOT feed "
+            "this -- it uses BREAKER_BUSY_DISTINCT_ACCOUNTS instead."),
     _s("BREAKER_COOLDOWN", L.BOOKING, float, 120.0, group="guards", min_value=1.0,
        note=
-       "Seconds the whole booking backs off after the portal serves its 'try again later' page. "
-       "Fleet-wide on purpose: that page is the portal throttling EVERYONE, so one worker retrying "
-       "does not help and 80 workers retrying makes it worse."),
+       "Seconds the whole booking backs off once the breaker trips. Fleet-wide on purpose: it "
+       "trips only on evidence the portal is refusing EVERYONE (maintenance page, or several "
+       "different sub-accounts throttled), so one worker retrying does not help and 80 retrying "
+       "makes it worse."),
+    # DISTINCT-SUB-ACCOUNT trip evidence (2026-09-23). The 'try again later' login throttle is
+    # ambiguous -- an account-level block returns it from every exit -- so it must NOT trip the
+    # fleet breaker on its own. It trips only once this many DIFFERENT sub-accounts hit it inside
+    # the window, which a single blocked account cannot fake. A success anywhere clears the tally.
+    _s("BREAKER_BUSY_DISTINCT_ACCOUNTS", L.BOOKING, int, 4, group="guards", min_value=1,
+       note="distinct sub-accounts that must hit the 'try again later' throttle before the fleet "
+            "breaker trips (proves it is portal-wide, not one blocked account)"),
+    _s("BREAKER_BUSY_WINDOW", L.BOOKING, float, 180.0, group="guards", min_value=1.0,
+       note="seconds the distinct-account throttle tally is kept before it expires"),
+    # The maintenance page is unambiguous (down for everyone), so it trips fast on a low threshold;
+    # still >1 so one worker misreading a body cannot down the whole fleet.
+    _s("BREAKER_MAINT_DISTINCT_ACCOUNTS", L.BOOKING, int, 2, group="guards", min_value=1,
+       note="distinct sub-accounts that must see the maintenance / 'Serviço Indisponível' page "
+            "before the fleet breaker trips (fast, because the portal is explicitly down)"),
+    _s("BREAKER_MAINT_WINDOW", L.BOOKING, float, 300.0, group="guards", min_value=1.0,
+       note="seconds the distinct-account maintenance tally is kept before it expires"),
     # Consecutive apply bounces before re-warming IN PLACE and trying again (operator, 2026-08-21).
     # Two failures in a row is far more likely a stale server-side form anchor than two genuinely
     # taken slots -- and a re-warm is ~38s against a re-login's CAPTCHA solve and sub-account spend.

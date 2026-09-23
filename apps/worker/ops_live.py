@@ -205,17 +205,26 @@ _PORTAL_BUSY_MARKERS = (
     "não foi possível de momento concretizar o seu pedido",
     "nao foi possivel de momento concretizar o seu pedido",
     "we were unable to complete your request at this time",
-    # The portal's MAINTENANCE page, added 2026-08-27. Same class as the refusals above -- the
-    # portal declining to serve, saying nothing about our session, our proxy or the account -- but
-    # it was not recognised, and the cost was concrete on booking "Test 2032": 154 refusals across
-    # 13 sub-accounts and 99 sub-account rotations, with the booking's RedisBreaker hash still
-    # EMPTY because record_portal_down() is gated on _is_portal_busy(). So nothing backed off, and
-    # every worker kept cycling accounts against a portal that was explicitly saying "come back
-    # later". Accent-stripped variants included for the same reason as the two above: the portal
-    # serves both forms.
+)
+
+# The portal's MAINTENANCE / 'Serviço Indisponível' page. SPLIT OUT of _PORTAL_BUSY_MARKERS
+# 2026-09-23: it was lumped in as "same class as the refusals above", but it is NOT the same class.
+# The 'try again later' throttle is ambiguous -- an account-level block returns it from every exit,
+# so it is per-account evidence as often as fleet-wide (CONFIRMED 2026-09-01: 11 throttle pages
+# coexisted with 4 successful logins in one bucket). The maintenance page is unambiguous: the portal
+# is explicitly down for EVERYONE, saying nothing about our session, proxy or account. Rolling exits
+# or rotating sub-accounts against it only burns the pool (booking "Test 2032": 154 refusals across
+# 13 sub-accounts and 99 rotations). So the two now route differently -- maintenance trips the fleet
+# breaker FAST via record_maintenance(); the throttle only trips it once several DISTINCT accounts
+# agree, via record_portal_busy(). Accent-stripped variants included because the portal serves both.
+_MAINTENANCE_MARKERS = (
     "serviço em manutenção",
     "servico em manutencao",
     "service under maintenance",
+    "serviço indisponível",
+    "servico indisponivel",
+    "serviço indisponível / unavailable",
+    "service unavailable. please visit again later",
 )
 
 
@@ -232,6 +241,8 @@ def _classify_gettime_page(html: str) -> str:
     """Name the page gettime answered with, so a rejection is actionable rather than a mystery."""
     if _is_challenge_body(html):
         return "waf_challenge"
+    if _is_maintenance(html):
+        return "portal_maintenance"
     if _is_portal_busy(html):
         return "portal_try_again_later"
     low = (html or "").lower()
@@ -265,9 +276,25 @@ def _is_recaptcha_verdict(reason: str) -> bool:
 
 
 def _is_portal_busy(html: str) -> bool:
-    """True when the portal answered with its generic 'try again later' refusal."""
+    """True when the portal answered with its 'try again later' login throttle (AMBIGUOUS: this is
+    per-account as often as fleet-wide -- see _MAINTENANCE_MARKERS). Not the maintenance page."""
     low = (html or "").lower()
     return any(m in low for m in _PORTAL_BUSY_MARKERS)
+
+
+def _is_maintenance(html: str) -> bool:
+    """True when the portal served its explicit maintenance / 'Serviço Indisponível' page -- down
+    for everyone, a strong fleet-wide signal."""
+    low = (html or "").lower()
+    return any(m in low for m in _MAINTENANCE_MARKERS)
+
+
+def _is_portal_refusal(html: str) -> bool:
+    """True when the portal declined to serve us for EITHER reason (throttle or maintenance). Use
+    this where the caller only needs 'the portal is not serving right now' and does not route the
+    two differently -- keepalive/warmup/gettime classification. The login path, which DOES route
+    them differently, calls _is_maintenance() and _is_portal_busy() separately."""
+    return _is_portal_busy(html) or _is_maintenance(html)
 # Fingerprints of an interstitial served INSTEAD of the page we asked for. bd.js is DataDome's
 # loader; the noindex/nofollow meta plus an empty styled body is its challenge shell.
 _CHALLENGE_MARKERS = ("/ch/bd.js", "captcha-delivery", "datadome",
@@ -327,7 +354,7 @@ def classify_session_state(page: str, final_url: str, *, warmed: bool) -> Sessio
     url_low = (final_url or "").lower()
     if "sessionlost" in url_low or "authentication.jsp" in url_low:
         return SessionState.SESSION_EXPIRED
-    if _is_portal_busy(page):
+    if _is_portal_refusal(page):
         return SessionState.PORTAL_ERROR
     # A WAF/bot-challenge interstitial served INSTEAD of the page is the portal declining our
     # request, NOT a dead session -- exactly like _is_portal_busy above (the apply/warmup paths
@@ -610,6 +637,9 @@ class LiveEngineOps(EngineOps):
         self._apply_sem: RedisSemaphore | None = None
         self._pool_sem: RedisSemaphore | None = None
         self._breaker: RedisBreaker | None = None
+        # Set by _sticky_login_attempts when the portal serves its maintenance page, read by
+        # _fresh_login to abandon sub-account rotation (down for everyone -- see the login path).
+        self._saw_maintenance: bool = False
         # /slots pacing + recovery state (2026-09-02). _slots_backoff_until gates the next attempt
         # so we stop buying tokens the endpoint will refuse; _slots_needs_relogin tells phases.py
         # that the ladder's cheap rung (re-warm) cannot help this failure.
@@ -645,6 +675,10 @@ class LiveEngineOps(EngineOps):
                 redis_client, booking_id,
                 trip_threshold=int(cfg.raw.get("BREAKER_TRIP_THRESHOLD", 5)),
                 cooldown=float(cfg.raw.get("BREAKER_COOLDOWN", 120.0)),
+                busy_threshold=int(cfg.raw.get("BREAKER_BUSY_DISTINCT_ACCOUNTS", 4)),
+                busy_window=float(cfg.raw.get("BREAKER_BUSY_WINDOW", 180.0)),
+                maint_threshold=int(cfg.raw.get("BREAKER_MAINT_DISTINCT_ACCOUNTS", 2)),
+                maint_window=float(cfg.raw.get("BREAKER_MAINT_WINDOW", 300.0)),
             )
 
     # ── shared warm-up ──────────────────────────────────────────────────────────
@@ -942,7 +976,7 @@ class LiveEngineOps(EngineOps):
             if _is_challenge_body(html):
                 self._log("schedule-state: bot challenge on Schedule.jsp -- session cannot POST")
                 return False
-            if _is_portal_busy(html):
+            if _is_portal_refusal(html):
                 # NOT a stale form. The portal is declining to serve this session right now, and it
                 # declines everything: CONFIRMED live 2026-08-23 on Test 2032 (AMILCAR LOPES) --
                 # the submit was refused with the 28531B "try again later" page, then Schedule.jsp
@@ -1038,7 +1072,15 @@ class LiveEngineOps(EngineOps):
         start_idx = next((i for i, a in enumerate(self.accounts)
                           if a.get("sub_account_id") == self.sub_account_id), 0)
         ordered = self.accounts[start_idx:] + self.accounts[:start_idx]
+        self._saw_maintenance = False
         for i, candidate in enumerate(ordered):
+            # A maintenance page is down-for-everyone: rotating to the next sub-account would hit
+            # the same page and burn it for nothing. _sticky_login_attempts sets this flag and
+            # returns False; abandon the rotation and let the fleet breaker gate re-entry.
+            if self._saw_maintenance:
+                self._log("login: portal in maintenance -- abandoning sub-account rotation "
+                          "(down for everyone), waiting on the fleet breaker")
+                return False
             # STOP IS CHECKED BETWEEN EVERY SUB-ACCOUNT (2026-09-11). This whole chain -- and
             # _sticky_login_attempts below it -- used to run to completion with no bus contact at
             # all, so a worker that entered a login storm went DEAF to stop/assign/self-scout for
@@ -1217,6 +1259,22 @@ class LiveEngineOps(EngineOps):
                 self._roll_exit("recaptcha token/ip mismatch")
                 self._backoff(ip_moves)
                 continue          # deliberately does NOT advance `attempt` or `captcha_fails`
+            if _is_maintenance(reason):
+                # The portal is EXPLICITLY down (maintenance / 'Serviço Indisponível'). Unlike the
+                # 'try again later' throttle below, this is not about our exit or our account, and
+                # every exit and every sub-account gets the same page -- so rolling exits or
+                # rotating accounts against it only burns the pool (booking "Test 2032": 154
+                # refusals across 13 accounts). Report it to the fleet breaker (distinct-account
+                # gated, trips fast) and STOP grinding: don't roll, don't spend a sticky attempt,
+                # and signal _fresh_login to abandon rotation. The breaker then gates re-entry until
+                # the portal is back.
+                if self._breaker is not None:
+                    self._breaker.record_maintenance(self.sub_account_id)
+                self._saw_maintenance = True
+                self._log("login: portal MAINTENANCE page ('Serviço Indisponível') -- reported to "
+                          "the fleet breaker; NOT rotating exit/account (the portal is down for "
+                          "everyone), letting the booking back off")
+                return False
             if _is_portal_busy(reason) and busy_rolls < max_busy_rolls:
                 busy_rolls += 1
                 self._log(f"login: 'try again later' on this exit ({busy_rolls}/{max_busy_rolls}) "
@@ -1253,14 +1311,20 @@ class LiveEngineOps(EngineOps):
             # cooldown, is re-tripped by the next few refusals, and repeats: 145 refusals over 91
             # minutes, ZERO successful logins after 23:37:52.
             #
-            # So a refusal is charged to the exit first and to the portal only once several
-            # DIFFERENT exits have said the same thing -- which is the fleet-wide evidence the
-            # original reasoning wanted, actually established rather than assumed.
+            # So a refusal is charged to the exit first (busy_rolls above), and to the fleet only
+            # on DISTINCT-SUB-ACCOUNT evidence -- REFINED 2026-09-23. "Several different exits said
+            # the same thing" is NOT that evidence: an account-level block returns 'try again later'
+            # from every exit, so one blocked account rolling through busy_rolls exits reaches this
+            # line and, under the old record_portal_down(), pushed the fleet breaker toward tripping
+            # on its own. record_portal_busy() instead trips only once BUSY_DISTINCT_ACCOUNTS
+            # different sub-accounts have hit the throttle inside the window -- which a single
+            # blocked account cannot fake, and which is the actual "portal declining everyone"
+            # signal. A single successful login anywhere clears the accumulated set (record_success).
             if self._breaker is not None and _is_portal_busy(reason):
-                self._breaker.record_portal_down()
-                self._log(f"login: 'try again later' from {busy_rolls + 1} different exits -- that "
-                          f"is the portal declining to serve anyone, reported to the booking "
-                          f"breaker so the whole fleet backs off")
+                self._breaker.record_portal_busy(self.sub_account_id)
+                self._log(f"login: 'try again later' on acct={self.sub_account_id[:8]} after "
+                          f"{busy_rolls} exit rolls -- charged to the fleet breaker's distinct-"
+                          f"account evidence (trips only if several DIFFERENT accounts agree)")
             # CAPTCHA BUDGET. The portal allows this account TWO reCAPTCHA failures before blocking
             # platform access outright, and the sticky budget was happily spending both -- leaving
             # the account at the edge, where any later retry in the same window blocks it for good.

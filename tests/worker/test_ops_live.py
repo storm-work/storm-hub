@@ -2396,9 +2396,11 @@ def test_a_rejected_gettime_says_why_instead_of_returning_silently():
 
 # ── a portal refusal at login is fleet-wide news (2026-08-24) ───────────────
 class _Breaker:
-    def __init__(self): self.down = 0; self.ok = 0; self.tripped = False
+    def __init__(self): self.down = 0; self.busy = 0; self.maint = 0; self.ok = 0; self.tripped = False
     def is_tripped(self): return self.tripped
     def record_portal_down(self): self.down += 1
+    def record_portal_busy(self, sub_account_id=None): self.busy += 1
+    def record_maintenance(self, sub_account_id=None): self.maint += 1
     def record_success(self): self.ok += 1
 
 
@@ -2577,16 +2579,23 @@ def test_the_maintenance_page_is_recognised_as_a_portal_refusal():
     bad proxy, not the account.
 
     It went unrecognised until 2026-08-27, and the cost was measured on booking "Test 2032": 154
-    refusals across 13 sub-accounts and 99 rotations, with the booking's RedisBreaker hash still
-    EMPTY -- record_portal_down() is gated on _is_portal_busy(), so nothing ever backed off and the
-    fleet kept cycling accounts against a portal explicitly saying "come back later".
+    refusals across 13 sub-accounts and 99 rotations. SPLIT OUT of _is_portal_busy 2026-09-23: it is
+    now its OWN classifier (_is_maintenance) because it routes differently -- it trips the fleet
+    breaker fast, while the ambiguous 'try again later' throttle needs distinct-account evidence. It
+    must still be recognised as a refusal overall (_is_portal_refusal), but must NOT be mistaken for
+    the throttle (_is_portal_busy).
     """
-    from apps.worker.ops_live import _is_portal_busy
-    assert _is_portal_busy("Serviço em manutenção. Tente novamente mais tarde.")
-    assert _is_portal_busy("SERVICO EM MANUTENCAO")            # accent-stripped form
-    assert _is_portal_busy("<html>Service under maintenance</html>")
+    from apps.worker.ops_live import _is_portal_busy, _is_maintenance, _is_portal_refusal
+    for page in ("Serviço em manutenção. Tente novamente mais tarde.",
+                 "SERVICO EM MANUTENCAO",                       # accent-stripped form
+                 "<html>Service under maintenance</html>",
+                 "Serviço Indisponível / Unavailable"):         # the observed screenshot title
+        assert _is_maintenance(page)
+        assert _is_portal_refusal(page)                         # still a refusal overall
+        assert not _is_portal_busy(page)                        # but NOT the throttle
     # and it must not fire on an ordinary page
-    assert not _is_portal_busy("<html>Solicitar pedido de Visto</html>")
+    assert not _is_maintenance("<html>Solicitar pedido de Visto</html>")
+    assert not _is_portal_refusal("<html>Solicitar pedido de Visto</html>")
 
 
 def test_the_existing_busy_refusals_still_match():
@@ -3406,9 +3415,11 @@ _BUSY_BODY = ('{"type":"error","description":"N\\u00e3o foi poss\\u00edvel de mo
 
 
 class _RecordingBreaker:
-    def __init__(self): self.downs = 0; self.successes = 0
+    def __init__(self): self.downs = 0; self.busy = 0; self.maint = 0; self.successes = 0
     def is_tripped(self): return False
     def record_portal_down(self): self.downs += 1
+    def record_portal_busy(self, sub_account_id=None): self.busy += 1
+    def record_maintenance(self, sub_account_id=None): self.maint += 1
     def record_success(self): self.successes += 1
 
 
@@ -3450,9 +3461,11 @@ def test_a_busy_page_rolls_the_exit_before_the_fleet_is_told_anything(monkeypatc
 
     assert len(_busy_rolls(rolls)) == 3, \
         f"the refusal was blamed on the portal without trying another exit: {rolls}"
-    assert ops._breaker.downs == 2, (
-        "the breaker should hear about it only after 3 DIFFERENT exits refused -- then once per "
-        f"remaining sticky attempt (got {ops._breaker.downs})")
+    assert ops._breaker.busy == 2, (
+        "the throttle should reach the breaker's DISTINCT-ACCOUNT evidence only after 3 different "
+        f"exits refused -- then once per remaining sticky attempt (got {ops._breaker.busy})")
+    assert ops._breaker.downs == 0, \
+        "a login throttle must NOT feed the consecutive portal-down path any more"
 
 
 def test_a_busy_page_is_not_charged_to_the_sub_account_while_rolling(monkeypatch):
@@ -3479,7 +3492,40 @@ def test_rolling_is_bounded_so_a_genuine_outage_still_reaches_the_fleet(monkeypa
 
     assert _busy_rolls(rolls) == [], \
         f"with the budget at 0 no BUSY roll should be attempted (got {rolls})"
-    assert ops._breaker.downs > 0, "a genuine outage never reached the breaker"
+    assert ops._breaker.busy > 0, "a genuine outage never reached the breaker's throttle evidence"
+
+
+_MAINT_BODY = ('{"type":"error","description":"Servi\\u00e7o em manuten\\u00e7\\u00e3o. '
+              'Tente novamente mais tarde."}')
+
+
+def test_the_maintenance_page_does_NOT_roll_and_feeds_the_maintenance_evidence(monkeypatch):
+    """Unlike the throttle, the maintenance page is down-for-everyone: rolling exits or rotating
+    sub-accounts against it only burns the pool (booking 'Test 2032': 154 refusals, 13 accounts).
+    So the login path must NOT roll on it, must NOT spend a sticky attempt, and must feed the
+    maintenance evidence (not the throttle or consecutive-down paths)."""
+    import apps.worker.ops_live as ops_live_mod
+
+    calls = {"n": 0}
+    class _AlwaysMaint(_FakeSession):
+        def browser_login(self, *a, **k):
+            calls["n"] += 1
+            return {"status": 200, "body": _MAINT_BODY}
+    monkeypatch.setattr(ops_live_mod, "get_session", lambda **kw: _AlwaysMaint())
+    ops = _make_ops(cfg=_cfg(STICKY_RETRY_MAX=2, LOGIN_TRANSIENT_RETRY_MAX=0, LOGIN_PORTAL_BUSY_ROLLS=3))
+    ops._backoff = lambda n: None
+    ops._request_proxy_rotation = lambda phase=None: None
+    ops._breaker = _RecordingBreaker()
+    rolls = []
+    ops._roll_exit = lambda why="": rolls.append(why) or True
+
+    ok = ops._sticky_login_attempts(ops.cfg.login.sticky_retry_max)
+    assert ok is False
+    assert calls["n"] == 1, f"maintenance must stop after ONE attempt, not grind (got {calls['n']})"
+    assert rolls == [], f"must not roll the exit against a down portal (got {rolls})"
+    assert ops._breaker.maint == 1, "maintenance page must feed the maintenance evidence"
+    assert ops._breaker.busy == 0 and ops._breaker.downs == 0,         "maintenance must NOT feed the throttle or consecutive-down paths"
+    assert ops._saw_maintenance is True, "the flag that makes _fresh_login abandon rotation"
 
 
 # ── four /slots answers that need four different responses (2026-09-02) ───────────────────────
