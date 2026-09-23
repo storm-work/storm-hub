@@ -602,6 +602,17 @@ _TEMPLATE = [
             "one 10-minute window -- and because only a SUCCESSFUL login resets the breaker, a "
             "degraded exit pool locked the fleet out entirely: 145 refusals over 91 minutes with "
             "zero logins after the first 14."),
+    # THROUGHPUT (2026-09-23). The 'try again later' throttle is a GLOBAL rate-limit lottery, not a
+    # verdict on our rate -- a success and a throttle are byte-identical requests (same score-10
+    # token, same POST), the portal just serves ~1%. So bookings scale with SHOTS TAKEN, and backing
+    # off after a throttle only makes the fleet sleep instead of shoot (measured ~1.75 attempts/min/
+    # worker). This is the per-throttle pause, kept tiny so a worker rolls to a fresh exit and fires
+    # again immediately -- just enough jitter to avoid a tight loop around the ~15s browser+solve.
+    _s("LOGIN_THROTTLE_BACKOFF", L.TEMPLATE, float, 0.5, _WRK, "login_resilience", min_value=0.0,
+       note="seconds a worker pauses after a 'try again later' throttle before firing again on a "
+            "fresh exit. Default 0.5. The throttle is a global lottery, not our-rate-limiting, so "
+            "this is deliberately near-zero to MAXIMISE login shots -- raise it only if a near-zero "
+            "retry rate is causing a different problem (it does not reduce the portal's throttle)."),
     _s("LOGIN_IP_MISMATCH_RETRIES", L.TEMPLATE, int, 2, _WRK, "login_resilience", min_value=0.0,
        note="reCAPTCHA rejections that may be excused as OUR exit moving rather than charged to "
             "the sub-account, per login. 'Por favor, confirma o reCAPTCHA' is the token/IP mismatch "

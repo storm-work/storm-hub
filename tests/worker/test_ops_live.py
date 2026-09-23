@@ -2397,9 +2397,10 @@ def test_a_rejected_gettime_says_why_instead_of_returning_silently():
 # ── portal-refusal detection (the fleet breaker that used to consume it was removed 2026-09-23) ──
 class _RecordingLiveness:
     """Stand-in for PortalLiveness: records the two facts workers report, never gates."""
-    def __init__(self): self.alive = 0; self.down = 0; self.down_accts = []
+    def __init__(self): self.alive = 0; self.down = 0; self.down_accts = []; self.attempts = 0
     def record_alive(self): self.alive += 1
     def record_down(self, sub_account_id=""): self.down += 1; self.down_accts.append(sub_account_id)
+    def record_login_attempt(self): self.attempts += 1
     def state(self): return {"state": "down" if self.down else "alive"}
 
 

@@ -57,6 +57,28 @@ class PortalLiveness:
             self.r.expire(self._down_accts, int(self.down_window))
         self.r.expire(self.key, int(self.backstop_ttl))
 
+    def _attempts_key(self, minute: int) -> str:
+        return f"{self.key}:attempts:{minute}"
+
+    def record_login_attempt(self) -> None:
+        """Count one login shot in a per-minute bucket, so the dashboard can show the fleet's SHOT
+        RATE. Under a global portal throttle (identical requests succeed ~1%, so bookings scale with
+        shots taken), attempts/min is THE number to watch when tuning throughput. O(1), self-expiring."""
+        m = int(time.time() // 60)
+        k = self._attempts_key(m)
+        self.r.incr(k)
+        self.r.expire(k, 180)
+
+    def _attempts_1m(self) -> int:
+        """The most recent COMPLETE minute's attempt count (stable), falling back to the current
+        partial minute right after start."""
+        m = int(time.time() // 60)
+        prev = self.r.get(self._attempts_key(m - 1))
+        if prev is not None:
+            return int(prev)
+        cur = self.r.get(self._attempts_key(m))
+        return int(cur) if cur is not None else 0
+
     def state(self) -> dict:
         """Current liveness for the dashboard. 'down' when a maintenance page was seen within
         down_window and no more-recent success; 'alive' when a success is within alive_window;
@@ -82,4 +104,5 @@ class PortalLiveness:
             "last_alive_at": alive_at or None,
             "last_down_at": down_at or None,
             "down_accounts": int(self.r.scard(self._down_accts) or 0),
+            "login_attempts_1m": self._attempts_1m(),
         }

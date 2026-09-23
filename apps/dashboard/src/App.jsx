@@ -901,6 +901,11 @@ function BookingOverview({ me, booking, events, workers, onBookingChanged, onDel
       <div className="row muted" style={{ fontSize: 13, marginBottom: 6, gap: 14, flexWrap: "wrap", alignItems: "center" }}>
         <span>status: <b>{booking.status}</b></span>
         <PortalBadge portal={portal} />
+        {portal && typeof portal.login_attempts_1m === "number" && (
+          <span title="login SHOTS taken in the last minute across this booking's fleet. The portal throttle is a global lottery (~1% served on identical requests), so bookings scale with shots — watch this climb when tuning throughput.">
+            🎯 {portal.login_attempts_1m} login shots/min
+          </span>
+        )}
         {booking.warmup_start_at && <span>warmup (scheduled)@{(booking.warmup_start_at || "").slice(0, 16).replace("T", " ")}Z</span>}
         {booking.slot_open_at && <span>slot-open (scheduled)@{(booking.slot_open_at || "").slice(0, 16).replace("T", " ")}Z</span>}
       </div>

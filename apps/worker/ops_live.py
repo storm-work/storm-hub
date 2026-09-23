@@ -1182,6 +1182,8 @@ class LiveEngineOps(EngineOps):
                 # race_all down its "wait for a good-enough score" path, which is what produced the
                 # 180s solver stalls -- to chase a score our tokens essentially never reach and that
                 # does not predict portal acceptance anyway. First usable token wins.
+                if self._liveness is not None:
+                    self._liveness.record_login_attempt()   # count the shot (dashboard shot-rate)
                 result = self.session.browser_login(
                     self.account["username"], self.account["password"],
                     capsolver_keys=self.capsolver_keys,
@@ -1270,10 +1272,19 @@ class LiveEngineOps(EngineOps):
                 return False
             if _is_portal_busy(reason) and busy_rolls < max_busy_rolls:
                 busy_rolls += 1
-                self._log(f"login: 'try again later' on this exit ({busy_rolls}/{max_busy_rolls}) "
-                          f"-- rolling to a different exit before blaming the portal")
+                # NEAR-ZERO BACKOFF ON A THROTTLE (2026-09-23). The portal's 'try again later' is a
+                # GLOBAL rate-limit lottery, not a verdict on our rate: a success and a throttle are
+                # byte-identical requests (same score-10 capsolver token, same POST) -- the portal
+                # just rolls the dice, ~1% served. So bookings scale with SHOTS TAKEN, and the old
+                # exponential _backoff(busy_rolls) (2-8s) only made our fleet SLEEP instead of shoot
+                # -- measured at ~1.75 attempts/min/worker, mostly idle. Backing off buys nothing (it
+                # is not our load being limited) and costs lottery tickets. Roll to a fresh exit and
+                # fire again immediately; LOGIN_THROTTLE_BACKOFF (default 0.5s, jittered) is the only
+                # pause, just enough to avoid a tight loop around the ~15s browser+solve cost.
+                self._log(f"login: 'try again later' ({busy_rolls}/{max_busy_rolls}) -- rolling to a "
+                          f"fresh exit and firing again immediately (throttle is a global lottery)")
                 self._roll_exit(f"portal busy {busy_rolls}/{max_busy_rolls}")
-                self._backoff(busy_rolls)
+                self._backoff_seconds(float(self.cfg.raw.get("LOGIN_THROTTLE_BACKOFF", 0.5)))
                 continue
             attempt += 1
             self._log(f"login attempt {attempt}/{sticky_max} [{_proxy_label(self.warm_proxy)}"
