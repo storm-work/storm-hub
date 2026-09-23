@@ -61,3 +61,33 @@ def test_portal_endpoint_reports_unknown_then_down(client):
 def test_portal_endpoint_404s_for_a_missing_booking(client):
     c, _ = client
     assert c.get("/bookings/nope/portal", headers=_op(c)).status_code == 404
+
+
+def test_workers_endpoint_surfaces_not_bookable_substate_detail(client):
+    """A KEEPING worker whose session went dead is marked with NOT_BOOKABLE_PREFIX in
+    substate_detail. That column was never RETURNED by the workers endpoint, so a dead 'keeping'
+    worker looked identical to a healthy one on the dashboard (the 'holding is a lie' gap)."""
+    from libs.db import models as M
+    from libs.domain.enums import NOT_BOOKABLE_PREFIX
+    c, _ = client
+    h = _op(c)
+    bid = c.post("/bookings", json={"name": "b", "type": "test", "posto_id": "5084"}, headers=h).json()["id"]
+    iid = c.post("/identities", json={"full_name": "X", "type": "test"}, headers=h).json()["id"]
+    wid = c.post(f"/bookings/{bid}/identities",
+                 json={"identity_id": iid, "assigned_role": "apply"}, headers=h).json()["id"]
+
+    import apps.hub.main as hub_main
+    db = hub_main.SessionLocal()
+    try:
+        w = db.get(M.Worker, wid)
+        w.status = "running"; w.substate = "keeping"
+        w.substate_detail = f"{NOT_BOOKABLE_PREFIX} keepalive dead-trip (await_assignment)"
+        db.commit()
+    finally:
+        db.close()
+
+    rows = c.get(f"/bookings/{bid}/workers", headers=h).json()
+    row = next(r for r in rows if r["id"] == wid)
+    assert row["substate"] == "keeping"
+    assert (row.get("substate_detail") or "").startswith(NOT_BOOKABLE_PREFIX), \
+        "the not-bookable marker must reach the client so a dead hold is visibly distinct"

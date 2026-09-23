@@ -205,6 +205,11 @@ class WorkerOut(BaseModel):
     role: WorkerRole
     status: str
     substate: str | None = None
+    # The machine-readable context behind the substate -- carries the NOT_BOOKABLE_PREFIX marker for
+    # a KEEPING worker whose session went dead (keepalive dead-trip / re-warm fail). Was written to
+    # the DB and read by the dashboard's workerView, but never RETURNED here, so a dead 'keeping'
+    # worker was indistinguishable from a healthy one on the page (the "holding is a lie" gap).
+    substate_detail: str | None = None
     sub_account_id: str | None = None
 
     model_config = {"from_attributes": True}

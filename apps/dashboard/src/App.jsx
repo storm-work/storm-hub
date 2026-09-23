@@ -1567,6 +1567,10 @@ function BookingWorkers({ me, booking, events, workers, setRightPanel }) {
                 <td className={w.live_outcome === "booked" ? "ok" : w.live_outcome === "failed" ? "err" : ""}
                     title={w.substate_detail || ""}>
                   {w.live_substate}{w.live_outcome ? ` (${w.live_outcome})` : ""}
+                  {w.running && (w.substate_detail || "").startsWith("not bookable:") && (
+                    <span className="pill err" style={{ marginLeft: 6, fontSize: 10 }}
+                      title={w.substate_detail}>⚠ not-bookable</span>
+                  )}
                 </td>
                 <td className="row" style={{ flexWrap: "nowrap", gap: 4 }}>
                   <button className="btn-sm btn" disabled={!op || !canWorkerAction("launch", w.status)}
