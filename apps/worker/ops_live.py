@@ -329,6 +329,13 @@ def classify_session_state(page: str, final_url: str, *, warmed: bool) -> Sessio
         return SessionState.SESSION_EXPIRED
     if _is_portal_busy(page):
         return SessionState.PORTAL_ERROR
+    # A WAF/bot-challenge interstitial served INSTEAD of the page is the portal declining our
+    # request, NOT a dead session -- exactly like _is_portal_busy above (the apply/warmup paths
+    # already treat it that way via _is_challenge_body; the keepalive was the one classifier blind
+    # to it, so a challenge fell through to UNKNOWN and the worker sat in limbo). Back off, don't
+    # re-authenticate: re-logging in cannot pass a WAF that is blocking the exit/session.
+    if _is_challenge_body(page):
+        return SessionState.PORTAL_ERROR
     if warmed:
         if any(m in page for m in _SCHED_PAGE_MARKERS):
             return SessionState.AUTHENTICATED
@@ -541,7 +548,7 @@ class LiveEngineOps(EngineOps):
         self.form_defaults = form_defaults
         self.capsolver_keys = capsolver_keys
         self.warm_proxy = warm_proxy
-        # phase-2 (hold/apply/discovery) proxy -- only used when HOLD_SWAP_AFTER_WARMUP is on
+        # phase-2 (hold/apply/discovery) proxy -- only used when HOLD_SWAP_AFTER_LOGIN is on
         # (do_swap() below). None is the correct/expected value when swap is off; the Hub only
         # leases and passes this when the setting is actually enabled (apps/hub/main.py).
         self.hold_proxy = hold_proxy
@@ -594,24 +601,46 @@ class LiveEngineOps(EngineOps):
 
         # P3 -- proxy rotation: which pool a rotation request should draw from. do_swap() flips this
         # to "hold" unconditionally the moment warmup finishes, regardless of whether
-        # HOLD_SWAP_AFTER_WARMUP is actually on (see do_swap()'s docstring and
+        # HOLD_SWAP_AFTER_LOGIN is actually on (see do_swap()'s docstring and
         # _request_proxy_rotation()) -- the operator's explicit requirement that pool selection "will
         # not be different when swap is off".
         self._current_phase = "warmup"
 
         self._login_sem: RedisSemaphore | None = None
         self._apply_sem: RedisSemaphore | None = None
+        self._pool_sem: RedisSemaphore | None = None
         self._breaker: RedisBreaker | None = None
         # /slots pacing + recovery state (2026-09-02). _slots_backoff_until gates the next attempt
         # so we stop buying tokens the endpoint will refuse; _slots_needs_relogin tells phases.py
         # that the ladder's cheap rung (re-warm) cannot help this failure.
         self._slots_backoff_until: float = 0.0
+        # SLOTS_PRESOLVE cache: a (token, solved_at) pair solved during the rate-limit wait so the
+        # next poll fires without paying the solve latency. Consumed once, and only while fresh
+        # (age < SLOTS_TOKEN_TTL, kept under reCAPTCHA's ~120s expiry). None = nothing cached.
+        self._presolved_slots: tuple[str, float] | None = None
         self._slots_last_grant_at: float = 0.0
         self._slots_needs_relogin: bool = False
+        # getTables handshake state (2026-09-23, ref-confirmed). getTables is a page-fired POST on
+        # Schedule.jsp that the WAF wants confirmed ("success":"true") before it serves /slots -- but
+        # it is POSTO-OPTIONAL (posto 5084 has none yet serves slots). _posto_gettables: None=unknown,
+        # True=this posto fires it, False=proven not to (so we stop waiting). _gt_hook_session tracks
+        # WHICH session object carries the capture hook, so a rebuilt session gets it re-installed.
+        self._posto_gettables: bool | None = None
+        self._gt_hook_session: object | None = None
         if redis_client is not None and booking_id:
-            from libs.bus.semaphore import make_gate
+            from libs.bus.semaphore import make_gate, make_provider_gate
             self._login_sem = make_gate(redis_client, booking_id, "login", cfg.raw.get("LOGIN_CONCURRENCY", 10))
             self._apply_sem = make_gate(redis_client, booking_id, "apply", cfg.raw.get("APPLY_CONCURRENCY", 100))
+            # Host-wide pool gate, deliberately NOT scoped to this booking -- see
+            # provider_semaphore_key. 0 disables it, which is the only way to opt out.
+            _pool_limit = int(cfg.raw.get("PROVIDER_LOGIN_CONCURRENCY", 20) or 0)
+            if _pool_limit > 0:
+                self._pool_sem = make_provider_gate(
+                    redis_client,
+                    str(cfg.raw.get("PROXY_PROVIDER") or "soax"),
+                    cfg.raw.get("PROXY_KIND") or None,
+                    _pool_limit,
+                )
             self._breaker = RedisBreaker(
                 redis_client, booking_id,
                 trip_threshold=int(cfg.raw.get("BREAKER_TRIP_THRESHOLD", 5)),
@@ -649,13 +678,35 @@ class LiveEngineOps(EngineOps):
             if not self._login_sem.acquire(self.identity_id, timeout=300):
                 self._log("do_login: login concurrency gate timed out")
                 return False
+        # The pool gate is acquired SECOND and released FIRST, so the two are strictly nested and
+        # every worker takes them in the same order -- no deadlock is possible between them. A
+        # failure here must still release the login slot, hence the try/finally around it rather
+        # than a bare early return.
         try:
-            if self._try_restore_from_checkpoint():
-                return True
-            return self._fresh_login()
+            if self._pool_sem is not None:
+                if not self._pool_sem.acquire(self._pool_holder_id(), timeout=300):
+                    self._log(f"do_login: pool concurrency gate ({self._pool_sem.key}) timed out")
+                    return False
+            try:
+                if self._try_restore_from_checkpoint():
+                    return True
+                return self._fresh_login()
+            finally:
+                if self._pool_sem is not None:
+                    self._pool_sem.release(self._pool_holder_id())
         finally:
             if self._login_sem is not None:
                 self._login_sem.release(self.identity_id)
+
+    def _pool_holder_id(self) -> str:
+        """Holder id for the HOST-WIDE pool gate, so it must be unique across bookings.
+
+        `identity_id` alone is not: the same identity can be assigned to more than one booking, and
+        two of its workers logging in concurrently would look like a single holder to the sorted set
+        -- the second would slip past a full gate, and the first to finish would release the other's
+        slot.
+        """
+        return f"{self.booking_id or '-'}:{self.identity_id}"
 
     def _try_restore_from_checkpoint(self) -> bool:
         """3-tier restore chain (Phase C3): restore -> health-check -> re-warm -> give up (return
@@ -712,6 +763,20 @@ class LiveEngineOps(EngineOps):
             return False
 
         if self._probe_alive():
+            # POSTO GUARD (confirmed risk 2026-09-21 on "0921-3058", posto changed after a stop). A
+            # checkpoint is keyed by IDENTITY and survives a posto change, and a bookable-stage one
+            # PINS the posto it was warmed at via posto_pdf -- which then drives discovery (Schedule.jsp
+            # / gettime) and the submit URL. Adopting it here SKIPS warmup, so a session warmed at the
+            # OLD posto would silently discover and book against that old posto instead of this run's
+            # target. Prefer the exact posto_id (stored on new checkpoints); fall back to posto_pdf for
+            # legacy ones (it is the pinned posto). A login-stage checkpoint has neither set and is
+            # posto-agnostic (it re-warms against the current posto), so it passes untouched.
+            ckpt_posto = data.get("posto_id") or data.get("posto_pdf")
+            if ckpt_posto is not None and str(ckpt_posto) != str(self.posto_id):
+                self._log(f"checkpoint restore: warmed at posto {ckpt_posto} but this run targets "
+                          f"{self.posto_id} -- stale after a posto change, discarding and re-warming")
+                self._restore_stage = "none"
+                return False
             self.posto_pdf = data.get("posto_pdf")
             # UNVERIFIED on this session: copied from a file, not rebuilt. _anchor_at stays None so
             # nothing downstream can mistake it for a fresh chain.
@@ -917,6 +982,49 @@ class LiveEngineOps(EngineOps):
             return False
         return "cmbPeriodo" in html or "getPeriodosOcupados" in html
 
+    def _probe_swapped_session(self) -> bool:
+        """Is the session still AUTHENTICATED after moving it to the hold proxy?
+
+        AUTH-LEVEL, NOT FORM-LEVEL, and that distinction is the whole bug this replaced.
+        do_swap runs between LOGGED_IN and KEEPING -- i.e. strictly BEFORE warmup, which has been
+        deferred to the slot-open/slot-found signal since 2026-09-09. It used to call
+        `_probe_alive()`, which navigates Schedule.jsp and requires cmbPeriodo/getPeriodosOcupados.
+        Those markers exist only once warmup has built the form-state anchor, so at swap time the
+        check could not pass even in principle: it asked "is this session WARMED?" at the one point
+        in the lifecycle where the machine guarantees it is not.
+
+        MEASURED on booking Test 0916 (2026-09-16): 20/20 swap attempts failed -- 5 workers x 4
+        attempts -- every one logging "new session failed health check". Deterministic, not flaky.
+        Each failure cost a 600s backoff, so every worker spent ~40 minutes parked at LOGGED_IN and
+        then fell through to KEEPING still on its phase-1 rotating proxy. The three appointments
+        that run booked were made over soax rotating; the leased ISP exits never carried a session.
+        `do_swap` moved before warmup when HOLD_SWAP_AFTER_WARMUP was renamed HOLD_SWAP_AFTER_LOGIN,
+        and this probe was left pointing at the old lifecycle.
+
+        `_probe_alive` is UNCHANGED and still correct for its other caller, the checkpoint-restore
+        path, which restores `posto_pdf` and therefore does expect a warmed session.
+
+        Reuses classify_session_state with `warmed=False` -- the same evidence the auth-only
+        keepalive uses on the same page -- rather than inventing a second opinion about what a
+        healthy home page looks like. PORTAL_ERROR/UNKNOWN are treated as "not proven alive": a
+        swap that cannot be confirmed must revert, since the alternative is silently holding a
+        session on an exit we have no evidence works.
+        """
+        try:
+            final_url = self.session.browser_nav(HOME_URL, timeout=30)
+        except Exception as e:
+            self._log(f"do_swap: probe nav failed on the hold proxy ({e})")
+            return False
+        try:
+            page = self.session.browser_eval("document.documentElement.outerHTML") or ""
+        except Exception:
+            return False
+        state = classify_session_state(page, final_url, warmed=False)
+        if state is not SessionState.AUTHENTICATED:
+            self._log(f"do_swap: hold-proxy session probe -> {state} (not authenticated)")
+            return False
+        return True
+
     def _fresh_login(self) -> bool:
         """Sticky-then-rotate (operator spec, ported from storm-auto's confirmed
         app/worker.py:323-326 pattern): up to STICKY_RETRY_MAX consecutive attempts on the CURRENT
@@ -931,6 +1039,18 @@ class LiveEngineOps(EngineOps):
                           if a.get("sub_account_id") == self.sub_account_id), 0)
         ordered = self.accounts[start_idx:] + self.accounts[:start_idx]
         for i, candidate in enumerate(ordered):
+            # STOP IS CHECKED BETWEEN EVERY SUB-ACCOUNT (2026-09-11). This whole chain -- and
+            # _sticky_login_attempts below it -- used to run to completion with no bus contact at
+            # all, so a worker that entered a login storm went DEAF to stop/assign/self-scout for
+            # as long as the storm lasted. CONFIRMED LIVE 2026-09-07: one worker ground from 18:04
+            # to past 18:31 (27+ minutes, 6 transient rolls x multiple sub-accounts) with zero
+            # response to the bus. Worst case is ~39 rounds (13 per sub-account x 3), each a
+            # browser launch + login attempt plus backoff, so the deaf window could be far longer
+            # than that. The Hub was never the bottleneck (it delivers in ~2s, measured); the
+            # worker simply never looked.
+            if self.is_stopped():
+                self._log("login: stop observed -- abandoning sub-account rotation")
+                return False
             if i > 0:
                 self._log(f"login: sticky retries exhausted on this sub-account -- rotating to "
                           f"candidate {i + 1}/{len(ordered)} ({candidate.get('sub_account_id')})")
@@ -969,16 +1089,41 @@ class LiveEngineOps(EngineOps):
         max_busy_rolls = max(0, int(self.cfg.raw.get("LOGIN_PORTAL_BUSY_ROLLS", 3)))
         rounds = 0
         while attempt < sticky_max:
+            # Every round here costs a browser launch + a login attempt + a backoff sleep, and the
+            # transient/ip_moves/busy_rolls budgets mean `attempt` may not advance for many rounds
+            # -- so this loop, not just the sub-account loop above it, is where a worker actually
+            # spends most of a storm. See _fresh_login's comment for the confirmed incident.
+            if self.is_stopped():
+                self._log("login: stop observed -- abandoning retries on this sub-account")
+                return False
             rounds += 1
             if rounds > 1:
                 # Regression (L2/L3, closed by P3): a repeated login failure used to keep retrying
-                # on the SAME leased proxy forever -- if the proxy itself is the problem (burned IP,
-                # rate-limited), no number of retries recovers. Rotate before every retry past the
-                # first, matching storm-auto's confirmed behavior of a fresh proxy per sticky
-                # attempt. Best-effort: if the Hub has nothing free, keep using the current proxy.
-                new_proxy = self._request_proxy_rotation(self._current_phase)
-                if new_proxy:
-                    self.warm_proxy = new_proxy
+                # on the SAME proxy forever -- if the exit itself is the problem (burned IP,
+                # rate-limited), no number of retries recovers. Move to a fresh exit before every
+                # retry past the first, matching storm-auto's confirmed behavior.
+                #
+                # LOCAL ROLL, not a Hub round-trip (2026-09-15). This was the one unconditional
+                # _request_proxy_rotation on the warm path -- every login retry round asked the Hub
+                # for another pooled row. MEASURED on booking 0911: that round-trip cost 46s/97s/
+                # 124s per rotation under load, because the Hub answered it from a 4-thread pool
+                # whose handler ran a ~25s browser probe per candidate. Rolling the session id is a
+                # string operation on a credential the worker already holds, and lands on an exit
+                # that is as good as any the Hub could have leased (lease.py:153).
+                self._roll_exit(f"login retry round {rounds}")
+                # DRAIN THE BUS EXPLICITLY. is_stopped() only reads a flag that BusSignals._drain
+                # sets, and _drain only runs inside a wait_* call -- during a login storm the only
+                # one reached was wait_proxy, via the Hub rotation this round-trip just replaced.
+                # Without this, removing that call would have made a storming worker deaf to `stop`
+                # again, undoing the 2026-09-11 fix. Non-blocking: one XREADGROUP, no added latency.
+                self._poll_signals()
+                # The stop check stays: _roll_exit is instant, but the browser launch plus login
+                # attempt that follow are not, and a stop landing here used to go unseen for
+                # minutes. (The rotation sites further down `continue` straight back to the
+                # loop top, so the check there covers them.)
+                if self.is_stopped():
+                    self._log("login: stop observed before retrying -- abandoning retries")
+                    return False
             try:
                 # Close the PREVIOUS attempt's browser before opening another. This line used to
                 # simply reassign self.session, orphaning a whole Chromium tree on every retry --
@@ -1069,20 +1214,14 @@ class LiveEngineOps(EngineOps):
                 self._log(f"login: reCAPTCHA rejection coincided with the exit moving "
                           f"({ip_moves}/{max_ip_moves}) -- token/IP mismatch, NOT charged to "
                           f"{self.sub_account_id[:8]}; rotating to a fresh exit and retrying")
-                if not self._roll_exit("recaptcha token/ip mismatch"):
-                    new_proxy = self._request_proxy_rotation(self._current_phase)
-                    if new_proxy:
-                        self.warm_proxy = new_proxy
+                self._roll_exit("recaptcha token/ip mismatch")
                 self._backoff(ip_moves)
                 continue          # deliberately does NOT advance `attempt` or `captcha_fails`
             if _is_portal_busy(reason) and busy_rolls < max_busy_rolls:
                 busy_rolls += 1
                 self._log(f"login: 'try again later' on this exit ({busy_rolls}/{max_busy_rolls}) "
                           f"-- rolling to a different exit before blaming the portal")
-                if not self._roll_exit(f"portal busy {busy_rolls}/{max_busy_rolls}"):
-                    new_proxy = self._request_proxy_rotation(self._current_phase)
-                    if new_proxy:
-                        self.warm_proxy = new_proxy
+                self._roll_exit(f"portal busy {busy_rolls}/{max_busy_rolls}")
                 self._backoff(busy_rolls)
                 continue
             attempt += 1
@@ -1193,16 +1332,28 @@ class LiveEngineOps(EngineOps):
         ))
 
     def _request_proxy_rotation(self, phase: str | None = None) -> str | None:
-        """Ask the Hub for a fresh proxy from the pool matching `phase` ("warmup" or "hold") -- P3,
-        spec'd directly by the operator: "each worker process request[s] a rotation of proxy to
-        proxy provider ... based on the phase: in warmup phase select one from warmup proxy pool, in
-        hold phase select one from hold proxy pool." The worker process is deliberately DB-less (see
-        apps/worker/__main__.py's own docstring), so it can't lease a proxy row itself -- this
-        round-trips through the same event/command bus slot assignment already uses: emit
-        `proxy_request`, block for the Hub's `proxy_assigned`/`proxy_unavailable` reply
+        """Ask the Hub to ASSIGN a STATIC/ISP proxy. One caller remains: do_swap's hold ladder.
+
+        SCOPE NARROWED 2026-09-15. This used to serve the warm path too, and was the single most
+        expensive thing on it: MEASURED on booking 0911 at 46s/97s/124s per rotation, because the
+        Hub answered from a 4-thread pool whose handler ran a ~25s browser probe per candidate, and
+        workers emitted ~12.7 requests/min against a capacity of ~4.8/min. The queue grew, every
+        rotation got slower, and each slow rotation made a worker roll MORE exits -- a feedback
+        loop, on top of an already-degraded portal, right through slot-open.
+
+        A ROTATING pool has nothing to ask the Hub for: the session id is a string the worker can
+        mint itself (libs/proxies/rotating.py, _roll_exit). A STATIC one genuinely does -- it is a
+        finite, individually-owned IP that two workers must not share, so it has to be assigned and
+        leased by the one side with DB access. That distinction is the whole reason this method
+        still exists.
+
+        The worker process is deliberately DB-less (see apps/worker/__main__.py's own docstring),
+        so it can't lease a proxy row itself -- this round-trips through the same event/command bus
+        slot assignment already uses: emit `proxy_request`, block for the Hub's
+        `proxy_assigned`/`proxy_unavailable` reply
         (apps/hub/events.py's `_handle_proxy_request`). `phase` defaults to `self._current_phase`,
         which do_swap() sets to "hold" unconditionally the instant warmup finishes -- so a rotation
-        during holding always draws from the hold pool even when HOLD_SWAP_AFTER_WARMUP is off (the
+        during holding always draws from the hold pool even when HOLD_SWAP_AFTER_LOGIN is off (the
         operator's explicit requirement: "it will not be different when swap is off"). Returns the
         new proxy URL on success, or None (caller keeps its current proxy) if there's no bus wired,
         the pool is exhausted, or the reply times out -- the same safe-degrade pattern do_swap()
@@ -1231,7 +1382,17 @@ class LiveEngineOps(EngineOps):
     def _backoff(self, attempt: int) -> None:
         base = float(self.cfg.raw.get("RESPAWN_BACKOFF_BASE", 2.0))
         cap = float(self.cfg.raw.get("RESPAWN_BACKOFF_CAP", 120.0))
-        time.sleep(min(cap, base * (2 ** (attempt - 1))) * random.uniform(0.8, 1.2))
+        delay = min(cap, base * (2 ** (attempt - 1))) * random.uniform(0.8, 1.2)
+        # Slept in ONE uninterruptible block until 2026-09-11. At the 120s cap (x1.2 jitter) that is
+        # ~144s of total deafness per failed round, on top of the browser launch and login attempt
+        # that precede it -- and this is called on EVERY failure branch in the login loop, so a
+        # storm's sleep time alone ran to many minutes. Chunked so is_stopped() is observed within
+        # ~1s, reusing the same shape as the discovery pacing sleep above (see its comment).
+        deadline = time.time() + delay
+        while time.time() < deadline:
+            if self.is_stopped():
+                return
+            time.sleep(min(1.0, max(0.0, deadline - time.time())))
 
     def do_warmup(self) -> bool:
         if self._restore_stage in ("alive", "rewarmed"):
@@ -1266,6 +1427,41 @@ class LiveEngineOps(EngineOps):
                       f"(anchor={self._anchor_desc()}); the first apply round re-warms")
             return True   # checkpoint restore already got us to a bookable state
         return self._run_warmup_steps()
+
+    def is_warmed(self) -> bool:
+        """EngineOps surface for whether the booking form-state anchor is established AND VERIFIED
+        -- lets phases.py's deferred-warmup call sites (_warm_if_needed) skip a redundant re-warm
+        when PREWARM_BEFORE_SLOT_OPEN or a prior round already ran the real chain.
+
+        PROVENANCE IS LOAD-BEARING, not a detail. posto_pdf has two writers that mean opposite
+        things: _run_warmup_steps sets it from a freshly-parsed Schedule.jsp (_set_anchor("chain")
+        -- verified, the questionnaire chain actually ran), while a checkpoint restore sets it from
+        a saved file (_set_anchor("checkpoint") -- as old as the file, never verified against the
+        portal). _attempt_keepalive_restore has always known this (`if ok and self._anchor_src !=
+        "chain"` -- it re-warms a checkpoint anchor); this method shipped 2026-09-09 checking only
+        `posto_pdf is not None` and so trusted both equally.
+
+        CONFIRMED LIVE 2026-09-11 (booking 0911): after slot-open, 26 workers entered DISCOVERING
+        but only 3 had ever reached WARMED. The rest had restored from checkpoint, reported warmed
+        here, skipped the warmup, and hit /slots with a stale anchor -- the Schedule.jsp captcha
+        widget was never rendered, so every round died on "window.onCaptchaSuccess never appeared
+        within 20s". Zero slots were discovered and the booking could not book. Same failure class
+        as the documented keepalive-suppression bug, reintroduced at a new call site.
+
+        AGE IS NOT OPTIONAL EITHER. FAILURE_MODES.md F28's remedy already spells out the full
+        invariant -- `_anchor_src == "chain"` AND `_anchor_age()` under the form-state TTL --
+        and says exactly why the second half cannot be dropped: "a failed re-warm never reaches
+        `_set_anchor`, so `_anchor_src` retains the previous *successful* warm's value." Provenance
+        alone therefore still reports warmed after a re-warm that failed, which is the same stale
+        anchor by a different route. TTL comes from FORM_STATE_TTL (catalog, "keepalive" group);
+        see its note for why the ~90-120s figure often quoted is NOT used -- it is storm-auto's and
+        was never measured here (OPEN_QUESTIONS Q3/Q24)."""
+        if self.posto_pdf is None or self._anchor_src != "chain":
+            return False
+        age = self._anchor_age()
+        if age is None:
+            return False      # chain anchors always stamp _anchor_at; no stamp = not trustworthy
+        return age < max(1.0, float(self.cfg.raw.get("FORM_STATE_TTL", 240.0)))
 
     # ── portal health: slow is not broken (Phase 3) ───────────────────────────
     # What a healthy portal costs, measured on live runs 2026-08-20. Used only as the baseline that
@@ -1305,16 +1501,12 @@ class LiveEngineOps(EngineOps):
             # a slice of the sub-account budget, to fail identically. Rotate the exit first and let
             # the ladder's next attempt run on a live one. Best-effort -- if the Hub has nothing
             # free, the ladder proceeds exactly as before.
-            # Prefer rolling the sticky session id: it always works, needs no Hub round-trip and
-            # no free pool row, and the exit it lands on is as good as any the Hub could lease.
-            # _request_proxy_rotation stays as the fallback for a credential with no session id.
-            if self._roll_exit(f"{phase} unreachable"):
-                pass
-            else:
-                new_proxy = self._request_proxy_rotation(self._current_phase)
-                if new_proxy:
-                    self.warm_proxy = new_proxy
-                    self._log(f"portal: {phase} unreachable -- rotated to a fresh exit before retrying")
+            # Roll the sticky session id: it always works, needs no Hub round-trip and no free
+            # pool row, and the exit it lands on is as good as any the Hub could have leased.
+            # The Hub fallback is gone -- for a rotating pool there is no longer anything to ask
+            # it FOR (2026-09-15), and a credential with no rollable session id is a static one,
+            # which never reaches this path.
+            self._roll_exit(f"{phase} unreachable")
 
         if kind == "slow" and self._health.is_degraded():
             # Not this worker's bad luck any more -- the window is degraded.
@@ -1608,7 +1800,7 @@ class LiveEngineOps(EngineOps):
     def do_swap(self) -> str | None:
         """Phase-1 (login/warmup) proxy -> phase-2 (hold/apply/discovery) proxy migration.
 
-        Off by default (HOLD_SWAP_AFTER_WARMUP, catalog default False) -- most bookings just hold on
+        Off by default (HOLD_SWAP_AFTER_LOGIN, catalog default False) -- most bookings just hold on
         the same proxy they logged in with, and that's the safe, unsurprising default. When the
         operator explicitly turns it on, the Hub leases a second proxy (HOLD_PROXY_PROVIDER/
         HOLD_PROXY_KIND) and passes it as `hold_proxy`; this carries the authoritative browser cookie
@@ -1640,11 +1832,11 @@ class LiveEngineOps(EngineOps):
         # configured PROXY_PROVIDER=soax spent most of its life on webshare instead. Confirmed live
         # 2026-08-19 -- every worker had frozen PROXY_PROVIDER='soax' and the run still took 1427
         # webshare leases against 552 soax, with every login going through p.webshare.io.
-        if not self.cfg.hold_swap.swap_after_warmup:
+        if not self.cfg.hold_swap.swap_after_login:
             return None
         self._current_phase = "hold"
         if not self.hold_proxy:
-            self._log("do_swap: HOLD_SWAP_AFTER_WARMUP is on but no hold_proxy was provided -- skipping")
+            self._log("do_swap: HOLD_SWAP_AFTER_LOGIN is on but no hold_proxy was provided -- skipping")
             return None
         if self.session is None:
             return None
@@ -1723,7 +1915,7 @@ class LiveEngineOps(EngineOps):
 
         old_session = self.session
         self.session = new_session
-        if not self._probe_alive():
+        if not self._probe_swapped_session():
             self._log("do_swap: new session failed health check -- reverting to phase-1 proxy")
             self.session = old_session
             try:
@@ -1884,12 +2076,12 @@ class LiveEngineOps(EngineOps):
         self._exit_ip = ip
         return moved
 
-    def _mark_hold_bookable(self, bookable: bool, why: str = "") -> None:
-        """Publish whether this HOLDING worker can actually take a slot.
+    def _mark_keep_bookable(self, bookable: bool, why: str = "") -> None:
+        """Publish whether this KEEPING worker can actually take a slot.
 
         Emits the same `status_change` event the PhaseMachine's on_transition emits, so it flows
         through the existing events.py -> Worker.substate/substate_detail path with no new plumbing.
-        The substate stays HOLDING (a holding -> holding transition is legal, and the worker really
+        The substate stays KEEPING (a keeping -> keeping transition is legal, and the worker really
         is still holding -- authenticated, keepalive-ing, recoverable in place); only the DETAIL
         changes, carrying apps/hub/scheduler.py's NOT_BOOKABLE_PREFIX marker that _assign_slots
         filters on. Same machine-readable-prefix convention as LAUNCH_FAILED_PREFIX.
@@ -1900,11 +2092,46 @@ class LiveEngineOps(EngineOps):
         # marks too, and that leaves the streak at 0, so a recovered worker would have stayed
         # unbookable forever. A permanently-unbookable holding worker is worse than the bug being
         # fixed: it is invisible capacity loss.
-        self._hold_unbookable = not bookable
+        self._keep_unbookable = not bookable
         if self._emit is None:
             return
         detail = f"{NOT_BOOKABLE_PREFIX} {why}" if not bookable else ""
-        self._emit("status_change", substate="holding", detail=detail)
+        self._emit("status_change", substate="keeping", detail=detail)
+
+    def _keepalive_read_page(self) -> str:
+        """Read the probe page ONCE it has settled, so a still-navigating home page is not misread
+        as a dead session. Two guards against the same nav race (root cause of the 2026-09-21
+        keeping failure -- 49 'Execution context was destroyed' + 38 UNKNOWN on live, healthy
+        sessions):
+
+          1. SETTLE FIRST -- poll briefly for document.readyState=complete with body text present,
+             so we read a rendered page whose markers are actually in the DOM (kills the UNKNOWN
+             mid-render reads). Best-effort: a page that never settles (dead/blocked) just falls
+             through to the read, which still classifies it correctly.
+          2. RE-READ ONCE on 'Execution context was destroyed' -- that specific error IS the nav
+             race, so settle a beat and read again. A genuinely dead page throws it BOTH times and
+             the exception propagates to the outer handler (correctly counted toward dead-trip); a
+             race recovers on the retry and never touches the dead-streak.
+        """
+        settle_js = (
+            "(async () => { const dl = Date.now() + %d;"
+            "  const ready = () => document.readyState === 'complete'"
+            "    && !!document.body && (document.body.innerText || '').trim().length > 0;"
+            "  while (Date.now() < dl) { if (ready()) return true;"
+            "    await new Promise(r => setTimeout(r, 150)); } return false; })()"
+            % self._KEEPALIVE_SETTLE_MS
+        )
+        try:
+            self.session.browser_eval(settle_js)
+        except Exception:
+            pass   # settle is best-effort; the read below is the real check
+        try:
+            return self.session.browser_eval("document.documentElement.outerHTML") or ""
+        except Exception as e:
+            if "execution context was destroyed" not in str(e).lower():
+                raise
+            time.sleep(1.0)
+            return self.session.browser_eval("document.documentElement.outerHTML") or ""
 
     def _do_keepalive(self, context: str) -> None:
         if self.cfg.keepalive.off:
@@ -1923,21 +2150,18 @@ class LiveEngineOps(EngineOps):
                 return
             self._attempt_keepalive_restore(context)
             return
-        # STATE-AWARE. This used to navigate HOME_URL unconditionally, which keeps the AUTH session
-        # alive and nothing else -- so a worker could hold for an hour, stay perfectly logged in, and
-        # still have a long-lapsed booking form-state. Its first gettime or first submit then failed,
-        # and the failure was counted toward a re-login rather than the re-warm that would fix it.
-        #
-        # Once a worker has warmed (posto_pdf set), the thing worth keeping alive is READINESS, not
-        # just the session: probe the schedule page and check it still carries the scheduling
-        # markers. Absent means the ScheduleController anchor is gone -- re-warm in place, which is
-        # ~40s and needs no login. Before warmup there is no form-state to hold, so home is right.
+        # AUTH-ONLY (2026-09-09, consolidated from the HOLD_AUTHED_ONLY A/B -- Test 0907 vs
+        # Test 0907-auth matched on outcome, 2/2 booked each, ~same apply latency, while the
+        # authed-only side ran zero full Schedule.jsp re-warm cycles over a 21h hold vs one every
+        # ~20min on the schedule-keepalive side). The routine hold-time probe is always the cheap
+        # authenticated home-page check now -- it never re-verifies or re-warms the booking
+        # form-state. do_apply already unconditionally re-warms at the start of every round
+        # regardless of what keepalive believed, and (since C) warmup itself is deferred to the
+        # slot-open/assignment signal rather than done proactively before hold -- so there is no
+        # form-state to verify here even in principle. SESSION_EXPIRED and dead-trip detection
+        # below are unaffected: they never depended on this.
         probe = self.cfg.keepalive.probe or "home"
-        warmed = self.posto_pdf is not None
-        if probe == "home" and warmed:
-            url = SCHED_JSP + "?posto_id=" + str(self.posto_pdf)
-        else:
-            url = HOME_URL if probe == "home" else probe
+        url = HOME_URL if probe == "home" else probe
         try:
             final_url = self.session.browser_nav(url, timeout=30)
             if probe != "home":
@@ -1950,7 +2174,7 @@ class LiveEngineOps(EngineOps):
                 if self._emit is not None:
                     self._emit("log_line", text=f"keepalive: probe OK ({context})")
                 return
-            page = self.session.browser_eval("document.documentElement.outerHTML") or ""
+            page = self._keepalive_read_page()
             # CONFIRMED LIVE 2026-09-03 ("Test 0901"): this reset used to sit right after
             # browser_nav, above -- before browser_eval, which is the call that actually throws
             # "Execution context was destroyed, most likely because of a navigation" (a nav race,
@@ -1963,16 +2187,16 @@ class LiveEngineOps(EngineOps):
             # fires once the FULL cycle -- nav AND eval -- has completed without raising, so a
             # nav-succeeds-then-eval-throws cycle correctly counts as one failure toward dead_trip.
             self._keepalive_dead_streak = 0
-            state = classify_session_state(page, final_url, warmed=warmed)
+            state = classify_session_state(page, final_url, warmed=False)
             if state == SessionState.AUTHENTICATED:
-                # Only fires on a RECOVERY transition (streak was > 0), matching the original
-                # behaviour of never emitting a bookable/streak-reset event on an already-healthy
-                # cycle -- an event on every single healthy tick is exactly the kind of
-                # write-amplification F6 exists to guard against.
-                if warmed and (getattr(self, "_rewarm_fail_streak", 0) > 0
-                               or getattr(self, "_hold_unbookable", False)):
-                    self._rewarm_fail_streak = 0
-                    self._mark_hold_bookable(True)
+                # Only fires on a RECOVERY transition (was marked not-bookable, e.g. by the
+                # dead-trip branch below), matching the original behaviour of never emitting a
+                # bookable-reset event on an already-healthy cycle -- an event on every single
+                # healthy tick is exactly the kind of write-amplification F6 exists to guard
+                # against. Not gated on "warmed" any more: there is no form-state left to verify,
+                # so a clean authenticated read is recovery evidence on its own.
+                if getattr(self, "_keep_unbookable", False):
+                    self._mark_keep_bookable(True)
                 if self._emit is not None:
                     self._emit("log_line", text=f"keepalive: probe OK ({context})")
                 return
@@ -1994,39 +2218,11 @@ class LiveEngineOps(EngineOps):
                           f"exit={getattr(self, '_exit_ip', None)}, {context}) -- "
                           f"backing off, not re-warming and not re-logging in")
                 return
-            # UNKNOWN: no positive AND no negative evidence. Pre-warm, there is nothing to re-warm
-            # (no ScheduleController anchor exists yet) -- wait for the next cycle rather than
-            # guess. Warmed, this is exactly the original "form-state lapsed" path: markers are
-            # absent, but nothing here says the SESSION is dead (that's the SESSION_EXPIRED branch
-            # above), so re-warming in place remains the correct bounded attempt, escalating to a
-            # full session rebuild via _maybe_escalate_stuck_rewarm if it keeps failing (F26: an
-            # unrecognised response gets a real "we don't know" branch instead of being silently
-            # forced into a specific verdict).
-            if not warmed:
-                self._log(f"keepalive: unrecognised pre-warm response ({len(page)}B, {context}) -- "
-                          f"inconclusive, will re-probe")
-                return
-            self._log(f"keepalive: form-state lapsed ({len(page)}B, no scheduling markers) "
-                      f"-- re-warming in place ({context})")
-            if self._run_warmup_steps():
-                self._rewarm_fail_streak = 0
-                self._log(f"keepalive: re-warm restored the schedule form ({context})")
-                # Clear the not-bookable marker: this worker can take a slot again.
-                self._mark_hold_bookable(True)
-            else:
-                # Still no re-login here: before slot-found the login wall is the scarce
-                # resource, and a lapsed FORM anchor is not a dead auth session (the LOOSE
-                # HOLD rule below). That part was always right. What was wrong is that the
-                # failure was recorded ONLY as a log line -- no substate, no detail, no
-                # counter -- so the worker kept reporting a bare `holding`, the Hub counted
-                # it as ready capacity, and it bounced the first slot it was handed.
-                # Confirmed live 2026-08-21: 110 such failures against 42 recoveries.
-                self._rewarm_fail_streak = getattr(self, "_rewarm_fail_streak", 0) + 1
-                self._log(f"keepalive: re-warm failed -- holding but NOT BOOKABLE "
-                          f"(streak={self._rewarm_fail_streak}, {context})")
-                self._mark_hold_bookable(
-                    False, f"form-state lapsed, re-warm failed x{self._rewarm_fail_streak}")
-                self._maybe_escalate_stuck_rewarm(context)
+            # UNKNOWN: no positive AND no negative evidence -- there is no form-state to re-warm
+            # (auth-only holding never establishes one), so this is always "inconclusive, wait for
+            # the next cycle" now, never a re-warm trigger.
+            self._log(f"keepalive: unrecognised pre-warm response ({len(page)}B, {context}) -- "
+                      f"inconclusive, will re-probe")
         except Exception as e:
             self._keepalive_dead_streak = getattr(self, "_keepalive_dead_streak", 0) + 1
             dead_trip = max(1, int(self.cfg.keepalive.dead_trip))
@@ -2037,7 +2233,7 @@ class LiveEngineOps(EngineOps):
                 self._keepalive_dead_streak = 0
                 # NOT BOOKABLE, for the same reason the re-warm branch above already says so: at
                 # this point the code has concluded the session is dead, but the substate stays a
-                # bare HOLDING and _assign_slots counts it as ready capacity. The fix was applied to
+                # bare KEEPING and _assign_slots counts it as ready capacity. The fix was applied to
                 # the re-warm branch in 2026-08-21 and this branch was missed.
                 # CONFIRMED LIVE 2026-09-02 (20:45 run of "Test 0901"): worker 1d1a9033 was handed
                 # the pool's ONLY available slot at 22:22:04, went straight to `applying`, and
@@ -2047,73 +2243,31 @@ class LiveEngineOps(EngineOps):
                 # spurious "Execution context was destroyed" nav race (6-8 per worker per hold in
                 # the 17:15 run), and marking on those would delete real capacity over nothing.
                 # The dead-trip is the point at which this code already believes the session is gone.
-                self._mark_hold_bookable(False, f"keepalive dead-trip ({context})")
-                # LOOSE HOLD rule, ported from storm-auto's confirmed anti-attrition logic: before a
-                # slot has actually been found, there is nothing to book yet, so a proxy/session
-                # blip must NEVER burn a re-login -- the login wall is the scarce resource, not
-                # portal traffic. Only actively restore once slot_found has actually fired (or the
-                # operator has explicitly disabled this caution via KEEPALIVE_NO_RESTORE=False AND
-                # slot_found is set). This was previously unconditional -- a transient WAF/DataDome
-                # flicker during a multi-hour pre-slot-found hold burned a full re-login by default.
-                if self.cfg.keepalive.no_restore or not self._slot_found_seen():
+                self._mark_keep_bookable(False, f"keepalive dead-trip ({context})")
+                # A SESSION THAT IS NOT VALID FOR ITS PURPOSE IS NOT WORTH KEEPING (operator
+                # principle, 2026-09-11). This used to also refuse to restore when slot_found had
+                # not fired yet -- the LOOSE HOLD rule, whose premise was that a pre-slot-found
+                # blip must never burn a re-login because the login wall is the scarce resource.
+                #
+                # That premise misreads what dead-trip is. Dead-trip is KEEPALIVE_DEAD_TRIP
+                # CONSECUTIVE failures, not a blip -- the comment above already says "the point at
+                # which this code already believes the session is gone". Keeping a session we
+                # believe is gone saves nothing: the re-login is owed either way, and the only
+                # question is whether it is paid now, during a quiet hold, or discovered at
+                # slot-open when the worker is needed and has nothing.
+                #
+                # CONFIRMED LIVE 2026-09-11 (booking 0911): workers sat at
+                # "not bookable: keepalive dead-trip" for HOURS under this rule, were still dead
+                # when slot-open fired, and the booking could not book. Paying the login early is
+                # strictly better. KEEPALIVE_NO_RESTORE remains honoured as the explicit
+                # diagnostic opt-out.
+                if self.cfg.keepalive.no_restore:
                     if self._emit is not None:
-                        self._emit("log_line", text="keepalive: dead-trip reached but slot not found "
-                                                      "yet (or KEEPALIVE_NO_RESTORE set) -- preserving "
-                                                      "session, not burning a re-login")
+                        self._emit("log_line", text="keepalive: dead-trip reached but "
+                                                      "KEEPALIVE_NO_RESTORE is set -- leaving the "
+                                                      "session dead rather than rebuilding it")
                 else:
                     self._attempt_keepalive_restore(context)
-
-    def _maybe_escalate_stuck_rewarm(self, context: str) -> None:
-        """A re-warm that keeps failing is not a lapsed form -- rebuild the session instead.
-
-        CONFIRMED LIVE 2026-08-22 (SOFIA FILOMENA COSTA on Test 2032). The worker held a perfectly
-        healthy AUTH session -- its keepalive nav returned a full 28,505-byte page every cycle -- but
-        every questionnaire POST came back 403 (a pt-pt block page, and once a 200 with an opaque
-        encoded body: the WAF challenging POSTs while letting GETs through). The exit IP was flagged,
-        not the session.
-
-        That state could not recover, because the two ladders each declined to act:
-          - the dead-session ladder never fired: browser_nav SUCCEEDS, so _keepalive_dead_streak
-            stayed 0 and the dead-trip never tripped. The session does not look dead because it
-            is not dead.
-          - the re-warm ladder marked NOT BOOKABLE and returned, by design.
-        So it looped lapse -> re-warm -> 403 -> mark -> wait, reaching streak 7 and climbing, on the
-        same proxy that was blocked the whole time. Re-warming cannot clear an IP-level block.
-
-        The remedy is the one the dead-session path already owns: drop the browser and rebuild
-        through a fresh login, which rotates the proxy on the way. Gated on slot_found because
-        before that the LOOSE HOLD rule applies -- a re-login costs a CAPTCHA solve and a slice of
-        the sub-account budget, and pre-slot-found there is nothing to book that would justify it.
-        Bounded by _MAX_KEEPALIVE_RESTORE_ATTEMPTS, so this cannot become a new unbounded loop.
-        """
-        after = max(1, int(self.cfg.raw.get("REWARM_ESCALATE_AFTER", 3)))
-        if self._rewarm_fail_streak < after:
-            return
-        # DEADLOCK, confirmed live 2026-08-23. Gating on slot_found is right for the SPLIT model,
-        # where an idle applier waits and scouts do the discovering. Under MONO_BOOKING the apply
-        # worker IS the discoverer, so the gate becomes circular: its form-state is lapsed -> it
-        # cannot discover -> no slots are found -> slot_found never fires -> escalation is refused
-        # forever. Four workers sat at "re-warm failed x7" for over an hour, displayed as `holding`,
-        # while the booking had nothing else that could ever find a slot.
-        #
-        # Once slot_OPEN has fired in mono mode there is real work to do and a rebuild is justified;
-        # the LOOSE HOLD rule still applies before that, and still applies throughout in split mode.
-        mono = bool(self.cfg.raw.get("MONO_BOOKING", False))
-        gate_open = self._slot_found_seen() or (mono and self._slot_open_seen())
-        if not gate_open:
-            self._log(f"keepalive: {self._rewarm_fail_streak} failed re-warms, but this booking has "
-                      f"not opened yet -- holding rather than burning a re-login ({context})")
-            return
-        self._log(f"keepalive: {self._rewarm_fail_streak} consecutive re-warm failures -- the form "
-                  f"is not the problem; rebuilding the session on a fresh proxy ({context})")
-        self._rewarm_fail_streak = 0          # the ladder owns it now; don't re-escalate every tick
-        # posto_pdf still holds the value from the warm-up that has since lapsed. Clearing it is what
-        # makes _attempt_keepalive_restore re-warm rather than stop at re-authenticating -- its
-        # `if ok and self.posto_pdf is None` guard exists for a launch-time restore, where a set
-        # posto_pdf really does mean the anchor is good. Here it means the opposite.
-        self._clear_anchor()
-        if self._attempt_keepalive_restore(context) and self.posto_pdf is not None:
-            self._mark_hold_bookable(True)
 
     def _attempt_keepalive_restore(self, context: str = "") -> bool:
         """Returns whether the session came back. The session looks dead -- try the same checkpoint-restore-then-fresh-login chain a fresh
@@ -2129,9 +2283,9 @@ class LiveEngineOps(EngineOps):
                                          f"{_MAX_KEEPALIVE_RESTORE_ATTEMPTS}, {context})")
         # THE WORKER IS NOT BOOKABLE FOR THE DURATION OF THIS REBUILD.
         #
-        # The substate stays HOLDING throughout -- correctly, the worker really is still holding --
+        # The substate stays KEEPING throughout -- correctly, the worker really is still keeping --
         # but the chain below closes the browser and runs a full checkpoint-restore-or-login, which
-        # can take minutes. _assign_slots selects on `substate == HOLDING` and nothing else, so
+        # can take minutes. _assign_slots selects on `substate == KEEPING` and nothing else, so
         # until now the Hub happily handed a real slot to a worker in the middle of rebuilding its
         # session. CONFIRMED LIVE 2026-09-02 (20:45 run of "Test 0901"): the pool's ONLY available
         # slot, 2026-09-30 p5, was leased at 22:22:04 to worker 41f656e6, which was inside this
@@ -2143,7 +2297,7 @@ class LiveEngineOps(EngineOps):
         # This is the marker that already exists for exactly this purpose; it simply was not set
         # here. Cleared on success below, and left set on failure -- a worker whose restore failed
         # is not bookable either, and the next successful restore or re-warm clears it.
-        self._mark_hold_bookable(False, "rebuilding the session")
+        self._mark_keep_bookable(False, "rebuilding the session")
         try:
             if self.session is not None:
                 self.session.close_browser()
@@ -2159,7 +2313,7 @@ class LiveEngineOps(EngineOps):
             ok = self._run_warmup_steps()   # restore only re-authenticates; form-state needs re-warming
         if ok:
             self._keepalive_restore_attempts = 0
-            self._mark_hold_bookable(True)
+            self._mark_keep_bookable(True)
         if self._emit is not None:
             self._emit("log_line", text=f"keepalive: restore {'succeeded' if ok else 'FAILED'}")
         return bool(ok)
@@ -2184,6 +2338,17 @@ class LiveEngineOps(EngineOps):
     # How long to wait for the portal's widget script to register window.onCaptchaSuccess. Checked
     # BEFORE the solve, so a page that never registers it costs seconds rather than a wasted token.
     _CALLBACK_WAIT_MS = 20000
+    # How long the keepalive probe waits for the home page to SETTLE before reading it. The home
+    # page runs reCAPTCHA + async JS and keeps navigating for a beat after load, so an immediate
+    # read races it: "Execution context was destroyed" (the outer handler counted this as a dead
+    # session) and mid-render reads missing the auth markers (UNKNOWN limbo) were BOTH that race,
+    # not a dead session -- confirmed live 2026-09-23, the authed home loads cleanly (57KB) given a
+    # moment. Short, because a genuinely dead/blocked page settles fast and still classifies right.
+    _KEEPALIVE_SETTLE_MS = 4000
+    # How long to wait for the getTables WAF handshake after landing on Schedule.jsp, before /slots.
+    # getTables fires early in the page load, so this is generous but bounded; a posto that proves it
+    # doesn't fire getTables is remembered and never waited on again.
+    _GETTABLES_WAIT_MS = 8000
     # How long to wait for the page's own getSlots()/handleServerResponse() to populate window.data
     # after the token is delivered. Raised 12s -> 25s: 5 of 55 rounds on "Test 0901" reached the
     # callback and then timed out here, which throws away a token that had already been accepted.
@@ -2200,6 +2365,12 @@ class LiveEngineOps(EngineOps):
     # because an APPLY worker that is self-scouting runs this same path and must stay able to act
     # on an assignment.
     _SLOTS_MAX_PACING_SLEEP = 20.0
+    # Pre-solve LEAD: how close to the window opening to solve the next token (SLOTS_PRESOLVE). Set
+    # comfortably above the worst measured solve (~23s) so the token is ready in time, yet small
+    # enough that it is only ~10-30s old when used -- far under SLOTS_TOKEN_TTL. Firing earlier
+    # (e.g. as soon as the wait drops below the TTL) would cache a token that is nearly expired by
+    # the time the window opens.
+    _SLOTS_PRESOLVE_LEAD = 35.0
 
     def _no_report(self, why: str) -> list[dict]:
         """OUR tooling failed before the portal was ever asked -- report nothing about any date.
@@ -2223,6 +2394,136 @@ class LiveEngineOps(EngineOps):
         self._log(f"do_discover[slots]: {why} -- reporting nothing for this round "
                   f"(the portal was never asked, so there is nothing to say about any date)")
         return []
+
+    def _solve_schedule_token(self, race_all) -> str:
+        """One SCHEDULE_EVISA solve, honouring RECAPTCHA_SOLVE_PROXY exactly as the login path does
+        (proxyless was 5/5 vs 2/5 proxied on Test 0901). Returns "" on no token."""
+        _rc_proxy = self.warm_proxy if self.cfg.solver.solve_proxy else None
+        return race_all(self.capsolver_keys, [], [], [], "SCHEDULE_EVISA", proxy=_rc_proxy) or ""
+
+    def _slots_token(self, race_all) -> str:
+        """The token for THIS /slots call. Prefers a fresh pre-solved token (SLOTS_PRESOLVE) so the
+        7-23s solve is off the critical path; otherwise solves inline exactly as before."""
+        ttl = float(self.cfg.raw.get("SLOTS_TOKEN_TTL", 90.0) or 90.0)
+        cached = self._presolved_slots
+        self._presolved_slots = None                 # consume-once, even if stale
+        if cached is not None:
+            token, solved_at = cached
+            age = time.time() - solved_at
+            if token and age < ttl:
+                self._log(f"do_discover[slots]: using pre-solved token (age {age:.0f}s, len {len(token)}) "
+                          f"-- solve was off the critical path")
+                return token
+            self._log(f"do_discover[slots]: pre-solved token discarded (age {age:.0f}s >= {ttl:.0f}s TTL)")
+        _rc_proxy = self.warm_proxy if self.cfg.solver.solve_proxy else None
+        self._log(f"do_discover[slots]: solving SCHEDULE_EVISA ({'via our proxy' if _rc_proxy else 'proxyless'})")
+        return self._solve_schedule_token(race_all)
+
+    def _maybe_presolve_slots(self, remaining_wait: float, race_all) -> None:
+        """During the rate-limit wait, spend the otherwise-idle time solving the NEXT token so the
+        poll fires the instant the window opens. Only when SLOTS_PRESOLVE is on, nothing fresh is
+        already cached, and the wait is short enough that the token will still be valid when used
+        (remaining_wait < SLOTS_TOKEN_TTL) -- solving earlier than that would cache a token that
+        expires before the window opens."""
+        if not bool(self.cfg.raw.get("SLOTS_PRESOLVE", False)):
+            return
+        ttl = float(self.cfg.raw.get("SLOTS_TOKEN_TTL", 90.0) or 90.0)
+        if self._presolved_slots is not None:
+            _t, solved_at = self._presolved_slots
+            if time.time() - solved_at < ttl:
+                return                                # a fresh one is already waiting
+        lead = min(self._SLOTS_PRESOLVE_LEAD, ttl)
+        if remaining_wait <= 0 or remaining_wait > lead:
+            return                                    # too early -- a token solved now would age out
+        try:
+            token = self._solve_schedule_token(race_all)
+        except Exception as e:
+            self._log(f"do_discover[slots]: pre-solve failed ({str(e)[:80]}) -- will solve inline")
+            return
+        if token:
+            self._presolved_slots = (token, time.time())
+            self._log(f"do_discover[slots]: pre-solved next token (len {len(token)}, {remaining_wait:.0f}s "
+                      f"of wait left) -- ready for the window")
+
+    # getTables capture hook: wrap fetch + XHR (in the page world, before the page's own scripts run
+    # via an init script) to flag window.__gt_ok the moment a getTables response returns
+    # '"success":"true"'. Non-destructive -- clones the response, never consumes the original.
+    _GETTABLES_HOOK_JS = """
+    (() => {
+      try {
+        window.__gt_ok = false;
+        const mark = (url, body) => {
+          try {
+            if (String(url).indexOf('getTables') !== -1 &&
+                ((body || '').indexOf('"success":"true"') !== -1 ||
+                 (body || '').indexOf('"success": "true"') !== -1)) {
+              window.__gt_ok = true;
+            }
+          } catch (e) {}
+        };
+        const of = window.fetch;
+        if (of) {
+          window.fetch = function (...a) {
+            return of.apply(this, a).then((r) => {
+              try {
+                const u = (r && r.url) || (a && a[0]) || '';
+                if (String(u).indexOf('getTables') !== -1) {
+                  r.clone().text().then((t) => mark(u, t)).catch(() => {});
+                }
+              } catch (e) {}
+              return r;
+            });
+          };
+        }
+        const oo = XMLHttpRequest.prototype.open, os = XMLHttpRequest.prototype.send;
+        XMLHttpRequest.prototype.open = function (m, u, ...rest) { this.__gt_u = u; return oo.call(this, m, u, ...rest); };
+        XMLHttpRequest.prototype.send = function (...a) {
+          try {
+            this.addEventListener('load', () => { try { mark(this.__gt_u || '', this.responseText || ''); } catch (e) {} });
+          } catch (e) {}
+          return os.apply(this, a);
+        };
+      } catch (e) {}
+    })();
+    """
+
+    def _ensure_gettables_hook(self) -> None:
+        """Install the getTables capture hook into THIS session, once. Re-installs on a rebuilt
+        session (the init script lives on the browser context, so a new context needs it again)."""
+        if self.session is None or self._gt_hook_session is self.session:
+            return
+        add = getattr(self.session, "browser_add_init_script", None)
+        if not callable(add):
+            return   # a session double with no init-script support (tests) -- getTables is best-effort
+        try:
+            add(self._GETTABLES_HOOK_JS)
+            self._gt_hook_session = self.session
+        except Exception as e:
+            self._log(f"do_discover[slots]: could not install getTables hook ({str(e)[:60]})")
+
+    def _await_gettables(self) -> None:
+        """Wait for the getTables WAF handshake to confirm before /slots -- the reference's mandatory
+        pre-/slots handshake (posto 5084 excepted). Bounded and posto-remembered: a posto proven not
+        to fire getTables is never waited on again. Advisory: we proceed to /slots either way, exactly
+        as the reference does; the value is not firing /slots BEFORE the handshake has completed."""
+        if self._posto_gettables is False:
+            return   # this posto proved it doesn't use getTables
+        poll = ("(async () => { const dl = Date.now() + %d;"
+                "  while (Date.now() < dl) { if (window.__gt_ok === true) return true;"
+                "    await new Promise(r => setTimeout(r, 200)); } return false; })()"
+                % self._GETTABLES_WAIT_MS)
+        try:
+            ok = self.session.browser_eval(poll, timeout=self._GETTABLES_WAIT_MS // 1000 + 10)
+        except Exception as e:
+            self._log(f"do_discover[slots]: getTables probe error ({str(e)[:60]}) -- proceeding")
+            return
+        if ok is True or str(ok).lower() == "true":
+            self._posto_gettables = True
+            self._log("do_discover[slots]: getTables handshake confirmed -- ready for /slots")
+        else:
+            if self._posto_gettables is None:
+                self._posto_gettables = False   # first miss -- assume this posto doesn't use it
+            self._log("do_discover[slots]: getTables not seen (posto may not use it) -- proceeding to /slots")
 
     def _discover_via_slots(self, dates: list[str]) -> list[dict]:
         """Solve SCHEDULE_EVISA, hand the token to window.onCaptchaSuccess, read window.data."""
@@ -2250,16 +2551,27 @@ class LiveEngineOps(EngineOps):
             _wait = max(self._slots_backoff_until - time.time(),
                         self._SLOTS_MIN_INTERVAL - (time.time() - self._slots_last_grant_at)
                         if self._slots_last_grant_at else 0.0)
+            # Spend the remaining wait pre-solving the next token (no-op unless SLOTS_PRESOLVE is on).
+            # Done AFTER re-computing _wait so the freshness/TTL check sees the true remaining time.
+            self._maybe_presolve_slots(_wait, race_all)
         if _wait > 0:
             return self._no_report(
                 f"/slots grants about one response per {self._SLOTS_MIN_INTERVAL:.0f}s and the last "
                 f"one was too recent ({_wait:.0f}s to go) -- not spending a solve")
+        # Install the getTables capture hook BEFORE navigating -- getTables fires during the page
+        # load, so the fetch/XHR wrapper must already be registered as an init script.
+        self._ensure_gettables_hook()
         try:
             self.session.browser_nav(SCHED_JSP + "?posto_id=" + str(self.posto_pdf or self.posto_id),
                                      timeout=30)
         except Exception as e:
             self._log(f"do_discover[slots]: could not reach Schedule.jsp ({str(e)[:90]})")
             return [{"date": d, "outcome": "failed"} for d in dates]
+
+        # WAF handshake: wait for getTables to confirm before spending a solve / firing /slots. The
+        # reference calls this the mandatory pre-/slots handshake; posto-optional, so it proceeds
+        # either way (see _await_gettables).
+        self._await_gettables()
 
         # WAIT FOR THE CALLBACK TO EXIST BEFORE SPENDING A SOLVE.
         #
@@ -2306,11 +2618,7 @@ class LiveEngineOps(EngineOps):
             # for a token score_token() only awards below 2,320 chars -- a length heuristic, and one
             # whose ordering rationale §16 already invalidated. The login path passes no min_score
             # (first usable token wins) and that is the path with the bookings behind it.
-            _rc_proxy = self.warm_proxy if self.cfg.solver.solve_proxy else None
-            self._log(f"do_discover[slots]: solving SCHEDULE_EVISA "
-                      f"({'via our proxy' if _rc_proxy else 'proxyless'})")
-            token = race_all(self.capsolver_keys, [], [], [], "SCHEDULE_EVISA",
-                             proxy=_rc_proxy) or ""
+            token = self._slots_token(race_all)
         except Exception as e:
             self._log(f"do_discover[slots]: CAPTCHA solve failed ({str(e)[:90]})")
             return self._no_report("the CAPTCHA solve failed")
@@ -2436,10 +2744,7 @@ class LiveEngineOps(EngineOps):
         if kind == SLOTS_BLOCKED:
             # The exit is done, not the session. Roll it and let the next round try from elsewhere.
             self._log("do_discover[slots]: the endpoint blocked this exit -- rolling off it")
-            if not self._roll_exit("slots blocked"):
-                new_proxy = self._request_proxy_rotation(self._current_phase)
-                if new_proxy:
-                    self.warm_proxy = new_proxy
+            self._roll_exit("slots blocked")
             return self._no_report("the endpoint blocked this exit")
         if res.get("err"):
             self._log(f"do_discover[slots]: {res['err']}")
@@ -2543,11 +2848,21 @@ class LiveEngineOps(EngineOps):
             res = self._discover_via_slots(dates)
             if source == "slots":
                 return res
-            unresolved = [r["date"] for r in res if r.get("outcome") == "failed"]
+            # UNRESOLVED = every date /slots did not DEFINITIVELY answer. A definitive answer is
+            # `found` or `empty` (the portal told us about that date); everything else -- a per-date
+            # `failed`, OR a date missing from `res` entirely -- is unresolved and gets the calendar.
+            #
+            # The missing-date case is the one that mattered live (2026-09-21): a rate-limited /slots
+            # round returns `_no_report()` -> `[]`, so the old `[r for r in res if outcome=='failed']`
+            # came back EMPTY and calendar never ran -- "both" silently degraded to "report nothing"
+            # exactly when /slots was down and calendar was the whole point of choosing "both". Now
+            # an empty (or partial) /slots round backfills the un-answered dates from calendar.
+            answered = {r["date"] for r in res if r.get("outcome") in ("found", "empty")}
+            unresolved = [d for d in dates if d not in answered]
             if not unresolved:
                 return res
-            self._log(f"do_discover[both]: slots resolved {len(dates) - len(unresolved)}/"
-                      f"{len(dates)} date(s); falling back to calendar for the rest")
+            self._log(f"do_discover[both]: slots resolved {len(answered)}/{len(dates)} date(s); "
+                      f"falling back to calendar for the other {len(unresolved)}")
             by_date = {r["date"]: r for r in res}
             for r in self._discover_via_calendar(unresolved):
                 by_date[r["date"]] = r
@@ -2659,14 +2974,81 @@ class LiveEngineOps(EngineOps):
             if not m:
                 out.append({"date": d, "outcome": "failed"})   # no marker -> WAF/context issue, UNKNOWN
                 continue
-            free, _occupied = parse_periodos_ocupados(m.group(1), max_period=self.cfg.discovery.max_period)
+            raw = m.group(1)
+            free, _occupied = parse_periodos_ocupados(raw, max_period=self.cfg.discovery.max_period)
             if free is None:
                 out.append({"date": d, "outcome": "failed"})   # untokenizable -> UNKNOWN, never prune
             elif free:
-                out.append({"date": d, "outcome": "found", "periods": free})
+                # `raw` is kept on the outcome for the phantom check below and logged there. It is
+                # the only evidence that distinguishes a real per-date answer from the portal's
+                # fallback template, and until 2026-09-18 it was thrown away the moment it was
+                # decoded -- so a phantom round left nothing to diagnose it by.
+                out.append({"date": d, "outcome": "found", "periods": free, "raw": raw})
             else:
                 out.append({"date": d, "outcome": "empty"})
-        return out
+        return self._reject_phantom_round(out)
+
+    def _reject_phantom_round(self, out: list[dict]) -> list[dict]:
+        """Downgrade a discovery round whose finds match the PHANTOM signature to UNKNOWN.
+
+        THE MECHANISM. The calendar path derives availability by SUBTRACTION: free = active range
+        minus the closed prefix decoded from getPeriodosOcupados. That inference has no way to tell
+        "the portal answered this date" from "the portal's backend query failed and it served the
+        template with a default occupied string". Under load the second happens, the marker is still
+        present, and EVERY date decodes to the same thin set -- a handful of periods, identical
+        across dates. The codebase already named this as "the exact inference that manufactures
+        phantom slots" when it removed the calendar fallback on 2026-09-02.
+
+        CONFIRMED LIVE 2026-09-18, Booking 0918, slot-open 10:39. One scout got a real Schedule.jsp
+        during the ~60s the portal stayed up, then found {3,4} on 2026-10-14 AND {3,4} on 2026-10-15.
+        The portal's own calendar showed 12/13/14 October available and the 15th greyed out. Both
+        finds fired slot_found; three apply workers leased them, re-warmed into a 503, and the
+        recovery ladder escalated them to re-login -- discarding authenticated sessions and spending
+        reCAPTCHA strikes on accounts, for slots that did not exist. Operator rule, confirmed on
+        earlier runs: "if there are only 3, 4 periods per every day and few slots than expected --
+        regard it as phantom slots found."
+
+        THE RULE (operator-confirmed, configurable). A round is phantom when at least
+        PHANTOM_MIN_DATES dates were found, every one of them carries the SAME period set, and that
+        set has at most PHANTOM_MAX_PERIODS entries. Uniformity is the load-bearing half: a real
+        open answers per date, with different occupied sets; only a template answers every date
+        identically. The size bound keeps a genuinely uniform but generous open (say 3 dates all
+        showing 6 periods) from being refused.
+
+        THE VERDICT IS "failed", NOT "empty" -- deliberately. "failed" is UNKNOWN: no slot rows are
+        written, slot_found does not fire, and no date is retired (bug fix #6 keeps failed distinct
+        from empty precisely so an unreadable round never prunes the window). The next round asks
+        again. "empty" would have retired real dates on the strength of a template.
+
+        PHANTOM_MAX_PERIODS=0 disables the check entirely.
+        """
+        max_p = int(self.cfg.raw.get("PHANTOM_MAX_PERIODS", 2) or 0)
+        min_d = int(self.cfg.raw.get("PHANTOM_MIN_DATES", 2) or 2)
+        found = [o for o in out if o.get("outcome") == "found"]
+        raws = {o.get("raw") for o in found}
+        # `raw` served its purpose (this decision + the log line below). Strip it before the
+        # outcomes leave: the slots_found/dates_reported bus payloads and the Hub's slot rows carry
+        # exactly {date, outcome, periods}, and that contract is asserted by exact equality.
+        for o in found:
+            o.pop("raw", None)
+        if max_p <= 0 or len(found) < min_d:
+            return out
+        sets = {tuple(sorted(o.get("periods") or [])) for o in found}
+        if len(sets) != 1:
+            return out                       # per-date variation = a real answer
+        (sig,) = sets
+        if len(sig) > max_p:
+            return out                       # uniform but generous -- allowed
+        self._log(f"do_discover: PHANTOM round -- {len(found)} date(s) all decoded to periods {list(sig)} "
+                  f"from {len(raws)} distinct raw string(s) {sorted(r or '' for r in raws)[:3]} -- "
+                  f"a real open answers per date; a template answers every date the same. "
+                  f"Reporting {len(found)} date(s) as FAILED (unknown), not found: no slot rows, no "
+                  f"slot_found, no retirement. (PHANTOM_MAX_PERIODS={max_p}, PHANTOM_MIN_DATES={min_d})")
+        if self._emit is not None:
+            self._emit("portal_health", phase="discover", kind="phantom_slots",
+                       seconds=0.0, **self._health.snapshot())
+        return [({"date": o["date"], "outcome": "failed"} if o.get("outcome") == "found" else o)
+                for o in out]
 
     def release_slot(self, slot: dict, reason: str = "bounce") -> None:
         """Hand a slot back to the pool. The worker has no DB access, so this rides the same event
@@ -2706,6 +3088,16 @@ class LiveEngineOps(EngineOps):
             if result is not TIMEOUT:
                 return result   # a real assign (slot dict or the scouts_invalid slot=None) or stop
             self._do_keepalive("await_assignment")
+
+    def _poll_signals(self) -> None:
+        """Non-blocking bus drain, so `stopped` can become true somewhere other than a wait_*.
+
+        See BusSignals.poll for why this has to be explicit now. Tolerant of a signals object that
+        does not implement it -- EngineOps has many partial test doubles, and a double with no bus
+        has nothing to drain."""
+        poll = getattr(self._signals, "poll", None)
+        if callable(poll):
+            poll()
 
     def is_stopped(self) -> bool:
         return self._signals is not None and self._signals.stopped
@@ -2761,7 +3153,15 @@ class LiveEngineOps(EngineOps):
             if self._breaker is not None and self._breaker.is_tripped():
                 return "portal_unreachable"      # see the note above: our gate, not the slot's fault
 
-            if not self._run_warmup_steps():
+            # Re-warm only when the anchor is actually stale. This was unconditional on every
+            # round, which is correct ONLY under the ~90-120s TTL it was written against -- and
+            # that figure is storm-auto's, was never measured here, and is contradicted by both of
+            # our own measurements (4-6 min and a 16.1-min median; OPEN_QUESTIONS Q3/Q24). Under a
+            # minutes-long TTL an unconditional replay of the questionnaire chain is ~40s of waste
+            # per round, and it hid the warm inside APPLYING so the lifecycle was invisible.
+            # is_warmed() enforces the full invariant (chain provenance AND age < FORM_STATE_TTL),
+            # so a stale or unverified anchor still re-warms exactly as before.
+            if not self.is_warmed() and not self._run_warmup_steps():
                 # NOT "bounced". This is OUR session failing before we ever spoke to the portal
                 # about this slot, and calling it a bounce blames the slot for our dead proxy:
                 # the lease is released WITH a penalty, that penalty feeds the Hub's false-slot
@@ -3061,6 +3461,9 @@ class LiveEngineOps(EngineOps):
             self.identity_id, cookies=cookies, sub_account_id=self.sub_account_id,
             cookies_full=cookies_full, stage="schedule_jsp" if self.posto_pdf else "login",
             posto_pdf=self.posto_pdf,
+            # Store the run's target posto too, so the restore posto-guard can compare EXACTLY rather
+            # than lean on posto_pdf (which can legitimately differ from posto_id on some responses).
+            posto_id=self.posto_id,
         )
 
     def _close_session_quietly(self) -> None:

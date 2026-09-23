@@ -281,3 +281,38 @@ def test_every_signal_the_hub_sends_survives_arriving_out_of_band():
     bus.send_command("w1", "assign", slot={"date": "2026-09-01", "period": 3})
     sig.wait_launch(timeout=1)
     assert sig.pending_assignment == {"date": "2026-09-01", "period": 3}
+
+
+# ── poll(): the bus drain that is no longer a side effect of asking for a proxy ────────────────
+def test_poll_drains_a_stop_without_waiting_for_anything(bus_signals_factory=None):
+    """CAUGHT DURING THE 2026-09-15 self-rotation change, before it shipped.
+
+    `stopped` is only ever set by _drain, and _drain only runs inside a wait_*. During a login
+    storm the single wait_* being reached was wait_proxy -- called by _request_proxy_rotation once
+    per retry round. Self-minted rotating pools removed that round-trip, which would ALSO have
+    removed the only bus drain in the loop, making a storming worker deaf to `stop` again and
+    silently undoing the 2026-09-11 responsiveness fix. poll() makes the drain explicit."""
+    import fakeredis
+    from libs.bus.bus import Bus
+    from apps.worker.bus_signals import BusSignals
+
+    r = fakeredis.FakeStrictRedis(decode_responses=True)
+    bus = Bus(r)
+    sig = BusSignals(bus, "w-poll", "c-poll")
+    assert sig.stopped is False
+
+    bus.send_command("w-poll", "stop")
+    sig.poll()
+    assert sig.stopped is True, "poll() must observe a stop sitting on the command stream"
+
+
+def test_poll_is_safe_and_quiet_when_there_is_nothing_to_read():
+    import fakeredis
+    from libs.bus.bus import Bus
+    from apps.worker.bus_signals import BusSignals
+
+    r = fakeredis.FakeStrictRedis(decode_responses=True)
+    sig = BusSignals(Bus(r), "w-quiet", "c-quiet")
+    for _ in range(5):
+        sig.poll()                     # non-blocking: must not hang, must not raise
+    assert sig.stopped is False

@@ -55,13 +55,13 @@ class BusSignals:
         # An `assign` that arrives while some OTHER wait_* is blocked. _drain acks the whole batch,
         # so a command not matched by the currently-running wait used to be acked and dropped on the
         # floor. Confirmed live 2026-08-14: the scheduler assigns a slot (creating a SlotLease) to
-        # any HOLDING apply worker -- including one still sitting in await_slot_open after a respawn
+        # any KEEPING apply worker -- including one still sitting in await_slot_open after a respawn
         # -- and that assign was silently discarded, stranding its lease forever. One worker
         # accumulated 120 stranded leases, consuming every slot in the booking.
         self.pending_assignment = TIMEOUT   # TIMEOUT = "nothing stashed" (None is a legal slot)
         bus.ensure_command_group(worker_id)
 
-    def _drain(self, block_ms: int = 2000) -> list:
+    def _drain(self, block_ms: int | None = 2000) -> list:
         """Fetch AND ack the whole batch (up to read_commands' own page size) before returning --
         never a lazy generator. Every wait_* below does `return` from partway through iterating this
         result once it finds the command it wants, which used to abandon a lazily-acking generator
@@ -75,6 +75,15 @@ class BusSignals:
         msgs = self.bus.read_commands(self.wid, self.consumer, block_ms=block_ms)
         for m in msgs:
             self.bus.ack_command(self.wid, m.id)
+            if m.type in ("stop", "shutdown"):
+                # PASSIVE, like every other flag below. Each wait_* already sets this when it sees a
+                # stop in its own batch -- but _drain ACKS the whole batch regardless of who is
+                # reading, so a stop drained by a caller that does not check for it was acked and
+                # dropped on the floor. That is the exact bug this docstring describes for `assign`
+                # and `slot_open`; `stopped` was simply never given the same treatment, because
+                # until poll() existed every _drain caller happened to handle stop itself.
+                # Recording it here makes the stop survive whichever path drained it.
+                self.stopped = True
             if m.type == "signal" and m.payload.get("name") == "slot_open":
                 # STICKY, like slot_found_seen. A signal is only ever sent once per worker: the Hub
                 # marks it notified after a confirmed send and _latch_signals then skips it forever.
@@ -168,6 +177,34 @@ class BusSignals:
                     self.stopped = True
                     return None
         return TIMEOUT
+
+    def poll(self) -> None:
+        """Drain the command stream WITHOUT waiting for anything in particular.
+
+        Exists because of what removing the warm-path proxy round-trip exposed (2026-09-15). Every
+        `wait_*` below drains the stream as a side effect, and during a login storm the ONLY one
+        being called was `wait_proxy` -- via _request_proxy_rotation, once per retry round. Taking
+        that round-trip out (rotating pools are self-minted now, there is nothing to ask the Hub
+        for) would also have taken out the only thing setting `self.stopped` while a worker ground
+        through a storm, silently undoing the 2026-09-11 fix that made a storming worker answer
+        `stop` at all.
+
+        So the drain becomes explicit instead of a side effect of asking for a proxy.
+
+        block_ms=None, NOT 0. Bus.read_commands passes this straight to redis-py's xreadgroup,
+        where `block=0` is the Redis wire meaning "BLOCK 0" -- block INDEFINITELY -- while
+        `block=None` omits the BLOCK argument and returns immediately. Passing 0 here would have
+        parked the login retry loop forever on a quiet stream, which is a far worse failure than
+        the deafness this method exists to prevent. Caught by
+        tests/worker/test_bus_signals.py::test_poll_drains_a_stop_without_waiting_for_anything.
+
+        Signals it sees (stop, slot_open, slot_found, assign) are recorded on the same flags
+        `_drain` always sets, so `is_stopped()` and friends just work.
+        """
+        try:
+            self._drain(block_ms=None)
+        except Exception:
+            pass    # a bus blip must never break a login retry; the next poll tries again
 
     def scouts_invalid(self) -> bool:
         """Set from the most recent `assign` command's `scouts_invalid` flag -- see the module

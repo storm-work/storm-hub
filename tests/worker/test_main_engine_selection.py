@@ -183,7 +183,7 @@ def test_every_vendor_env_knob_is_a_real_catalog_setting():
         p.read_text() for p in Path("libs/engine/vendor").glob("*.py"))
     read_from_env = set(re.findall(r'os\.environ\.get\("([A-Z_]+)"', vendor_src))
     # every env knob the engine reads should be exported by the worker (minus infra-only ones)
-    unexported = read_from_env - set(_VENDOR_ENV_KNOBS) - {"REDIS_URL", "DATABASE_URL"}
+    unexported = read_from_env - set(_VENDOR_ENV_KNOBS) - {"REDIS_URL", "DATABASE_URL", "DISPLAY"}
     assert not unexported, f"vendor reads these from env but the worker never exports them: {unexported}"
 
 

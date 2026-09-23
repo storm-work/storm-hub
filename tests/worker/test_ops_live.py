@@ -3,6 +3,8 @@ import pathlib
 network calls (that's Phase E's live-gated tier); this covers what's testable offline: the response
 classification, the discovery outcome shaping, and that the class actually satisfies EngineOps."""
 import json
+import time
+
 import pytest
 
 from libs.domain.enums import SettingsLayer as L
@@ -87,20 +89,39 @@ def test_identity_id_explicit_overrides_default():
 
 
 class _FakeSession:
+    """A live session that answers per-PAGE, the way the portal does.
+
+    It used to return "<html>cmbPeriodo</html>" for every url -- i.e. a session that is always
+    WARMED. That made it impossible to express "authenticated but not yet warmed", which is the
+    only state do_swap ever runs in, and is why every do_swap test passed for months while the real
+    swap failed 20/20 in production (FAILURE_MODES.md F-swap-probe).
+
+    `alive=True` now means authenticated AND warmed, so both probes see what they ask for:
+      * home page      -> both home markers  -> classify_session_state(warmed=False) = AUTHENTICATED
+      * Schedule.jsp   -> cmbPeriodo         -> _probe_alive()'s warmed check passes
+    `alive=False` returns the explicit expiry signal on either page. A test that needs the
+    authenticated-but-UNWARMED state uses _UnwarmedSession instead.
+    """
     def __init__(self, *, alive=True, cookies=None):
         self._alive = alive
         self.closed = False
         self._cookies = cookies or [{"name": "Vistos_sid", "value": "abc"}]
+        self._last_url = ""
 
     def get_all_cookies(self):
         return self._cookies
 
     def browser_nav(self, url, timeout=30):
+        self._last_url = url or ""
         return url
 
     def browser_eval(self, js):
         if "location.origin" in (js or ""): return _origin_reply(js)
-        return "<html>cmbPeriodo</html>" if self._alive else "<html>Authentication.jsp</html>"
+        if not self._alive:
+            return "<html>Authentication.jsp</html>"
+        if "Schedule.jsp" in self._last_url:
+            return "<html>cmbPeriodo</html>"
+        return "<html>solicitar pedido de visto ... consultar pedidos</html>"
 
     def close_browser(self):
         self.closed = True
@@ -109,13 +130,13 @@ class _FakeSession:
 def test_do_swap_off_by_default_returns_none():
     ops = _make_ops()
     ops.session = _FakeSession()
-    assert ops.cfg.hold_swap.swap_after_warmup is False   # catalog default
+    assert ops.cfg.hold_swap.swap_after_login is False   # catalog default
     assert ops.do_swap() is None
     assert ops.session.closed is False   # untouched
 
 
 def test_do_swap_on_but_no_hold_proxy_returns_none():
-    ops = _make_ops(cfg=_cfg(HOLD_SWAP_AFTER_WARMUP=True))
+    ops = _make_ops(cfg=_cfg(HOLD_SWAP_AFTER_LOGIN=True))
     ops.session = _FakeSession()
     assert ops.do_swap() is None
 
@@ -123,7 +144,7 @@ def test_do_swap_on_but_no_hold_proxy_returns_none():
 def test_do_swap_success_replaces_session_and_closes_old(monkeypatch):
     import apps.worker.ops_live as ops_live_mod
 
-    ops = _make_ops(cfg=_cfg(HOLD_SWAP_AFTER_WARMUP=True), hold_proxy="http://u:p@holdhost:9999")
+    ops = _make_ops(cfg=_cfg(HOLD_SWAP_AFTER_LOGIN=True), hold_proxy="http://u:p@holdhost:9999")
     old_session = _FakeSession()
     ops.session = old_session
     new_session = _FakeSession(alive=True)
@@ -141,7 +162,7 @@ def test_do_swap_reverts_on_failed_health_check(monkeypatch):
 
     # HOLD_SWAP_RETRIES=0 -- testing the single-attempt revert behavior in isolation from the retry
     # protocol (covered separately below).
-    ops = _make_ops(cfg=_cfg(HOLD_SWAP_AFTER_WARMUP=True, HOLD_SWAP_RETRIES=0),
+    ops = _make_ops(cfg=_cfg(HOLD_SWAP_AFTER_LOGIN=True, HOLD_SWAP_RETRIES=0),
                     hold_proxy="http://u:p@holdhost:9999")
     old_session = _FakeSession()
     ops.session = old_session
@@ -173,7 +194,7 @@ def test_do_swap_retries_with_fresh_proxy_and_succeeds_on_final_attempt(monkeypa
     sleeps = []
     monkeypatch.setattr(ops_live_mod.time, "sleep", lambda s: sleeps.append(s))
 
-    ops = _make_ops(cfg=_cfg(HOLD_SWAP_AFTER_WARMUP=True, HOLD_SWAP_RETRIES=1,
+    ops = _make_ops(cfg=_cfg(HOLD_SWAP_AFTER_LOGIN=True, HOLD_SWAP_RETRIES=1,
                              HOLD_SWAP_RETRY_HOLD_SECS=600.0),
                     hold_proxy="http://u:p@holdhost:9999", emit=lambda t, **p: None,
                     signals=_RotationSignals(proxy="http://u:p@freshhold:8888"))
@@ -204,7 +225,7 @@ def test_do_swap_retry_still_rolls_a_rotating_hold_proxy(monkeypatch):
 
     monkeypatch.setattr(ops_live_mod, "get_session", _spy)
     signals = _RotationSignals(proxy="http://sodade2026-99:pw@hold.example:80", resource_type="static")
-    ops = _make_ops(cfg=_cfg(HOLD_SWAP_AFTER_WARMUP=True, HOLD_SWAP_RETRIES=1,
+    ops = _make_ops(cfg=_cfg(HOLD_SWAP_AFTER_LOGIN=True, HOLD_SWAP_RETRIES=1,
                              HOLD_SWAP_RETRY_HOLD_SECS=0.0),
                     hold_proxy="http://sodade2026-51:pw@hold.example:80",
                     hold_proxy_static=False, emit=lambda t, **p: None, signals=signals)
@@ -236,7 +257,7 @@ def test_do_swap_retry_never_rolls_a_static_hold_proxy(monkeypatch):
 
     monkeypatch.setattr(ops_live_mod, "get_session", _spy)
     signals = _RotationSignals(proxy="http://freshstatic:pw@static.example:80", resource_type="static")
-    ops = _make_ops(cfg=_cfg(HOLD_SWAP_AFTER_WARMUP=True, HOLD_SWAP_RETRIES=1,
+    ops = _make_ops(cfg=_cfg(HOLD_SWAP_AFTER_LOGIN=True, HOLD_SWAP_RETRIES=1,
                              HOLD_SWAP_RETRY_HOLD_SECS=0.0),
                     hold_proxy="http://sodade2026-51:pw@hold.example:80",
                     hold_proxy_static=True, emit=lambda t, **p: None, signals=signals)
@@ -258,7 +279,7 @@ def test_do_swap_gives_up_after_exhausting_retries_never_stops_worker(monkeypatc
     monkeypatch.setattr(ops_live_mod, "get_session", lambda **kw: _FakeSession(alive=False))
     monkeypatch.setattr(ops_live_mod.time, "sleep", lambda s: None)
 
-    ops = _make_ops(cfg=_cfg(HOLD_SWAP_AFTER_WARMUP=True, HOLD_SWAP_RETRIES=2), emit=lambda t, **p: None,
+    ops = _make_ops(cfg=_cfg(HOLD_SWAP_AFTER_LOGIN=True, HOLD_SWAP_RETRIES=2), emit=lambda t, **p: None,
                     hold_proxy="http://u:p@holdhost:9999",
                     signals=_RotationSignals(proxy="http://u:p@freshhold:8888"))
     original_session = _FakeSession()
@@ -308,6 +329,43 @@ def test_checkpoint_restore_passes_stable_fp_seed(monkeypatch):
     assert captured.get("fp_seed") == "u"
 
 
+def _restore_ops_with_checkpoint(monkeypatch, ckpt_data):
+    import apps.worker.ops_live as ops_live_mod
+    monkeypatch.setattr(ops_live_mod, "get_session", lambda **kw: _FakeSession(alive=True))
+    monkeypatch.setattr(ops_live_mod.ckpt, "load_checkpoint", lambda identity_id: ckpt_data)
+    return _make_ops(cfg=_cfg(RESTORE_STAMPEDE_JITTER=0))   # _make_ops default posto_id = "5084"
+
+
+def test_checkpoint_restore_adopts_a_matching_posto(monkeypatch):
+    """A bookable checkpoint warmed at THIS run's posto is adopted (warmup skipped) as before."""
+    base = {"cookies": {}, "cookies_full": [], "sub_account_id": "sub-1"}
+    ops = _restore_ops_with_checkpoint(monkeypatch, {**base, "posto_pdf": "5084", "posto_id": "5084"})
+    assert ops._try_restore_from_checkpoint() is True
+    assert ops.posto_pdf == "5084"
+
+
+def test_checkpoint_restore_discards_a_stale_posto_after_a_change(monkeypatch):
+    """THE posto-change bug (confirmed 2026-09-21 "0921-3058"): a checkpoint is keyed by identity and
+    survives a posto change; a bookable one pins the OLD posto via posto_pdf and adopting it SKIPS
+    warmup, so the worker would discover+book against the old posto. It must be discarded so the
+    worker re-warms against the run's current posto."""
+    base = {"cookies": {}, "cookies_full": [], "sub_account_id": "sub-1"}
+    # exact posto_id mismatch (new-format checkpoint)
+    ops = _restore_ops_with_checkpoint(monkeypatch, {**base, "posto_pdf": "3059", "posto_id": "3059"})
+    assert ops._try_restore_from_checkpoint() is False        # posto_id 3059 != this run's 5084
+    # legacy checkpoint with only posto_pdf still guarded
+    ops2 = _restore_ops_with_checkpoint(monkeypatch, {**base, "posto_pdf": "3018"})
+    assert ops2._try_restore_from_checkpoint() is False        # posto_pdf 3018 != 5084
+
+
+def test_checkpoint_restore_allows_a_login_stage_checkpoint_at_any_posto(monkeypatch):
+    """A login-stage checkpoint pins no posto (posto_pdf/posto_id both absent) -- it is posto-agnostic
+    and re-warms against the current posto, so the guard must not touch it."""
+    ops = _restore_ops_with_checkpoint(monkeypatch,
+                                       {"cookies": {}, "cookies_full": [], "sub_account_id": "sub-1"})
+    assert ops._try_restore_from_checkpoint() is True
+
+
 def test_do_swap_passes_stable_fp_seed(monkeypatch):
     import apps.worker.ops_live as ops_live_mod
 
@@ -318,7 +376,7 @@ def test_do_swap_passes_stable_fp_seed(monkeypatch):
         return _FakeSession(alive=True)
 
     monkeypatch.setattr(ops_live_mod, "get_session", _spy)
-    ops = _make_ops(cfg=_cfg(HOLD_SWAP_AFTER_WARMUP=True), hold_proxy="http://u:p@holdhost:9999")
+    ops = _make_ops(cfg=_cfg(HOLD_SWAP_AFTER_LOGIN=True), hold_proxy="http://u:p@holdhost:9999")
     ops.session = _FakeSession()
     ops.do_swap()
     assert captured.get("fp_seed") == "u"
@@ -428,15 +486,22 @@ def test_do_swap_does_not_touch_the_pool_phase_when_swap_is_off():
     ops = _make_ops()
     assert ops._current_phase == "warmup"
     ops.session = _FakeSession()
-    assert ops.cfg.hold_swap.swap_after_warmup is False   # catalog default: swap off
+    assert ops.cfg.hold_swap.swap_after_login is False   # catalog default: swap off
     assert ops.do_swap() is None
     assert ops._current_phase == "warmup"
 
 
-def test_fresh_login_requests_proxy_rotation_before_retry(monkeypatch):
+def test_fresh_login_rolls_to_a_new_exit_before_retry(monkeypatch):
     """Regression (L2/L3, closed by P3): a repeated login failure used to keep retrying on the SAME
-    leased proxy forever. Attempt 1 uses the proxy already on hand; attempt 2+ must rotate first."""
+    proxy forever. Attempt 1 uses the exit already on hand; attempt 2+ must move first.
+
+    The MECHANISM changed on 2026-09-15 -- it rolls the session id locally instead of asking the
+    Hub for another pooled row (that round-trip measured 46-124s per rotation on booking 0911) --
+    but the contract is the same, and the fixture now carries a realistic rotating credential so
+    the roll has a session id to move. A credential with no session id deliberately does NOT roll
+    (D2: never invent one); that is the static case, which goes through the Hub instead."""
     import apps.worker.ops_live as ops_live_mod
+    from libs.proxies.lease import session_id
 
     calls = []
 
@@ -450,15 +515,24 @@ def test_fresh_login_requests_proxy_rotation_before_retry(monkeypatch):
         return s
 
     monkeypatch.setattr(ops_live_mod, "get_session", _spy)
-    ops = _make_ops(emit=lambda t, **p: None,
-                    signals=_RotationSignals(proxy="http://u:p@rotated:9999"))
+    start = ("http://package-352438-sessionid-AAAAAAAAAAAAAAAA-sessionlength-3600"
+             "-bindttl-600-idlettl-900-opt-wb:pw@proxy.soax.com:5000")
+    ops = _make_ops(emit=lambda t, **p: None, warm_proxy=start)
     ops._backoff = lambda attempt: None   # skip the real sleep
+    # No bus rotation available at all -- proves the retry moves exits WITHOUT the Hub.
+    ops._request_proxy_rotation = lambda phase=None: pytest.fail(
+        "the warm path must not ask the Hub for a proxy -- rotating pools are self-minted")
 
     assert ops._fresh_login() is True
     assert len(calls) == 2
-    assert calls[0]["proxy"] == "http://u:p@proxy:1234"    # attempt 1: original proxy, no rotation yet
-    assert calls[1]["proxy"] == "http://u:p@rotated:9999"  # attempt 2: rotated
-    assert ops.warm_proxy == "http://u:p@rotated:9999"
+    assert calls[0]["proxy"] == start                       # attempt 1: the exit already on hand
+    assert calls[1]["proxy"] != start                       # attempt 2: moved
+    assert session_id(calls[1]["proxy"]) != "AAAAAAAAAAAAAAAA"
+    # Everything except the session id must survive the roll -- same package, password, endpoint.
+    assert calls[1]["proxy"].startswith("http://package-352438-sessionid-")
+    assert calls[1]["proxy"].endswith("-opt-wb:pw@proxy.soax.com:5000")
+    # The roll is persisted on the worker, not just used for one attempt.
+    assert ops.warm_proxy == calls[1]["proxy"]
 
 
 def test_fresh_login_keeps_current_proxy_when_rotation_unavailable(monkeypatch):
@@ -536,6 +610,93 @@ def test_fresh_login_gives_up_after_exhausting_all_accounts_sticky_budget(monkey
 
     assert ops._fresh_login() is False
     assert len(attempts) == 2 * 3   # sticky=2 x rotating=3 accounts -- the operator's own worked example
+
+
+# ── a login storm must stay responsive to stop (confirmed live 2026-09-07) ─────────────────────
+# The whole do_login -> _fresh_login -> _sticky_login_attempts chain ran with NO bus contact, so a
+# worker that entered a retry storm went deaf to stop/assign/self-scout for as long as it lasted --
+# traced live at 27+ minutes, and the worst case (13 rounds x 3 sub-accounts, each a browser launch
+# + login attempt + backoff) is far longer. The Hub was never the bottleneck: it delivers in ~2s.
+class _StopAfter:
+    """Minimal signals stub: `stopped` flips True once `after` backoffs have elapsed."""
+    def __init__(self, after=1):
+        self.stopped = False
+        self._after = after
+        self.backoffs = 0
+
+    def note_backoff(self):
+        self.backoffs += 1
+        if self.backoffs >= self._after:
+            self.stopped = True
+
+
+def test_a_login_storm_abandons_remaining_sub_accounts_once_stopped(monkeypatch):
+    import apps.worker.ops_live as ops_live_mod
+
+    monkeypatch.setattr(ops_live_mod, "get_session",
+                        lambda **kw: _AccountAwareSession(succeeds_for=set()))   # nobody succeeds
+    accounts = [
+        {"username": "user-a", "password": "pa", "sub_account_id": "sub-a"},
+        {"username": "user-b", "password": "pb", "sub_account_id": "sub-b"},
+        {"username": "user-c", "password": "pc", "sub_account_id": "sub-c"},
+    ]
+    sig = _StopAfter(after=1)          # a stop lands during the very first backoff
+    ops = _make_ops(cfg=_cfg(STICKY_RETRY_MAX=2), accounts=accounts, sub_account_id="sub-a",
+                    signals=sig)
+    ops._backoff = lambda attempt: sig.note_backoff()
+    ops._request_proxy_rotation = lambda phase=None: None
+
+    assert ops._fresh_login() is False
+    # Without the fix this burns the full 2x3=6 attempts regardless of the stop. It must bail as
+    # soon as the stop is visible -- one backoff in, long before sub-b/sub-c are even tried.
+    assert sig.backoffs < 6, f"kept grinding after stop: {sig.backoffs} backoffs"
+
+
+def test_a_stop_drained_between_retry_rounds_short_circuits_the_retry(monkeypatch):
+    """A stop landing mid-storm must be acted on before the NEXT browser launch.
+
+    The mechanism moved on 2026-09-15. It used to be incidental: _request_proxy_rotation blocked in
+    wait_proxy(), which drained the stream as a side effect. Removing that round-trip (rotating
+    pools are self-minted; there is nothing to ask the Hub for) would have removed the only bus
+    drain in the whole login loop, making a storming worker deaf to `stop` again -- so the drain is
+    now explicit, via BusSignals.poll(). This test pins the OUTCOME, which is unchanged: once the
+    stop is observable, no further browser is launched."""
+    import apps.worker.ops_live as ops_live_mod
+
+    launches = []
+
+    def _spy(**kw):
+        launches.append(1)
+        return _AccountAwareSession(succeeds_for=set())
+
+    monkeypatch.setattr(ops_live_mod, "get_session", _spy)
+    sig = _StopAfter(after=99)         # never stops via backoff -- the rotation call does it
+    ops = _make_ops(cfg=_cfg(STICKY_RETRY_MAX=3), signals=sig,
+                    accounts=[{"username": "u", "password": "p", "sub_account_id": "sub-a"}],
+                    sub_account_id="sub-a")
+    ops._backoff = lambda attempt: None
+
+    # The explicit drain is what sets `stopped` now -- exactly what BusSignals.poll() does when a
+    # stop is sitting on the command stream.
+    sig.poll = lambda: setattr(sig, "stopped", True)
+    ops._request_proxy_rotation = lambda phase=None: pytest.fail(
+        "the warm path must not ask the Hub for a proxy")
+
+    assert ops._sticky_login_attempts(3) is False
+    # Round 1 launches a browser, fails, backs off; round 2 drains the bus and sees the stop.
+    # It must NOT go on to launch another browser for round 2's login attempt.
+    assert len(launches) == 1, f"launched a browser after the stop was observable: {launches}"
+
+
+def test_backoff_is_interruptible_by_a_stop():
+    """At the 120s cap (x1.2 jitter) a single backoff was ~144s of total deafness, and it runs on
+    every failure branch in the login loop."""
+    sig = _StopAfter(after=99)
+    ops = _make_ops(cfg=_cfg(RESPAWN_BACKOFF_BASE=60.0, RESPAWN_BACKOFF_CAP=120.0), signals=sig)
+    sig.stopped = True                 # already stopped when the backoff starts
+    t0 = time.time()
+    ops._backoff(3)                    # would be ~120s x jitter if it slept straight through
+    assert time.time() - t0 < 2.0, "backoff slept through a stop instead of checking for it"
 
 
 def test_fresh_login_rotation_starts_from_current_sub_account_not_index_zero():
@@ -826,6 +987,50 @@ def test_keepalive_dead_trip_accumulates_across_a_nav_succeeds_eval_throws_cycle
         "trigger a restore -- got no restore, meaning the streak is still being reset mid-cycle")
 
 
+def test_keepalive_a_recovered_nav_race_does_not_count_as_dead(monkeypatch):
+    """THE 2026-09-21 keeping fix: 'Execution context was destroyed' on the read is a nav race, not
+    a dead session (the healthy home page keeps navigating for a beat after load). The keepalive now
+    re-reads once; a race recovers on the retry and must NOT trip dead-detection -- otherwise a
+    healthy held session is condemned and its slot capacity deleted, exactly what killed the booking
+    window. Contrast test_keepalive_dead_trip_accumulates... where the eval throws BOTH times (a
+    genuinely dead page) and correctly does count."""
+    import apps.worker.ops_live as ops_live_mod
+    monkeypatch.setattr(ops_live_mod.time, "sleep", lambda *_a, **_k: None)   # no real 1s wait
+    ops = _make_ops(cfg=_cfg(KEEPALIVE_DEAD_TRIP=1), signals=_FakeSignals(timeouts=1, final="slot_open"))
+    ops._signals.slot_found_seen = True
+
+    class _EvalThrowsOnceThenReads(_FakeSession):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            self._reads = 0
+
+        def browser_eval(self, js):
+            if "document.documentElement.outerHTML" in (js or ""):
+                self._reads += 1
+                if self._reads == 1:
+                    raise RuntimeError("Execution context was destroyed, most likely because of a navigation")
+                return "<html>solicitar pedido de visto ... consultar pedidos</html>"
+            return super().browser_eval(js)   # settle poll and origin checks
+
+    ops.session = _EvalThrowsOnceThenReads()
+    restore_calls = []
+    ops._attempt_keepalive_restore = lambda context="": restore_calls.append(context)
+    ops.await_slot_open()
+    assert restore_calls == [], \
+        "a nav race that recovers on the re-read must not trip KEEPALIVE_DEAD_TRIP=1"
+
+
+def test_classify_session_state_treats_a_waf_challenge_as_portal_error():
+    """A WAF/bot-challenge interstitial is the portal declining our request, not a dead session --
+    the keepalive was the one classifier blind to it, so it fell through to UNKNOWN limbo. Now it is
+    PORTAL_ERROR (back off, don't re-authenticate)."""
+    from apps.worker.ops_live import classify_session_state, SessionState
+    challenge = ('<html><head><meta name="robots" content="noindex,nofollow">'
+                 '<script src="/ch/bd.js"></script></head><body></body></html>')
+    assert classify_session_state(challenge, "https://portal/", warmed=False) == SessionState.PORTAL_ERROR
+    assert classify_session_state(challenge, "https://portal/", warmed=True) == SessionState.PORTAL_ERROR
+
+
 def test_keepalive_no_restore_skips_restore_on_dead_trip():
     ops = _make_ops(cfg=_cfg(KEEPALIVE_DEAD_TRIP=1, KEEPALIVE_NO_RESTORE=True),
                     signals=_FakeSignals(timeouts=1, final="slot_open"))
@@ -842,12 +1047,23 @@ def test_keepalive_no_restore_skips_restore_on_dead_trip():
     assert restore_calls == []
 
 
-def test_keepalive_loose_hold_preserves_session_before_slot_found():
-    """Regression (N2): storm-auto's confirmed anti-attrition rule -- before a slot has actually
-    been found there is nothing to book yet, so a proxy/session blip must NEVER burn a re-login.
-    This was previously unconditional (any dead-trip triggered a restore regardless of slot_found)."""
+def test_dead_trip_rebuilds_even_before_slot_found():
+    """REPLACES test_keepalive_loose_hold_preserves_session_before_slot_found, which asserted the
+    opposite and was WRONG (operator principle, 2026-09-11: a session that is not valid for its
+    purpose must not be kept).
+
+    The old LOOSE HOLD rule refused to restore before slot_found, on the premise that a
+    pre-slot-found blip must never burn a scarce re-login. But dead-trip is KEEPALIVE_DEAD_TRIP
+    CONSECUTIVE failures, not a blip -- ops_live's own comment calls it "the point at which this
+    code already believes the session is gone". Keeping a session we believe is gone saves nothing:
+    the re-login is owed either way, and the only question is whether it is paid during a quiet
+    hold or discovered at slot-open with nothing to book from.
+
+    CONFIRMED LIVE 2026-09-11 (booking 0911): workers sat at "not bookable: keepalive dead-trip"
+    for hours under the old rule, were still dead when slot-open fired, and the booking could not
+    book."""
     ops = _make_ops(cfg=_cfg(KEEPALIVE_DEAD_TRIP=1), signals=_FakeSignals(timeouts=1, final="slot_open"))
-    assert ops._signals.slot_found_seen is False   # no slot found yet
+    assert ops._signals.slot_found_seen is False   # no slot found yet -- must NOT matter any more
 
     class _DyingSession(_FakeSession):
         def browser_nav(self, url, timeout=30):
@@ -857,8 +1073,25 @@ def test_keepalive_loose_hold_preserves_session_before_slot_found():
     restore_calls = []
     ops._attempt_keepalive_restore = lambda context="": restore_calls.append(context)
     ops.await_slot_open()
-    assert restore_calls == []   # preserved, not restored -- the session object is untouched
-    assert ops.session is not None
+    assert restore_calls == ["await_slot_open"], "a dead session must be rebuilt, not preserved"
+
+
+def test_keepalive_no_restore_still_suppresses_the_rebuild_before_slot_found():
+    """KEEPALIVE_NO_RESTORE remains the explicit diagnostic opt-out -- the only thing that still
+    leaves a dead session dead."""
+    ops = _make_ops(cfg=_cfg(KEEPALIVE_DEAD_TRIP=1, KEEPALIVE_NO_RESTORE=True),
+                    signals=_FakeSignals(timeouts=1, final="slot_open"))
+    assert ops._signals.slot_found_seen is False
+
+    class _DyingSession(_FakeSession):
+        def browser_nav(self, url, timeout=30):
+            raise RuntimeError("net::ERR_TUNNEL_CONNECTION_FAILED")
+
+    ops.session = _DyingSession()
+    restore_calls = []
+    ops._attempt_keepalive_restore = lambda context="": restore_calls.append(context)
+    ops.await_slot_open()
+    assert restore_calls == []
 
 
 def test_keepalive_restore_attempts_are_bounded():
@@ -1630,7 +1863,7 @@ def test_a_real_portal_bounce_is_still_a_real_bounce():
 def test_swap_on_moves_the_worker_to_the_hold_pool(monkeypatch):
     import apps.worker.ops_live as ops_live_mod
 
-    ops = _make_ops(cfg=_cfg(HOLD_SWAP_AFTER_WARMUP=True), hold_proxy="http://u:p@holdhost:9999")
+    ops = _make_ops(cfg=_cfg(HOLD_SWAP_AFTER_LOGIN=True), hold_proxy="http://u:p@holdhost:9999")
     ops.session = _FakeSession()
     monkeypatch.setattr(ops_live_mod, "get_session", lambda **kw: _FakeSession(alive=True))
     assert ops.do_swap() == "holdhost:9999"
@@ -1640,7 +1873,7 @@ def test_swap_on_moves_the_worker_to_the_hold_pool(monkeypatch):
 def test_the_old_setting_name_is_no_longer_accepted():
     """Phase 6: HOLD_SWAP_AFTER_FOUND named a trigger point the code never had, and was never a
     supported alias/compatibility mechanism -- it was removed outright, not reconciled with
-    HOLD_SWAP_AFTER_WARMUP. A template that still names it must fail to resolve at all (the same
+    HOLD_SWAP_AFTER_LOGIN. A template that still names it must fail to resolve at all (the same
     UnknownSetting every other unrecognised key produces), not silently enable the swap."""
     from libs.domain.settings.resolver import SettingsError
 
@@ -1648,9 +1881,9 @@ def test_the_old_setting_name_is_no_longer_accepted():
         _cfg(HOLD_SWAP_AFTER_FOUND=True)
 
 
-def test_hold_swap_after_warmup_is_the_sole_setting_that_enables_the_swap():
-    cfg = _cfg(HOLD_SWAP_AFTER_WARMUP=True)
-    assert cfg.hold_swap.swap_after_warmup is True
+def test_hold_swap_after_login_is_the_sole_setting_that_enables_the_swap():
+    cfg = _cfg(HOLD_SWAP_AFTER_LOGIN=True)
+    assert cfg.hold_swap.swap_after_login is True
 
 
 # ── keepalive must maintain READINESS, not just liveness (operator, 2026-08-19) ───────────────
@@ -1678,40 +1911,63 @@ def _keepalive_ops(page, warmed=True):
     return ops
 
 
-def test_a_warmed_worker_probes_the_schedule_page_not_home():
-    """Probing home keeps the AUTH session alive and nothing else, so a worker could hold for an
-    hour, stay perfectly logged in, and still have a long-lapsed booking form-state -- its first
-    gettime or submit then failed, and that failure was counted toward a re-login rather than the
-    re-warm that fixes it."""
-    ops = _keepalive_ops(_SCHED_OK)
+
+# ── keepalive is auth-only, unconditionally (consolidated 2026-09-09 after the Test 0907/
+# 0907-auth A/B: authed-only matched schedule-keepalive on outcome while eliminating ~one full
+# Schedule.jsp re-warm cycle every ~20min). do_apply/do_discover establish the booking form-state
+# fresh on demand instead of keepalive trying to keep it warm -- so it never adds a cold-start
+# cost, it only removes what was redundant churn. Must never weaken SESSION_EXPIRED/dead-trip
+# detection -- keepalive never had a form-state to verify in the first place any more.
+
+def test_keepalive_probes_home_never_schedule_jsp_even_when_previously_warmed():
+    ops = _keepalive_ops("<html><title>E-VISA</title>no scheduling markers here</html>", warmed=True)
+    ops._run_warmup_steps = lambda: pytest.fail("keepalive must never re-warm the booking form-state")
     ops._do_keepalive("test")
-    assert any("Schedule.jsp" in u for u in ops.session.navs), ops.session.navs
+    assert ops.session.navs and "Schedule.jsp" not in ops.session.navs[0], ops.session.navs
 
 
-def test_a_lapsed_form_state_is_re_warmed_in_place():
-    """No login: the auth session is fine, only the ScheduleController anchor is gone."""
-    rewarmed = []
-    ops = _keepalive_ops("<html><title>E-VISA</title>no scheduling markers here</html>")
-    ops._run_warmup_steps = lambda: (rewarmed.append(1), True)[1]
-    ops.do_login = lambda: pytest.fail("keepalive must never re-login")
+def test_keepalive_still_detects_session_expired_and_restores():
+    """Session-death detection is independent of form-state verification -- it never depended on
+    it, and must keep working now that there is no form-state check at all."""
+    ops = _keepalive_ops("<html>session gone</html>", warmed=True)
+    ops.session = _RedirectingKeepaliveSession(
+        "<html>session gone</html>", final_url="https://x/VistosOnline/sessionLost.jsp")
+    ops._run_warmup_steps = lambda: pytest.fail("must not re-warm a dead session")
+    restore_calls = []
+    ops._attempt_keepalive_restore = lambda context="": restore_calls.append(context)
     ops._do_keepalive("test")
-    assert rewarmed, "form-state was lapsed and the keepalive did not re-warm"
+    assert restore_calls == ["test"]
 
 
-def test_a_healthy_schedule_page_is_left_alone():
-    """It must not re-warm on every ping -- that is a full quest replay each interval."""
-    rewarmed = []
-    ops = _keepalive_ops(_SCHED_OK)
-    ops._run_warmup_steps = lambda: (rewarmed.append(1), True)[1]
+def test_keepalive_still_reaches_dead_trip_on_transport_failure():
+    """The transport-failure/dead-trip branch never read `warmed` and is unaffected by the
+    form-state check being removed entirely."""
+    cfg = _cfg(KEEPALIVE_DEAD_TRIP=2)
+    ops = _make_ops(cfg=cfg, signals=_FakeSignals(timeouts=2, final="slot_open"))
+    ops._signals.slot_found_seen = True
+
+    class _DyingSession(_FakeSession):
+        def browser_nav(self, url, timeout=30):
+            raise RuntimeError("net::ERR_TUNNEL_CONNECTION_FAILED")
+
+    ops.session = _DyingSession()
+    restore_calls = []
+    ops._attempt_keepalive_restore = lambda context="": restore_calls.append(context)
+    ops.await_slot_open()
+    assert restore_calls == ["await_slot_open"]
+
+
+def test_keepalive_recovers_bookable_after_a_prior_not_bookable_marking():
+    """Recovery clearing (_mark_keep_bookable(True)) must fire on a clean AUTHENTICATED read even
+    though there is no more `warmed` concept -- a worker previously marked not-bookable (e.g. by
+    dead-trip) must not stay stuck unbookable forever once its session is confirmed healthy again."""
+    ops = _keepalive_ops("<html><body>solicitar pedido de visto ... consultar pedidos ... "
+                         "terminar sessão</body></html>")
+    ops._keep_unbookable = True
+    bookable_calls = []
+    ops._mark_keep_bookable = lambda ok, why="": bookable_calls.append(ok)
     ops._do_keepalive("test")
-    assert not rewarmed
-
-
-def test_an_unwarmed_worker_still_probes_home():
-    """Before warmup there is no form-state to hold, so home remains right."""
-    ops = _keepalive_ops(_SCHED_OK, warmed=False)
-    ops._do_keepalive("test")
-    assert ops.session.navs and "Schedule.jsp" not in ops.session.navs[0]
+    assert bookable_calls == [True]
 
 
 # ── explicit session-state classifier (F21-F26) ────────────────────────────────────────────────
@@ -1878,81 +2134,6 @@ def test_exit_ip_change_is_informational_and_does_not_override_a_healthy_classif
     ops._do_keepalive("test")   # must return cleanly: healthy page, exit-change is informational only
 
 
-# ── escalating a re-warm that keeps failing (2026-08-22) ─────────────────────
-# CONFIRMED LIVE on Test 2032: a worker held a HEALTHY auth session (keepalive nav returned a full
-# 28,505-byte page every cycle) while every questionnaire POST came back 403 -- the exit IP was
-# WAF-flagged, not the session. Neither ladder acted: the dead-session path never fired because
-# browser_nav succeeded, and the re-warm path marked NOT BOOKABLE and returned. It looped to streak
-# 7 on the same blocked proxy. Re-warming cannot clear an IP-level block; rebuilding on a fresh
-# proxy can.
-class _Restores:
-    """Records whether the escalation reached the restore chain."""
-    def __init__(self):
-        self.calls = 0
-
-    def __call__(self, context=""):
-        self.calls += 1
-        return True
-
-
-def _stuck_ops(streak, *, slot_found, escalate_after=3):
-    ops = _make_ops(cfg=_cfg(REWARM_ESCALATE_AFTER=escalate_after))
-    ops._rewarm_fail_streak = streak
-    ops.posto_pdf = "5084"
-    ops._slot_found_seen = lambda: slot_found
-    ops._attempt_keepalive_restore = _Restores()
-    ops._mark_hold_bookable = lambda ok, why="": None
-    ops._log = lambda *a, **k: None
-    return ops
-
-
-def test_below_the_threshold_it_keeps_re_warming_in_place():
-    ops = _stuck_ops(2, slot_found=True)
-    ops._maybe_escalate_stuck_rewarm("await_assignment")
-    assert ops._attempt_keepalive_restore.calls == 0
-
-
-def test_at_the_threshold_it_rebuilds_the_session():
-    ops = _stuck_ops(3, slot_found=True)
-    ops._maybe_escalate_stuck_rewarm("await_assignment")
-    assert ops._attempt_keepalive_restore.calls == 1
-
-
-def test_it_never_escalates_before_slot_found():
-    """The LOOSE HOLD rule: a re-login costs a CAPTCHA solve and sub-account budget, and before
-    slot_found there is nothing to book that would justify spending them."""
-    ops = _stuck_ops(9, slot_found=False)
-    ops._maybe_escalate_stuck_rewarm("await_slot_open")
-    assert ops._attempt_keepalive_restore.calls == 0
-    assert ops._rewarm_fail_streak == 9, "streak must survive so it escalates once slot_found fires"
-
-
-def test_escalating_clears_the_streak_so_it_does_not_fire_every_tick():
-    ops = _stuck_ops(7, slot_found=True)
-    ops._maybe_escalate_stuck_rewarm("await_assignment")
-    assert ops._rewarm_fail_streak == 0
-
-
-def test_escalation_forces_the_anchor_to_be_rebuilt():
-    """posto_pdf still holds the value from the warm-up that has since lapsed. It must be cleared,
-    or _attempt_keepalive_restore stops at re-authenticating and leaves the dead anchor in place."""
-    seen = {}
-    ops = _stuck_ops(3, slot_found=True)
-
-    def _restore(context=""):
-        seen["posto_pdf_at_restore"] = ops.posto_pdf
-        return True
-    ops._attempt_keepalive_restore = _restore
-    ops._maybe_escalate_stuck_rewarm("await_assignment")
-    assert seen["posto_pdf_at_restore"] is None
-
-
-def test_the_threshold_is_operator_configurable():
-    ops = _stuck_ops(4, slot_found=True, escalate_after=9)
-    ops._maybe_escalate_stuck_rewarm("await_assignment")
-    assert ops._attempt_keepalive_restore.calls == 0, "REWARM_ESCALATE_AFTER must be read, not hardcoded"
-
-
 # ── a challenged ScheduleController must not report a warm session (2026-08-22) ──
 def test_challenge_body_is_recognised():
     """44699 bytes of DataDome shell -- the exact body that was accepted as a successful
@@ -2009,6 +2190,62 @@ def test_a_live_anchor_skips_the_rewarm_entirely():
     ops.posto_pdf = "2032"
     assert ops._schedule_state_ok() is True
     assert ops.session.navs == 1, "one GET, no rebuild"
+
+
+# ── is_warmed() must check anchor PROVENANCE (confirmed live 2026-09-11, booking 0911) ────────
+# posto_pdf has two writers meaning opposite things: _run_warmup_steps sets it from a freshly
+# parsed Schedule.jsp (_set_anchor("chain") -- verified), a checkpoint restore sets it from a saved
+# file (_set_anchor("checkpoint") -- never verified). is_warmed() shipped checking only
+# `posto_pdf is not None`, so a checkpoint-restored worker reported warmed, skipped the deferred
+# warmup, and hit /slots with a stale anchor. Live result: 26 workers entered DISCOVERING, only 3
+# had ever been WARMED, and every discovery round died on "onCaptchaSuccess never appeared".
+def test_is_warmed_is_true_only_for_a_verified_chain_anchor():
+    ops = _make_ops(emit=lambda t, **p: None)
+    assert ops.is_warmed() is False               # nothing established yet
+
+    ops.posto_pdf = "5084"
+    ops._set_anchor("chain")                      # the real questionnaire chain ran
+    assert ops.is_warmed() is True
+
+
+def test_is_warmed_rejects_an_unverified_checkpoint_anchor():
+    ops = _make_ops(emit=lambda t, **p: None)
+    ops.posto_pdf = "5084"                        # restored from a saved checkpoint file...
+    ops._set_anchor("checkpoint")                 # ...never verified against the portal
+    assert ops.is_warmed() is False, (
+        "a checkpoint anchor is as old as the file -- reporting it as warmed makes the deferred "
+        "warmup skip, and discovery then hits /slots with no captcha widget rendered")
+
+
+def test_is_warmed_goes_false_once_the_anchor_is_cleared():
+    ops = _make_ops(emit=lambda t, **p: None)
+    ops.posto_pdf = "5084"
+    ops._set_anchor("chain")
+    ops._clear_anchor()
+    assert ops.is_warmed() is False
+
+
+def test_is_warmed_goes_false_once_the_chain_anchor_ages_past_the_ttl():
+    """FAILURE_MODES F28's remedy spells out the full invariant: chain provenance AND age under the
+    form-state TTL. Provenance alone is not enough."""
+    ops = _make_ops(cfg=_cfg(FORM_STATE_TTL=60.0), emit=lambda t, **p: None)
+    ops.posto_pdf = "5084"
+    ops._set_anchor("chain")
+    assert ops.is_warmed() is True                 # fresh
+    ops._anchor_at = time.time() - 61.0            # aged past the TTL
+    assert ops.is_warmed() is False
+
+
+def test_is_warmed_rejects_a_stale_chain_anchor_left_by_a_FAILED_rewarm():
+    """The exact case F28 warns about: 'a failed re-warm never reaches _set_anchor, so _anchor_src
+    retains the previous *successful* warm's value.' Provenance still says "chain" -- only the age
+    reveals that the anchor belongs to a warm that happened long ago."""
+    ops = _make_ops(cfg=_cfg(FORM_STATE_TTL=120.0), emit=lambda t, **p: None)
+    ops.posto_pdf = "5084"
+    ops._set_anchor("chain")                       # an earlier warm DID succeed
+    ops._anchor_at = time.time() - 3600.0          # ...an hour ago; every re-warm since failed
+    assert ops._anchor_src == "chain"              # provenance is unchanged by the failures
+    assert ops.is_warmed() is False, "age is what catches a stale anchor a failed re-warm left behind"
 
 
 def test_a_challenged_schedule_page_is_not_ok():
@@ -2155,47 +2392,6 @@ def test_a_rejected_gettime_says_why_instead_of_returning_silently():
     out = ops.do_discover(["2026-09-01", "2026-09-02"])
     assert [o["outcome"] for o in out] == ["failed", "failed"]
     assert any("scanned NOTHING" in m and "waf_challenge" in m for m in logged), logged
-
-
-# ── the escalation deadlock under MONO_BOOKING (2026-08-23) ─────────────────
-def _stuck(mono, slot_open, slot_found, streak=5):
-    # MONO_BOOKING is a BOOKING-layer setting; _cfg() puts everything in TEMPLATE.
-    cfg = EngineConfig.from_settings(resolve({
-        L.BOOKING: {"MONO_BOOKING": mono},
-        L.TEMPLATE: {"ROLE": "apply", "REWARM_ESCALATE_AFTER": 3},
-    }))
-    ops = _make_ops(cfg=cfg)
-    ops._rewarm_fail_streak = streak
-    ops.posto_pdf = "2032"
-    ops._slot_open_seen = lambda: slot_open
-    ops._slot_found_seen = lambda: slot_found
-    ops._mark_hold_bookable = lambda ok, why="": None
-    ops._log = lambda *a, **k: None
-    calls = {"n": 0}
-    ops._attempt_keepalive_restore = lambda context="": calls.__setitem__("n", calls["n"] + 1) or True
-    return ops, calls
-
-
-def test_mono_escalates_once_slot_open_has_fired():
-    """The deadlock: under MONO the apply worker IS the discoverer, so gating on slot_found is
-    circular -- lapsed form-state means it cannot discover, so nothing is ever found, so escalation
-    is refused forever. Four workers sat at 're-warm failed x7' for over an hour."""
-    ops, calls = _stuck(mono=True, slot_open=True, slot_found=False)
-    ops._maybe_escalate_stuck_rewarm("await_assignment")
-    assert calls["n"] == 1
-
-
-def test_split_mode_still_waits_for_slot_found():
-    """The LOOSE HOLD rule is correct where an idle applier really is waiting on scouts."""
-    ops, calls = _stuck(mono=False, slot_open=True, slot_found=False)
-    ops._maybe_escalate_stuck_rewarm("await_assignment")
-    assert calls["n"] == 0
-
-
-def test_nothing_escalates_before_the_booking_opens():
-    ops, calls = _stuck(mono=True, slot_open=False, slot_found=False)
-    ops._maybe_escalate_stuck_rewarm("await_slot_open")
-    assert calls["n"] == 0
 
 
 # ── a portal refusal at login is fleet-wide news (2026-08-24) ───────────────
@@ -2800,6 +2996,85 @@ def test_both_falls_back_to_calendar_only_for_unresolved_dates(monkeypatch):
     assert out == {"2026-09-14": "found", "2026-09-15": "empty"}
 
 
+def test_both_falls_back_to_calendar_when_slots_reports_nothing(monkeypatch):
+    """Confirmed live 2026-09-21: a RATE-LIMITED /slots round returns `_no_report()` -> [], which
+    carries no per-date `failed` outcomes. The old backfill keyed only on `outcome == 'failed'`, so
+    an empty round left `unresolved` empty and calendar NEVER ran -- 'both' silently degraded to
+    'report nothing' exactly when /slots was down and calendar was the reason for choosing 'both'.
+    Now an empty (or partial) /slots round backfills every un-answered date from calendar."""
+    ops = _slots_ops({"ok": True, "data": []}, "both", monkeypatch)
+    ops._discover_via_slots = lambda dates: []          # rate-limited / blocked / no-token
+    seen = []
+    ops._discover_via_calendar = lambda dates: seen.append(list(dates)) or [
+        {"date": d, "outcome": "found", "periods": [5]} for d in dates]
+    out = {r["date"]: r["outcome"] for r in ops.do_discover(["2026-09-14", "2026-09-15"])}
+    assert seen == [["2026-09-14", "2026-09-15"]], f"calendar must cover ALL dates: {seen}"
+    assert out == {"2026-09-14": "found", "2026-09-15": "found"}
+
+
+# ── getTables WAF handshake (ref-confirmed, 2026-09-23) ───────────────────────────────────────
+class _GtSession(_FakeSession):
+    """A session that records init scripts and answers the __gt_ok poll with a configurable result,
+    modelling the getTables hook flagging (or never flagging) window.__gt_ok."""
+    def __init__(self, gt_ok):
+        super().__init__()
+        self._gt_ok = gt_ok
+        self.init_scripts = []
+        self.navs = []
+
+    def browser_add_init_script(self, js, timeout=15):
+        self.init_scripts.append(js)
+        return True
+
+    def browser_nav(self, url, timeout=30, **kw):
+        self.navs.append(url)
+        return url
+
+    def browser_eval(self, js, timeout=30):
+        if "__gt_ok" in (js or ""):
+            return self._gt_ok
+        if "location.origin" in (js or ""):
+            return _origin_reply(js)
+        return ""
+
+
+def test_gettables_hook_installed_once_and_reinstalled_on_new_session():
+    ops = _make_ops(emit=lambda t, **p: None); ops._log = lambda *a, **k: None
+    s1 = _GtSession(True); ops.session = s1
+    ops._ensure_gettables_hook(); ops._ensure_gettables_hook()   # twice
+    assert len(s1.init_scripts) == 1, "the getTables hook must be installed exactly once per session"
+    assert "getTables" in s1.init_scripts[0] and "__gt_ok" in s1.init_scripts[0]
+    # a rebuilt session (new object) must get the hook re-installed
+    s2 = _GtSession(True); ops.session = s2
+    ops._ensure_gettables_hook()
+    assert len(s2.init_scripts) == 1
+
+
+def test_gettables_confirmed_marks_posto_and_proceeds():
+    ops = _make_ops(emit=lambda t, **p: None); ops._log = lambda *a, **k: None
+    ops.session = _GtSession(True)
+    assert ops._posto_gettables is None
+    ops._await_gettables()
+    assert ops._posto_gettables is True   # this posto fires getTables
+
+
+def test_gettables_absent_is_remembered_and_not_waited_again(monkeypatch):
+    """POSTO-OPTIONAL (ref: posto 5084 has no getTables but serves slots). A first miss is remembered
+    as 'this posto doesn't use it', and later rounds must NOT poll again (no repeated 8s wait)."""
+    ops = _make_ops(emit=lambda t, **p: None); ops._log = lambda *a, **k: None
+    s = _GtSession(False); ops.session = s
+    polls = {"n": 0}
+    _orig = s.browser_eval
+    def _count(js, timeout=30):
+        if "__gt_ok" in (js or ""): polls["n"] += 1
+        return _orig(js, timeout)
+    s.browser_eval = _count
+    ops._await_gettables()                     # first round: polls, times out -> remembers False
+    assert ops._posto_gettables is False and polls["n"] == 1
+    ops._await_gettables()                     # second round: must short-circuit, no poll
+    assert polls["n"] == 1
+
+
 def test_the_token_is_bound_to_SCHEDULE_EVISA(monkeypatch):
     """Action mismatch is the documented way this fails: a LOGIN_EVISA token is validated for the
     wrong action and the backend answers {"ReCaptchaError": true}."""
@@ -3156,13 +3431,25 @@ def _busy_login_ops(monkeypatch, calls, *, busy_rolls=3, sticky=2):
     return ops, rolls
 
 
+def _busy_rolls(rolls):
+    """Only the rolls the PORTAL-BUSY budget is responsible for.
+
+    Since 2026-09-15 every login retry round past the first also rolls the exit locally (it used to
+    ask the Hub for another pooled row instead -- same effect on the exit, different mechanism), so
+    counting every _roll_exit call would conflate the two. What LOGIN_PORTAL_BUSY_ROLLS bounds, and
+    what these tests are about, is how many different exits are tried BEFORE the fleet-wide breaker
+    is told the portal is refusing everyone."""
+    return [w for w in rolls if str(w).startswith("portal busy")]
+
+
 def test_a_busy_page_rolls_the_exit_before_the_fleet_is_told_anything(monkeypatch):
     calls = {"n": 0}
     ops, rolls = _busy_login_ops(monkeypatch, calls, busy_rolls=3)
 
     ops._sticky_login_attempts(ops.cfg.login.sticky_retry_max)
 
-    assert len(rolls) == 3, f"the refusal was blamed on the portal without trying another exit: {rolls}"
+    assert len(_busy_rolls(rolls)) == 3, \
+        f"the refusal was blamed on the portal without trying another exit: {rolls}"
     assert ops._breaker.downs == 2, (
         "the breaker should hear about it only after 3 DIFFERENT exits refused -- then once per "
         f"remaining sticky attempt (got {ops._breaker.downs})")
@@ -3190,7 +3477,8 @@ def test_rolling_is_bounded_so_a_genuine_outage_still_reaches_the_fleet(monkeypa
 
     ops._sticky_login_attempts(ops.cfg.login.sticky_retry_max)
 
-    assert rolls == [], "with the budget at 0 no exit roll should be attempted"
+    assert _busy_rolls(rolls) == [], \
+        f"with the budget at 0 no BUSY roll should be attempted (got {rolls})"
     assert ops._breaker.downs > 0, "a genuine outage never reached the breaker"
 
 
@@ -3308,11 +3596,11 @@ def _marks(ops):
 
 
 class _MarkRecordingOps:
-    """Captures _mark_hold_bookable calls without needing the whole emit pipeline."""
+    """Captures _mark_keep_bookable calls without needing the whole emit pipeline."""
     def __init__(self, ops):
         self.ops = ops
         self.calls = []
-        ops._mark_hold_bookable = lambda bookable, why="": self.calls.append((bookable, why))
+        ops._mark_keep_bookable = lambda bookable, why="": self.calls.append((bookable, why))
 
 
 def test_a_session_rebuild_marks_the_worker_unbookable_for_its_duration(monkeypatch):
@@ -3353,10 +3641,10 @@ def test_the_marker_is_tracked_so_recovery_can_clear_whatever_set_it():
     RE-WARM branch had marked. The dead-trip branch leaves that streak at 0, so a recovered worker
     would have stayed unbookable forever."""
     ops = _make_ops(emit=lambda t, **p: None)
-    ops._mark_hold_bookable(False, "dead trip")
-    assert ops._hold_unbookable is True
-    ops._mark_hold_bookable(True)
-    assert ops._hold_unbookable is False
+    ops._mark_keep_bookable(False, "dead trip")
+    assert ops._keep_unbookable is True
+    ops._mark_keep_bookable(True)
+    assert ops._keep_unbookable is False
 
 
 # ── the two defects introduced by the pacing fix (2026-09-02) ─────────────────────────────────
@@ -3392,3 +3680,367 @@ def test_the_pacing_wait_is_capped_and_stops_on_stop(monkeypatch):
     t0 = _t.time()
     ops._discover_via_slots(["2026-09-14"])
     assert _t.time() - t0 < 2.0, "a stopped worker sat through the whole pacing wait"
+
+
+# ── host-wide pool concurrency gate (2026-09-15) ────────────────────────────
+class _Sem:
+    """Recording stand-in for RedisSemaphore -- enough surface for do_login's two gates."""
+    def __init__(self, key="sem:test", grant=True):
+        self.key, self.grant = key, grant
+        self.acquired, self.released = [], []
+
+    def acquire(self, holder_id, timeout=None):
+        self.acquired.append(holder_id)
+        return self.grant
+
+    def release(self, holder_id):
+        self.released.append(holder_id)
+
+
+def _login_ops():
+    ops = _make_ops(emit=lambda t, **p: None)
+    ops._log = lambda *a, **k: None
+    ops._try_restore_from_checkpoint = lambda: False
+    ops._fresh_login = lambda: True
+    return ops
+
+
+def test_do_login_takes_and_releases_the_pool_gate():
+    ops = _login_ops()
+    ops._login_sem, ops._pool_sem = _Sem("sem:login:bk"), _Sem("sem:pool:soax:rotating")
+    assert ops.do_login() is True
+    assert ops._pool_sem.acquired == [ops._pool_holder_id()]
+    assert ops._pool_sem.released == [ops._pool_holder_id()]
+
+
+def test_a_full_pool_gate_still_releases_the_login_slot():
+    """The failure mode this guards: an early `return False` between the two acquires would leak a
+    per-booking login slot on every refusal. The gate is busiest exactly when the fleet is largest,
+    so a leak here would ratchet LOGIN_CONCURRENCY down to zero and stall the booking outright."""
+    ops = _login_ops()
+    ops._login_sem = _Sem("sem:login:bk")
+    ops._pool_sem = _Sem("sem:pool:soax:rotating", grant=False)
+    assert ops.do_login() is False
+    assert ops._login_sem.released == [ops.identity_id], "login slot leaked when the pool gate was full"
+    assert ops._pool_sem.released == [], "never acquired, so must not be released"
+
+
+def test_the_pool_holder_id_is_unique_across_bookings():
+    """identity_id alone is not host-wide-unique: one identity can be assigned to several bookings,
+    and to a host-wide sorted set those two workers would look like ONE holder -- the second would
+    slip past a full gate and the first to finish would release the other's slot."""
+    a, b = _login_ops(), _login_ops()
+    a.booking_id, b.booking_id = "bk-1", "bk-2"
+    a.identity_id = b.identity_id = "same-identity"
+    assert a._pool_holder_id() != b._pool_holder_id()
+
+
+def test_the_pool_gate_is_optional():
+    """Older/simpler constructions (and every test double) carry no pool gate; do_login must not
+    require one. PROVIDER_LOGIN_CONCURRENCY=0 is the operator's documented way to opt out."""
+    ops = _login_ops()
+    ops._login_sem, ops._pool_sem = _Sem(), None
+    assert ops.do_login() is True
+
+
+# ── do_swap probes AUTH, not form-state (booking Test 0916, 2026-09-16) ─────────────────────
+_HOME_AUTHED = "<html>solicitar pedido de visto ... consultar pedidos</html>"
+_SCHED_PAGE = "<html>cmbPeriodo getPeriodosOcupados</html>"
+
+
+class _SwapSession:
+    """Serves the page the portal really would at swap time: authenticated home, UNWARMED.
+
+    Schedule.jsp carries none of the form markers because warmup has not run -- that is the state
+    the machine guarantees between LOGGED_IN and KEEPING since warmup was deferred (2026-09-09).
+    """
+    def __init__(self):
+        self.navs = []
+
+    def browser_nav(self, url, timeout=None):
+        self.navs.append(url)
+        return url
+
+    def browser_eval(self, _js):
+        last = self.navs[-1]
+        return _SCHED_PAGE if "Schedule.jsp" in last else _HOME_AUTHED
+
+    def close_browser(self):
+        pass
+
+
+def test_the_swap_probe_accepts_an_authenticated_but_unwarmed_session():
+    """THE REGRESSION. do_swap ran `_probe_alive`, which navigates Schedule.jsp and demands
+    cmbPeriodo/getPeriodosOcupados -- markers warmup creates. do_swap runs BEFORE warmup, so the
+    check could never pass: measured 20/20 failures on Test 0916 (5 workers x 4 attempts), each
+    costing a 600s backoff, ~40 min per worker parked at LOGGED_IN. The three appointments that run
+    booked went out over the phase-1 rotating proxy; the leased ISP exits never carried a session.
+
+    The probe must judge AUTH on the home page, exactly as the auth-only keepalive does."""
+    ops = _make_ops(emit=lambda t, **p: None)
+    ops._log = lambda *a, **k: None
+    ops.session = _SwapSession()
+
+    assert ops._probe_swapped_session() is True
+    assert all("Schedule.jsp" not in u for u in ops.session.navs), (
+        "the swap probe must not depend on form-state that warmup has not built yet")
+
+
+def test_the_swap_probe_rejects_an_expired_session():
+    """The guard still has to work: a session that did NOT survive the move to the hold exit must
+    revert to phase-1 rather than silently hold on an exit we have no evidence works."""
+    ops = _make_ops(emit=lambda t, **p: None)
+    ops._log = lambda *a, **k: None
+
+    class _Expired(_SwapSession):
+        def browser_nav(self, url, timeout=None):
+            self.navs.append(url)
+            return "https://pedidodevistos.mne.gov.pt/VistosOnline/Authentication.jsp"
+
+    ops.session = _Expired()
+    assert ops._probe_swapped_session() is False
+
+
+def test_probe_alive_is_unchanged_for_the_checkpoint_restore_caller():
+    """_probe_alive's OTHER caller restores posto_pdf from a checkpoint and therefore legitimately
+    expects a warmed session. Fixing do_swap must not weaken that one."""
+    ops = _make_ops(emit=lambda t, **p: None)
+    ops._log = lambda *a, **k: None
+    ops.session = _SwapSession()
+
+    assert ops._probe_alive() is True
+    assert any("Schedule.jsp" in u for u in ops.session.navs)
+
+
+class _UnwarmedSession:
+    """An AUTHENTICATED but UNWARMED session -- the only state do_swap ever actually runs in.
+
+    The home page carries both home markers (so classify_session_state(warmed=False) reads
+    AUTHENTICATED); Schedule.jsp carries NO form markers, because warmup has not run.
+
+    This is the double the existing `_FakeSession` should have been: that one returns
+    "<html>cmbPeriodo</html>" for EVERY url, i.e. a session that is always warmed, which is why
+    every do_swap test passed for months while the real swap failed 20/20 in production.
+    """
+    def __init__(self):
+        self.navs = []
+        self.closed = False
+
+    def get_all_cookies(self):
+        return [{"name": "Vistos_sid", "value": "abc"}]
+
+    def browser_nav(self, url, timeout=30):
+        self.navs.append(url)
+        return url
+
+    def browser_eval(self, js):
+        if "location.origin" in (js or ""):
+            return _origin_reply(js)
+        if "Schedule.jsp" in (self.navs[-1] if self.navs else ""):
+            return "<html>nothing useful here yet</html>"     # unwarmed: no form markers
+        return "<html>solicitar pedido de visto ... consultar pedidos</html>"
+
+    def close_browser(self):
+        self.closed = True
+
+
+def test_do_swap_succeeds_on_an_unwarmed_session(monkeypatch):
+    """THE SEAM TEST. Asserts do_swap itself completes against an authenticated-but-unwarmed
+    session -- not that the probe works in isolation, which says nothing about whether do_swap
+    calls it.
+
+    Against the previous probe (`_probe_alive`, which navigates Schedule.jsp and requires
+    cmbPeriodo/getPeriodosOcupados) this returns None on every attempt. Production measured exactly
+    that on booking Test 0916: 20/20 failures, 5 workers x 4 attempts, ~40 min per worker parked at
+    LOGGED_IN, and the three appointments booked went out over the phase-1 rotating proxy while the
+    leased ISP exits never carried a session."""
+    import apps.worker.ops_live as ops_live_mod
+
+    monkeypatch.setattr(ops_live_mod, "get_session", lambda **kw: _UnwarmedSession())
+    ops = _make_ops(cfg=_cfg(HOLD_SWAP_AFTER_LOGIN=True, HOLD_SWAP_RETRIES=0,
+                             HOLD_SWAP_RETRY_HOLD_SECS=0.0),
+                    hold_proxy="http://u:p@isp.example:61234",
+                    hold_proxy_static=True, emit=lambda t, **p: None)
+    ops._log = lambda *a, **k: None
+    ops.session = _UnwarmedSession()
+
+    result = ops.do_swap()
+
+    assert result is not None, (
+        "do_swap rejected a healthy authenticated session because it was not WARMED -- "
+        "warmup is deferred to slot-open/slot-found, so it never can be at this point")
+
+
+# ── phantom-slot guard (operator-confirmed rule, Booking 0918, 2026-09-18) ──────────────────
+def _phantom_ops(**raw):
+    ops = _make_ops(emit=lambda t, **p: None)
+    ops._log = lambda *a, **k: None
+    ops.cfg.raw.update(raw)
+    return ops
+
+
+def _found(d, periods, raw="12"):
+    return {"date": d, "outcome": "found", "periods": list(periods), "raw": raw}
+
+
+def test_a_uniform_thin_round_is_reported_as_unknown_not_found():
+    """REPRODUCES BOOKING 0918. One scout found {3,4} on 10-14 and {3,4} on 10-15 while the
+    portal's own calendar showed the 15th unavailable. Both fired slot_found; three apply workers
+    leased them, re-warmed into a 503, and were escalated to re-login -- good sessions and reCAPTCHA
+    strikes spent on slots that did not exist.
+
+    The verdict is 'failed' (unknown), never 'empty': an unreadable round must not retire dates."""
+    ops = _phantom_ops()
+    out = ops._reject_phantom_round([_found("2026-10-14", [3, 4]), _found("2026-10-15", [3, 4]),
+                                     {"date": "2026-10-16", "outcome": "empty"}])
+    assert [o["outcome"] for o in out] == ["failed", "failed", "empty"]
+    assert all("periods" not in o for o in out if o["outcome"] == "failed")
+
+
+def test_a_real_open_answers_each_date_differently_and_is_kept():
+    """Uniformity is the load-bearing half of the rule. Per-date variation is what a real
+    getPeriodosOcupados answer looks like; only the portal's fallback template answers every date
+    the same. Two thin-but-different dates must pass."""
+    ops = _phantom_ops()
+    out = ops._reject_phantom_round([_found("2026-10-14", [3, 4]), _found("2026-10-15", [3, 5])])
+    assert [o["outcome"] for o in out] == ["found", "found"]
+
+
+def test_a_uniform_but_generous_round_is_kept():
+    """The size bound: three dates all showing six periods is a genuinely uniform open, not a
+    template. Test 0916 booked real appointments on dates that all showed {3,4,5}."""
+    ops = _phantom_ops()
+    out = ops._reject_phantom_round([_found(f"2026-10-{d}", [3, 4, 5]) for d in (13, 14, 15)])
+    assert all(o["outcome"] == "found" for o in out)
+
+
+def test_a_single_thin_find_is_not_enough_to_call_phantom():
+    """Uniformity across one date is not evidence of anything -- PHANTOM_MIN_DATES defaults to 2."""
+    ops = _phantom_ops()
+    out = ops._reject_phantom_round([_found("2026-10-14", [3, 4])])
+    assert out[0]["outcome"] == "found"
+
+
+def test_the_guard_can_be_disabled_and_tuned():
+    ops = _phantom_ops(PHANTOM_MAX_PERIODS=0)
+    out = ops._reject_phantom_round([_found("2026-10-14", [3, 4]), _found("2026-10-15", [3, 4])])
+    assert all(o["outcome"] == "found" for o in out), "0 must disable the check"
+
+    ops = _phantom_ops(PHANTOM_MAX_PERIODS=3)
+    out = ops._reject_phantom_round([_found(f"2026-10-{d}", [3, 4, 5]) for d in (13, 14)])
+    assert all(o["outcome"] == "failed" for o in out), "raising the bound widens what counts as thin"
+
+
+def test_the_calendar_path_runs_the_guard_on_its_own_output():
+    """THE SEAM -- drives the REAL do_discover, not the guard in isolation. The guard is worthless
+    unless _discover_via_calendar actually routes its output through it, and a test that calls
+    _reject_phantom_round directly proves nothing about that (the first version of this test did
+    exactly that, and would have passed with the guard unwired).
+
+    _RecordingSession serves the SAME getPeriodosOcupados body for every date -- the portal's
+    fallback template under load. '1256789' decodes to closed prefix {1,2}, inactive tail 5..9,
+    active holes {1,2,3,4}, free = {3,4}: the exact Booking 0918 signature."""
+    events = []
+    ops = _make_ops(emit=lambda t, **p: events.append((t, p)))
+    ops._log = lambda *a, **k: None
+
+    class _TemplateSession(_RecordingSession):
+        PERIODOS_BODY = "<html>periodos_ocupados='1256789'</html>"    # -> free=[3,4] for EVERY date
+
+    ops.session = _TemplateSession()
+    out = ops.do_discover(["2026-10-14", "2026-10-15", "2026-10-16"])
+
+    outcomes = {o["date"]: o["outcome"] for o in out}
+    assert set(outcomes.values()) == {"failed"}, (
+        f"a uniform thin round must come out of do_discover as unknown, got {outcomes}")
+    assert not any(t == "slots_found" for t, _ in events), "phantom finds must never fire slots_found"
+    assert any(t == "portal_health" and p.get("kind") == "phantom_slots" for t, p in events)
+
+
+def test_the_calendar_path_still_reports_real_variation_as_found():
+    """Control for the seam test: per-date variation through the same real path is kept."""
+    ops = _make_ops(emit=lambda t, **p: None)
+    ops._log = lambda *a, **k: None
+
+    class _VaryingSession(_RecordingSession):
+        def browser_eval(self, js):
+            if "location.origin" in (js or ""): return _origin_reply(js)
+            if "gettime" in self._last_url: return self.GETTIME_BODY
+            # different closed prefix per date -> different free set per date
+            d = self._last_url.rsplit("/", 1)[-1]
+            return ("<html>periodos_ocupados='1256789'</html>" if d.endswith("14")
+                    else "<html>periodos_ocupados='256789'</html>")   # free={1,3,4}
+
+    ops.session = _VaryingSession()
+    out = ops.do_discover(["2026-10-14", "2026-10-15"])
+    assert {o["outcome"] for o in out} == {"found"}
+
+
+# ── SLOTS_PRESOLVE: token pre-solve off the critical path (2026-09-20, A/B lever) ────────────
+import time as _time_mod
+
+
+def _presolve_ops(**raw):
+    # Set via cfg.raw directly (as the existing slots tests set DISCOVERY_SOURCE) -- the presolve
+    # methods read only cfg.raw, and this sidesteps the settings-layer plumbing entirely.
+    ops = _make_ops(emit=lambda t, **p: None)
+    ops._log = lambda *a, **k: None
+    ops.cfg.raw.update(raw)
+    return ops
+
+
+def test_slots_token_uses_a_fresh_pre_solved_token_and_skips_the_inline_solve():
+    """The whole point: a token solved during the wait is used without paying the 7-23s solve on
+    the critical path. race_all must NOT be called when a fresh token is cached."""
+    ops = _presolve_ops(SLOTS_PRESOLVE=True, SLOTS_TOKEN_TTL=90.0)
+    ops._presolved_slots = ("PRESOLVED_TOKEN", _time_mod.time())   # fresh
+
+    calls = []
+    def _race(*a, **k): calls.append(a); return "INLINE_TOKEN"
+
+    assert ops._slots_token(_race) == "PRESOLVED_TOKEN"
+    assert calls == [], "a fresh cached token must skip the inline solve"
+    assert ops._presolved_slots is None, "cached token is consumed once"
+
+
+def test_a_stale_pre_solved_token_is_discarded_and_solved_inline():
+    """reCAPTCHA tokens expire ~120s; a cached token older than SLOTS_TOKEN_TTL must never be sent.
+    Fall back to a fresh inline solve rather than submitting an expired token."""
+    ops = _presolve_ops(SLOTS_PRESOLVE=True, SLOTS_TOKEN_TTL=90.0)
+    ops._presolved_slots = ("OLD_TOKEN", _time_mod.time() - 200)   # well past TTL
+
+    assert ops._slots_token(lambda *a, **k: "FRESH_INLINE") == "FRESH_INLINE"
+    assert ops._presolved_slots is None
+
+
+def test_presolve_only_fires_in_the_lead_window_and_only_when_enabled():
+    ON = _presolve_ops(SLOTS_PRESOLVE=True, SLOTS_TOKEN_TTL=90.0)
+    OFF = _presolve_ops(SLOTS_PRESOLVE=False)
+
+    def _race(*a, **k): return "T"
+
+    # disabled: never solves, never caches
+    OFF._maybe_presolve_slots(20.0, _race)
+    assert OFF._presolved_slots is None
+
+    # too early (wait far above the lead): a token now would age out before use
+    ON._maybe_presolve_slots(80.0, _race)
+    assert ON._presolved_slots is None
+
+    # inside the lead window: pre-solves and caches
+    ON._maybe_presolve_slots(ON._SLOTS_PRESOLVE_LEAD - 5, _race)
+    assert ON._presolved_slots is not None and ON._presolved_slots[0] == "T"
+
+    # already has a fresh one: does not solve again
+    before = ON._presolved_slots
+    ON._maybe_presolve_slots(10.0, lambda *a, **k: "SECOND")
+    assert ON._presolved_slots is before
+
+
+def test_presolve_off_is_a_pure_inline_solve_no_behaviour_change():
+    """The default path must be byte-for-byte the old behaviour: no cache consulted, always solve."""
+    ops = _presolve_ops(SLOTS_PRESOLVE=False)
+    calls = []
+    def _race(*a, **k): calls.append(1); return "TOK"
+    assert ops._slots_token(_race) == "TOK"
+    assert len(calls) == 1 and ops._presolved_slots is None

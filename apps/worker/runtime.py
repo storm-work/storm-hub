@@ -16,7 +16,7 @@ from libs.engine.phases import EngineOps, PhaseMachine, PhaseResult
 # the restore chain for any later respawn -- previously save_checkpoint_now() had zero callers
 # anywhere, so checkpoint restore was fully dead code despite being built and tested), and every
 # scout POLLING lap (already-recurring, so a free periodic refresh).
-_CHECKPOINT_SUBSTATES = {WorkerSubstate.HOLDING, WorkerSubstate.POLLING}
+_CHECKPOINT_SUBSTATES = {WorkerSubstate.KEEPING, WorkerSubstate.POLLING}
 
 
 class WorkerRuntime:

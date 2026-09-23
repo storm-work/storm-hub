@@ -86,6 +86,9 @@ class SimEngineOps(EngineOps):
         self._pause(); self.warmups += 1
         return self._warmup_oks[min(self.warmups - 1, len(self._warmup_oks) - 1)]
 
+    def is_warmed(self) -> bool:
+        return self.warmups > 0
+
     def do_swap(self) -> str | None:
         self._pause(); return self._swap_ip
 
