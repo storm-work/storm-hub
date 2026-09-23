@@ -86,28 +86,35 @@ def _ensure_headful_display():
     if not xvfb:
         return None, None
     import subprocess
-
-    def _die_with_parent():
-        # PR_SET_PDEATHSIG: the OS sends SIGTERM to this Xvfb the moment the worker process dies, so
-        # a crashed/killed worker (a flaky launch, an OOM kill) can never orphan a display server.
-        # close() still terminates it on the normal path; this covers every abnormal one.
-        try:
-            import ctypes, signal
-            ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGTERM)  # PR_SET_PDEATHSIG=1
-        except Exception:
-            pass
-
-    for _ in range(5):
+    # No preexec_fn / PR_SET_PDEATHSIG: this session runs in a MULTI-THREADED worker, and a
+    # preexec_fn forked from a multithreaded process is unsafe (it can deadlock on a lock another
+    # thread held at fork). Cleanup is handled explicitly -- close() terminates it, and the launch
+    # path terminates it if the browser fails to come up.
+    for _ in range(6):
         num = random.randint(100, 9999)
+        sock = f"/tmp/.X11-unix/X{num}"
+        if os.path.exists(sock):
+            continue                     # that display number is already taken
         try:
             proc = subprocess.Popen(
                 [xvfb, f":{num}", "-screen", "0", "1280x1024x24", "-nolisten", "tcp"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, preexec_fn=_die_with_parent)
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception:
             return None, None
-        time.sleep(0.6)
-        if proc.poll() is None:          # still alive -> the display is up
-            return f":{num}", proc
+        # WAIT FOR THE DISPLAY TO BE USABLE, not just for the process to be alive. Xvfb takes a
+        # moment to create its X socket; a Chromium launched before then dies with "Missing X
+        # server or $DISPLAY" (confirmed live 2026-09-23). Poll for the socket.
+        deadline = time.time() + 8.0
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                break                    # Xvfb exited (display busy / failed) -> try another number
+            if os.path.exists(sock):
+                return f":{num}", proc   # socket is up -> the display is genuinely usable
+            time.sleep(0.15)
+        try:
+            proc.terminate()
+        except Exception:
+            pass
     return None, None
 
 
@@ -1291,6 +1298,15 @@ class PlaywrightSession:
                     pw.stop()
             except Exception:
                 pass
+            # Terminate a private Xvfb this session started, even if the browser LAUNCH failed (the
+            # caller's close() never runs when __init__ raises, so this is the only cleanup for a
+            # failed-launch headful worker -- otherwise every failed headful launch leaks a display).
+            if self._xvfb_proc is not None:
+                try:
+                    self._xvfb_proc.terminate()
+                except Exception:
+                    pass
+                self._xvfb_proc = None
             print(f"[session] browser closed")
 
     def _take_screenshot(self, page, username: str, stage: str) -> None:

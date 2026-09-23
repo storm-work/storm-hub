@@ -1567,7 +1567,15 @@ function BookingWorkers({ me, booking, events, workers, setRightPanel }) {
                 </td>
               </tr>
               {logsFor === w.id && (
-                <tr><td colSpan={8} style={{ padding: 0 }}><WorkerLog workerId={w.id} liveLogs={live.logs} /></td></tr>
+                <tr><td colSpan={8} style={{ padding: 0 }}>
+                  {/* flex + minWidth:0 lets the log box scroll its own long lines (the Playwright
+                      launch command is one very wide line) instead of stretching the whole table
+                      and forcing a page-wide horizontal scrollbar. */}
+                  <div style={{ display: "flex" }}>
+                    <div style={{ flex: "1 1 0", minWidth: 0 }}>
+                      <WorkerLog workerId={w.id} liveLogs={live.logs} />
+                    </div>
+                  </div></td></tr>
               )}
             </React.Fragment>
           );
