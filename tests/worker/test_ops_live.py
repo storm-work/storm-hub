@@ -336,12 +336,15 @@ def _restore_ops_with_checkpoint(monkeypatch, ckpt_data):
     return _make_ops(cfg=_cfg(RESTORE_STAMPEDE_JITTER=0))   # _make_ops default posto_id = "5084"
 
 
-def test_checkpoint_restore_adopts_a_matching_posto(monkeypatch):
-    """A bookable checkpoint warmed at THIS run's posto is adopted (warmup skipped) as before."""
+def test_checkpoint_restore_is_authed_only_never_adopts_the_form_anchor(monkeypatch):
+    """A checkpoint restore re-establishes an AUTHENTICATED session ONLY (operator, 2026-09-23):
+    it must NOT adopt the saved posto_pdf form-anchor or mark itself bookable, because KEEPING is an
+    authed home session with no live Schedule-page cursor. It must warm before applying."""
     base = {"cookies": {}, "cookies_full": [], "sub_account_id": "sub-1"}
     ops = _restore_ops_with_checkpoint(monkeypatch, {**base, "posto_pdf": "5084", "posto_id": "5084"})
-    assert ops._try_restore_from_checkpoint() is True
-    assert ops.posto_pdf == "5084"
+    assert ops._try_restore_from_checkpoint() is True     # authed (login short-circuited)
+    assert ops.posto_pdf is None, "restore must NOT adopt the file form-anchor -- authed only"
+    assert ops.is_warmed() is False, "an authed-only restore is NOT warmed"
 
 
 def test_checkpoint_restore_discards_a_stale_posto_after_a_change(monkeypatch):
@@ -1422,11 +1425,14 @@ def test_restore_skips_the_rewarm_once_the_budget_is_spent(monkeypatch):
     assert cleared == ["id-1"]
 
 
-def test_a_live_checkpoint_still_short_circuits_login(monkeypatch):
-    """The whole point of the chain: a good checkpoint must still skip login+warmup entirely."""
+def test_a_live_checkpoint_short_circuits_LOGIN_but_not_warmup(monkeypatch):
+    """A good checkpoint skips the LOGIN wall (the scarce resource) -- but NOT warmup. It is an
+    authed-only session (operator 2026-09-23), so it is not marked bookable and must still run the
+    real warmup chain before applying; is_warmed() stays False until that chain runs."""
     ops, cleared = _ckpt_ops(monkeypatch, _FakeSession(alive=True))
-    assert ops._try_restore_from_checkpoint() is True
-    assert ops._restore_stage == "alive"
+    assert ops._try_restore_from_checkpoint() is True     # authed -- login short-circuited
+    assert ops._restore_stage == "none", "must NOT claim a warmed/bookable restore stage"
+    assert ops.is_warmed() is False, "authed-only: not warmed until the chain runs"
     assert cleared == []
 
 
@@ -4136,3 +4142,32 @@ def test_apply_does_NOT_roll_when_rewarm_fails_on_a_portal_rejection():
     ops._roll_exit = lambda why="": rolls.append(why) or True
     assert ops.do_apply({"date": "2026-09-01", "period": 4}) == "session"
     assert rolls == [], "a portal-rejection re-warm failure must NOT roll the exit"
+
+
+# ── restore = authed only; warmup is mandatory before apply (operator model, 2026-09-23) ──
+def test_do_warmup_always_runs_the_chain_even_after_a_restore():
+    """The checkpoint-restore skip is gone: do_warmup must run the real questionnaire chain, never
+    return True off a restore stage. A restore is authed-only, never warmed."""
+    ops = _make_ops()
+    ops._restore_stage = "alive"                 # the OLD skip condition
+    calls = {"n": 0}
+    ops._run_warmup_steps = lambda: (calls.__setitem__("n", calls["n"] + 1), True)[1]
+    assert ops.do_warmup() is True
+    assert calls["n"] == 1, "do_warmup must run the chain, not skip on a restore stage"
+
+
+def test_do_apply_rewarms_unconditionally_even_when_is_warmed():
+    """The Schedule form cursor is NAVIGATION-bound, not time-bound -- a keeping worker that reads
+    'warmed' (chain anchor within FORM_STATE_TTL) may have a cursor destroyed by the keepalive
+    home-nav. do_apply must run the warmup right before EVERY submit, not trust is_warmed(); a
+    skipped warm is a guaranteed form_stale."""
+    events = []
+    ops = _apply_ops(b"%PDF-1.4\nreal", events)
+    ops.is_warmed = lambda: True                  # even though it claims warmed...
+    calls = {"n": 0}
+    def _count():
+        calls["n"] += 1
+        return True
+    ops._run_warmup_steps = _count
+    ops.do_apply({"date": "2026-09-01", "period": 4})
+    assert calls["n"] >= 1, "do_apply must re-warm before the submit regardless of is_warmed()"

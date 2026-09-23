@@ -802,13 +802,20 @@ class LiveEngineOps(EngineOps):
                           f"{self.posto_id} -- stale after a posto change, discarding and re-warming")
                 self._restore_stage = "none"
                 return False
-            self.posto_pdf = data.get("posto_pdf")
-            # UNVERIFIED on this session: copied from a file, not rebuilt. _anchor_at stays None so
-            # nothing downstream can mistake it for a fresh chain.
-            self._set_anchor("checkpoint")
-            self._restore_stage = "alive"
-            self._log(f"checkpoint restore: session alive and bookable after {spent():.0f}s "
-                      f"-- skipping login+warmup")
+            # A checkpoint restore re-establishes an AUTHENTICATED session ONLY -- it is NOT warmed
+            # and NOT bookable (operator, 2026-09-23: "regard every checkpoint restore as an authed
+            # session only; don't think it has valid form_state and bookable"). The saved posto_pdf
+            # is a file value never verified on THIS session, and the portal's form cursor does not
+            # survive a restore -- KEEPING is an authed HOME session, not the Schedule page. So do
+            # NOT adopt posto_pdf and do NOT set any anchor: leave the worker a plain authed KEEPING
+            # session that must run the real questionnaire->ScheduleController->Schedule.jsp chain
+            # before applying. Confirmed live on 'Prev 0923-3018 (copy)': adopting the file anchor and
+            # skipping warmup made workers submit with a lapsed cursor -> form_stale -> re-login loop
+            # (self-saved checkpoints, restored on re-login, restored the same dead form-state).
+            self._clear_anchor()
+            self._restore_stage = "none"
+            self._log(f"checkpoint restore: session AUTHENTICATED after {spent():.0f}s "
+                      f"-- authed-only (NOT warmed); will run the full warmup before applying")
             return True
 
         # Health-check failed. A re-warm is worth trying -- the session may still be authenticated
@@ -1455,37 +1462,12 @@ class LiveEngineOps(EngineOps):
             time.sleep(min(1.0, max(0.0, deadline - time.time())))
 
     def do_warmup(self) -> bool:
-        if self._restore_stage in ("alive", "rewarmed"):
-            # CONSUMED, not just read. This short-circuit is true exactly ONCE -- for the warm-up
-            # that immediately follows a checkpoint restore, which already left the session bookable
-            # so redoing the questionnaire chain would be waste. It was never cleared, so it stayed
-            # true for the worker's entire life, and every LATER do_warmup() -- all of which come
-            # from the recovery ladder asking for a genuine re-warm -- returned True instantly
-            # without touching the portal.
-            #
-            # That turned the ladder into a no-op and produced a perfect infinite loop. Traced live
-            # 2026-08-20 on booking "Test 3018", worker CARLOS FURTADO, ~26s per cycle, 120 slot
-            # leases deep and still going:
-            #
-            #   do_warmup: csrf_missing after Formulario POST
-            #   do_apply: re-warm at round start failed -- session problem, not the slot
-            #   [slot_released]
-            #   -> holding (re-warming: apply re-warm failed)
-            #   -> warming_up
-            #   -> warmed          <- SAME SECOND; a real warm-up takes ~38s
-            #   -> holding
-            #   -> applying        <- leases another slot, fails identically, forever
-            #
-            # The worker could never recover, and each cycle churned a slot lease: leased, released
-            # (reopening the slot), re-leased. Consuming the flag makes the second call do real work.
-            self._restore_stage = "none"
-            # Honest about what this is: the checkpoint probe found the session bookable, but the
-            # questionnaire chain did NOT run, so the anchor is as old as the file. do_apply
-            # re-warms unconditionally at round start, which is what makes this safe -- without
-            # that, this is a worker displaying `warmed` on form state nobody verified.
-            self._log(f"do_warmup: skipped -- checkpoint restore left the session bookable "
-                      f"(anchor={self._anchor_desc()}); the first apply round re-warms")
-            return True   # checkpoint restore already got us to a bookable state
+        # ALWAYS run the real questionnaire->ScheduleController->Schedule.jsp chain. The old
+        # short-circuit (skip when _restore_stage in {"alive","rewarmed"}) is gone (2026-09-23): a
+        # checkpoint restore is an AUTHENTICATED session only, never a warmed/bookable one, so there
+        # is no restored form-state to trust -- warmup must actually establish the Schedule-page form
+        # cursor. The restore path no longer claims "alive/bookable" (see _try_restore_from_checkpoint),
+        # so nothing sets those stages to skip on any more; this is belt-and-suspenders.
         return self._run_warmup_steps()
 
     def is_warmed(self) -> bool:
@@ -3232,15 +3214,16 @@ class LiveEngineOps(EngineOps):
             # (The booking breaker's is_tripped gate here was removed 2026-09-23 -- do_apply no
             # longer refuses fleet-wide; a down portal is shown on the dashboard, not gated.)
 
-            # Re-warm only when the anchor is actually stale. This was unconditional on every
-            # round, which is correct ONLY under the ~90-120s TTL it was written against -- and
-            # that figure is storm-auto's, was never measured here, and is contradicted by both of
-            # our own measurements (4-6 min and a 16.1-min median; OPEN_QUESTIONS Q3/Q24). Under a
-            # minutes-long TTL an unconditional replay of the questionnaire chain is ~40s of waste
-            # per round, and it hid the warm inside APPLYING so the lifecycle was invisible.
-            # is_warmed() enforces the full invariant (chain provenance AND age < FORM_STATE_TTL),
-            # so a stale or unverified anchor still re-warms exactly as before.
-            if not self.is_warmed() and not self._run_warmup_steps():
+            # RE-WARM UNCONDITIONALLY, right before the submit (operator model, 2026-09-23). The
+            # portal's Schedule-page form cursor is NAVIGATION-bound, not time-bound: KEEPING is an
+            # authed HOME session (the keepalive nav'd there), and any nav away from Schedule.jsp
+            # destroys the cursor -- so a "chain anchor within FORM_STATE_TTL" is NOT a live cursor.
+            # Gating the re-warm on is_warmed()/FORM_STATE_TTL let a worker submit with a lapsed
+            # cursor and get the questionnaire back -- form_stale -> re-login loop, measured on 'Prev
+            # 0923-3018 (copy)' as 20/46 applies entering APPLYING with no warm-up. The chain is the
+            # only thing that establishes the cursor, so run it every round; ~40s is the price of a
+            # valid submit, and a skipped warm is a guaranteed form_stale (zero bookings).
+            if not self._run_warmup_steps():
                 # NOT "bounced". This is OUR session failing before we ever spoke to the portal
                 # about this slot, and calling it a bounce blames the slot for our dead proxy:
                 # the lease is released WITH a penalty, that penalty feeds the Hub's false-slot
