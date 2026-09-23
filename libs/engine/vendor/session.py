@@ -80,7 +80,15 @@ def _ensure_headful_display():
     """
     disp = os.environ.get("DISPLAY", "").strip()
     if disp:
-        return disp, None
+        # Reuse $DISPLAY ONLY if its X server is actually alive. A stale DISPLAY left over from a
+        # PRIOR per-worker Xvfb this same process started and then terminated on a failed attempt
+        # points at nothing -> Chromium dies "Missing X server" and never falls back to headless
+        # (confirmed live 2026-09-23: 60 such failures on retries). A real shared display -- operator
+        # set DISPLAY + a persistent Xvfb -- has its socket and is reused as intended.
+        num = disp.lstrip(":").split(".")[0]
+        if num.isdigit() and os.path.exists(f"/tmp/.X11-unix/X{num}"):
+            return disp, None
+        # stale/dead -> fall through and start a fresh one
     import shutil
     xvfb = shutil.which("Xvfb")
     if not xvfb:
