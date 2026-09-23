@@ -1568,13 +1568,14 @@ function BookingWorkers({ me, booking, events, workers, setRightPanel }) {
               </tr>
               {logsFor === w.id && (
                 <tr><td colSpan={8} style={{ padding: 0 }}>
-                  {/* flex + minWidth:0 lets the log box scroll its own long lines (the Playwright
-                      launch command is one very wide line) instead of stretching the whole table
-                      and forcing a page-wide horizontal scrollbar. */}
-                  <div style={{ display: "flex" }}>
-                    <div style={{ flex: "1 1 0", minWidth: 0 }}>
-                      <WorkerLog workerId={w.id} liveLogs={live.logs} />
-                    </div>
+                  {/* The log box is positioned ABSOLUTELY inside this fixed-height relative wrapper,
+                      so a very wide line (the Playwright launch command) is taken OUT of the table's
+                      width calculation entirely. Without this, the workers table (table-nowrap: width
+                      auto) grows to the log's width and the whole table -- rows and controls -- gets a
+                      horizontal scrollbar. Now only the log box scrolls its own long lines; the table
+                      width is set by the actual row cells (Actions etc.). */}
+                  <div style={{ position: "relative", height: 272 }}>
+                    <WorkerLog workerId={w.id} liveLogs={live.logs} fill />
                   </div></td></tr>
               )}
             </React.Fragment>
@@ -1591,7 +1592,7 @@ function BookingWorkers({ me, booking, events, workers, setRightPanel }) {
 // before the tab connected showed "no log lines received over the WS yet" while its whole history
 // sat in Redis -- i.e. the log was blank exactly when you needed it to explain something that had
 // already happened.
-function WorkerLog({ workerId, liveLogs }) {
+function WorkerLog({ workerId, liveLogs, fill }) {
   const [history, setHistory] = useState(null);   // null = still loading
   const [err, setErr] = useState("");
   // Scoped to the CURRENT booking run by default. A worker ROW is reused by every /start, and the
@@ -1639,7 +1640,10 @@ function WorkerLog({ workerId, liveLogs }) {
   return (
     <div ref={boxRef} onScroll={onScroll}
          style={{ background: "var(--panel2)", border: "1px solid var(--border)", borderRadius: 8,
-                  padding: 8, maxHeight: 260, overflowY: "auto", overflowX: "auto",
+                  padding: 8, overflowY: "auto", overflowX: "auto",
+                  // `fill`: absolutely fill the fixed-height wrapper so the log's width is decoupled
+                  // from the table (see the log row). Otherwise a plain max-height box.
+                  ...(fill ? { position: "absolute", inset: 0 } : { maxHeight: 260 }),
                   fontFamily: "monospace", fontSize: 12, whiteSpace: "pre", lineHeight: 1.5 }}>
       {err && <div className="err">could not load history: {err}</div>}
       {history === null ? <span className="muted">loading log…</span>
