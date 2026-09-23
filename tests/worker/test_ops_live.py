@@ -4090,3 +4090,71 @@ def test_presolve_off_is_a_pure_inline_solve_no_behaviour_change():
     def _race(*a, **k): calls.append(1); return "TOK"
     assert ops._slots_token(_race) == "TOK"
     assert len(calls) == 1 and ops._presolved_slots is None
+
+
+# ── dead-exit (chrome-error / tunnel) rolls the exit instead of re-probing (2026-09-23) ──
+def test_is_dead_exit_response_recognises_dead_tunnel_pages():
+    ops = _make_ops()
+    assert ops._is_dead_exit_response("", "chrome-error://chromewebdata/")
+    assert ops._is_dead_exit_response("This site can't be reached ERR_CONNECTION_CLOSED", "https://portal/")
+    assert ops._is_dead_exit_response("... ERR_TUNNEL_CONNECTION_FAILED ...", "")
+    assert ops._is_dead_exit_response("... ERR_TIMED_OUT ...", "")
+    # a healthy portal page is NOT a dead exit
+    assert not ops._is_dead_exit_response("<html>Solicitar pedido de Visto</html>",
+                                          "https://pedidodevistos.mne.gov.pt/VistosOnline/")
+
+
+def test_keepalive_rolls_the_exit_on_a_dead_exit_page_returned_as_a_string(monkeypatch):
+    """The dominant 'Prev 0923-3018' stall: a dead tunnel returns the chrome-error page as a STRING
+    (nav raised nothing), classify reads it as UNKNOWN, and the keepalive re-probed the SAME dead
+    exit forever -- warmed workers stuck in await_assignment, never assignable, never applying. A
+    dead exit is not inconclusive: roll to a fresh exit and re-authenticate."""
+    import apps.worker.ops_live as ops_live_mod
+    monkeypatch.setattr(ops_live_mod.time, "sleep", lambda *_a, **_k: None)
+    ops = _make_ops(cfg=_cfg(KEEPALIVE_DEAD_TRIP=5), signals=_FakeSignals(timeouts=1, final="slot_open"))
+    ops._signals.slot_found_seen = True
+
+    class _DeadExitSession(_FakeSession):
+        def browser_nav(self, url, timeout=30, **k):
+            return "chrome-error://chromewebdata/"       # nav 'succeeds' onto the dead-tunnel shell
+        def browser_eval(self, js):
+            return "<html><body>This site can't be reached ERR_TUNNEL_CONNECTION_FAILED</body></html>"
+
+    ops.session = _DeadExitSession()
+    rolls, restores = [], []
+    ops._roll_exit = lambda why="": rolls.append(why) or True
+    ops._attempt_keepalive_restore = lambda context="": restores.append(context)
+    ops.await_slot_open()
+    assert rolls, "a dead-exit keepalive page must roll the exit, not re-probe it"
+    assert restores == ["await_slot_open"], "and re-authenticate on the fresh exit"
+
+
+def test_apply_rolls_the_exit_when_round_start_rewarm_dies_on_a_dead_exit():
+    """178 of 'Prev 0923-3018's 186 slot releases were reason 'session' -- the round-start re-warm
+    failing on a dead exit. Releasing without rolling means the worker re-logs in on the SAME dead
+    exit and the next slot dies identically. Roll first so the re-login runs on a fresh exit."""
+    ops = _make_ops()
+    ops.is_warmed = lambda: False
+    def _dead_rewarm():
+        ops._warmup_last_error = "TypeError: Failed to fetch"   # a dead-exit signature
+        return False
+    ops._run_warmup_steps = _dead_rewarm
+    rolls = []
+    ops._roll_exit = lambda why="": rolls.append(why) or True
+    assert ops.do_apply({"date": "2026-09-01", "period": 4}) == "session"
+    assert rolls, "a dead-exit round-start re-warm must roll the exit before releasing the slot"
+
+
+def test_apply_does_NOT_roll_when_rewarm_fails_on_a_portal_rejection():
+    """A portal rejection (quest_state_stale / csrf / sc-rejected) leaves _warmup_last_error empty,
+    and the exit may be perfectly live -- rolling it would discard a good exit over a portal hiccup."""
+    ops = _make_ops()
+    ops.is_warmed = lambda: False
+    def _clean_fail():
+        ops._warmup_last_error = ""     # a non-exception return False -- NOT a dead exit
+        return False
+    ops._run_warmup_steps = _clean_fail
+    rolls = []
+    ops._roll_exit = lambda why="": rolls.append(why) or True
+    assert ops.do_apply({"date": "2026-09-01", "period": 4}) == "session"
+    assert rolls == [], "a portal-rejection re-warm failure must NOT roll the exit"

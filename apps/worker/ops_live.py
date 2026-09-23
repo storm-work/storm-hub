@@ -640,6 +640,9 @@ class LiveEngineOps(EngineOps):
         # Set by _sticky_login_attempts when the portal serves its maintenance page, read by
         # _fresh_login to abandon sub-account rotation (down for everyone -- see the login path).
         self._saw_maintenance: bool = False
+        # Last _run_warmup_steps exception message; lets do_apply distinguish a dead-exit re-warm
+        # failure (roll the exit) from a portal rejection (keep it). See _run_warmup_steps.
+        self._warmup_last_error: str = ""
         # /slots pacing + recovery state (2026-09-02). _slots_backoff_until gates the next attempt
         # so we stop buying tokens the endpoint will refuse; _slots_needs_relogin tells phases.py
         # that the ladder's cheap rung (re-warm) cannot help this failure.
@@ -1395,6 +1398,20 @@ class LiveEngineOps(EngineOps):
             "failed to fetch",
         ))
 
+    def _is_dead_exit_response(self, page: str, final_url: str) -> bool:
+        """True when a nav 'succeeded' (raised nothing) but LANDED on a dead-tunnel page -- Chrome's
+        chrome-error://chromewebdata shell carrying 'This site can't be reached' /
+        ERR_TUNNEL_CONNECTION_FAILED / ERR_CONNECTION_CLOSED / ERR_TIMED_OUT. This is the EXIT being
+        dead, not the portal and not the session, and its opaque origin also makes every in-page
+        fetch throw. Confirmed dominant on booking 'Prev 0923-3018' (2026-09-23): 2456 chrome-error
+        pages, 1076 ERR_CONNECTION_CLOSED, 687 ERR_TUNNEL, 481 ERR_TIMED_OUT -- returned as ~185KB
+        strings, so no exception fired and classify_session_state read them as UNKNOWN, which just
+        re-probed the same dead exit forever. Reuses the login path's transient-marker set."""
+        if "chrome-error" in (final_url or "").lower():
+            return True
+        return (self._is_transient_login_failure(final_url or "")
+                or self._is_transient_login_failure((page or "")[:4000]))
+
     def _request_proxy_rotation(self, phase: str | None = None) -> str | None:
         """Ask the Hub to ASSIGN a STATIC/ISP proxy. One caller remains: do_swap's hold ladder.
 
@@ -1597,6 +1614,10 @@ class LiveEngineOps(EngineOps):
         """Questionnaire -> Formulario -> ScheduleController -> Schedule.jsp (confirmed URLs/flow,
         ported from storm-auto batch_apply._run_steps_2_to_6)."""
         _t0 = time.time()
+        # Records the last EXCEPTION message so a caller can tell a dead-exit warmup failure (roll
+        # the exit) from a portal rejection (do not). Cleared each run; only the except path below
+        # sets it, so a plain `return False` (quest_state_stale, csrf, sc-rejected) leaves it empty.
+        self._warmup_last_error = ""
         try:
             # Every step below is an in-page fetch. If a prior failed navigation left the page on
             # chrome-error, all three retries of the home-lang POST are guaranteed to raise
@@ -1858,6 +1879,7 @@ class LiveEngineOps(EngineOps):
             self._note_exit_ip("warmed")
             return True
         except Exception as e:
+            self._warmup_last_error = str(e)
             self._note_portal("warmup", time.time() - _t0, ok=False, error=str(e))
             return False
 
@@ -2281,6 +2303,21 @@ class LiveEngineOps(EngineOps):
                 self._log(f"keepalive: portal is refusing requests ({len(page)}B, "
                           f"exit={getattr(self, '_exit_ip', None)}, {context}) -- "
                           f"backing off, not re-warming and not re-logging in")
+                return
+            # DEAD EXIT returned as a string (2026-09-23). classify_session_state reads a
+            # chrome-error / dead-tunnel page as UNKNOWN (it carries none of the portal/session
+            # markers), and the UNKNOWN branch below just re-probes -- on the SAME dead exit,
+            # forever. Confirmed the dominant stall on 'Prev 0923-3018': warmed workers sat in
+            # await_assignment emitting hundreds of "unrecognised pre-warm response (185266B)" while
+            # their tunnel was dead, never assignable and never applying. A dead exit is not
+            # inconclusive: roll to a fresh one and re-authenticate on it, the same action the login
+            # path already takes when the very same markers arrive as a raised exception.
+            if self._is_dead_exit_response(page, final_url):
+                self._log(f"keepalive: DEAD EXIT / chrome-error ({len(page)}B, "
+                          f"exit={getattr(self, '_exit_ip', None)}, {context}) -- rolling to a fresh "
+                          f"exit and re-authenticating rather than re-probing a dead tunnel")
+                self._roll_exit("keepalive: dead exit (chrome-error/tunnel)")
+                self._attempt_keepalive_restore(context)
                 return
             # UNKNOWN: no positive AND no negative evidence -- there is no form-state to re-warm
             # (auth-only holding never establishes one), so this is always "inconclusive, wait for
@@ -3231,6 +3268,18 @@ class LiveEngineOps(EngineOps):
                 # the lease is released WITH a penalty, that penalty feeds the Hub's false-slot
                 # revert, and the worker parks on "5 consecutive bounces". All three were observed
                 # live 2026-08-15 -- 5082 bounced leases against a pool that was never phantom.
+                #
+                # ROLL THE EXIT before giving the slot back (2026-09-23). The round-start re-warm
+                # fails overwhelmingly because the exit is dead (chrome-error/tunnel) -- confirmed on
+                # 'Prev 0923-3018' as 178 `session` releases. Releasing without rolling means the
+                # worker re-logs in on the SAME dead exit and the NEXT slot it leases dies
+                # identically; the 37 available slots churned this way with 4 bookings. Rolling now
+                # means the re-login the caller triggers runs on a fresh exit. Roll ONLY when the
+                # re-warm failed on a dead-exit exception (chrome-error/tunnel), not a portal
+                # rejection (quest_state_stale/csrf/sc-rejected leave _warmup_last_error empty), so a
+                # live exit with a portal hiccup is not needlessly discarded.
+                if self._is_transient_login_failure(getattr(self, "_warmup_last_error", "")):
+                    self._roll_exit("apply: dead exit at round-start re-warm")
                 self._log("do_apply: re-warm at round start failed -- session problem, not the slot")
                 return "session"
 
