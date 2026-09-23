@@ -43,6 +43,55 @@ initial hold lease and `_handle_proxy_request`'s every subsequent hold-phase rot
 post-swap pool is static" now holds for a worker's entire life, not only its first hold-proxy
 assignment. No rotating fallback exists at either call site.
 
+### Rotating pools left the database entirely — 2026-09-15 (`DECISIONS.md` D39)
+**The inventory statements above are now history for rotating pools.** Migration `ci000droprot`
+deleted every `resource_type != 'static'` row (42,600 of them) and their leases. A rotating pool is
+no longer a set of rows at all: it is a set of credentials in global settings
+(`SOAX_ROTATING_PACKAGE`/`_PASSWORD`, `SOAX_MOBILE_*`, `WEBSHARE_PREFIX`/`_PASSWORD`, plus the three
+soax TTLs), out of which `libs/proxies/rotating.py::mint_rotating_url` builds a credential at launch
+and `roll_sticky_session` mints a fresh 16-alphanumeric session id on every rotation.
+
+So the current inventory reads the other way round from everything above: **`resource_type='static'`
+is now the only kind of row that exists**, and there are still none of them ("we own none", below,
+is unchanged and is the *whole* table). Everything the D33/D34 entries describe — the health filter,
+the exact-match `resource_type` parameter, the static-hold invariant — is byte-unchanged and is now
+the only path through `lease_proxy`.
+
+**One module per provider (2026-09-16).** Each provider now owns a single file under
+`libs/proxies/providers/` holding its connection-string format, the credential fields it needs, and
+how a session id is written/re-written inside that string. `soax.py` and `webshare.py` are ~70 lines
+each; `base.py` states the contract. Adding a provider is: write the module, add it to the registry
+in `providers/__init__.py`. Nothing in the Hub or the worker changes, because `roll()`/`read_id()`
+dispatch through `providers.for_url()` instead of a hard-coded if/else over both grammars (which is
+what `lease.py` used to carry, in the STATIC leasing module, for rotating credentials).
+
+**Credentials live in the environment, not the database.** `{env_prefix}_{FIELD}` -- e.g.
+`SOAX_ROTATING_PACKAGE`/`SOAX_ROTATING_PASSWORD`, `SOAX_MOBILE_*`, `WEBSHARE_PREFIX`/`_PASSWORD`.
+They are deployment facts and secrets: identical for every booking, changing only when a
+subscription changes. They were briefly catalogued as GLOBAL settings and that was wrong twice over
+-- a setting is editable from the web dashboard and readable by any DB connection, and because
+`apps/hub/config.py` loads `.env` at import, credential resolution consulting ambient `os.environ`
+made the TEST SUITE resolve live production credentials (one appeared in a pytest failure message).
+Secrets now resolve from the environment only; `resolve_credentials(env=...)` exists so tests are
+hermetic.
+
+**Operational knobs stay in the dashboard**, which is the correct half of the split: geo selection,
+`PROVIDER_LOGIN_CONCURRENCY`, and the soax TTLs (`SOAX_SESSIONLENGTH`/`BINDTTL`/`IDLETTL`) are
+resolved at launch and passed in. The TTL names are deliberately NOT pool-prefixed -- they describe
+SOAX's behaviour, not one purchase, so both soax pools share them.
+
+Consequences worth knowing before reading the rest of this file:
+- `is_healthy` on a rotating row is not merely "not a filter" any more; there are no rotating rows
+  to carry it. The D19 rule survives in code as a guard, not as a live behaviour.
+- The Hub never assigns a rotating exit. `_handle_proxy_request` refuses one with
+  `proxy_unavailable` rather than minting Hub-side, because a Hub-side mint would restore the
+  46–124 s round-trip the change removed.
+- The bound on concurrent use is `PROVIDER_LOGIN_CONCURRENCY`, keyed by provider+kind and enforced
+  **host-wide across all bookings**. `Proxy.max_sessions` never bounded anything and now has no
+  rotating rows to be ignored on.
+- `scripts/gen_proxy_pool.py`'s rotating modes still work and are the documented way to recreate the
+  deleted rows if D39 is ever reversed.
+
 **`HOLD_SWAP_AFTER_WARMUP` is the sole hold-swap setting — Phase 6, 2026-08-26 (`DECISIONS.md`
 D35).** A deprecated spelling, `HOLD_SWAP_AFTER_FOUND`, existed until this entry and was removed
 outright, not reconciled — it was never a legitimate second name, and its presence let the Hub-side
@@ -240,3 +289,69 @@ showed connection reuse conferring no protection.
 **The only configuration in this project's lineage with a real per-session exit guarantee is a
 STATIC ISP proxy** — one IP per held session, which is what storm-auto migrates onto before holding
 (`CONFIRMED_FACTS.md` §19). We own none.
+
+### Named ISP pools — 2026-09-16 (`DECISIONS.md` D41)
+A **pool is a name on a row** (`proxies.pool_name`, migration `cj000poolname`), not a table.
+Importing under a new name creates the pool by definition; importing under an existing one appends.
+There is no create step and no lifecycle. A `proxy_pools` table would buy referential integrity and
+per-pool metadata we have no use for, at the cost of a join on the lease hot path and an
+orphan-pool cleanup problem — revisit only when a pool needs attributes of its own (a cost, a
+contract expiry, a vendor contact).
+
+`NULL` means *belongs to no named pool*, and every pre-`cj000` row stays NULL. Unlike the geo
+filter, **a pool filter does not admit NULL**: a booking that named its pools must never be handed
+an unrelated ad-hoc import, because these are finite individually-owned IPs another booking may be
+relying on. No filter at all still means "any pool", so every pre-existing caller is unaffected.
+
+**Several pools per booking is the requirement, not a nicety.** An ISP purchase is a fixed number
+of IPs — "10 from Thordata" — and that is routinely fewer than the worker count, so a booking draws
+from the **union** of the pools it names. `PROXY_POOLS` / `HOLD_PROXY_POOLS` mirror
+`PROXY_GEOS` / `HOLD_PROXY_GEOS` exactly: comma-separated, blank means all, one pair per phase — so
+there is one filter idiom rather than two.
+
+Both filters compose and neither overrides the other, and neither weakens **D33**: an unhealthy
+*static* row stays excluded inside a named pool, because a static probe failure describes a real
+resource (unlike a rotating one, D19). Dedup on `(endpoint, credentials_ref)` is **global, not
+per-pool** — the same physical IP in two pools would be leased twice concurrently, and
+one-worker-one-IP is the whole point of a static resource.
+
+Capacity is reported as `leasable`, not `total` (`GET /proxies/isp-pools`). The operator's real
+question when assigning pools is "do these cover my worker count?", and a deactivated or condemned
+static row really is out of service. Pool exhaustion now names the pools searched, because with
+finite pools that is the *expected* error once workers outnumber proxies and the next action is to
+assign another pool or buy more.
+
+### Two-tier health check, and what may be deleted — 2026-09-16 (`DECISIONS.md` D42)
+| | tier 1 | tier 2 |
+|---|---|---|
+| question | can this proxy carry traffic at all? | can this IP reach the portal right now? |
+| probe | raw request → **neutral** url (`api.ipify.org`) | real browser → the portal |
+| cost | ~1 s, 16 in parallel | ~25 s, 4 in parallel |
+| stored in | `is_healthy` / `health` | `portal_ok` / `portal_health` |
+| gates selection? | **yes** (static rows, D33) | **never** |
+| gates deletion? | **yes** | **never** |
+
+**Tier 1 must not probe the portal, and this is the one rule that matters here.** `quick_screen`
+does — it is a pre-lease negative filter and tolerable there — but a throttling portal produces
+timeouts, `"timed out"` is a dead-marker, and the verdict then describes the portal. On 2026-08-28
+that condemned 4,489 rows and stopped 73 of 120 workers launching; re-probed against a neutral url
+the same rows connected 20/20. That was survivable when rows were regenerable strings. It is not
+survivable now: tier 1 is what the delete button keys off, and an ISP proxy is a purchased,
+individually-owned IP.
+
+**Tier 2 is skipped when tier 1 fails** — not (only) to save ~25 s of Chromium, but because a
+browser probe through a dead tunnel returns a portal-shaped error for a connectivity problem, which
+is precisely the misattribution that has repeatedly sent investigations here the wrong way.
+
+**Delete refuses three things**, and `force` is required to override any of them: a row with an
+**active lease** (`proxy_leases.proxy_id` is a live FK — deleting through it is the non-JSON 500 that
+the Detach button produced and that made `ci000droprot` fail on its first run); a row whose **tier 1
+passed**; and a row that has **never been checked**, because absence of a verdict is not a verdict.
+The unchecked test is evaluated *first*: `is_healthy` defaults to `True`, so an unprobed row would
+otherwise be reported as "tier 1 passed", stating a verdict that never ran.
+
+Selection is capped at 200 per run. One dashboard click must not be able to launch hundreds of
+browsers — that is the shape of the 2026-09-15 incident where an inline probe saturated the
+executor and took the Hub down. Probing also happens **outside** the DB session: the connection is
+released before the probes and re-acquired to write, because holding a pooled connection across
+tens of seconds of browser work is what produced the audit deadlock.

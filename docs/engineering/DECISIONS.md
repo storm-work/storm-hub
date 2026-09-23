@@ -519,3 +519,218 @@ must never be reported as containment.
 
 **Do not reuse one password across systems.** In F27 a single literal exposed both Postgres and an
 admin login to an internet-reachable Hub, turning one mistake into two compromises.
+
+### D38. A gate is enforced where the resource is spent, and the dashboard only renders the verdict
+Eligibility rules (which identity may launch, which sub-account may be used, which action a worker
+status allows) live in `libs/domain`, are enforced by the endpoint that spends something real — a
+proxy lease, a CAPTCHA solve, a subprocess — and reach the dashboard as a computed field or a
+mirrored table with a parity test behind it. The dashboard filters on that answer; it never derives
+one from whatever field looks close enough.
+**Why:** every instance of the opposite has cost a live run. `WORKER_ACTIONS` was a UI table the
+`detach` endpoint never enforced (F-detach). The attach panel gated on `Identity.status === "active"`,
+which only ever meant "sub-account rows exist", and no launch-side check existed at all (F37). A UI
+gate is a suggestion: it is bypassed by a stale page, a direct API call, a scheduler path, or a
+second panel written later.
+**How this shows up in review:** a filter in `App.jsx` that names domain values (statuses, roles,
+thresholds) is the smell. Either the server should answer it, or the shared table needs a parity
+test — `tests/hub/test_action_guard_parity.py` and
+`tests/hub/test_sub_account_readiness_parity.py` are the two worked examples.
+**Reverse if:** never for anything that spends a resource. Purely cosmetic grouping (colour, sort
+order) is exempt.
+
+### D39. Rotating proxies are not inventory — the worker mints its own session id
+**Operator direction, 2026-09-15.** A rotating "proxy" was never an exit; it was a *session
+template*, and the session id inside it is a string we choose. Storing 42,600 of them as DB rows
+modelled them as if they were finite resources. They are not, and the codebase had said so for
+months without acting on it (`libs/proxies/lease.py:153`, D19, `libs/proxies/health.py:121-140`:
+"There is no row-level subject to screen").
+
+**The change:** rotating pools have no rows. `libs/proxies/rotating.py::mint_rotating_url` builds a
+credential from global settings at launch; `roll_sticky_session` mints a new 16-alphanumeric id
+locally whenever a worker needs a different exit. The Hub is not in the path — `_do_launch_worker`
+mints instead of leasing, and `_handle_proxy_request` refuses a rotating request outright rather
+than silently minting Hub-side. Migration `ci000droprot` deletes the rows.
+
+**Static/ISP proxies keep the entire leasing and health system, unchanged.** That is the point of
+the split, not an exception to it: a static row is a genuinely finite, individually-owned IP, so a
+failed probe has a real subject and a per-row verdict means something. `lease_proxy` and
+`_candidate_query` are byte-unchanged.
+
+**Why it was safe** — arithmetic, not a new experiment. The objection was Q2 (does an established
+session id outperform a fresh one?), whose supporting measurement was already retracted
+(`CONFIRMED_FACTS.md` §16). Checking the data settled the pool half outright: 0 of 42,600 rows had
+been used within soax's own `sessionlength=3600` / `idlettl=900`, so no row held a live session and
+tier 1 was ranking 32,590 rows on a property none had. See Q2 for what remains open — the
+*first-use* rate of a minted id is still unmeasured, and is now on the critical path for every
+login.
+
+**What it removes**, all measured the same week: 46–124 s of Hub proxy-rotation latency per
+rotation; the `proxy_request`/`wait_proxy` round-trip that saturated a 4-thread executor; one DB-pool
+consumer that fed the audit deadlock; the 42,600-row table that collapsed the Proxies page; and
+19,983 `is_healthy=false` condemnations that meant nothing about a per-session exit.
+
+**Relationship to prior decisions.** A carve-out to **D32**, which freezes active proxy selection —
+taken on explicit operator instruction. It *fulfils* **D19** (scope health to where it has a
+subject) and *extends* **D33 item 1** (which already drew the rotating/static line at the health
+filter). It respects **D2**: `roll_sticky_session` still only replaces a value in a *recognised*
+credential slot and never appends an id to an unrecognised username.
+
+**Two things this forced, which are the reusable lessons.** First, id width is a correctness
+property once minting is decentralised: the old `randint(100000, 999999)` was fine for a rare
+recovery step against a pre-generated pool, but as the *only* way any worker changes exit it
+collides at roughly even odds by ~1k rolls, and two workers sharing an id share an exit silently.
+Second, `max_sessions` was never a bound — every row carried 2, a nominal 85,200-lease ceiling
+nothing could reach. The real limit belongs to the *provider*, so `PROVIDER_LOGIN_CONCURRENCY` is
+keyed by provider+kind and is deliberately **host-wide, not per-booking**: two bookings each
+staying under their own `LOGIN_CONCURRENCY` is exactly how the fleet jointly blew through soax's
+limit. Its default (20) is an untuned guess and is labelled as one.
+
+**Reverse if:** a live run shows minted ids logging in materially worse than the pool did. The
+generator (`scripts/gen_proxy_pool.py`) still recreates the rows, and the migration is the only
+thing that must be undone.
+
+### D40. One module per proxy provider; credentials in the environment, knobs in the dashboard
+**Operator direction, 2026-09-16.** Extends D39 from "rotating proxies are not rows" to "each
+provider is a self-contained module".
+
+**Structure.** `libs/proxies/providers/` holds `base.py` (the contract), one file per provider
+(`soax.py`, `webshare.py`), and a registry in `__init__.py`. A provider module owns exactly four
+things: its connection-string format, the credential fields it needs (declared per *pool*), and the
+`mint`/`roll`/`read_id` grammar for session ids. `libs/proxies/rotating.py` is now a thin dispatcher.
+Adding a provider is one new file plus one registry line.
+
+**What this removed.** `roll_sticky_session`/`session_id` lived in `libs/proxies/lease.py` — the
+*static* leasing module — and each carried a hard-coded if/else over both providers' username
+grammars. Every new provider meant editing that shared branch. Dispatch now goes through
+`providers.for_url()`, so a worker rolls its exit without knowing which provider it is on. The old
+names survive as thin aliases because they are called from worker hot paths.
+
+**Two namespaces, resolved from different sources — this is the security half.**
+*Secrets* (login/password/package) come from the ENVIRONMENT only, as `{env_prefix}_{FIELD}`.
+*Options* (the soax TTLs) come from dashboard settings, then env, then a declared default.
+
+Credentials were briefly catalogued as GLOBAL settings, and that was wrong for two concrete
+reasons, not taste. A setting is editable from a web dashboard and readable by anything with a DB
+connection — inappropriate for a proxy password. And because `apps/hub/config.py` loads `.env` at
+import, credential resolution that consulted ambient `os.environ` meant the TEST SUITE resolved
+live production credentials: one appeared verbatim in a pytest failure message. `resolve_credentials`
+now takes `env=` so tests are hermetic, and secrets are unreachable from `settings` — asserted by
+`test_secrets_never_come_from_settings`.
+
+**A pool is the unit, not a provider.** SOAX sells `rotating` (352438) and `mobile` (350716) as
+separate purchases with SEPARATE passwords. Conflating them silently authenticates one pool with
+the other's password — which has happened here for real, twice: 11,000 rows generated against a
+rotating package using the mobile password, and 10,000 mobile rows carrying a retired rotating
+package's password. Hence one `Pool` per purchase, each with its own `env_prefix`. TTL names are
+deliberately *not* pool-prefixed: they describe the provider's behaviour, not one purchase.
+
+**Operational note learned the hard way.** The `ci000droprot` migration ran before the credential
+backfill did, deleting the only DB copy. The credentials were recovered from
+`scripts/gen_proxy_pool.py`'s own output files in `data/`, which is why that script is kept working
+and documented-legacy rather than deleted. `backfill_rotating_credentials.py` now tries the rows
+first and falls back to those files — and the files are the *better* source, holding exactly one
+package and one password each, with no generation ambiguity to resolve.
+
+**Reverse if:** never for the module split. The env-only rule for secrets could be relaxed only if
+a real secret store replaced it — not by moving them back into `settings`.
+
+### D41. A named ISP pool is a label on a row, and a booking may draw from several
+**Operator requirement, 2026-09-16.** Two halves, both about capacity being *real* — which is what
+separates ISP pools from the rotating "pools" that D39/D40 deleted, where a pool was a bag of
+strings we minted on demand.
+
+**Import names the pool.** `proxies.pool_name` (`cj000poolname`). New name → pool created; existing
+name → appended. No create endpoint, because a pool *is* the set of rows carrying its name. The
+dashboard offers existing names from `GET /proxies/isp-pools` via a datalist, and says which of the
+two is about to happen before the operator commits.
+
+**A booking assigns several pools.** `PROXY_POOLS` / `HOLD_PROXY_POOLS`, comma-separated, mirroring
+the `PROXY_GEOS` pair. Usable capacity is the union. This exists because one purchase is normally
+smaller than the fleet, so requiring one-pool-per-booking would cap a booking at the size of its
+smallest supplier.
+
+**Three rules that are easy to get wrong, and why they are what they are.**
+*NULL is not admitted by a pool filter* — a booking that named its pools must not receive an
+unrelated ad-hoc import; these are finite IPs someone else may be using. *Dedup is global, not
+per-pool* — the same IP in two pools would be leased twice at once, defeating one-worker-one-IP.
+*Capacity is reported as `leasable`, not `total`* — a condemned static row is genuinely out of
+service (D33), so `total` overstates capacity exactly when the operator is deciding whether to buy
+more.
+
+**Delivery, not just storage.** `pool_name` was added to `ProxyImport` and `ProxyOut` first and the
+create path silently dropped it — the row looked right in the table and was invisible to every
+booking that assigned the pool. Caught by asserting that `PROXY_POOLS` *reaches `lease_proxy`*
+rather than that the setting round-trips, which is the only form of this assertion that catches the
+delivery-gap class (see `delivery_gaps`).
+
+**Reverse if:** a pool ever needs attributes of its own. Then `pool_name` becomes a foreign key and
+this entry is superseded — but not before, because the join is on the lease hot path.
+
+### D42. Proxy health has two tiers, and only tier 1 is a verdict about the proxy
+**Operator requirement, 2026-09-16:** "2 tier healthy check — one with normal ping and another with
+reachability check to the portal", plus bulk selection, filtering, and deletion of dead proxies.
+
+**Tier 1** (raw → neutral url) asks *can this proxy carry traffic*. It writes `is_healthy`/`health`,
+gates selection for static rows (D33), and is the only thing deletion keys off.
+**Tier 2** (browser → portal) asks *can this IP reach the portal right now*. It writes
+`portal_ok`/`portal_health` and is diagnostic only.
+
+**Why they cannot share a column.** On 2026-08-28 a throttling portal flipped 4,489 rows to
+`is_healthy=False` and 73 of 120 workers never launched; re-probed against a neutral url those rows
+connected 20/20 — "the flag was recording the portal, not the proxy". That was recoverable when the
+rows were regenerable session strings. It is not recoverable now: these are purchased ISP IPs and
+the dashboard can delete them, so a portal outage must never be able to present a healthy pool as
+deletable garbage.
+
+**Deletion guards.** Active lease → refuse (live FK; the same one that produced the Detach 500 and
+broke `ci000droprot`'s first run). Tier 1 passed → refuse. Never checked → refuse, tested *before*
+the health test because `is_healthy` defaults to `True` and an unprobed row would otherwise be
+reported as having passed a check that never ran. `force` overrides all three, deliberately
+explicit.
+
+**Bounded and off-session.** 200 proxies per run, 4 concurrent browsers; probes run with the DB
+connection released and re-acquired to write. Both limits are drawn from real incidents — the
+executor saturation that took the Hub down on 2026-09-15, and the audit deadlock caused by holding a
+pooled connection across slow work.
+
+**Reverse if:** never for the tier split. The neutral-url target may change if ipify proves
+unreliable; it must stay a host we do not otherwise depend on, and it must never be the portal.
+
+### D43. Blind apply — seed the pool on sight, reuse the machinery, retire by evidence
+**Operator direction, 2026-09-18.** When the operator has confirmed availability by eye on the
+portal's calendar and discovery finds nothing, seed the slot pool with the (date × period) grid and
+let apply workers try the combinations. Two records say discovery can miss what is there: `/slots`
+is on file as under-reporting (`slots_reference_implementation`, superseded 2026-07-06), and the
+calendar path manufactures phantoms from the portal's template under load (F-phantom-slots). On
+Booking 0918 the calendar showed 12/13/14 October open while fifteen sessions got `[]`.
+
+**Design: no new mode.** `POST /bookings/{id}/blind-apply` writes one `Slot` per combination with
+`source='blind'`. Everything downstream is unchanged: `_fire_slot_found_if_new` fires because an
+`AVAILABLE` row exists, apply workers warm (mandatory every round), `_assign_slots` hands out
+combinations under multi-capacity leasing, a bounce releases and the worker gets the next one, a
+booking lands in `booked_appointments`. A blind slot that books is real by evidence.
+
+**Exactly three things treat a blind row differently**, each a one-line rule with a seam test:
+1. `phases.py` — `form_stale` on a blind slot → `no_slot` (release with the bounce penalty, next
+   combination). Never the stale ladder, whose end is re-login: `apply_path_proven_healthy` records
+   that the portal rejects a well-formed submit for a gone slot, which lands as `form_stale` with
+   the cursor intact — routing that through the ladder spends a session and a reCAPTCHA strike on
+   a combination that never existed.
+2. `events.py` — a BOUNCED release counts against the blind slot; at `BLIND_MAX_BOUNCES` (3) it is
+   CLOSED. A discovered slot retires via the scouts' miss count; a blind one was never discovered
+   and would otherwise be reassigned forever. `form_stale`/`session` releases do not count.
+3. `scheduler.py` — blind bounces are excluded from the false-slot-open revert. A grid is mostly
+   phantom by construction; counted, one sweep would hit the limit of 12 and wipe the pool.
+
+**The period table is measured, not assumed** (`libs/domain/blind.py`): every PDF-verified booking
+and every discovered slot as of 2026-09-18. Periods are posto-specific — 3 only at 2032, 7/8 only at
+3018/3059. Capacity per (date, period) ≥ 3 (three verified bookings on 2026-10-09 p5). Weekends are
+never seeded.
+
+**Deliberately manual.** A blind sweep is the densest submit load this fleet generates, and every
+attempt is a warmup chain + a CAPTCHA solve + a submit. It is a decision at a moment the operator
+has verified, not a background behaviour — and it refuses while discovery still has `AVAILABLE`
+slots unless forced, because seeding phantoms on top of real finds only dilutes the pool.
+
+**Reverse if:** the portal starts answering a bad-slot submit in a way the bounce classifier reads as
+a session fault. Then rule 1 stops being safe and blind apply needs its own verdict, not a reuse.

@@ -17,9 +17,28 @@ Traffic volume (30x range) and connection reuse both showed no protective effect
 ### Q2. Does an established session id actually outperform a fresh one?
 The tier ordering in `_candidate_query` rests on a measurement its own file declares invalid
 (`CONFIRMED_FACTS.md` §16). Sample sizes were 600 vs 12.
-**Why it matters:** it orders selection across a 32,600-row pool.
+**Why it matters:** ~~it orders selection across a 32,600-row pool.~~
 **Settled by:** a clean re-measurement with tier-1 screening off, comparable sample sizes, and
 the browser as the only prober.
+
+**PARTLY RETIRED 2026-09-15 — the pool half, by arithmetic rather than experiment.**
+The question had two halves. The *pool-ordering* half is gone: soax's own params are
+`sessionlength=3600` / `idlettl=900`, and **0 of 42,600 rows had `last_used_at` inside either
+window** (10,010 never used; 32,590 last used > 1 h ago). No row held a live provider-side session,
+so tier 1 — "established, verdict unknown" — was ranking 32,590 rows on a property *none of them
+had*. The ordering could not have been delivering established sessions, because the pool contained
+none. That is what made it safe to delete the rotating rows entirely (migration `ci000droprot`);
+workers now mint a fresh session id per rotation, so nothing orders them any more.
+
+**Still open: the first-use half.** Whether a *freshly minted* session id connects as well as one
+already established remains unmeasured, and it is now on the critical path for every login rather
+than for pool ordering. The retracted 0.5%/92% figures say nothing about it (§16).
+**Scope caveat:** airtight for soax (31,600 rows, the TTLs are ours to read). Webshare's session
+lifetime is provider-determined and undocumented here, so the arithmetic does not transfer — its
+11,000 rows were equally dead by `last_used_at`, which is the weaker ground the same conclusion
+rests on there.
+**Settled by:** the same clean re-measurement, now comparing a minted id's first connection against
+a deliberately pre-established one, browser-only.
 
 ### Q3. What is the ScheduleController form-state TTL?
 Assumed ~90–120 s, inherited from storm-auto. **Never measured in storm-hub.**

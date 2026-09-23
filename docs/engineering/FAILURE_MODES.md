@@ -600,3 +600,133 @@ APP (our logic/state) · OPS (configuration, deployment, human action).
   flapping. It now waits out the remainder in 1s chunks, checking `is_stopped`. The wait is
   **capped** (`_SLOTS_MAX_PACING_SLEEP = 20s`, not the full 100s interval) because an APPLY worker
   that is self-scouting runs this same path and must stay able to act on a real assignment.
+
+## F37 — an eligibility gate that lived only in the dashboard, over a status that never meant what it was read as
+- **Class:** APP
+- **Symptom:** identities with nothing to log in with were offered as attachable, attached, and
+  launched. The worker leased a proxy, solved a CAPTCHA and attempted a login against a sub-account
+  the portal has never verified — there is no confirmed account behind those credentials, so the
+  login cannot succeed, and the run pays for the attempt in full.
+- **Cause, part 1 — a derived field read as an answer to a different question.** The attach panel
+  filtered on `Identity.status === "active"`. `IdentityStatus.ACTIVE`'s own definition is ">=1
+  sub-account **exists**", and `gen_subaccounts_bulk` / the CSV import set it the moment sub-account
+  rows are GENERATED (`status="new"`). It says nothing about registration or verification. The same
+  class as `Identity.status` being stale eight days after a real booking (see `attach_identity`'s
+  own note): a derived field is evidence about what it was derived from, never about what a caller
+  wishes it meant.
+- **Cause, part 2 — the only gate was in the UI.** Nothing behind the panel re-checked.
+  `_rank_live_sub_accounts` ranked `REGISTERED` 3rd and `NEW` 4th, i.e. it deliberately HANDED an
+  unverified account to a live worker once the verified ones ran out, and `_do_launch_worker` took
+  `ranked_subs[0]` whatever it was. A rotation into an account that cannot log in is not a fallback;
+  it is a slower failure that costs a proxy lease, a CAPTCHA solve and one slot of the
+  sticky/rotating login budget.
+- **The first fix was the same bug again.** It rebuilt the tier client-side: fetch `/sub-accounts`,
+  filter `["verified","login_ok","held"]` in JSX, gate on that. Correct on the day it was written
+  and free to drift from `_rank_live_sub_accounts` the day the enum changes — a second copy of a
+  domain rule, in a language that cannot import the first.
+- **Fixed 2026-09-04, in three parts:**
+  1. `READY_SUB_ACCOUNT_STATUSES` in `libs/domain/enums.py` is the one definition;
+     `_rank_live_sub_accounts` filters on it, so NEW/REGISTERED/BOOKED are never candidates.
+  2. `GET /identities` reports `ready_sub_accounts` (a count, computed from that set); the dashboard
+     renders it and computes nothing.
+  3. `_do_launch_worker` refuses a live launch with no ready sub-account, naming how many are still
+     unverified. The UI filter is a convenience; the launch gate is the guarantee. Attach stays
+     permissive on purpose — registration legitimately finishes after attach.
+- **Drift guard:** `tests/hub/test_sub_account_readiness_parity.py` asserts, for every member of
+  `SubAccountStatus`, that what `GET /identities` reports is exactly what the launch gate enforces,
+  and fails if a sub-account status literal reappears inside the attach panel's JSX.
+- **The general rule:** an eligibility rule enforced only where it is displayed is not enforced. Put
+  it where the resource is actually spent, publish the result, and bind the two with a test.
+
+### F-swap-probe. `do_swap` validated with a WARMED-session check at a point that is never warmed
+**Measured live, booking Test 0916, 2026-09-16: 20/20 swap attempts failed** — 5 workers × 4
+attempts, every one logging `do_swap: new session failed health check -- reverting to phase-1
+proxy`. Deterministic, not flaky.
+
+`do_swap` runs between `LOGGED_IN` and `KEEPING`. Warmup has been **deferred** to the
+slot-open/slot-found signal since 2026-09-09, so a worker at that point is by definition **not
+warmed** — the keepalive code says so in its own comment: *"there is no form-state to verify here
+even in principle."* But `do_swap` validated the moved session with `_probe_alive()`, which
+navigates `Schedule.jsp` and requires `cmbPeriodo`/`getPeriodosOcupados` — markers that only exist
+once warmup has built the form-state anchor. The check asked *"is this session warmed?"* at the one
+point in the lifecycle where the machine guarantees it is not, so it could never pass.
+
+**Origin:** the swap used to run *after* warmup. When `HOLD_SWAP_AFTER_WARMUP` became
+`HOLD_SWAP_AFTER_LOGIN` and moved ahead of warmup, the probe was left pointing at the old lifecycle
+— the same class of stale-ordering bug as the substate display fixed the same day.
+
+**Cost:** each failure triggers a `HOLD_SWAP_RETRY_HOLD_SECS` backoff (600 s), so every worker spent
+~40 minutes parked at `LOGGED_IN`, unwarmed and with no keepalive running, before falling through to
+`KEEPING` still on its phase-1 rotating proxy. The three appointments that run booked were made over
+**soax rotating**; the leased ISP exits were allocated, probed, abandoned four times each, and never
+carried a session. Static ISP hold has therefore never actually been exercised in production.
+
+**Why no test caught it:** `_FakeSession` returns `"<html>cmbPeriodo</html>"` for *every* URL — a
+session that is always warmed. Every `do_swap` test passed against a double that could not express
+the failing state. The fix adds `_UnwarmedSession` (authenticated home, bare `Schedule.jsp`) and
+asserts through `do_swap` itself rather than on the probe in isolation — the first version of the
+test called the new probe directly and passed happily with the old one still wired in.
+
+**Fix:** `_probe_swapped_session()` classifies the **home page** with
+`classify_session_state(..., warmed=False)` — the same evidence the auth-only keepalive uses.
+`_probe_alive` is unchanged and still correct for its other caller, the checkpoint-restore path,
+which restores `posto_pdf` and legitimately expects a warmed session.
+
+**Rule this generalises:** when a step moves in the lifecycle, every check it performs has to be
+re-read against the new position. A probe is an assertion about *when* it runs, not only *what* it
+tests.
+
+### F-phantom-slots. The calendar path manufactures slots from the portal's fallback template
+**Confirmed live, Booking 0918, 2026-09-18, slot-open 10:39.** One scout got a real `Schedule.jsp`
+during the ~60 s the portal stayed up, then reported `{3,4}` on 2026-10-14 **and** `{3,4}` on
+2026-10-15. The portal's own calendar showed 12/13/14 October available and the 15th greyed out.
+Both fired `slot_found`; three apply workers leased them, re-warmed into a 503, and the recovery
+ladder escalated them to re-login — discarding authenticated sessions and spending reCAPTCHA strikes
+on slots that did not exist.
+
+**Mechanism.** The calendar path derives availability by *subtraction*: `free = active range −
+closed prefix`, decoded from `getPeriodosOcupados`. That inference cannot distinguish "the portal
+answered this date" from "the backend query failed and the portal served its template with a default
+occupied string". Under load the second happens; the `periodos_ocupados='…'` marker is still
+present, so the parser succeeds, and **every date decodes to the same thin set**. The codebase named
+this exact hazard when it removed the calendar *fallback* on 2026-09-02 ("the exact inference that
+manufactures phantom slots") — but the primary calendar path carried the same inference with no
+guard.
+
+**Signature (operator-confirmed on earlier runs):** "only 3, 4 periods per every day and fewer
+slots than expected". Uniformity across dates is the load-bearing half — a real open answers each
+date differently; only a template answers every date identically. Test 0916 booked real appointments
+on dates that all showed `{3,4,5}`, which is why the size bound is needed alongside uniformity.
+
+**Guard:** `_reject_phantom_round` — a round with ≥ `PHANTOM_MIN_DATES` (2) found dates, all with the
+same period set of ≤ `PHANTOM_MAX_PERIODS` (2) entries, is reported as **failed (unknown)**, never
+found and never empty: no slot rows, no `slot_found`, no date retirement; the next round asks again.
+The raw occupied string is now logged per phantom round, so the next real open leaves evidence to
+refine the rule with — until 2026-09-18 it was discarded the moment it was decoded.
+
+**Definitive check, not yet built:** the portal's calendar widget renders available days from
+*something* in the `gettime` response. Only `SPECIAL_DAYS` (closed days) is parsed today. If the
+available-days list is there, cross-checking finds against it would replace this heuristic with
+ground truth. Needs a live `gettime` body to inspect; the portal was 503 when this was written.
+
+### F-nationality-truncation. Unknown passport demonyms were truncated into invalid portal codes
+**Measured 2026-09-19.** Registration failed 100% for every nationality the importer's five-entry
+map did not know: `GUINEENS` 0/14, `GUINÉENN` 0/4, `GHANAIAN` 0/2, against ~1% for the mapped `CPV`
+(483/489) and `SEN` (12/12). The portal's registration form takes an ISO 3166-1 alpha-3 code; passport
+OCR yields the demonym in the passport's own language (Portuguese `CABO-VERDIANA`, French `GUINÉENNE`,
+English `GHANAIAN`). The old `_map_nationality` fell back to `value.upper()[:8]` for anything unmapped,
+so a demonym was stored as a truncated fragment and sent to the portal as a code -- which it rejects.
+
+**The truncation also destroyed the evidence**, which is the sharper lesson. Both broken Guinea values
+were cut at exactly 8 characters, and the 8th-plus letters are what distinguish the two countries:
+`GUINEENSE` (Guinea-Bissau, Portuguese, GNB) and `GUINÉENNE` (Guinea-Conakry, French, GIN) both
+truncate to something an operator cannot tell apart. The passports settled it (C00-prefixed +
+Bissau surnames vs 9-digit + Barry), but a lossy transform must never put the operator there.
+
+**Fix:** `libs/domain/nationality.py::to_iso3` -- a proper demonym→ISO-3 map (diacritic- and
+separator-insensitive, masculine/feminine/plural forms, ~40 nationalities relevant to this pool),
+returning `(code, error)`. An unrecognised value is a NAMED IMPORT ERROR that skips the record, never
+a silent truncated code. The importer (labeled + CSV) surfaces it against the person's name;
+`scripts/repair_nationalities.py` re-mapped the 10 already-broken rows in place (GUINEENS→GNB×7,
+GUINÉENN→GIN×2, GHANAIAN→GHA×1). ISO-3 is the confirmed contract because SEN/CPV -- the only codes
+that ever registered -- are exactly ISO-3.
