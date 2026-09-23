@@ -4,8 +4,8 @@ import time
 import fakeredis
 import pytest
 
-from libs.bus.names import semaphore_key
-from libs.bus.semaphore import RedisSemaphore, make_gate
+from libs.bus.names import provider_semaphore_key, semaphore_key
+from libs.bus.semaphore import RedisSemaphore, make_gate, make_provider_gate
 
 
 @pytest.fixture()
@@ -55,6 +55,36 @@ def test_refresh_extends_holder_and_returns_false_if_pruned(r):
 def test_make_gate_uses_expected_key_pattern(r):
     gate = make_gate(r, booking_id="bk1", name="login", limit=5)
     assert gate.key == semaphore_key("login", "bk1")
+
+
+def test_provider_gate_is_shared_across_bookings(r):
+    """THE point of the pool gate (2026-09-15): the limit it models belongs to the provider, and
+    the soax package is shared by every booking on the host. Two bookings each staying under their
+    own LOGIN_CONCURRENCY is exactly how the fleet jointly blew through the provider's limit --
+    acknowledged-but-unimplemented at apps/hub/main.py:1776. So the key must NOT carry a booking."""
+    a = make_provider_gate(r, "soax", "rotating", limit=2)
+    b = make_provider_gate(r, "soax", "rotating", limit=2)
+    assert a.key == b.key == provider_semaphore_key("soax", "rotating")
+    assert "bk" not in a.key
+
+    assert a.acquire("bk1:w1") is True
+    assert b.acquire("bk2:w1") is True
+    # A third holder from EITHER booking is refused -- the gate is genuinely joint.
+    assert a.acquire("bk1:w2") is False
+    assert b.acquire("bk2:w2") is False
+
+
+def test_provider_gate_separates_distinct_pools(r):
+    """soax/rotating, soax/mobile and webshare are different packages with different limits (and,
+    per the catalog, different passwords) -- they must not contend with each other."""
+    rot = make_provider_gate(r, "soax", "rotating", limit=1)
+    mob = make_provider_gate(r, "soax", "mobile", limit=1)
+    web = make_provider_gate(r, "webshare", None, limit=1)
+    assert len({rot.key, mob.key, web.key}) == 3
+    assert rot.acquire("h") is True
+    assert mob.acquire("h") is True    # same holder id, different pool -- not blocked
+    assert web.acquire("h") is True
+    assert rot.acquire("other") is False
 
 
 def test_backstop_ttl_set_on_the_key(r):

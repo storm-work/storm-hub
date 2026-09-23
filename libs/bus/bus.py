@@ -93,11 +93,13 @@ class Bus:
             if "BUSYGROUP" not in str(e):
                 raise
 
-    def read_commands(self, worker_id: str, consumer: str, *, block_ms: int = 1000,
+    def read_commands(self, worker_id: str, consumer: str, *, block_ms: int | None = 1000,
                       count: int = 10) -> list[Message]:
         self.ensure_command_group(worker_id)
         resp = self.r.xreadgroup(
             cmd_group(worker_id), consumer,
+            # block=None omits BLOCK entirely (non-blocking). block=0 would mean "BLOCK 0" --
+            # block FOREVER -- which is why BusSignals.poll passes None, not 0.
             {CMD_STREAM(worker_id): ">"}, count=count, block=block_ms,
         )
         out: list[Message] = []

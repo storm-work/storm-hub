@@ -20,6 +20,21 @@ def semaphore_key(name: str, booking_id: str) -> str:
     return f"sem:{name}:{booking_id}"
 
 
+def provider_semaphore_key(provider: str, kind: str | None) -> str:
+    """Concurrency gate scoped to a PROXY POOL, deliberately not to a booking.
+
+    Every other semaphore here is per-booking, because every other limit is ours. This one models
+    somebody else's limit: soax does not establish unlimited concurrent sticky sessions per package,
+    and the package is shared by every booking on the host. A per-booking key would let two bookings
+    each stay under their own cap and jointly blow through the provider's -- which is exactly the
+    gap acknowledged-but-unimplemented at apps/hub/main.py:1776.
+
+    Replaces the `max_sessions` column as the real bound. That column never bounded anything: all
+    42,600 rows carried max_sessions=2, a nominal 85,200-lease ceiling nothing could ever reach.
+    """
+    return f"sem:pool:{provider}:{kind or 'default'}"
+
+
 def breaker_key(booking_id: str) -> str:
     return f"breaker:{booking_id}"
 

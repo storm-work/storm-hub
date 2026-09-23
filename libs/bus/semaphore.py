@@ -18,7 +18,7 @@ import time
 
 import redis
 
-from .names import semaphore_key
+from .names import provider_semaphore_key, semaphore_key
 
 _ACQUIRE_SCRIPT = """
 redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[2] - ARGV[3])
@@ -93,3 +93,18 @@ class RedisSemaphore:
 
 def make_gate(r: "redis.Redis", booking_id: str, name: str, limit: int, **kwargs) -> RedisSemaphore:
     return RedisSemaphore(r, semaphore_key(name, booking_id), limit, **kwargs)
+
+
+def make_provider_gate(r: "redis.Redis", provider: str, kind: str | None, limit: int,
+                       **kwargs) -> RedisSemaphore:
+    """Host-wide gate on concurrent session ESTABLISHMENT against one proxy pool.
+
+    Deliberately host-wide rather than per-booking -- see provider_semaphore_key's docstring for
+    why a per-booking cap cannot bound a limit that belongs to the provider.
+
+    Holders are released as soon as the login attempt finishes, so this bounds the RATE of new
+    sticky sessions being established, not the number held. That is the quantity that produced the
+    2026-09-11 ERR_CONNECTION_CLOSED storms: ~40-160 workers all establishing fresh exits against
+    one package inside the same few seconds.
+    """
+    return RedisSemaphore(r, provider_semaphore_key(provider, kind), limit, **kwargs)
