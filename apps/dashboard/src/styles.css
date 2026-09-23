@@ -161,6 +161,22 @@ button.btn:disabled { opacity: 0.5; cursor: not-allowed; }
 table { width: 100%; table-layout: fixed; border-collapse: collapse; font-size: 14px; }
 th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); overflow-wrap: break-word; word-break: break-word; }
 th { color: var(--muted); font-weight: 500; font-size: 12px; text-transform: uppercase; letter-spacing: 0.4px; }
+/* A header never wraps. With `table-layout: fixed` above, a column that ends up narrower than its
+   own header -- which happens the moment sibling widths sum past 100%, and did on the Proxies page
+   when four columns were added -- combines with `word-break: break-word` on the row above to break
+   the LABEL one character per line, rendering a vertical tower of letters. Truncating with an
+   ellipsis is wrong-but-legible; a letter tower is neither. Cells keep wrapping: their content is
+   data the operator may need in full. */
+th { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* Long single-token cell values (proxy endpoints, credential strings) truncate on one line instead
+   of forcing the row several lines tall. The full value stays available via `title`. */
+td.ellipsis { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* The row-number column's own width (36px) minus padding leaves little room, and the base rule's
+   word-break: break-word wraps a 2-3 digit number onto multiple lines under any pressure from
+   other columns -- fixed-layout tables size columns off the header row, so nowrap on the header
+   alone doesn't stop the body cell from wrapping. Applied to the numbering <td> specifically, not
+   .muted generally (used for many cells that should still wrap/truncate normally). */
+.row-num { white-space: nowrap; }
 /* white-space: nowrap is load-bearing, not cosmetic. A pill is a single label; in a narrow column
    (the attach panel's Type/Role at 16% inside a side panel) the text broke mid-word and rendered as
    "re al" / "ap ply" stacked vertically, which reads as corrupted data rather than a tight column.

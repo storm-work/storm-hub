@@ -56,6 +56,34 @@ function useEvents(enabled) {
 // Generic client-side search + click-to-sort for any row array. Small and reused across every
 // table page instead of a bespoke filter per page (conversation_extract #224: "sort/filter/search
 // by table or by column features for all tables").
+// Distinct target postos across a list of identities, sorted, for a filter dropdown. Identities
+// with no target (test identities, or reals imported without one) are grouped under "" so the
+// filter can select them explicitly -- "which of these are unassigned?" is a real question when
+// preparing a booking, and a filter that could only pick named postos would have no answer for it.
+function targetPostoOptions(identities) {
+  const set = new Set();
+  let hasNone = false;
+  for (const i of identities || []) {
+    if (i.target_posto) set.add(String(i.target_posto)); else hasNone = true;
+  }
+  return { postos: [...set].sort(), hasNone };
+}
+
+function matchesTargetPosto(identity, filter) {
+  if (filter === "all") return true;
+  if (filter === "none") return !identity.target_posto;
+  return String(identity.target_posto || "") === filter;
+}
+
+// Comments are freeform (in practice "++" or empty), so a case-insensitive CONTAINS match beats a
+// dropdown -- it filters the "++" batch today and any future note without a code change. A blank
+// query matches everything.
+function matchesComment(identity, query) {
+  const q = (query || "").trim().toLowerCase();
+  if (!q) return true;
+  return String(identity.comment || "").toLowerCase().includes(q);
+}
+
 function useSortSearch(rows, initialSort) {
   const [q, setQ] = useState("");
   const [sort, setSort] = useState(initialSort || null); // {key, dir}
@@ -164,7 +192,11 @@ export default function App() {
   // Enforcement still lives on the server -- require_operator / the admin checks on those endpoints
   // are what actually protect them. This hides what a viewer cannot use, so the UI stops offering
   // dead ends; it is not the security boundary.
-  const HIDDEN_FOR_VIEWER = new Set(["templates", "settings", "ops", "audit", "sessions"]);
+  // "sessions" deliberately NOT hidden from viewers (2026-09-10): a capped/paused viewer session
+  // needs to reach the "Request extra session" button somewhere, and Sessions is where it lives.
+  // Not a security boundary either way -- GET /sessions already has no role restriction, and the
+  // admin-only actions on that page (force-remove, grant/deny) already gate on me.role==="admin".
+  const HIDDEN_FOR_VIEWER = new Set(["templates", "settings", "ops", "audit"]);
   const visiblePages = ["bookings", "identities", "registration", "proxies",
                         "templates", "settings", "ops", "audit", "sessions"]
     .filter((p) => me.role !== "viewer" || !HIDDEN_FOR_VIEWER.has(p));
@@ -284,7 +316,12 @@ function useList(path, { pollMs = 0 } = {}) {
 }
 
 function Bookings({ me, events, setLeftPanel, setRightPanel }) {
-  const { rows, err, reload } = useList("/bookings", { pollMs: 5000 });
+  // Archived bookings are hidden server-side by default; the toggle asks for them explicitly.
+  // Filtering server-side rather than fetching everything and hiding in the browser keeps the
+  // default page cheap as old runs accumulate -- the same reason the proxy list is paginated.
+  const [showArchived, setShowArchived] = useState(false);
+  const { rows, err, reload } = useList(
+    `/bookings${showArchived ? "?include_archived=true" : ""}`, { pollMs: 5000 });
   const [selectedId, setSelectedId] = useState(null);
   const [showCreate, setShowCreate] = useState(false);
   const booking = rows.find((b) => b.id === selectedId) || null;
@@ -300,10 +337,11 @@ function Bookings({ me, events, setLeftPanel, setRightPanel }) {
       title: "Bookings",
       closable: false,
       content: <BookingListPanel me={me} bookings={rows} selectedId={selectedId}
-        onSelect={setSelectedId} onNew={() => setShowCreate(true)} />,
+        onSelect={setSelectedId} onNew={() => setShowCreate(true)}
+        showArchived={showArchived} onToggleArchived={() => setShowArchived((v) => !v)} />,
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [rows, selectedId]);
+  }, [rows, selectedId, showArchived]);
   useEffect(() => () => setLeftPanel(null), []); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
@@ -331,7 +369,8 @@ function Bookings({ me, events, setLeftPanel, setRightPanel }) {
   );
 }
 
-function BookingListPanel({ me, bookings, selectedId, onSelect, onNew }) {
+function BookingListPanel({ me, bookings, selectedId, onSelect, onNew,
+                           showArchived, onToggleArchived }) {
   const [filter, setFilter] = useState("all"); // all | test | real
   const enriched = bookings.map((b) => ({ ...b, _date: b.warmup_start_at || b.created_at || "" }));
   const filtered = enriched.filter((b) => filter === "all" || b.type === filter);
@@ -349,19 +388,27 @@ function BookingListPanel({ me, bookings, selectedId, onSelect, onNew }) {
           <option value="all">all types</option><option value="test">test</option><option value="real">real</option>
         </select>
       </div>
+      <div className="field" style={{ marginBottom: 10, display: "flex", alignItems: "center", gap: 8 }}>
+        <input type="checkbox" id="show-archived" checked={!!showArchived} onChange={onToggleArchived} />
+        <label htmlFor="show-archived" style={{ margin: 0, fontSize: 13 }}>Show archived</label>
+      </div>
       <table className="table-compact">
         <thead><tr>
-          <th style={{ width: 24 }}>#</th>
+          <th style={{ width: 36, whiteSpace: "nowrap" }}>#</th>
           <Sortable label="Name" k="name" sort={sort} setSort={setSort} w="42%" />
           <Sortable label="Date" k="_date" sort={sort} setSort={setSort} w="26%" />
           <Sortable label="Status" k="status" sort={sort} setSort={setSort} w="24%" />
         </tr></thead>
         <tbody>{shown.map((b, i) => (
           <tr key={b.id} className={`row-clickable${b.id === selectedId ? " row-selected" : ""}`} onClick={() => onSelect(b.id)}>
-            <td className="muted">{i + 1}</td>
+            <td className="muted row-num">{i + 1}</td>
             <td>{b.name}</td>
             <td className="muted">{b._date ? b._date.slice(0, 10) : "—"}</td>
-            <td className="muted">{b.status}</td>
+            {/* The archived marker sits BESIDE the status, never replacing it: status records how
+                the run ended, which is the most useful thing about an old booking. */}
+            <td className="muted">
+              {b.status}{b.archived_at ? <span className="muted" title="archived"> · 🗄</span> : ""}
+            </td>
           </tr>
         ))}</tbody>
       </table>
@@ -472,13 +519,32 @@ function actionTitle(action, status) {
 
 // The operator's requested run-summary layout (2026-08-14): 8 named phases in a fixed 2-column
 // grid, always shown (including zeros) so the panel's shape stays stable at a glance rather than
-// reflowing as workers move between phases. Left column = session lifecycle, right = what the
-// worker is actually doing.
+// reflowing as workers move between phases.
+//
+// LEFT COLUMN IS THE SESSION LIFECYCLE, IN ORDER; right column is what the worker is doing with
+// it; the last row is the two terminal outcomes side by side.
+//
+// Reordered 2026-09-16: this grid still listed `warming_up` ABOVE `keeping`, which was the
+// lifecycle before warmup became deferred. It has been backwards since 2026-09-09. The real order
+// is in libs/engine/phases.py's own docstring --
+//
+//     common:  login -> swap-to-ISP -> KEEPING
+//     apply :  KEEPING -> (slot-found) -> warmup -> applying/book
+//     scout :  KEEPING -> (slot-open)  -> warmup -> discovering
+//
+// -- i.e. a KEEPING worker is by definition NOT warmed yet; it is holding an AUTHENTICATED session
+// and warms only when the signal that needs the form-state arrives. Reading the panel top-down
+// therefore told the opposite story to the one the machine follows, on the exact two states an
+// operator watches during a run. (WARMING_UP precedes KEEPING only in `warmup_only` mode, a
+// terminal diagnostic path that never reaches KEEPING at all.)
+//
+// `failed` and `booked` now share the bottom row because they are the two STATUS_COUNTED terminal
+// outcomes below -- previously they sat diagonally opposite for no reason.
 const RUN_SUMMARY_ROWS = [
-  ["failed", "discovering"],
-  ["logging_in", "polling"],
+  ["logging_in", "discovering"],
+  ["keeping", "polling"],
   ["warming_up", "applying"],
-  ["holding", "booked"],
+  ["failed", "booked"],
 ];
 
 // `failed` and `booked` are STATUSES, not substates -- and counting them off substates (as the
@@ -589,6 +655,42 @@ function BookingOverview({ me, booking, events, workers, onBookingChanged, onDel
     const r = await api(`/bookings/${booking.id}/self-scout`, { method: "POST" });
     if (r && r.commanded) setMsg(`${r.commanded} apply worker(s) told to discover slots themselves.`);
   }, "self-scouting");
+  // Blind apply (operator direction 2026-09-18). For the moment the operator has confirmed
+  // availability BY EYE on the portal's calendar and the system has found nothing -- /slots is on
+  // record as under-reporting, and the calendar path manufactures phantoms under load. Seeds the
+  // slot pool with a (date x period) grid; the existing apply machinery does the rest (assignment,
+  // multi-capacity leasing, bounce -> next combination, booking). Deliberately manual and prompted:
+  // a blind sweep is the densest submit load this fleet generates, so it is a decision, not a
+  // background behaviour. Periods default to the posto's PROVEN set (libs/domain/blind.py).
+  const blindApply = () => act(async () => {
+    const dflt = booking.settings_json || {};
+    const dates = window.prompt(
+      "BLIND APPLY — dates you have CONFIRMED open on the portal's calendar, comma-separated "
+      + "(ISO, weekdays only). Leave as-is to use the booking's whole CAL window.",
+      dflt.CAL_START_DATE && dflt.CAL_END_DATE ? `${dflt.CAL_START_DATE}..${dflt.CAL_END_DATE}` : "");
+    if (dates === null) return;
+    const periods = window.prompt(
+      "Periods to try, comma-separated. Leave blank for this posto's proven set "
+      + "(2032: 3,4,5 · 3018/3059: 4,5,7,8 · unknown posto: 3,4,5,7,8).\n"
+      + "3 = 09-10h, 4 = 10-11h, 5 = 11-12h.", "");
+    if (periods === null) return;
+    const body = {};
+    if (dates.trim() && !dates.includes("..")) body.dates = dates;
+    if (periods.trim()) body.periods = periods;
+    try {
+      const r = await api(`/bookings/${booking.id}/blind-apply`, { method: "POST", body });
+      setMsg(`Seeded ${r.seeded} blind slot(s) across ${r.dates.length} date(s) × periods `
+        + `[${r.periods.join(",")}]${r.skipped_existing ? ` (${r.skipped_existing} already existed)` : ""}. `
+        + `Apply workers will be assigned on the next tick.`);
+    } catch (e) {
+      if (/already has \d+ AVAILABLE/.test(e.message)
+          && window.confirm(`${e.message}\n\nSeed anyway (force)?`)) {
+        const r = await api(`/bookings/${booking.id}/blind-apply`,
+                            { method: "POST", body: { ...body, force: true } });
+        setMsg(`Seeded ${r.seeded} blind slot(s) (forced).`);
+      } else { throw e; }
+    }
+  }, "blind-apply");
   async function duplicateBooking() {
     setMsg("");
     try {
@@ -609,6 +711,18 @@ function BookingOverview({ me, booking, events, workers, onBookingChanged, onDel
     setMsg("");
     try { await api(`/bookings/${booking.id}`, { method: "DELETE" }); onDeleted(); }
     catch (e) { setMsg(e.message); }
+  }
+  // Archive is a VISIBILITY action, not a lifecycle one -- it never touches `status`, so an
+  // archived booking still reads "completed" or "stopped" and keeps the record of how it ended.
+  // The server refuses while the booking is live (scheduled/warming/armed/running): hiding a run
+  // the scheduler is still driving would make it invisible on the page used to watch it.
+  async function toggleArchive() {
+    setMsg("");
+    const act_ = booking.archived_at ? "unarchive" : "archive";
+    try {
+      await api(`/bookings/${booking.id}/${act_}`, { method: "POST" });
+      onBookingChanged();
+    } catch (e) { setMsg(e.message); }
   }
   const saveEdit = () => act(async () => {
     await api(`/bookings/${booking.id}`, {
@@ -638,6 +752,13 @@ function BookingOverview({ me, booking, events, workers, onBookingChanged, onDel
     && new Date(booking.warmup_start_at).getTime() > Date.now();
   const canSchedule = warmupInFuture
     && ["draft", "scheduled", "stopped"].includes(booking.status);
+  // Genuine blind-apply mode (BLIND_APPLY_MODE, set from the booking settings editor): the pool is
+  // seeded BEFORE the run and the scheduler auto-fires slot-open -> slot-found off it, so seeding
+  // must be reachable pre-start. The backend /blind-apply guard is relaxed the same way.
+  const blindMode = !!(booking.settings_json || {}).BLIND_APPLY_MODE;
+  const canSeedBlind = booking.status === "running"
+    ? !!booking.slot_open_fired_at
+    : blindMode && ["draft", "scheduled", "stopped"].includes(booking.status);
 
   return (
     <div className="card">
@@ -702,9 +823,25 @@ function BookingOverview({ me, booking, events, workers, onBookingChanged, onDel
                  ? `booking is ${booking.status} — self-scout needs a running booking (there is nothing to discover before slot-open)`
                  : "tell every HOLDING apply worker to discover slots itself — use when the scouts look busy but are finding nothing"}>
           {busy === "self-scouting" ? "Sending…" : "🔎 Self-scout now"}</button>
+        <button className="btn ghost" disabled={!op || !canSeedBlind || !!busy}
+          onClick={blindApply}
+          title={canSeedBlind
+                 ? (blindMode && booking.status !== "running"
+                    ? "BLIND MODE: seed the slot pool now, before the run — Start will auto-fire slot-open then slot-found off this pool"
+                    : "seed the slot pool with a date × period grid and let apply workers try the combinations — ONLY when you have confirmed availability on the portal yourself and discovery finds nothing")
+                 : booking.status === "running"
+                   ? "fire slot-open first — apply workers are not waiting for assignments yet"
+                   : `turn on BLIND_APPLY_MODE in this booking's settings to seed before the run (booking is ${booking.status})`}>
+          {busy === "blind-apply" ? "Seeding…" : blindMode ? "🌑 Blind mode: seed…" : "🎯 Blind apply…"}</button>
         <button className="btn ghost" disabled={!op || !canStop || !!busy} onClick={stopAll} title={!canStop ? `booking is ${booking.status}` : "stop all running workers"}>■ Stop</button>
         <button className="btn ghost" disabled={!op || !!busy} onClick={duplicateBooking}
           title="create a DRAFT copy of this booking's configuration — identities are not carried over">⧉ Duplicate</button>
+        <button className="btn ghost" disabled={!op} onClick={toggleArchive}
+          title={booking.archived_at
+            ? "bring this booking back into the default list"
+            : "hide this booking from the default list — keeps its status and history, and is reversible"}>
+          {booking.archived_at ? "↩ Unarchive" : "🗄 Archive"}
+        </button>
         <button className="btn ghost" disabled={!op} onClick={deleteBooking} title="permanently delete this booking and everything on it">🗑 Delete</button>
       </div>
       <div className="row muted" style={{ fontSize: 13, marginBottom: 6, gap: 14, flexWrap: "wrap" }}>
@@ -732,15 +869,44 @@ function BookingOverview({ me, booking, events, workers, onBookingChanged, onDel
 // {provider, kind: ""} means "any kind of that provider" (PROXY_KIND/HOLD_PROXY_KIND blank = no
 // filter, see apps/hub/main.py's `eff.get("...KIND") or None`). Falls back to the two known
 // providers (soax/webshare) when no proxies are loaded yet, so the dropdown is never empty.
-function derivePoolOptions(proxyRows) {
-  const providers = [...new Set(proxyRows.map((p) => p.provider))].sort();
-  if (providers.length === 0) return [{ provider: "soax", kind: "", label: "soax (any kind)" },
-                                       { provider: "webshare", kind: "", label: "webshare (any kind)" }];
-  const out = [];
+// Takes the AGGREGATED pool rows from GET /proxies/pools ({provider, kind, geo, total, active,
+// unhealthy, leasable}), not the full proxy table. Every picker on every page used to derive its
+// ~3 dropdown options by downloading all 42,600 proxy rows -- 14.8 MB and ~340k DOM nodes, which
+// is what stopped the Proxies page working at all (measured 2026-09-15). The aggregate is ~2.3 KB.
+//
+// ROTATING POOLS ARE NOT ROWS (2026-09-15, migration ci000droprot). A rotating pool is a set of
+// credentials in global settings; the worker mints its own session id against it. So the three
+// rotating pools are a FIXED, known list, and deriving them from `poolRows` would make them
+// disappear from every picker the moment the migration ran -- the old `providers.length === 0`
+// fallback only guessed two of them and silently dropped soax/mobile entirely.
+//
+// Static/ISP pools ARE rows (finite, individually-owned IPs), so those are still derived from the
+// aggregate and appended. The aggregate is GET /proxies/pools (~2.3 KB); every picker used to
+// derive its ~3 options by downloading all 42,600 proxy rows -- 14.8 MB and ~340k DOM nodes, which
+// is what stopped the Proxies page working at all (measured 2026-09-15).
+// The blank-kind ("any kind") entries are NOT decoration: PROXY_KIND/HOLD_PROXY_KIND default to ""
+// and most existing bookings store exactly that, so the select's value is `soax|`. Drop these and
+// that value matches no option -- the dropdown then renders its first entry instead, silently
+// showing a pool the booking is not configured for, and any later edit saves from that wrong
+// baseline. Blank is also still meaningful to the backend: mint_rotating_url treats a falsy kind as
+// the provider's rotating pool, and lease_proxy treats it as "no kind filter".
+const ROTATING_POOLS = [
+  { provider: "soax", kind: "", label: "soax (any kind)" },
+  { provider: "soax", kind: "rotating", label: "soax / rotating (self-minted)" },
+  { provider: "soax", kind: "mobile", label: "soax / mobile (self-minted)" },
+  { provider: "webshare", kind: "", label: "webshare (any kind)" },
+  { provider: "webshare", kind: "rotating", label: "webshare / rotating (self-minted)" },
+];
+
+function derivePoolOptions(poolRows) {
+  const out = [...ROTATING_POOLS];
+  // Only static rows contribute; a rotating row here is pre-migration residue and is already
+  // represented above, so including it would duplicate the option.
+  const staticRows = poolRows.filter((p) => p.resource_type === "static");
+  const providers = [...new Set(staticRows.map((p) => p.provider))].sort();
   for (const provider of providers) {
-    out.push({ provider, kind: "", label: `${provider} (any kind)` });
-    const kinds = [...new Set(proxyRows.filter((p) => p.provider === provider).map((p) => p.kind))].sort();
-    for (const kind of kinds) out.push({ provider, kind, label: `${provider} / ${kind}` });
+    const kinds = [...new Set(staticRows.filter((p) => p.provider === provider).map((p) => p.kind))].sort();
+    for (const kind of kinds) out.push({ provider, kind, label: `${provider} / ${kind} (static/ISP)` });
   }
   return out;
 }
@@ -778,8 +944,54 @@ function useServerSyncedSettings(booking) {
 }
 
 
+// Multi-select over NAMED ISP pools. Multi is the requirement, not a nicety: an ISP purchase is a
+// fixed number of individually-owned IPs ("10 from Thordata") and that is routinely fewer than the
+// worker count, so a booking draws from the union of the pools it names. The running capacity total
+// is shown because that is the operator's actual question -- "do these cover my workers?" -- and
+// `leasable` (not total) is the honest number, since a deactivated or condemned static row really
+// is out of service.
+function IspPoolPicker({ label, value, onChange, disabled }) {
+  const { rows } = useList("/proxies/isp-pools");
+  const pools = (rows || []).filter((p) => p.pool_name);
+  const selected = String(value || "").split(",").map((s) => s.trim()).filter(Boolean);
+  const capacity = pools.filter((p) => selected.includes(p.pool_name))
+                        .reduce((n, p) => n + (p.leasable || 0), 0);
+  function toggle(name) {
+    const next = selected.includes(name) ? selected.filter((n) => n !== name) : [...selected, name];
+    onChange(next.join(","));
+  }
+  return (
+    <div className="field" style={{ margin: 0, minWidth: 260 }}>
+      <label>{label}</label>
+      {pools.length === 0 ? (
+        <div className="muted" style={{ fontSize: 12 }}>
+          No named ISP pools yet — import some on the Proxies page.
+        </div>
+      ) : (
+        <>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+            {pools.map((p) => (
+              <button key={p.pool_name} type="button" disabled={disabled}
+                className={"btn " + (selected.includes(p.pool_name) ? "" : "ghost")}
+                style={{ fontSize: 12, padding: "3px 8px" }}
+                onClick={() => toggle(p.pool_name)}>
+                {p.pool_name} ({p.leasable})
+              </button>
+            ))}
+          </div>
+          <div className="muted" style={{ fontSize: 12, marginTop: 4 }}>
+            {selected.length === 0
+              ? "None selected = any pool."
+              : `${selected.length} pool(s), ${capacity} proxies usable.`}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 function BookingShortcutSettings({ me, booking, onSaved }) {
-  const proxies = useList("/proxies");
+  const proxies = useList("/proxies/pools");
   const { settings, setSettings } = useServerSyncedSettings(booking);
   const [msg, setMsg] = useState("");
   const op = me.is_operating;
@@ -788,7 +1000,7 @@ function BookingShortcutSettings({ me, booking, onSaved }) {
   const poolValue = (provider, kind) => `${provider}|${kind}`;
   const warmupValue = poolValue(settings.PROXY_PROVIDER ?? "soax", settings.PROXY_KIND ?? "");
   const holdValue = poolValue(settings.HOLD_PROXY_PROVIDER ?? "soax", settings.HOLD_PROXY_KIND ?? "");
-  const swapOn = !!settings.HOLD_SWAP_AFTER_WARMUP;
+  const swapOn = !!settings.HOLD_SWAP_AFTER_LOGIN;
 
   // PATCH, not PUT. This panel owns a handful of proxy/swap fields; it used to write back its own
   // snapshot of the WHOLE settings object, taken when the page loaded -- so toggling a proxy pool
@@ -820,8 +1032,8 @@ function BookingShortcutSettings({ me, booking, onSaved }) {
       </div>
       <div className="field" style={{ margin: 0, display: "flex", alignItems: "center", gap: 8 }}>
         <input type="checkbox" id="hold-swap-toggle" checked={swapOn} disabled={!op}
-          onChange={(e) => saveFields({ HOLD_SWAP_AFTER_WARMUP: e.target.checked })} />
-        <label htmlFor="hold-swap-toggle" style={{ margin: 0 }}>Swap after warmup</label>
+          onChange={(e) => saveFields({ HOLD_SWAP_AFTER_LOGIN: e.target.checked })} />
+        <label htmlFor="hold-swap-toggle" style={{ margin: 0 }}>Swap after login</label>
       </div>
       <div className="field" style={{ margin: 0, minWidth: 220 }}>
         <label>Post-hold phase proxy pool{!swapOn ? " (enabled when swap is on)" : ""}</label>
@@ -830,6 +1042,17 @@ function BookingShortcutSettings({ me, booking, onSaved }) {
           {pools.map((p) => <option key={`h-${p.provider}-${p.kind}`} value={poolValue(p.provider, p.kind)}>{p.label}</option>)}
         </select>
       </div>
+      {/* Only meaningful when the phase draws from a STATIC pool -- rotating pools are minted per
+          worker and have no rows to belong to a named pool. Shown regardless rather than hidden on
+          the kind, because an operator selecting pools before switching the pool kind would
+          otherwise see the control vanish and assume the setting was lost. */}
+      <IspPoolPicker label="Warmup ISP pools" disabled={!op}
+        value={settings.PROXY_POOLS}
+        onChange={(v) => saveFields({ PROXY_POOLS: v })} />
+      <IspPoolPicker label={"Post-hold ISP pools" + (!swapOn ? " (enabled when swap is on)" : "")}
+        disabled={!op || !swapOn}
+        value={settings.HOLD_PROXY_POOLS}
+        onChange={(v) => saveFields({ HOLD_PROXY_POOLS: v })} />
     </div>
   );
 }
@@ -922,7 +1145,7 @@ function BookingSlots({ booking, me }) {
       {msg && <div className="banner">{msg}</div>}
       {err && <div className="banner err">{err}</div>}
       <table className="table-compact"><thead><tr>
-        <th style={{ width: 24 }}>#</th>
+        <th style={{ width: 36, whiteSpace: "nowrap" }}>#</th>
         <Sortable label="Date" k="date" sort={sort} setSort={setSort} w="19%" />
         <Sortable label="Period" k="period" sort={sort} setSort={setSort} w="11%" />
         <Sortable label="Status" k="status" sort={sort} setSort={setSort} w="16%" />
@@ -932,7 +1155,7 @@ function BookingSlots({ booking, me }) {
       </tr></thead>
         <tbody>{shown.map((s, i) => (
           <tr key={s.id}>
-            <td className="muted">{i + 1}</td>
+            <td className="muted row-num">{i + 1}</td>
             <td>{s.date}</td><td>{s.period}</td>
             <td><span className={`pill ${s.status === "available" ? "ok" : s.status === "taken" ? "err" : ""}`}>{s.status}</span></td>
             <td className="muted">{s.capacity_estimate ?? "—"}</td>
@@ -979,7 +1202,7 @@ function BookingAppointments({ booking }) {
       </div>
       {err && <div className="banner err">{err}</div>}
       <table className="table-compact"><thead><tr>
-        <th style={{ width: 24 }}>#</th>
+        <th style={{ width: 36, whiteSpace: "nowrap" }}>#</th>
         <Sortable label="Identity" k="identity_name" sort={sort} setSort={setSort} w="25%" />
         <Sortable label="Reference" k="appointment_ref" sort={sort} setSort={setSort} w="19%" />
         <Sortable label="Booked at" k="booked_at" sort={sort} setSort={setSort} w="25%" />
@@ -987,7 +1210,7 @@ function BookingAppointments({ booking }) {
       </tr></thead>
         <tbody>{shown.map((a, i) => (
           <tr key={a.id}>
-            <td className="muted">{i + 1}</td>
+            <td className="muted row-num">{i + 1}</td>
             <td>{a.identity_name}</td>
             <td className="muted">{a.appointment_ref || "—"}</td>
             <td className="muted">{a.booked_at ? a.booked_at.slice(0, 19).replace("T", " ") : "—"}</td>
@@ -1188,6 +1411,7 @@ function BookingWorkers({ me, booking, events, workers, setRightPanel }) {
     return {
       ...w,
       identity_name: ident ? ident.full_name : w.identity_id.slice(0, 8),
+      passport_no: (ident && ident.passport_no) || "",
       live_substate: view.substate || "—",
       live_outcome: view.outcome || "",
       substate_detail: view.detail || "",
@@ -1273,25 +1497,28 @@ function BookingWorkers({ me, booking, events, workers, setRightPanel }) {
       )}
       <table className="table-compact table-nowrap">
         <thead><tr>
-          <th style={{ width: 24 }}>#</th>
+          <th style={{ width: 36, whiteSpace: "nowrap" }}>#</th>
           <th style={{ width: 28 }}><input type="checkbox" checked={shown.length > 0 && shown.every((w) => sel[w.id])}
             onChange={(e) => { const s = {}; if (e.target.checked) shown.forEach((w) => (s[w.id] = true)); setSel(s); }} /></th>
-          <Sortable label="Identity" k="identity_name" sort={sort} setSort={setSort} w="19%" />
+          <Sortable label="Identity" k="identity_name" sort={sort} setSort={setSort} w="16%" />
+          <Sortable label="Passport" k="passport_no" sort={sort} setSort={setSort} w="11%" />
           <Sortable label="Role" k="role" sort={sort} setSort={setSort} w="7%" />
           <Sortable label="Status" k="status" sort={sort} setSort={setSort} w="9%" />
-          <Sortable label="Live substate" k="live_substate" sort={sort} setSort={setSort} w="15%" />
-          <th style={{ width: "37%" }}>Actions</th>
+          <Sortable label="Live substate" k="live_substate" sort={sort} setSort={setSort} w="14%" />
+          <th style={{ width: "31%" }}>Actions</th>
         </tr></thead>
         <tbody>{shown.map((w, i) => {
           const live = events.byWorker[w.id] || {};   // log lines only -- status/substate come from workerView
           return (
             <React.Fragment key={w.id}>
               <tr>
-                <td className="muted">{i + 1}</td>
+                <td className="muted row-num">{i + 1}</td>
                 <td onClick={(e) => e.stopPropagation()}>
                   <input type="checkbox" checked={!!sel[w.id]} onChange={(e) => setSel({ ...sel, [w.id]: e.target.checked })} />
                 </td>
                 <td>{w.identity_name}</td>
+                <td className="muted" style={{ fontFamily: "monospace", fontSize: 12 }}>
+                  {w.passport_no || "—"}</td>
                 <td><span className="pill">{w.role}</span></td>
                 <td className={w.status === "completed" ? "ok" : w.status === "failed" ? "err" : ""}
                     title={w.substate_detail || ""}>{w.status}</td>
@@ -1340,7 +1567,7 @@ function BookingWorkers({ me, booking, events, workers, setRightPanel }) {
                 </td>
               </tr>
               {logsFor === w.id && (
-                <tr><td colSpan={7}><WorkerLog workerId={w.id} liveLogs={live.logs} /></td></tr>
+                <tr><td colSpan={8} style={{ padding: 0 }}><WorkerLog workerId={w.id} liveLogs={live.logs} /></td></tr>
               )}
             </React.Fragment>
           );
@@ -1386,9 +1613,26 @@ function WorkerLog({ workerId, liveLogs }) {
   }
   const lines = [...hist, ...live.slice(overlap)];
 
+  // Tail like a terminal: as new lines stream in, keep the view pinned to the bottom -- but ONLY when
+  // the operator was already there. If they have scrolled up to read something, a fresh line must not
+  // yank them back down. `stick` tracks whether the last scroll left us within a line-height of the
+  // end; the effect re-pins after each render that added lines.
+  const boxRef = useRef(null);
+  const stick = useRef(true);
+  const onScroll = () => {
+    const el = boxRef.current;
+    if (el) stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
+  };
+  useEffect(() => {
+    const el = boxRef.current;
+    if (el && stick.current) el.scrollTop = el.scrollHeight;
+  }, [lines.length]);
+
   return (
-    <div style={{ background: "var(--panel2)", border: "1px solid var(--border)", borderRadius: 8,
-                  padding: 8, maxHeight: 220, overflowY: "auto", fontFamily: "monospace", fontSize: 12 }}>
+    <div ref={boxRef} onScroll={onScroll}
+         style={{ background: "var(--panel2)", border: "1px solid var(--border)", borderRadius: 8,
+                  padding: 8, maxHeight: 260, overflowY: "auto", overflowX: "auto",
+                  fontFamily: "monospace", fontSize: 12, whiteSpace: "pre", lineHeight: 1.5 }}>
       {err && <div className="err">could not load history: {err}</div>}
       {history === null ? <span className="muted">loading log…</span>
         : lines.length ? lines.map((l, i) => <div key={i}>{l}</div>)
@@ -1418,6 +1662,15 @@ function AttachPanel({ me, booking, identities, templates, attached, onAttached 
   const [role, setRole] = useState("scout");
   const [showRole, setShowRole] = useState("all");
   const [tplId, setTplId] = useState("");
+  // Named levels only (libs/domain/priority.py: HIGH=200, NORMAL=100, LOW=0), same filter as the
+  // Identities page -- an operator can PATCH any int in between, so "all" is the escape hatch.
+  const [priorityFilter, setPriorityFilter] = useState("all");  // all | 200 | 100 | 0
+  // Target posto. Defaults to "all" like every other filter here; the booking's own posto is
+  // labelled "(this booking)" in the dropdown so a mismatch is visible without hiding anything.
+  // MUST be declared in THIS component -- an earlier edit's anchor matched the Identities page
+  // instead, leaving AttachPanel referencing an undefined `postoFilter` and crashing on open.
+  const [postoFilter, setPostoFilter] = useState("all");        // all | none | <posto id>
+  const [commentFilter, setCommentFilter] = useState("");       // contains-match; "" = all
   const [msg, setMsg] = useState("");
   // `attached`/`identities` are plain props captured on the JSX element the instant openAttachPanel()
   // built it (App owns rightPanel.content as an already-constructed element, not a render prop) -- a
@@ -1430,9 +1683,20 @@ function AttachPanel({ me, booking, identities, templates, attached, onAttached 
 
   // Eligible = right type for this booking, not already attached HERE, not allocated to another
   // ACTIVE booking (C2 exclusivity -- attach_identity 409s on those, and listing them meant the
-  // operator only found out by picking one), AND has a usable sub-account (status "active" means
-  // >=1 sub-account exists per IdentityStatus's own definition) -- conversation_extract #269:
-  // not-ready identities (zero verified sub-accounts) were showing up here before.
+  // operator only found out by picking one), AND has at least one sub-account that could actually
+  // log in (`ready_sub_accounts`, computed by the Hub).
+  //
+  // CONFIRMED LIVE: this used to gate on i.status === "active", which per IdentityStatus's own
+  // definition just means ">=1 sub-account exists" -- apps/hub/main.py's gen_subaccounts_bulk sets
+  // it the moment sub-accounts are GENERATED (status="new"), not once any of them are verified. So
+  // an identity whose sub-accounts were all still NEW/REGISTERED (unverified) passed this gate and
+  // showed up as attachable, even though none of them could actually log in yet.
+  //
+  // The fix is deliberately NOT "list the ready statuses in JSX instead": that just moves the same
+  // duplicated rule to a second place to drift from. `ready_sub_accounts` is counted server-side
+  // from READY_SUB_ACCOUNT_STATUSES, the same set the live launch gate refuses to launch without,
+  // and tests/hub/test_sub_account_readiness_parity.py fails if the two ever disagree. This panel
+  // renders that answer; it does not compute one.
   // Which role each identity will actually get. On a REAL booking the Role select is not shown and
   // `assigned_role` is IGNORED by the server -- resolve_worker_role derives it from identity type
   // (test -> scout, real -> apply). That rule was invisible here: the operator picked identities
@@ -1459,8 +1723,12 @@ function AttachPanel({ me, booking, identities, templates, attached, onAttached 
   // applied here.
   const eligible = forThisBooking.filter(
     (i) => !attached.has(i.id) && !justAttached.has(i.id) && !i.allocated_booking_id
-           && i.status === "active"
-           && (booking.type === "test" || showRole === "all" || roleFor(i) === showRole));
+           && (i.ready_sub_accounts || 0) > 0
+           && (booking.type === "test" || showRole === "all" || roleFor(i) === showRole)
+           && (priorityFilter === "all" || (i.priority ?? 100) === Number(priorityFilter))
+           && matchesTargetPosto(i, postoFilter)
+           && matchesComment(i, commentFilter));
+  const postoOpts = targetPostoOptions(forThisBooking);
 
   // An identity attached ANYWHERE is not mentioned at all (operator, 2026-08-21). It was already
   // excluded from the selectable list -- `attached` covers this booking, `allocated_booking_id`
@@ -1473,7 +1741,7 @@ function AttachPanel({ me, booking, identities, templates, attached, onAttached 
   // one the operator can DO something about (register more sub-accounts) rather than simply live
   // with. Counting it also keeps the panel from silently showing an empty list with no explanation.
   const hiddenNotReady = forThisBooking.filter(
-    (i) => !attached.has(i.id) && !i.allocated_booking_id && i.status !== "active").length;
+    (i) => !attached.has(i.id) && !i.allocated_booking_id && !(i.ready_sub_accounts > 0)).length;
 
   // Sort only -- reuses useSortSearch's sort/rows half; its own `q`/setQ is unused here because the
   // panel already has a deliberately narrow passport/name search above (matchesSearch), not the
@@ -1531,6 +1799,25 @@ function AttachPanel({ me, booking, identities, templates, attached, onAttached 
               <option value="scout">scout</option><option value="apply">apply</option>
             </select></div>
         )}
+        <div className="field"><label>Priority</label>
+          <select value={priorityFilter} onChange={(e) => setPriorityFilter(e.target.value)}
+                  style={{ width: "100%" }}>
+            <option value="all">all</option>
+            <option value="200">high</option>
+            <option value="100">normal</option>
+            <option value="0">low</option>
+          </select></div>
+        <div className="field"><label>Target posto</label>
+          <select value={postoFilter} onChange={(e) => { setPostoFilter(e.target.value); setSel({}); }}
+                  style={{ width: "100%" }}>
+            <option value="all">all</option>
+            {postoOpts.postos.map((p) => (
+              <option key={p} value={p}>{p}{String(p) === String(booking.posto_id) ? " (this booking)" : ""}</option>))}
+            {postoOpts.hasNone && <option value="none">(none)</option>}
+          </select></div>
+        <div className="field"><label>Comment</label>
+          <input value={commentFilter} onChange={(e) => { setCommentFilter(e.target.value); setSel({}); }}
+                 placeholder="e.g. ++" style={{ width: "100%" }} /></div>
         <div className="field"><label>Template</label>
           <select value={tplId} onChange={(e) => setTplId(e.target.value)} style={{ width: "100%" }}>
             <option value="">auto (by role)</option>
@@ -1547,23 +1834,30 @@ function AttachPanel({ me, booking, identities, templates, attached, onAttached 
       {msg && <div className="banner err">{msg}</div>}
       <table className="table-nowrap">
         <thead><tr>
-          <th style={{ width: 24 }}>#</th>
+          <th style={{ width: 36, whiteSpace: "nowrap" }}>#</th>
           <th style={{ width: 28 }}><input type="checkbox" checked={eligible.length > 0 && eligible.every((i) => sel[i.id])}
             onChange={(e) => { const s = {}; if (e.target.checked) eligible.forEach((i) => (s[i.id] = true)); setSel(s); }} /></th>
           <th>Passport</th>
           <th>Name</th>
           <Sortable label="Type" k="type" sort={sort} setSort={setSort} w={70} />
+          <Sortable label="Priority" k="priority" sort={sort} setSort={setSort} w={80} />
+          {/* Verified sub-accounts = how many login attempts do_login() has to rotate through
+              before this worker is out of accounts. Always >=1 here (that is the eligibility
+              gate); the number is what differs. */}
+          <Sortable label="Ready" k="ready_sub_accounts" sort={sort} setSort={setSort} w={60} />
           <th style={{ width: 70 }}>Role</th>
           <Sortable label="Target" k="target_posto" sort={sort} setSort={setSort} w={80} />
           <Sortable label="Created" k="created_at" sort={sort} setSort={setSort} w={130} />
         </tr></thead>
         <tbody>{sortedEligible.map((i, idx) => (
           <tr key={i.id}>
-            <td className="muted">{idx + 1}</td>
+            <td className="muted row-num">{idx + 1}</td>
             <td><input type="checkbox" checked={!!sel[i.id]} onChange={(e) => setSel({ ...sel, [i.id]: e.target.checked })} /></td>
             <td>{i.passport_no || <span className="muted">— none —</span>}</td>
             <td>{i.full_name}</td>
             <td><span className="pill">{i.type}</span></td>
+            <td className="muted">{priorityLabel(i.priority)}</td>
+            <td className="muted">{i.ready_sub_accounts}</td>
             <td><span className="pill">{roleFor(i)}</span></td>
             <td className="muted">{i.target_posto || "—"}</td>
             <td className="muted">{i.created_at ? new Date(i.created_at).toLocaleDateString() : "—"}</td>
@@ -1580,7 +1874,7 @@ function AttachPanel({ me, booking, identities, templates, attached, onAttached 
       )}
       {hiddenNotReady > 0 && (
         <div className="muted" style={{ fontSize: 12, padding: "8px 4px", borderTop: "1px solid var(--border)", marginTop: 8 }}>
-          Not shown: {hiddenNotReady} without a usable sub-account.
+          Not shown: {hiddenNotReady} with no verified sub-account yet — register/verify them first.
         </div>
       )}
     </>
@@ -1718,7 +2012,7 @@ function BookedIdentities({ me }) {
       {err && <div className="banner err">{err}</div>}
       {msg && <div className="banner">{msg}</div>}
       <table className="table-compact"><thead><tr>
-        <th style={{ width: 24 }}>#</th>
+        <th style={{ width: 36, whiteSpace: "nowrap" }}>#</th>
         {me.role === "admin" && <th style={{ width: "3%" }}>
           <input type="checkbox"
                  checked={!!shown.length && shown.every((r) => sel[r.identity_id])}
@@ -1733,7 +2027,7 @@ function BookedIdentities({ me }) {
         <th style={{ width: "8%" }}>PDF</th></tr></thead>
         <tbody>{shown.map((r, i) => (
           <tr key={r.identity_id}>
-            <td className="muted">{i + 1}</td>
+            <td className="muted row-num">{i + 1}</td>
             {me.role === "admin" && <td><input type="checkbox" checked={!!sel[r.identity_id]}
               onChange={(e) => setSel({ ...sel, [r.identity_id]: e.target.checked })} /></td>}
             <td>{r.full_name}</td>
@@ -1762,6 +2056,8 @@ function Identities({ me, setLeftPanel, setRightPanel }) {
   // Named levels only (libs/domain/priority.py: HIGH=200, NORMAL=100, LOW=0) -- an operator can
   // PATCH any int in between, so "all" is the escape hatch for anything off the three named points.
   const [priorityFilter, setPriorityFilter] = useState("all");  // all | 200 | 100 | 0
+  const [postoFilter, setPostoFilter] = useState("all");        // all | none | <posto id>
+  const [commentFilter, setCommentFilter] = useState("");       // contains-match; "" = all
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
   const [subCount, setSubCount] = useState(3);
@@ -1771,7 +2067,10 @@ function Identities({ me, setLeftPanel, setRightPanel }) {
   const typeAndStatus = rows.filter((i) => filter === "all" ? true : i.type === filter);
   const priorityFiltered = typeAndStatus.filter((i) =>
     priorityFilter === "all" ? true : (i.priority ?? 100) === Number(priorityFilter));
-  const dateFiltered = priorityFiltered.filter((i) => {
+  const postoFiltered = priorityFiltered.filter((i) => matchesTargetPosto(i, postoFilter));
+  const commentFiltered = postoFiltered.filter((i) => matchesComment(i, commentFilter));
+  const postoOpts = targetPostoOptions(rows);
+  const dateFiltered = commentFiltered.filter((i) => {
     if (!i.created_at) return true;
     const d = i.created_at.slice(0, 10);
     if (dateFrom && d < dateFrom) return false;
@@ -1784,9 +2083,49 @@ function Identities({ me, setLeftPanel, setRightPanel }) {
   for (const s of subRows) (subsByIdentity[s.identity_id] = subsByIdentity[s.identity_id] || []).push(s);
 
   const selectedIds = Object.keys(sel).filter((k) => sel[k]);
+  const [bulkPriority, setBulkPriority] = useState("200");
   async function act(fn) { setMsg(""); try { await fn(); setSel({}); reload(); reloadSubs(); } catch (e) { setMsg(e.message); } }
   const genSubs = () => act(() => api("/identities/gen-subaccounts",
     { method: "POST", body: { identity_ids: selectedIds, count: Number(subCount) } }));
+  const setPriority = () => act(() => api("/identities/bulk-priority",
+    { method: "POST", body: { identity_ids: selectedIds, priority: Number(bulkPriority) } }));
+
+  // Two-step, mirroring the single-identity Delete in the details panel. A plain delete refuses
+  // while an identity still owns rows WE generated (sub-accounts, allocations, event history) --
+  // which is the ordinary state of a stale identity, so a one-shot bulk delete would refuse almost
+  // everything an operator actually wants gone. The endpoint reports per-id outcomes rather than
+  // failing on the first refusal, so the second pass can say exactly what survived and why.
+  // A real booked appointment is refused either way: force does not override it, by design.
+  async function deleteSelectedIdentities() {
+    setMsg("");
+    if (!window.confirm(
+      `Delete ${selectedIds.length} selected identity/identities?\n\n`
+      + `Any identity attached to a booking, or holding a real booked appointment, will be refused.`
+    )) return;
+    try {
+      let r = await api("/identities/bulk-delete",
+        { method: "POST", body: { identity_ids: selectedIds } });
+      let refused = Object.entries(r.refused || {});
+      // Offer force ONLY for refusals force can actually fix -- never for a booked appointment,
+      // which no amount of force deletes and which would be a dishonest prompt.
+      const forceable = refused.filter(([, why]) => !/booked appointment/i.test(why));
+      if (forceable.length && window.confirm(
+        `Deleted ${r.deleted.length}. ${refused.length} refused.\n\n`
+        + `${forceable.length} of those can be removed together with the sub-accounts, allocations `
+        + `and event history we generated for them. Do that?\n\nThis cannot be undone.`
+      )) {
+        const r2 = await api("/identities/bulk-delete",
+          { method: "POST", body: { identity_ids: forceable.map(([id]) => id), force: true } });
+        r = { deleted: [...r.deleted, ...r2.deleted], refused: r2.refused };
+        refused = Object.entries(r.refused || {});
+      }
+      setMsg(refused.length
+        ? `Deleted ${r.deleted.length}. Kept ${refused.length}: `
+          + refused.slice(0, 3).map(([, why]) => why).join("; ")
+        : `Deleted ${r.deleted.length}.`);
+      setSel({}); reload(); reloadSubs();
+    } catch (e) { setMsg(e.message); }
+  }
 
   function openCreatePanel() {
     // reload() alone left the Sub-accounts column stale after Generate/Import (which create
@@ -1822,6 +2161,15 @@ function Identities({ me, setLeftPanel, setRightPanel }) {
             <option value="100">normal</option>
             <option value="0">low</option>
           </select></div>
+        <div className="field" style={{ margin: 0 }}><label>Target posto</label>
+          <select value={postoFilter} onChange={(e) => setPostoFilter(e.target.value)}>
+            <option value="all">all</option>
+            {postoOpts.postos.map((p) => <option key={p} value={p}>{p}</option>)}
+            {postoOpts.hasNone && <option value="none">(none)</option>}
+          </select></div>
+        <div className="field" style={{ margin: 0 }}><label>Comment</label>
+          <input value={commentFilter} onChange={(e) => setCommentFilter(e.target.value)}
+                 placeholder="e.g. ++" style={{ width: 90 }} /></div>
         <div className="field" style={{ margin: 0 }}><label>Created from</label>
           <input type="date" value={dateFrom} onChange={(e) => setDateFrom(e.target.value)} /></div>
         <div className="field" style={{ margin: 0 }}><label>to</label>
@@ -1842,11 +2190,23 @@ function Identities({ me, setLeftPanel, setRightPanel }) {
           <label style={{ margin: 0 }}>Sub-accounts/id</label>
           <input type="number" value={subCount} onChange={(e) => setSubCount(e.target.value)} style={{ width: 60 }} />
           <button className="btn" disabled={!op} onClick={genSubs}>Gen sub-accounts</button>
+          <span className="grow" />
+          <label style={{ margin: 0 }}>Priority</label>
+          <select value={bulkPriority} onChange={(e) => setBulkPriority(e.target.value)}>
+            <option value="200">high</option>
+            <option value="100">normal</option>
+            <option value="0">low</option>
+          </select>
+          <button className="btn" disabled={!op} onClick={setPriority}>Set priority</button>
+          <button className="btn ghost" disabled={!op} onClick={deleteSelectedIdentities}
+                  title="Delete the selected identities. Anything attached to a booking, or holding a real booked appointment, is refused.">
+            🗑 Delete selected
+          </button>
         </div>
       )}
       <table className="table-nowrap">
         <thead><tr>
-          <th style={{ width: 24 }}>#</th>
+          <th style={{ width: 36, whiteSpace: "nowrap" }}>#</th>
           <th style={{ width: 36 }}><input type="checkbox" checked={shown.length > 0 && shown.every((i) => sel[i.id])}
             onChange={(e) => { const s = {}; if (e.target.checked) shown.forEach((i) => (s[i.id] = true)); setSel(s); }} /></th>
           <Sortable label="Name" k="full_name" sort={sort} setSort={setSort} w="17%" />
@@ -1861,7 +2221,7 @@ function Identities({ me, setLeftPanel, setRightPanel }) {
         <tbody>{shown.map((i, idx) => (
           <tr key={i.id} className={`row-clickable${i.id === selectedId ? " row-selected" : ""}`}
             onClick={() => openDetailPanel(i)}>
-            <td className="muted">{idx + 1}</td>
+            <td className="muted row-num">{idx + 1}</td>
             <td onClick={(e) => e.stopPropagation()}>
               <input type="checkbox" checked={!!sel[i.id]} onChange={(e) => setSel({ ...sel, [i.id]: e.target.checked })} />
             </td>
@@ -2238,16 +2598,43 @@ function Registration({ me, events }) {
   // ("soax", "webshare"), so a newly imported pool -- soax_mobile, say -- was simply unreachable
   // from this page however many proxies it had. Deriving them also lets the count below tell you a
   // selection is empty BEFORE you press Register, instead of a 409 afterwards.
-  const { rows: poolRows } = useList("/proxies");
-  const providers = [...new Set(poolRows.map((p) => p.provider))].sort();
-  const kinds = [...new Set(poolRows.filter((p) => p.provider === provider).map((p) => p.kind))].sort();
-  const geoOpts = [...new Set(poolRows.filter((p) => p.provider === provider && p.geo)
-                                      .map((p) => p.geo))].sort();
+  const { rows: poolRows } = useList("/proxies/pools");
+  // Providers/kinds come from the ROTATING pool list PLUS whatever static rows exist -- not from
+  // rows alone. Deriving them from rows left this dropdown showing only "thordata" once
+  // ci000droprot deleted the rotating rows, so registration could not be pointed at soax at all,
+  // even though minting it works fine. Same fix as the booking pool pickers (derivePoolOptions);
+  // this page has its own controls and was missed.
+  const staticPoolRows = poolRows.filter((p) => p.resource_type === "static");
+  const providers = [...new Set([...ROTATING_POOLS.map((p) => p.provider),
+                                 ...staticPoolRows.map((p) => p.provider)])].sort();
+  const rotatingKinds = [...new Set(ROTATING_POOLS.filter((p) => p.provider === provider && p.kind)
+                                                  .map((p) => p.kind))];
+  const kinds = [...new Set([...rotatingKinds,
+                             ...staticPoolRows.filter((p) => p.provider === provider)
+                                              .map((p) => p.kind)])].sort();
+  // A minted pool has no rows to carry a geo, so the geo list falls back to the same measured set
+  // the booking path uses (PROXY_GEOS' note: DE/IT clear the login wall ~8x better than CZ).
+  const staticGeos = [...new Set(staticPoolRows.filter((p) => p.provider === provider && p.geo)
+                                               .map((p) => p.geo))];
+  const isRotatingSel = ROTATING_POOLS.some((p) => p.provider === provider
+                                                   && (!kind || p.kind === kind));
+  const geoOpts = (staticGeos.length ? staticGeos
+                                     : (isRotatingSel ? ["DE", "IT", "PT", "NL", "ES", "LU", "CZ"] : []))
+                  .sort();
   const wantGeos = geos.split(",").map((g) => g.trim().toUpperCase()).filter(Boolean);
-  const matching = poolRows.filter((p) =>
-    p.provider === provider && p.active && p.is_healthy !== false
+  // For a STATIC pool this SUMS the aggregate's `leasable` (active AND not-condemned, computed
+  // server-side) rather than counting rows -- poolRows is one row per (provider, kind, geo), not
+  // per proxy, so counting rows would report "3" for a 30,000-proxy pool.
+  //
+  // For a ROTATING pool the count is meaningless: exits are minted on demand, one per concurrency
+  // slot, so there is no finite number to report. It said "0 proxys match" in red next to a
+  // perfectly usable pool, which read as a blocker.
+  const matchingStatic = staticPoolRows.reduce((n, p) => (
+    p.provider === provider
     && (!kind || p.kind === kind)
-    && (!wantGeos.length || !p.geo || wantGeos.includes(p.geo))).length;
+    && (!wantGeos.length || !p.geo || wantGeos.includes(p.geo))
+      ? n + (p.leasable || 0) : n), 0);
+  const matching = isRotatingSel ? null : matchingStatic;
 
   const typeFiltered = rows.filter((s) => typeFilter === "all" || s.identity_type === typeFilter);
   const statusFiltered = typeFiltered.filter((s) => {
@@ -2363,8 +2750,10 @@ function Registration({ me, events }) {
                 {geoOpts.map((g) => <option key={g} value={g}>{g}</option>)}
                 {geoOpts.length > 1 && <option value={geoOpts.join(",")}>{geoOpts.join(",")}</option>}
               </select></div>
-            <span className={matching ? "muted" : "err"} style={{ fontSize: 12 }}>
-              {matching} proxy{matching === 1 ? "" : "s"} match
+            <span className={matching === null || matching ? "muted" : "err"} style={{ fontSize: 12 }}>
+              {matching === null
+                ? "self-minted — one fresh exit per slot"
+                : `${matching} prox${matching === 1 ? "y" : "ies"} match`}
             </span>
             <div className="field" style={{ margin: 0 }}><label>Concurrency</label>
               <input type="number" value={concurrency} onChange={(e) => setConcurrency(e.target.value)} disabled={!op} style={{ width: 60 }} /></div>
@@ -2376,7 +2765,7 @@ function Registration({ me, events }) {
         )}
         <table className="table-nowrap">
           <thead><tr>
-            <th style={{ width: 24 }}>#</th>
+            <th style={{ width: 36, whiteSpace: "nowrap" }}>#</th>
             <th style={{ width: 36 }}><input type="checkbox" checked={shown.length > 0 && shown.every((s) => sel[s.id])}
               onChange={(e) => { const s = {}; if (e.target.checked) shown.forEach((r) => (s[r.id] = true)); setSel(s); }} /></th>
             <Sortable label="Identity" k="identity_name" sort={sort} setSort={setSort} w="17%" />
@@ -2391,7 +2780,7 @@ function Registration({ me, events }) {
             const live = events.bySubAccount[s.id] || {};
             return (
               <tr key={s.id}>
-                <td className="muted">{i + 1}</td>
+                <td className="muted row-num">{i + 1}</td>
                 <td><input type="checkbox" checked={!!sel[s.id]} onChange={(e) => setSel({ ...sel, [s.id]: e.target.checked })} /></td>
                 <td>{s.identity_name}</td>
                 <td><span className="pill">{s.identity_type}</span></td>
@@ -2425,10 +2814,10 @@ function RegistrationJobHistory() {
         <button className="btn ghost" onClick={reload}>Refresh</button>
       </div>
       {err && <div className="banner err">{err}</div>}
-      <table><thead><tr><th style={{ width: 24 }}>#</th><th>Sub-account</th><th>Mode</th><th>Status</th><th>Attempts</th><th>When</th></tr></thead>
+      <table><thead><tr><th style={{ width: 36, whiteSpace: "nowrap" }}>#</th><th>Sub-account</th><th>Mode</th><th>Status</th><th>Attempts</th><th>When</th></tr></thead>
         <tbody>{rows.map((j, i) => (
           <tr key={j.id}>
-            <td className="muted">{i + 1}</td>
+            <td className="muted row-num">{i + 1}</td>
             <td className="muted">{j.sub_account_id.slice(0, 8)}</td>
             <td>{j.mode}</td>
             <td className={j.status === "failed" ? "err" : j.status === "verified" ? "ok" : ""}>{j.status}</td>
@@ -2453,7 +2842,20 @@ function ImportCsv({ me, path, label, hint, makeBody, onDone, compact }) {
   const body = (
     <>
       {err && <div className="banner err">{err}</div>}
-      {res && <div className="banner info">Created {res.created}{res.sub_accounts != null ? ` (+${res.sub_accounts} sub-accounts)` : ""}. {res.errors?.length ? `${res.errors.length} skipped/errors.` : ""}</div>}
+      {res && (
+        <div className={`banner ${res.errors?.length ? "warn" : "info"}`}>
+          Created {res.created}{res.sub_accounts != null ? ` (+${res.sub_accounts} sub-accounts)` : ""}.
+          {res.errors?.length ? ` ${res.errors.length} row(s) skipped:` : ""}
+          {/* The actual reasons, not just a count. An operator can only fix a rejected row if they
+              are told WHICH person and WHAT is missing -- that is the whole point of rejecting an
+              incomplete real identity instead of admitting a half-filled one. */}
+          {res.errors?.length ? (
+            <ul style={{ margin: "6px 0 0", paddingLeft: 18, fontSize: 12, maxHeight: 160, overflow: "auto" }}>
+              {res.errors.map((e, i) => <li key={i} style={{ whiteSpace: "pre-wrap" }}>{e}</li>)}
+            </ul>
+          ) : null}
+        </div>
+      )}
       <div className="muted" style={{ marginBottom: 6, fontSize: 12 }}>{hint}</div>
       <textarea value={text} onChange={(e) => setText(e.target.value)} rows={6}
         style={{ width: "100%", fontFamily: "monospace", fontSize: 12, background: "var(--panel2)", color: "var(--text)", border: "1px solid var(--border)", borderRadius: 8, padding: 8 }}
@@ -2471,21 +2873,118 @@ function ImportCsv({ me, path, label, hint, makeBody, onDone, compact }) {
 }
 
 function Proxies({ me, setLeftPanel }) {
-  const { rows, err, reload } = useList("/proxies");
   const [selectedPool, setSelectedPool] = useState(null); // {provider, kind?} | null (null = all)
+  const [page, setPage] = useState(0);
   const [modal, setModal] = useState(null);               // "add" | "import" | null
   const [msg, setMsg] = useState("");
-  const op = me.is_operating;
-
-  const filtered = rows.filter((p) => {
-    if (!selectedPool) return true;
-    if (selectedPool.kind) return p.provider === selectedPool.provider && p.kind === selectedPool.kind;
-    return p.provider === selectedPool.provider;
-  });
-  const { q, setQ, sort, setSort, rows: shown } = useSortSearch(filtered, { key: "created_at", dir: "desc" });
-
+  // Declared here rather than beside resetHealth below: the bulk health-check/delete handlers added
+  // 2026-09-16 sit above that point and close over both.
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState("");
+  const op = me.is_operating;
+  const PAGE = 100;
+
+  // PAGINATED, FILTERED SERVER-SIDE (2026-09-15). This page used to fetch the entire proxy table
+  // and filter/sort it in the browser. That was fine at the ~2,000 rows it was written against;
+  // the pool grew to 42,600 (+30k on 08-21, +10k on 09-03), which is 14.8 MB per load and ~340k
+  // DOM nodes, and the page stopped working. The pool TREE comes from the aggregate endpoint, so
+  // it still shows true totals for the whole pool while the table only ever holds one page.
+  const poolsList = useList("/proxies/pools");
+  const qs = new URLSearchParams({ limit: String(PAGE), offset: String(page * PAGE) });
+  if (selectedPool?.provider) qs.set("provider", selectedPool.provider);
+  if (selectedPool?.kind) qs.set("kind", selectedPool.kind);
+  const { rows, err, reload } = useList(`/proxies?${qs.toString()}`);
+  // Selecting a different pool must reset to page 1 -- otherwise picking a small pool while on
+  // page 40 shows an empty table that looks like "no proxies here".
+  const poolKey = `${selectedPool?.provider || ""}|${selectedPool?.kind || ""}`;
+  useEffect(() => { setPage(0); }, [poolKey]);
+
+  // Search/sort are now WITHIN the current page. Sorting across a 42,600-row pool client-side is
+  // exactly what this change removes; doing it per-page keeps the column headers useful without
+  // reintroducing the cost.
+  const { q, setQ, sort, setSort, rows: sortedRows } = useSortSearch(rows, { key: "created_at", dir: "desc" });
+
+  // Filters are applied AFTER the server-side pool filter and within the loaded page, matching the
+  // search/sort above. Pool name and health are the two an operator actually triages on: "which of
+  // the Thordata batch is dead".
+  const [poolFilter, setPoolFilter] = useState("");     // "" = any named pool
+  const [healthFilter, setHealthFilter] = useState(""); // "" | dead | alive | unchecked | portal_bad
+  const shown = sortedRows.filter((p) => {
+    if (poolFilter && (p.pool_name || "") !== poolFilter) return false;
+    if (healthFilter === "dead" && !(p.checked_at && p.is_healthy === false)) return false;
+    if (healthFilter === "alive" && !(p.checked_at && p.is_healthy !== false)) return false;
+    if (healthFilter === "unchecked" && p.checked_at) return false;
+    if (healthFilter === "portal_bad" && p.portal_ok !== false) return false;
+    return true;
+  });
+
+  // Selection is keyed by id and survives sorting/filtering; "select all" only ever covers what is
+  // CURRENTLY VISIBLE, so a filter narrows what a bulk action can touch. Selecting rows you cannot
+  // see is how a bulk delete becomes a surprise.
+  const [sel, setSel] = useState({});
+  const selIds = Object.keys(sel).filter((k) => sel[k]);
+  const visibleIds = shown.map((p) => p.id);
+  const allVisibleSelected = visibleIds.length > 0 && visibleIds.every((id) => sel[id]);
+  const toggleAllVisible = () => setSel((prev) => {
+    const next = { ...prev };
+    visibleIds.forEach((id) => { next[id] = !allVisibleSelected; });
+    return next;
+  });
+  // Clearing on pool change prevents a selection made in one pool from being acted on in another.
+  useEffect(() => { setSel({}); }, [poolKey, page]);
+
+  const poolNames = [...new Set(poolsList.rows.map((p) => p.pool_name).filter(Boolean))].sort();
+
+  async function runHealthCheck(portal) {
+    setMsg(""); setNote(""); setBusy(true);
+    try {
+      const r = await api("/proxies/health-check",
+        { method: "POST", body: { ids: selIds, portal } });
+      setNote(`Checked ${r.checked}: ${r.alive} alive, ${r.dead} dead`
+        + (r.portal_checked ? ` · portal reachable on ${r.portal_ok}/${r.portal_checked}` : ""));
+      reload();
+    } catch (e) { setMsg(e.message); } finally { setBusy(false); }
+  }
+
+  async function setMaxSessions() {
+    const cur = [...new Set(shown.filter((p) => selIds.includes(p.id)).map((p) => p.max_sessions))];
+    const ans = window.prompt(
+      `Max concurrent sessions per proxy for ${selIds.length} selected.\n\n`
+      + `Currently: ${cur.join(", ")}\n\n`
+      + `1 = strict one-worker-one-IP. Higher multiplies pool capacity but puts several `
+      + `sub-accounts behind the same exit at the same time.`,
+      String(cur.length === 1 ? cur[0] : 2));
+    if (ans === null) return;
+    const n = Number(ans);
+    if (!Number.isFinite(n) || n < 1) { setMsg("max_sessions must be a number >= 1"); return; }
+    setMsg(""); setNote(""); setBusy(true);
+    try {
+      await api("/proxies/bulk-update", { method: "POST", body: { ids: selIds, max_sessions: n } });
+      setNote(`Set max_sessions=${n} on ${selIds.length} proxy/proxies.`);
+      setSel({}); reload();
+    } catch (e) { setMsg(e.message); } finally { setBusy(false); }
+  }
+
+  async function deleteSelected() {
+    const dead = shown.filter((p) => selIds.includes(p.id) && p.checked_at && p.is_healthy === false);
+    const ok = window.confirm(
+      `Delete ${selIds.length} selected proxy/proxies?\n\n`
+      + `${dead.length} of them failed tier 1 (dead) and will be removed.\n`
+      + `Anything still alive, still leased, or never checked is REFUSED — `
+      + `a portal failure is not a dead proxy.\n\nThis cannot be undone.`);
+    if (!ok) return;
+    setMsg(""); setNote(""); setBusy(true);
+    try {
+      const r = await api("/proxies/bulk-delete", { method: "POST", body: { ids: selIds } });
+      setNote(`Deleted ${r.deleted}.`
+        + (r.skipped?.length ? ` Kept ${r.skipped.length}: ` +
+            r.skipped.slice(0, 3).map((x) => `${x.endpoint} (${x.reason})`).join("; ") : ""));
+      setSel({}); reload();
+    } catch (e) { setMsg(e.message); } finally { setBusy(false); }
+  }
+  const poolTotal = poolsList.rows.reduce((n, p) => (
+    (!selectedPool?.provider || p.provider === selectedPool.provider)
+    && (!selectedPool?.kind || p.kind === selectedPool.kind) ? n + (p.total || 0) : n), 0);
 
   async function toggle(id) {
     setMsg("");
@@ -2523,10 +3022,12 @@ function Proxies({ me, setLeftPanel }) {
   // action panels), so it stays mounted in the left slot the whole time this page is active,
   // re-set whenever the underlying data or selection changes.
   useEffect(() => {
+    // Built from the AGGREGATE, not the loaded page -- the tree must show the whole pool's true
+    // counts. Counting the current page would have reported "100" for every pool.
     const tree = {};
-    for (const p of rows) {
+    for (const p of poolsList.rows) {
       tree[p.provider] = tree[p.provider] || {};
-      tree[p.provider][p.kind] = (tree[p.provider][p.kind] || 0) + 1;
+      tree[p.provider][p.kind] = (tree[p.provider][p.kind] || 0) + (p.total || 0);
     }
     setLeftPanel({
       title: "Proxy pools",
@@ -2537,7 +3038,7 @@ function Proxies({ me, setLeftPanel }) {
       ),
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [rows, selectedPool, op]);
+  }, [poolsList.rows, selectedPool, op]);
   useEffect(() => () => setLeftPanel(null), []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const poolLabel = selectedPool ? `${selectedPool.provider}${selectedPool.kind ? " / " + selectedPool.kind : ""}` : "All proxies";
@@ -2556,9 +3057,18 @@ function Proxies({ me, setLeftPanel }) {
             onDone={() => { reload(); setModal(null); }} />
         </Modal>
       )}
+      {/* This page is the STATIC/ISP inventory now (2026-09-15, DECISIONS.md D39). Without this
+          note an empty table reads as "our proxies are gone" -- which is exactly what it would have
+          looked like the morning after the migration, during a booking. Rotating pools are still
+          fully configured and in use; they simply are not rows any more. */}
+      <div className="banner" style={{ marginBottom: 12 }}>
+        <b>Static / ISP proxies only.</b> Rotating pools (soax, webshare) are self-minted per worker
+        from <b>.env</b> credentials — nothing to store, probe or lease, so they are not listed here.
+        An empty table means no ISP inventory has been imported, not that proxies are missing.
+      </div>
       <div className="card">
         <div className="row" style={{ marginBottom: 10 }}>
-          <h2 style={{ margin: 0 }}>{poolLabel} ({shown.length}/{rows.length})</h2>
+          <h2 style={{ margin: 0 }}>{poolLabel} ({poolTotal.toLocaleString()})</h2>
           <span className="grow" />
           <SearchBox q={q} setQ={setQ} placeholder="search proxies…" />
           <button className="btn ghost" disabled={!op || busy} onClick={resetHealth}
@@ -2570,33 +3080,159 @@ condemned by a failed probe. Shows the scope before writing.">
         {err && <div className="banner err">{err}</div>}
         {msg && <div className="banner err" style={{ whiteSpace: "pre-line" }}>{msg}</div>}
         {note && <div className="banner">{note}</div>}
-        {rows.length > 0 && (() => {
-          const dead = rows.filter((p) => p.is_healthy === false).length;
+        {/* Counted from the AGGREGATE, pool-wide -- counting the loaded page would have said
+            "12 of 100". Wording is also corrected: a rotating row's is_healthy does NOT exclude it
+            from leasing (D19/libs/proxies/lease.py -- a rotating row is a session template, so a
+            probe failure describes an exit that has since changed, not the row). Only static rows
+            are actually excluded, and the pool holds none today. The old text claimed everything
+            marked unhealthy was excluded, which reads as a 20,000-proxy outage that isn't real. */}
+        {poolsList.rows.length > 0 && (() => {
+          const scope = poolsList.rows.filter((p) =>
+            (!selectedPool?.provider || p.provider === selectedPool.provider)
+            && (!selectedPool?.kind || p.kind === selectedPool.kind));
+          const dead = scope.reduce((n, p) => n + (p.unhealthy || 0), 0);
+          const leasable = scope.reduce((n, p) => n + (p.leasable || 0), 0);
+          const total = scope.reduce((n, p) => n + (p.total || 0), 0);
           return dead > 0 ? (
-            <div className="banner err">
-              {dead} of {rows.length} proxies are marked unhealthy and are excluded from leasing.
+            <div className="banner">
+              {dead.toLocaleString()} of {total.toLocaleString()} carry a failed health probe.
+              Rotating pools still lease them (a probe describes an exit, not the row) —
+              {" "}{leasable.toLocaleString()} are active and leasable.
             </div>
           ) : null;
         })()}
+        {rows.length > 0 && (
+        <div className="row" style={{ gap: 8, marginBottom: 10, flexWrap: "wrap", alignItems: "center" }}>
+          <select value={poolFilter} onChange={(e) => setPoolFilter(e.target.value)}>
+            <option value="">All pools</option>
+            {poolNames.map((n) => <option key={n} value={n}>{n}</option>)}
+          </select>
+          <select value={healthFilter} onChange={(e) => setHealthFilter(e.target.value)}>
+            <option value="">Any health</option>
+            <option value="dead">Dead (tier 1 failed)</option>
+            <option value="alive">Alive (tier 1 passed)</option>
+            <option value="unchecked">Never checked</option>
+            <option value="portal_bad">Portal unreachable (tier 2)</option>
+          </select>
+          <span className="grow" />
+          {/* Bulk actions act on the CURRENT SELECTION only, and "select all" only covers visible
+              rows -- so a filter genuinely narrows what delete can touch. */}
+          <span className="muted" style={{ fontSize: 13 }}>
+            {selIds.length ? `${selIds.length} selected` : "none selected"}
+          </span>
+          <button className="btn ghost" disabled={!op || busy || !selIds.length}
+                  onClick={() => runHealthCheck(false)}
+                  title="Tier 1 only: a raw request through each proxy to a NEUTRAL url. Fast (~1s each). Answers 'is this proxy alive at all' — the verdict that gates selection and delete.">
+            {busy ? "Checking…" : "Check connectivity"}
+          </button>
+          <button className="btn ghost" disabled={!op || busy || !selIds.length}
+                  onClick={() => runHealthCheck(true)}
+                  title="Tier 1 + tier 2: also opens a real browser to the portal from each proxy. Slow (~25s each, 4 at a time). Tier 2 is DIAGNOSTIC — a portal failure never marks a proxy dead.">
+            {busy ? "Checking…" : "Check portal too"}
+          </button>
+          <button className="btn ghost" disabled={!op || busy || !selIds.length}
+                  onClick={setMaxSessions}
+                  title="Change how many workers may hold each selected IP at once. This is the pool's real capacity ceiling.">
+            Max sessions…
+          </button>
+          <button className="btn ghost" disabled={!op || busy || !selIds.length}
+                  onClick={deleteSelected}
+                  title="Delete dead proxies. Refuses anything alive, still leased, or never checked.">
+            🗑 Delete dead
+          </button>
+        </div>
+        )}
+        {rows.length > 0 && (
         <table><thead><tr>
+          <th style={{ width: 32 }}>
+            <input type="checkbox" checked={allVisibleSelected} onChange={toggleAllVisible}
+                   disabled={visibleIds.length === 0} title="Select all visible rows" />
+          </th>
           <th style={{ width: 40 }}>#</th>
-          <Sortable label="Provider" k="provider" sort={sort} setSort={setSort} w="15%" />
-          <Sortable label="Kind" k="kind" sort={sort} setSort={setSort} w="15%" />
-          <Sortable label="Endpoint" k="endpoint" sort={sort} setSort={setSort} />
-          <Sortable label="Active" k="active" sort={sort} setSort={setSort} w="10%" />
-          <Sortable label="Health" k="is_healthy" sort={sort} setSort={setSort} w="16%" />
-          <th style={{ width: "10%" }}>Max/IP</th><th style={{ width: "12%" }}></th></tr></thead>
+          {/* Widths sum to 100%. They must: with `table-layout: fixed`, whatever is left over
+              after the explicit widths is all the unsized columns get, and when these summed to
+              99% the unsized Endpoint column collapsed to ~1ch and broke its header one letter per
+              line. Endpoint takes the largest share because it holds the longest value. */}
+          <Sortable label="Provider" k="provider" sort={sort} setSort={setSort} w="9%" />
+          <Sortable label="Pool" k="pool_name" sort={sort} setSort={setSort} w="12%" />
+          <Sortable label="Kind" k="kind" sort={sort} setSort={setSort} w="7%" />
+          <Sortable label="Endpoint" k="endpoint" sort={sort} setSort={setSort} w="19%" />
+          <Sortable label="Geo" k="geo" sort={sort} setSort={setSort} w="5%" />
+          <Sortable label="Active" k="active" sort={sort} setSort={setSort} w="6%" />
+          <Sortable label="Tier 1" k="is_healthy" sort={sort} setSort={setSort} w="10%" />
+          <Sortable label="Tier 2" k="portal_ok" sort={sort} setSort={setSort} w="11%" />
+          <Sortable label="Checked" k="checked_at" sort={sort} setSort={setSort} w="10%" />
+          <th style={{ width: "11%" }}></th></tr></thead>
           <tbody>{shown.map((p, i) => (
-            <tr key={p.id}><td className="muted">{i + 1}</td><td><span className="pill">{p.provider}</span></td><td>{p.kind}</td>
-              <td className="muted">{p.endpoint}</td><td className={p.active ? "ok" : "muted"}>{String(p.active)}</td>
-              <td className={p.is_healthy === false ? "err" : "muted"}
-                  title={p.health || "unprobed"}>
-                {p.is_healthy === false ? (p.health || "unhealthy") : (p.health ? "ok" : "unprobed")}
+            <tr key={p.id}>
+              <td><input type="checkbox" checked={!!sel[p.id]}
+                         onChange={() => setSel((s2) => ({ ...s2, [p.id]: !s2[p.id] }))} /></td>
+              <td className="muted row-num">{i + 1}</td>
+              <td><span className="pill">{p.provider}</span></td>
+              <td className="muted">{p.pool_name || "—"}</td>
+              <td>{p.kind}</td>
+              <td className="muted ellipsis" title={p.endpoint}>{p.endpoint}</td>
+              <td className="muted">{p.geo || "—"}</td>
+              <td className={p.active ? "ok" : "muted"}>{String(p.active)}</td>
+              {/* Tier 1 and tier 2 are shown as separate columns because they answer different
+                  questions and only tier 1 is a verdict about the proxy. Collapsing them is the
+                  2026-08-28 mistake: a throttling portal condemned 4,489 good rows. */}
+              <td className={!p.checked_at ? "muted" : (p.is_healthy === false ? "err" : "ok")}
+                  title={p.health || "never checked"}>
+                {!p.checked_at ? "unchecked" : (p.is_healthy === false ? "DEAD" : "alive")}
               </td>
-              <td>{p.max_sessions}</td>
+              <td className={p.portal_ok == null ? "muted" : (p.portal_ok ? "ok" : "warn")}
+                  title={p.portal_health || "not portal-checked"}>
+                {p.portal_ok == null ? "—" : (p.portal_ok ? "reachable" : "blocked")}
+              </td>
+              <td className="muted" style={{ fontSize: 12 }}>
+                {p.checked_at ? new Date(p.checked_at).toLocaleString() : "—"}
+              </td>
               <td><button className="btn ghost" disabled={!op} onClick={() => toggle(p.id)}>{p.active ? "Deactivate" : "Activate"}</button></td></tr>
           ))}</tbody></table>
-        {shown.length === 0 && <div className="muted">No proxies in this pool yet.</div>}
+        )}
+        {/* Three genuinely different empty states. Telling an operator "no proxies in this pool"
+            when their own filter hid them all is how a filter gets mistaken for data loss. */}
+        {rows.length > 0 && shown.length === 0 && (
+          <div className="muted" style={{ padding: "12px 0" }}>
+            No proxies match these filters — {rows.length} on this page are hidden.{" "}
+            <button className="btn ghost" style={{ fontSize: 12, padding: "2px 8px" }}
+                    onClick={() => { setPoolFilter(""); setHealthFilter(""); setQ(""); }}>
+              Clear filters
+            </button>
+          </div>
+        )}
+        {rows.length === 0 && (
+          <div className="muted" style={{ padding: "16px 0", textAlign: "center" }}>
+            {page > 0 ? "No more proxies past this page." : (
+              <>
+                <div style={{ marginBottom: 10 }}>
+                  No static/ISP proxies imported yet.
+                </div>
+                <button className="btn" disabled={!op} onClick={() => setModal("import")}>
+                  Import ISP proxies
+                </button>
+              </>
+            )}
+          </div>
+        )}
+        {(page > 0 || rows.length === PAGE) && (
+          <div className="row" style={{ marginTop: 10, alignItems: "center", gap: 10 }}>
+            <button className="btn ghost" disabled={page === 0} onClick={() => setPage((p) => Math.max(0, p - 1))}>
+              ‹ Prev
+            </button>
+            <span className="muted" style={{ fontSize: 13 }}>
+              {(page * PAGE + 1).toLocaleString()}–{(page * PAGE + rows.length).toLocaleString()}
+              {poolTotal ? ` of ${poolTotal.toLocaleString()}` : ""}
+            </span>
+            {/* A full page means there is probably a next one. The endpoint returns rows, not a
+                total, so "probably" is the honest bound -- landing on an empty page says so
+                rather than pretending the button was disabled. */}
+            <button className="btn ghost" disabled={rows.length < PAGE} onClick={() => setPage((p) => p + 1)}>
+              Next ›
+            </button>
+          </div>
+        )}
       </div>
     </>
   );
@@ -2675,20 +3311,61 @@ function ProxyAddForm({ me, onDone, defaultProvider, defaultKind }) {
   );
 }
 
-function ProxyImportForm({ me, onDone, defaultProvider, defaultKind }) {
-  const [prov, setProv] = useState(defaultProvider || "soax");
-  const [kind, setKind] = useState(defaultKind || "mobile");
+// Import is ISP/STATIC-oriented now: rotating pools are minted per worker and have no rows at all
+// (D39/D40), so the only thing an operator imports is a finite purchase of individually-owned IPs.
+// `pool_name` is a free-text field backed by a datalist of existing names -- typing a new name
+// CREATES the pool, picking an existing one APPENDS to it, with no separate create step, because a
+// pool is nothing more than the set of rows carrying its name.
+function ProxyImportForm({ me, onDone, defaultProvider, defaultKind, defaultPool }) {
+  const [prov, setProv] = useState(defaultProvider || "thordata");
+  const [kind, setKind] = useState(defaultKind || "static");
+  const [pool, setPool] = useState(defaultPool || "");
+  // Was hardcoded to 1 when this form was written, which silently capped the whole ISP pool at one
+  // worker per IP -- on the 2026-09-16 run that exhausted 7/7 leases and starved both scouts out of
+  // the swap entirely. Editable, and defaulting to the same 2 the Add-proxy form and the API schema
+  // already use, so the three paths agree.
+  const [maxSessions, setMaxSessions] = useState(2);
+  const { rows: ispPools } = useList("/proxies/isp-pools");
+  const known = (ispPools || []).map((p) => p.pool_name).filter(Boolean);
+  const isNew = pool.trim() && !known.includes(pool.trim());
   return (
     <>
       <div className="field"><label>Provider</label>
-        <select value={prov} onChange={(e) => setProv(e.target.value)} style={{ width: "100%" }}>
-          <option value="soax">soax</option><option value="webshare">webshare</option>
-        </select></div>
+        <input value={prov} onChange={(e) => setProv(e.target.value)} style={{ width: "100%" }}
+          placeholder="thordata, iproyal, soax…" /></div>
       <div className="field"><label>Kind</label>
         <select value={kind} onChange={(e) => setKind(e.target.value)} style={{ width: "100%" }}>
+          <option value="static">static (ISP)</option>
+          <option value="isp">isp</option>
           <option value="rotating">rotating</option><option value="mobile">mobile</option>
         </select></div>
-      <ImportInline me={me} makeBody={(text) => ({ provider: prov, kind, text })} onDone={onDone} />
+      <div className="field"><label>Pool name</label>
+        <input list="isp-pool-names" value={pool} onChange={(e) => setPool(e.target.value)}
+          style={{ width: "100%" }} placeholder="e.g. thordata-oct" />
+        <datalist id="isp-pool-names">
+          {known.map((n) => <option key={n} value={n} />)}
+        </datalist>
+        <div className="muted" style={{ fontSize: 12, marginTop: 4 }}>
+          {pool.trim()
+            ? (isNew
+                ? <>New pool <b>{pool.trim()}</b> will be created.</>
+                : <>Adding to existing pool <b>{pool.trim()}</b> ({(ispPools.find((p) => p.pool_name === pool.trim()) || {}).total || 0} already in it).</>)
+            : <>Leave blank to import without a pool name. Named pools are what a booking assigns.</>}
+        </div>
+      </div>
+      <div className="field"><label>Max concurrent sessions per proxy</label>
+        <input type="number" min="1" value={maxSessions}
+          onChange={(e) => setMaxSessions(e.target.value)} style={{ width: "100%" }} />
+        <div className="muted" style={{ fontSize: 12, marginTop: 4 }}>
+          How many workers may hold one IP at once. 1 = strict one-worker-one-IP; higher multiplies
+          pool capacity but puts several sub-accounts behind the same exit at the same time.
+        </div>
+      </div>
+      <ImportInline me={me}
+        makeBody={(text) => ({ provider: prov, kind, resource_type: "static",
+                               pool_name: pool.trim() || null,
+                               max_sessions: Number(maxSessions) || 1, text })}
+        onDone={onDone} />
     </>
   );
 }
@@ -2779,9 +3456,9 @@ function GlobalSettingsEditor({ me }) {
         </div>
         <div className="field" style={{ alignSelf: "end" }}><button className="btn" disabled={!me.is_operating || !key || !val} onClick={save}>Save</button></div>
       </div>
-      <table><thead><tr><th style={{ width: 24 }}>#</th><th>Key</th><th>Value</th></tr></thead>
+      <table><thead><tr><th style={{ width: 36, whiteSpace: "nowrap" }}>#</th><th>Key</th><th>Value</th></tr></thead>
         <tbody>{Object.entries(current).map(([k, v], i) => (
-          <tr key={k}><td className="muted">{i + 1}</td><td><code>{k}</code></td><td className="muted">{String(v)}</td></tr>
+          <tr key={k}><td className="muted row-num">{i + 1}</td><td><code>{k}</code></td><td className="muted">{String(v)}</td></tr>
         ))}{Object.keys(current).length === 0 && <tr><td colSpan={3} className="muted">none set</td></tr>}</tbody></table>
     </div>
   );
@@ -2842,6 +3519,7 @@ function ConfigJsonEditor({ me, ck }) {
 
 function Templates({ me }) {
   const { rows, err, reload } = useList("/templates");
+  const { rows: proxyRows } = useList("/proxies/pools");
   const [f, setF] = useState({ name: "", role: "scout", settings: "{}" });
   const [editId, setEditId] = useState(null);
   const [msg, setMsg] = useState("");
@@ -2852,6 +3530,26 @@ function Templates({ me }) {
     setF({ name: t.name, role: t.role, settings: JSON.stringify(t.settings_json || {}, null, 2) });
   }
   function cancelEdit() { setEditId(null); setF({ name: "", role: "scout", settings: "{}" }); }
+
+  // Quick-picker for the six template-overridable proxy settings (2026-09-09) -- mirrors
+  // BookingShortcutSettings' pool picker, but merges into this form's own f.settings JSON text
+  // rather than a separate PATCH, so the picker and the raw JSON stay in sync and Save/Create
+  // keeps sending exactly what it already sends today.
+  let parsedSettings = {};
+  try { parsedSettings = JSON.parse(f.settings || "{}"); } catch { /* left to save()'s own error banner */ }
+  const pools = derivePoolOptions(proxyRows);
+  const poolValue = (provider, kind) => `${provider}|${kind}`;
+  const warmupPoolValue = poolValue(parsedSettings.PROXY_PROVIDER ?? "soax", parsedSettings.PROXY_KIND ?? "");
+  const holdPoolValue = poolValue(parsedSettings.HOLD_PROXY_PROVIDER ?? "soax", parsedSettings.HOLD_PROXY_KIND ?? "");
+  const swapOn = !!parsedSettings.HOLD_SWAP_AFTER_LOGIN;
+  function mergeSettings(patch) {
+    const next = { ...parsedSettings, ...patch };
+    setF((prev) => ({ ...prev, settings: JSON.stringify(next, null, 2) }));
+  }
+  function onTemplatePoolChange(providerKey, kindKey, value) {
+    const [provider, kind] = value.split("|");
+    mergeSettings({ [providerKey]: provider, [kindKey]: kind });
+  }
 
   async function save() {
     setMsg("");
@@ -2880,6 +3578,31 @@ function Templates({ me }) {
             <select value={f.role} onChange={(e) => setF({ ...f, role: e.target.value })}>
               <option value="scout">scout</option><option value="apply">apply</option>
             </select></div>
+          <div className="field" style={{ margin: 0, minWidth: 220 }}>
+            <label>Warmup phase proxy pool</label>
+            <select value={warmupPoolValue} style={{ width: "100%" }}
+              onChange={(e) => onTemplatePoolChange("PROXY_PROVIDER", "PROXY_KIND", e.target.value)}>
+              {pools.map((p) => <option key={`w-${p.provider}-${p.kind}`} value={poolValue(p.provider, p.kind)}>{p.label}</option>)}
+            </select></div>
+          <div className="field" style={{ margin: 0, display: "flex", alignItems: "center", gap: 8 }}>
+            <input type="checkbox" id="tpl-hold-swap-toggle" checked={swapOn}
+              onChange={(e) => mergeSettings({ HOLD_SWAP_AFTER_LOGIN: e.target.checked })} />
+            <label htmlFor="tpl-hold-swap-toggle" style={{ margin: 0 }}>Swap after login</label></div>
+          <div className="field" style={{ margin: 0, minWidth: 200 }}>
+            <label>Browser mode</label>
+            <select value={parsedSettings.HEADLESS_MODE ?? "new"} style={{ width: "100%" }}
+              onChange={(e) => mergeSettings({ HEADLESS_MODE: e.target.value })}
+              title="headful passes the WAF best (a real window) but is heavy and needs a display — the worker auto-starts a virtual one (Xvfb), falling back to 'new' if none is available. 'new' is stealthy headless; 'old' is detectable.">
+              <option value="new">new — headless, stealthy (default)</option>
+              <option value="headful">headful — visible, best vs WAF (heavy)</option>
+              <option value="old">old — headless, detectable</option>
+            </select></div>
+          <div className="field" style={{ margin: 0, minWidth: 220 }}>
+            <label>Post-hold phase proxy pool{!swapOn ? " (enabled when swap is on)" : ""}</label>
+            <select value={holdPoolValue} disabled={!swapOn} style={{ width: "100%" }}
+              onChange={(e) => onTemplatePoolChange("HOLD_PROXY_PROVIDER", "HOLD_PROXY_KIND", e.target.value)}>
+              {pools.map((p) => <option key={`h-${p.provider}-${p.kind}`} value={poolValue(p.provider, p.kind)}>{p.label}</option>)}
+            </select></div>
           <div className="field grow"><label>Settings (JSON, template-layer knobs)</label>
             <textarea value={f.settings} onChange={(e) => setF({ ...f, settings: e.target.value })} rows={3}
               style={{ width: "100%", fontFamily: "monospace", fontSize: 12, background: "var(--panel2)", color: "var(--text)", border: "1px solid var(--border)", borderRadius: 8, padding: 8 }}
@@ -2893,9 +3616,9 @@ function Templates({ me }) {
       <div className="card">
         <h2>Templates ({rows.length})</h2>
         {err && <div className="banner err">{err}</div>}
-        <table><thead><tr><th style={{ width: 24 }}>#</th><th>Name</th><th>Role</th><th>Settings</th><th></th></tr></thead>
+        <table><thead><tr><th style={{ width: 36, whiteSpace: "nowrap" }}>#</th><th>Name</th><th>Role</th><th>Settings</th><th></th></tr></thead>
           <tbody>{rows.map((t, i) => (
-            <tr key={t.id}><td className="muted">{i + 1}</td><td>{t.name}</td><td><span className="pill">{t.role}</span></td>
+            <tr key={t.id}><td className="muted row-num">{i + 1}</td><td>{t.name}</td><td><span className="pill">{t.role}</span></td>
               <td className="muted" style={{ fontFamily: "monospace", fontSize: 12 }}>{JSON.stringify(t.settings_json)}</td>
               <td className="row">
                 <button className="btn ghost" disabled={!op} onClick={() => startEdit(t)}>Edit</button>
@@ -2926,9 +3649,9 @@ function Settings({ me }) {
       {layers.map((l) => (
         <div className="card" key={l}>
           <h2>{l} ({cat[l].length})</h2>
-          <table><thead><tr><th style={{ width: 24 }}>#</th><th>Key</th><th>Type</th><th>Default</th><th>Group</th><th>Override at</th></tr></thead>
+          <table><thead><tr><th style={{ width: 36, whiteSpace: "nowrap" }}>#</th><th>Key</th><th>Type</th><th>Default</th><th>Group</th><th>Override at</th></tr></thead>
             <tbody>{cat[l].map((s, i) => (
-              <tr key={s.key}><td className="muted">{i + 1}</td><td><code>{s.key}</code></td><td className="muted">{s.type}</td>
+              <tr key={s.key}><td className="muted row-num">{i + 1}</td><td><code>{s.key}</code></td><td className="muted">{s.type}</td>
                 <td className="muted">{String(s.default)}</td><td>{s.group}</td>
                 <td className="muted">{s.override_layers.join(", ") || "—"}</td></tr>
             ))}</tbody></table>
@@ -2995,7 +3718,7 @@ function Audit() {
       </div>
       {err && <div className="banner err">{err}</div>}
       <table><thead><tr>
-        <th style={{ width: 24 }}>#</th>
+        <th style={{ width: 36, whiteSpace: "nowrap" }}>#</th>
         <Sortable label="Time" k="ts" sort={sort} setSort={setSort} />
         <Sortable label="Actor" k="actor" sort={sort} setSort={setSort} />
         <Sortable label="Action" k="action" sort={sort} setSort={setSort} />
@@ -3004,7 +3727,7 @@ function Audit() {
       </tr></thead>
         <tbody>{shown.map((r, i) => (
           <tr key={r.id}>
-            <td className="muted">{i + 1}</td>
+            <td className="muted row-num">{i + 1}</td>
             <td className="muted">{r.ts ? r.ts.replace("T", " ").slice(0, 19) : "—"}</td>
             <td>{r.actor || "—"}</td>
             <td><span className="pill">{r.action}</span></td>
@@ -3019,8 +3742,19 @@ function Audit() {
 
 function Sessions({ me, onChange }) {
   const { rows, err, reload } = useList("/sessions");
+  const pending = useList(me.role === "admin" ? "/sessions/extra-view/pending" : null);
   const [msg, setMsg] = useState("");
-  async function act(fn) { setMsg(""); try { await fn(); reload(); onChange(); } catch (e) { setMsg(e.message); } }
+  const [sel, setSel] = useState({});           // session_id -> bool (bulk force-remove, admin only)
+  async function act(fn) { setMsg(""); try { await fn(); reload(); pending.reload(); onChange(); } catch (e) { setMsg(e.message); } }
+  const removable = rows.filter((s) => s.status !== "ended");
+  const selectedIds = Object.keys(sel).filter((k) => sel[k]);
+  async function bulkForceRemove() {
+    setMsg("");
+    try {
+      await Promise.all(selectedIds.map((sid) => api(`/sessions/${sid}/force-release`, { method: "POST" })));
+      setSel({}); reload(); pending.reload(); onChange();
+    } catch (e) { setMsg(e.message); }
+  }
   return (
     <div className="card">
       <h2>Active sessions</h2>
@@ -3032,14 +3766,57 @@ function Sessions({ me, onChange }) {
             Request operate seat
           </button>
         )}
+        {me.role === "viewer" && me.session_status === "paused" && (
+          <button className="btn" onClick={() => act(() => api("/sessions/extra-view/request", { method: "POST" }))}>
+            Request extra session
+          </button>
+        )}
       </div>
-      <table><thead><tr><th style={{ width: 24 }}>#</th><th>User</th><th>Purpose</th><th>Status</th><th></th></tr></thead>
+      {me.role === "admin" && selectedIds.length > 0 && (
+        <div className="banner info row">
+          <span>{selectedIds.length} selected</span>
+          <span className="grow" />
+          <button className="btn" onClick={bulkForceRemove}>Force-remove ({selectedIds.length})</button>
+        </div>
+      )}
+      <table><thead><tr><th style={{ width: 36, whiteSpace: "nowrap" }}>#</th>
+          {me.role === "admin" && <th style={{ width: 36 }}>
+            <input type="checkbox" checked={removable.length > 0 && removable.every((s) => sel[s.session_id])}
+              onChange={(e) => { const s = {}; if (e.target.checked) removable.forEach((row) => (s[row.session_id] = true)); setSel(s); }} />
+          </th>}
+          <th>User</th><th>Purpose</th><th>Status</th><th></th></tr></thead>
         <tbody>{rows.map((s, i) => (
-          <tr key={s.session_id}><td className="muted">{i + 1}</td><td>{s.user}</td><td><span className="pill">{s.purpose}</span></td><td>{s.status}</td>
-            <td>{me.role === "admin" && s.purpose === "operate" && s.status === "active" && (
-              <button className="btn ghost" onClick={() => act(() => api(`/sessions/${s.session_id}/force-release`, { method: "POST" }))}>Force-release</button>
+          <tr key={s.session_id}><td className="muted row-num">{i + 1}</td>
+            {me.role === "admin" && (
+              <td onClick={(e) => e.stopPropagation()}>
+                {s.status !== "ended" && (
+                  <input type="checkbox" checked={!!sel[s.session_id]}
+                    onChange={(e) => setSel({ ...sel, [s.session_id]: e.target.checked })} />
+                )}
+              </td>
+            )}
+            <td>{s.user}</td><td><span className="pill">{s.purpose}</span></td><td>{s.status}</td>
+            <td>{me.role === "admin" && s.status !== "ended" && (
+              <button className="btn ghost" onClick={() => act(() => api(`/sessions/${s.session_id}/force-release`, { method: "POST" }))}>Force-remove</button>
             )}</td></tr>
         ))}</tbody></table>
+      {me.role === "admin" && (
+        <>
+          <h2 style={{ marginTop: 16 }}>Pending extra-session requests ({pending.rows.length})</h2>
+          {pending.rows.length === 0 && <div className="muted">None.</div>}
+          {pending.rows.length > 0 && (
+            <table><thead><tr><th style={{ width: 36, whiteSpace: "nowrap" }}>#</th><th>Requested by</th><th>Requested</th><th></th></tr></thead>
+              <tbody>{pending.rows.map((r, i) => (
+                <tr key={r.request_id}><td className="muted row-num">{i + 1}</td><td>{r.requester}</td>
+                  <td className="muted">{r.created_at ? r.created_at.slice(0, 19).replace("T", " ") : "—"}</td>
+                  <td className="row">
+                    <button className="btn" onClick={() => act(() => api(`/sessions/extra-view/${r.request_id}/grant`, { method: "POST" }))}>Grant</button>
+                    <button className="btn ghost" onClick={() => act(() => api(`/sessions/extra-view/${r.request_id}/deny`, { method: "POST" }))}>Deny</button>
+                  </td></tr>
+              ))}</tbody></table>
+          )}
+        </>
+      )}
     </div>
   );
 }
