@@ -53,6 +53,39 @@ def _s(key, home, type=str, default=None, override=frozenset(), group="", note="
     return Setting(key, home, type, default, override, group, note, min_value, tuple(choices))
 
 
+# ── RETIRED SETTINGS ─────────────────────────────────────────────────────────────────────────
+# Keys that USED to be in the catalog and deliberately are not any more. `validate_layer` ignores a
+# stored value for one of these instead of raising UnknownSetting.
+#
+# THIS EXISTS BECAUSE DELETING A CATALOG ENTRY IS A PRODUCTION OUTAGE, and it happened on
+# 2026-09-16. The six rotating-credential keys below were removed from the catalog when credentials
+# moved to the environment (D40) -- but a backfill had already written them into the live `settings`
+# table. `resolve()` then raised UnknownSetting on EVERY call, which is on the scheduler's per-tick
+# path: the scheduler crash-looped for ~2h45m, booking "Test 0916" never left SCHEDULED, and no
+# worker could launch. One stale row took down every booking on the host.
+#
+# The catalog already warned about exactly this, in TELEGRAM_BOT_TOKEN's note: "Kept because
+# deleting the catalog entry would make resolve() reject the stored value and break every worker
+# launch." Retiring a key is now an explicit, safe operation rather than a deletion that happens to
+# be a landmine for whichever host has the value stored.
+#
+# A retired key is NOT settable: writing one still fails, because it has no catalog entry and
+# nothing reads it. Only reading a leftover row is tolerated, which is the only case that matters.
+RETIRED_SETTINGS = frozenset({
+    # Rotating-proxy credentials -> moved to the environment, 2026-09-16 (DECISIONS.md D40).
+    "SOAX_ROTATING_PACKAGE", "SOAX_ROTATING_PASSWORD",
+    "SOAX_MOBILE_PACKAGE", "SOAX_MOBILE_PASSWORD",
+    "WEBSHARE_PREFIX", "WEBSHARE_PASSWORD",
+    # Scout discovery redesigned to the round-robin full-range ROTATION model, 2026-09-21 -- the
+    # single-probe/split-partition scheme these configured no longer exists. SINGLE_MODE_INTERVAL's
+    # pacing role is now DISCOVERY_MIN_INTERVAL; the rest have no analogue (a full-range round has no
+    # per-scout slice to cap, partition, or retire dates from). Kept here (not deleted silently) so a
+    # booking still carrying a stored value doesn't crash resolve() on the per-tick path.
+    "DISCOVERY_MODE", "DISCOVERY_CONCURRENCY", "DISCOVERY_MAX_PARALLEL",
+    "SINGLE_MODE_INTERVAL", "DATE_RETIRE_ENABLED", "DATE_RETIRE_AFTER_MISSES",
+})
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 6.1 GLOBAL — system, infra, credentials, provider config
 # ─────────────────────────────────────────────────────────────────────────────
@@ -70,6 +103,25 @@ _GLOBAL = [
     _s("CAPSOLVER_KEYS", L.GLOBAL, str, group="credentials",
        note=
        "Comma-separated CapSolver API keys. Credential -- never commit it to source."),
+    # ── rotating-pool credentials: DELIBERATELY ABSENT ───────────────────────────────────────
+    # ROTATING CREDENTIALS ARE NOT SETTINGS (operator direction 2026-09-16). SOAX_ROTATING_PACKAGE
+    # /_PASSWORD, SOAX_MOBILE_*, WEBSHARE_PREFIX/_PASSWORD were briefly catalogued here and have
+    # been removed: they are deployment facts and secrets, so they live in the environment (.env)
+    # and are declared per pool in libs/proxies/providers/. Two concrete reasons, not taste:
+    #   * a setting is editable from the web dashboard and readable by anything with a DB
+    #     connection -- neither is appropriate for a proxy password;
+    #   * while they were settings, credential resolution had to consult ambient os.environ, and
+    #     because apps/hub/config.py loads .env at import, the TEST SUITE resolved live production
+    #     credentials -- one appeared verbatim in a pytest failure message.
+    # The TTLs below stay: they are non-secret operational knobs an operator legitimately tunes.
+    _s("SOAX_SESSIONLENGTH", L.GLOBAL, int, 3600, group="credentials", min_value=1.0,
+       note="Seconds a SOAX sticky session lives after binding. Also the hard ceiling on how long "
+            "any session id can be 'established'."),
+    _s("SOAX_BINDTTL", L.GLOBAL, int, 600, group="credentials", min_value=1.0,
+       note="Seconds SOAX holds the bound exit IP for a session."),
+    _s("SOAX_IDLETTL", L.GLOBAL, int, 900, group="credentials", min_value=1.0,
+       note="Seconds of inactivity before SOAX drops the session's exit. KEEPALIVE_INTERVAL must "
+            "stay under this or a holding worker's exit dies between probes."),
     _s("TELEGRAM_BOT_TOKEN", L.GLOBAL, str, group="credentials",
        note=
        "Telegram bot token. NOT IMPLEMENTED -- stored and validated, but nothing reads it yet. Kept "
@@ -102,9 +154,15 @@ _GLOBAL = [
        note="shared secret for CF_WORKER_URL"),
     # Browser / stealth defaults (override-ok at template)
     _s("HEADLESS_MODE", L.GLOBAL, str, "new", _TPL, "browser",
+       choices=("new", "old", "headful"),
        note=
-       "Chromium headless mode ('new' is the modern one). Headful is measurably heavier per worker "
-       "and matters at fleet scale."),
+       "Chromium browser mode, settable per TEMPLATE. 'new' (default) = Chrome --headless=new, the "
+       "modern render path -- far less detectable than 'old' (a bot tell), needs NO display. "
+       "'headful' = a real visible window; a reference bot built from a successful-booking HAR "
+       "insists the WAF only passes a headful browser -- but it needs a display (xvfb): where none "
+       "is present the worker auto-starts a virtual one, and if that is unavailable it falls back to "
+       "'new' with a warning rather than failing to launch. Headful is heavy, so use it for a SMALL "
+       "critical fleet, not 100+ workers."),
     _s("DRIVER", L.GLOBAL, str, "playwright", _TPL, "browser",
        note=
        "Browser automation driver. 'playwright' is the only path exercised in production here."),
@@ -198,14 +256,23 @@ _BOOKING = [
     # foot-gun: a booking created without touching this ran a full fleet that could never book.
     _s("ENGINE_MODE", L.BOOKING, str, "live", group="mode",
        note="'live' books real appointments; 'sim' drives the same flow against SimEngineOps"),
-    # Phase 3 (D32): all six proxy settings below now take _WRK -- a worker can override its
-    # booking's proxy configuration. Previously override=frozenset() on every one of them, meaning
-    # NO worker-level override existed for any proxy setting despite the resolver already
-    # implementing WORKER > TEMPLATE > BOOKING > GLOBAL precedence correctly; this was a missing
-    # opt-in, not a missing mechanism. See workers.settings_json (Worker model) for where a
-    # worker's override value now actually comes from.
-    _s("PROXY_PROVIDER", L.BOOKING, str, "soax", _WRK, group="mode",
-       note="phase-1 (login/warmup) leased-proxy provider: 'soax' | 'webshare'"),
+    # Phase 3 (D32): all six proxy settings below take _WRK (worker override) -- a worker can
+    # override its booking's proxy configuration. Previously override=frozenset() on every one of
+    # them, meaning NO worker-level override existed for any proxy setting despite the resolver
+    # already implementing WORKER > TEMPLATE > BOOKING > GLOBAL precedence correctly; this was a
+    # missing opt-in, not a missing mechanism. See workers.settings_json (Worker model) for where
+    # a worker's override value now actually comes from.
+    #
+    # Widened to _TPL (operator instruction, 2026-09-09): a WorkerTemplate can now ALSO carry
+    # these six, so several templates (e.g. "soax warmup" / "webshare warmup") can be attached to
+    # different identities within the SAME booking instead of needing one booking per proxy
+    # config. Reduces blast radius: a single provider's outage (soax, 2026-09-07/08) no longer
+    # has to stall a whole booking's apply capacity if some workers are on a different template.
+    # Mechanism was already proven end-to-end by HOLD_SWAP_AFTER_LOGIN, the first L.TEMPLATE-home
+    # setting -- this just opens the same door to booking-home settings via override, not home.
+    _s("PROXY_PROVIDER", L.BOOKING, str, "soax", _TPL, group="mode",
+       note="phase-1 (login/warmup) leased-proxy provider: 'soax' | 'webshare'. Template-overridable "
+            "(2026-09-09) so different worker templates in one booking can draw from different pools."),
     # Exit countries the phase-1 pool may draw from, comma-separated (e.g. "DE,IT"); blank = all.
     # Measured over 1392 real login attempts 2026-08-18: DE 23.7% / IT 23.4% / PT 10.8% / NL 10.6%
     # / ES 8.1% / LU 4.9% / CZ 2.9%. An 8x spread, and the pool was being spent almost backwards --
@@ -213,22 +280,61 @@ _BOOKING = [
     # highest-leverage change available against the login wall, which is where ~90% of this fleet's
     # time goes. Left blank by default: it trades pool breadth for pass rate, and how far to push
     # that is an operator call, not a default.
-    _s("PROXY_GEOS", L.BOOKING, str, "", _WRK, group="mode",
+    _s("PROXY_GEOS", L.BOOKING, str, "", _TPL, group="mode",
        note=
        "Comma-separated exit countries, injected into the proxy credential. Login success varies ~8x "
        "by geo (DE 23.7% / IT 23.4% / PT 10.8% / NL 10.6% / ES 8.1% / CZ 2.9%), so a narrow low-rate "
-       "set can stop the fleet logging in at all. Empty = no geo constraint."),
-    _s("HOLD_PROXY_GEOS", L.BOOKING, str, "", _WRK, group="mode",
-       note="same, for the phase-2 (hold/apply) pool; blank = all"),
-    _s("PROXY_KIND", L.BOOKING, str, override=_WRK, group="mode",
-       note="optional phase-1 proxy kind filter (Proxy.kind): 'rotating' | 'mobile'; blank = no filter"),
-    _s("HOLD_PROXY_PROVIDER", L.BOOKING, str, "webshare", _WRK, group="mode",
-       note="phase-2 (hold/apply/discovery) leased-proxy provider, used only when HOLD_SWAP_AFTER_WARMUP "
+       "set can stop the fleet logging in at all. Empty = no geo constraint. Template-overridable."),
+    _s("HOLD_PROXY_GEOS", L.BOOKING, str, "", _TPL, group="mode",
+       note="same, for the phase-2 (hold/apply) pool; blank = all. Template-overridable."),
+    # Named ISP pools (2026-09-16). MULTIPLE pools per booking is the point, not a convenience: an
+    # ISP purchase is a fixed number of individually-owned IPs -- "10 from Thordata" -- and that is
+    # routinely fewer than the worker count, so a booking draws from the UNION of the pools it
+    # names. Blank = any pool, which is what every existing booking means.
+    #
+    # Only meaningful when the phase actually uses a STATIC pool; rotating pools are minted per
+    # worker and have no rows to belong to a pool (D39/D40). Mirrors PROXY_GEOS/HOLD_PROXY_GEOS
+    # deliberately -- same comma-separated shape, same blank-means-all rule, same per-phase pair --
+    # so there is one filter idiom to learn rather than two.
+    _s("PROXY_POOLS", L.BOOKING, str, "", _TPL, group="mode",
+       note="Comma-separated NAMED ISP pools the phase-1 (login/warmup) static pool may draw from, "
+            "e.g. 'thordata-oct,iproyal-a'. Blank = any pool. A booking may name several because one "
+            "ISP purchase is usually smaller than the worker count. Ignored for rotating pools, "
+            "which have no rows. Template-overridable."),
+    _s("HOLD_PROXY_POOLS", L.BOOKING, str, "", _TPL, group="mode",
+       note="same, for the phase-2 (hold/apply/discovery) static pool; blank = any. "
+            "Template-overridable."),
+    _s("PROXY_KIND", L.BOOKING, str, override=_TPL, group="mode",
+       note="optional phase-1 proxy kind filter (Proxy.kind): 'rotating' | 'mobile'; blank = no filter. "
+            "Template-overridable."),
+    _s("HOLD_PROXY_PROVIDER", L.BOOKING, str, "webshare", _TPL, group="mode",
+       note="phase-2 (hold/apply/discovery) leased-proxy provider, used only when HOLD_SWAP_AFTER_LOGIN "
             "is on -- default 'webshare' (long, ~24h session lifetime) vs phase-1's 'soax' default "
             "(~1h session lifetime): a long hold needs to outlive soax's own session cap, which a "
-            "same-provider swap can't fix -- see libs.domain.settings.catalog's hold_swap group"),
-    _s("HOLD_PROXY_KIND", L.BOOKING, str, override=_WRK, group="mode",
-       note="optional phase-2 proxy kind filter ('rotating' | 'mobile'); blank = no filter"),
+            "same-provider swap can't fix -- see libs.domain.settings.catalog's hold_swap group. "
+            "Template-overridable."),
+    _s("HOLD_PROXY_KIND", L.BOOKING, str, override=_TPL, group="mode",
+       note="optional phase-2 proxy kind filter ('rotating' | 'mobile'); blank = no filter. "
+            "Template-overridable."),
+    # The only real bound on how hard we hit one provider at once. `Proxy.max_sessions` was never
+    # one: all 42,600 rows carried max_sessions=2, a nominal 85,200-lease ceiling nothing could
+    # reach -- and as of 2026-09-15 rotating pools have no rows to carry it. The gap was
+    # acknowledged-but-unimplemented in apps/hub/main.py's registration path: "a provider like SOAX
+    # does not establish unlimited concurrent sticky sessions per package."
+    #
+    # Host-wide (keyed by provider+kind, NOT by booking) because the limit being modelled is the
+    # provider's, and the package is shared by every booking on the host.
+    #
+    # The default is a GUESS, not a measurement -- soax publishes no per-package concurrency figure
+    # and we have never probed for one. 20 is chosen to be clearly below the ~40-160 simultaneous
+    # establishments that preceded the 2026-09-11 ERR_CONNECTION_CLOSED storms while staying above
+    # LOGIN_CONCURRENCY's default of 10, so a single booking is not additionally throttled by it.
+    # Tune against an observed limit before trusting it.
+    _s("PROVIDER_LOGIN_CONCURRENCY", L.BOOKING, int, 20, group="mode",
+       note="max concurrent LOGIN attempts host-wide against one proxy pool (provider+kind), across "
+            "ALL bookings. Bounds the rate at which fresh sticky sessions are established, which is "
+            "what a provider actually rate-limits. 0 disables the gate. Default 20 is an untuned "
+            "guess -- see the catalog comment."),
     # Timing (warmup_start_at / slot_open_at are booking timestamp columns)
     _s("WARMUP_START_JITTER", L.BOOKING, float, 0.0, group="timing",
        note="anti-herd (operator spec 2026-08-14: 'hub spawns worker processors -- concurrency "
@@ -257,10 +363,6 @@ _BOOKING = [
        note=
        "Days forward to scan when CAL_END_DATE is empty. 0 = the posto's own default horizon."),
     # Discovery / pool policy
-    _s("DISCOVERY_MODE", L.BOOKING, str, "parallel", group="discovery",
-       note=
-       "'parallel' slices the date window across scouts; 'serial' walks it with one. Parallel is "
-       "faster and spreads load across sessions/IPs, and is what the split model assumes."),
     _s("DISCOVERY_SOURCE", L.BOOKING, str, "calendar", group="discovery",
        choices=("calendar", "slots", "both"),
        note="Which endpoint discovery reads. One of: calendar | slots | both. "
@@ -271,28 +373,15 @@ _BOOKING = [
             "15s before a confirmed booking). both = slots first, calendar for any date slots "
             "could not resolve. The catalog has no enum type, so this renders as free text -- an "
             "unrecognised value is REFUSED LOUDLY by the worker rather than silently falling back."),
-    _s("DISCOVERY_MAX_PARALLEL", L.BOOKING, int, 10, group="discovery",
-       note="SINGLE-mode (pre slot-found) 'awaken scout limit' -- only up to this many scouts are "
-            "ever in the single-mode probe rotation at once, the rest stay parked in hold; a dead "
-            "awakened scout is replaced from the parked pool. Renamed in meaning 2026-08-14 (was "
-            "briefly wired as a SPLIT-mode cap on 2026-08-13, which was wrong -- split mode never "
-            "benches a scout, see DISCOVERY_CONCURRENCY)"),
-    _s("DISCOVERY_CONCURRENCY", L.BOOKING, int, 5, group="discovery",
-       note="SPLIT-mode (post slot-found) concurrency window: every scout gets a persistent date "
-            "slice (full fleet coverage, nobody benched), but only this many may have a discover "
-            "round actively in flight at once -- the window rotates across the fleet as rounds "
-            "finish, so 'more scouts' still means faster full-range coverage without hammering the "
-            "portal with everyone at once"),
-    _s("SINGLE_MODE_INTERVAL", L.BOOKING, float, 30.0, group="discovery", min_value=1.0,
-       note="minimum seconds between successive SINGLE-mode probes fleet-wide (not per scheduler "
-            "tick, which is much hotter at 5s) -- 'if there are 10 scouts, 1 scout retries "
-            "discovery per 300s'"),
-    _s("DATE_RETIRE_ENABLED", L.BOOKING, bool, True, group="discovery",
-       note="on/off switch for date retirement -- when off, a date is NEVER pruned from a scout's "
-            "discovery slice no matter how many empty reports it gets"),
-    _s("DATE_RETIRE_AFTER_MISSES", L.BOOKING, int, 3, group="discovery", min_value=1.0,
-       note="consecutive empty (never 'failed'/unknown) reports before a date is retired from "
-            "active scanning; ignored when DATE_RETIRE_ENABLED is off"),
+    _s("DISCOVERY_MIN_INTERVAL", L.BOOKING, float, 30.0, group="discovery", min_value=1.0,
+       note="ROTATION model (2026-09-21): minimum seconds between successive REAL discovery rounds "
+            "fleet-wide -- one scout does a full-range round, then the next healthy scout after this "
+            "interval, round-robin, so with n healthy scouts a given scout is revisited about every "
+            "MIN*n. A FAILED round (dead session / nothing reported) does NOT wait this interval -- "
+            "the rotation moves to the next scout immediately. Paces real portal traffic, not the "
+            "5s scheduler tick. (Replaced SINGLE_MODE_INTERVAL and the split-mode knobs "
+            "DISCOVERY_MODE/DISCOVERY_CONCURRENCY/DISCOVERY_MAX_PARALLEL/DATE_RETIRE_* -- see "
+            "RETIRED_SETTINGS.)"),
     _s("SLOT_OPEN_INACTIVATE_AFTER", L.BOOKING, float, 1200.0, group="discovery",
        note="false-slot-open guard (operator spec 2026-08-14): if slot-open has been fired for this "
             "many seconds and NOT ONE slot has been found in that whole window, acknowledge the "
@@ -305,6 +394,43 @@ _BOOKING = [
     # fleet enters the window with fresh form state rather than scattered across their own
     # ~16-minute keepalive cycles. 0 disables. Only meaningful when slot_open_at is set --
     # a manually fired slot-open has no advance notice to act on.
+    # Phantom-slot guard (operator-confirmed rule, 2026-09-18). The calendar discovery path derives
+    # availability by subtraction (active range minus getPeriodosOcupados' closed prefix), which
+    # cannot tell a real per-date answer from the portal's fallback template under load -- and the
+    # template decodes every date to the SAME thin period set. Confirmed on Booking 0918: {3,4} on
+    # 10-14 AND {3,4} on 10-15 while the portal's own calendar showed the 15th unavailable. Both
+    # fired slot_found; three apply workers leased them, re-warmed into a 503, and the recovery
+    # ladder re-logged them in -- discarding good sessions and spending reCAPTCHA strikes on slots
+    # that did not exist. A phantom round is reported as FAILED (unknown): no rows, no slot_found,
+    # no date retirement; the next round simply asks again.
+    _s("PHANTOM_MAX_PERIODS", L.BOOKING, int, 2, _TPL, group="discovery", min_value=0,
+       note="a discovery round whose found dates ALL decode to the same period set of at most this "
+            "many periods is treated as phantom (portal template, not real availability) and "
+            "reported as unknown rather than found. 0 disables. Uniformity across dates is the "
+            "signal; a real open answers each date differently."),
+    _s("PHANTOM_MIN_DATES", L.BOOKING, int, 2, _TPL, group="discovery", min_value=1,
+       note="the phantom verdict needs at least this many found dates in the round -- uniformity "
+            "across one date is not evidence of anything."),
+    # Blind apply (operator direction 2026-09-18, libs/domain/blind.py). A blind slot is never
+    # discovered, so nothing would ever retire it; each BOUNCED release counts against it and past
+    # this many it is CLOSED. Capacity per (date, period) is >= 3, so a real combination can absorb
+    # a couple of bounces from workers racing each other -- 3 keeps a real one alive through that
+    # while retiring a phantom after three independent failures. 0 = never retire.
+    # Genuine blind-apply MODE (operator direction 2026-09-21). Distinct from the mid-run
+    # /blind-apply fallback: this is configured up front. The operator seeds blind slots BEFORE
+    # scheduling, and on start the booking skips discovery entirely -- no scouts, no /slots polling,
+    # no waiting for slot-open/slot-found on a timer. slot-open is fired the moment the booking
+    # starts (so it goes RUNNING) and slot-found fires immediately off the seeded pool, so apply
+    # workers go straight to warmup -> apply and cycle the blind grid, retiring what bounces and
+    # booking what is real. A real booking already derives apply-only workers, which is exactly what
+    # this needs.
+    _s("BLIND_APPLY_MODE", L.BOOKING, bool, False, _TPL, group="discovery",
+       note="run the booking purely off an operator-seeded blind slot pool: no scouts, no discovery, "
+            "signals auto-fire on start. Seed the grid with POST /bookings/{id}/blind-apply before "
+            "starting. Off by default."),
+    _s("BLIND_MAX_BOUNCES", L.BOOKING, int, 3, _TPL, group="discovery", min_value=0,
+       note="bounces off an operator-seeded blind slot before it is retired (CLOSED). Discovered "
+            "slots are unaffected; they retire via the scouts' miss count. 0 = never."),
     _s("PREWARM_BEFORE_SLOT_OPEN", L.BOOKING, float, 120.0, group="discovery",
        note="re-warm holding workers this many seconds before the scheduled slot-open"),
     _s("SLOT_LEASE_TTL", L.BOOKING, float, 180.0, group="discovery",
@@ -313,6 +439,19 @@ _BOOKING = [
             "a booking within seconds; a worker that dies, hangs, or bounces without emitting a "
             "terminal event would otherwise sterilise those units forever. A worker actually in "
             "APPLYING/BOOKED is never reclaimed, however long it takes. 0 disables reclaim."),
+    # Slots-path CAPTCHA pre-solve (2026-09-20, A/B lever). Today _discover_via_slots waits out the
+    # ~100s /slots rate-limit window and THEN solves a token (7-23s), so the solve latency sits on
+    # the critical path of every poll. With this on, the token is solved DURING the tail of that
+    # otherwise-idle wait and cached, so when the window opens the request fires immediately. Off by
+    # default: this touches the confirmed booking path, and the win is only realised in steady-state
+    # polling -- the first poll at slot-open has no wait to pre-solve in. Measure on a test booking
+    # before trusting it on a real run.
+    _s("SLOTS_PRESOLVE", L.BOOKING, bool, False, _TPL, group="discovery",
+       note="pre-solve the /slots CAPTCHA during the rate-limit wait so the poll fires the instant "
+            "the window opens, instead of paying the 7-23s solve after the wait. Off by default."),
+    _s("SLOTS_TOKEN_TTL", L.BOOKING, float, 90.0, _TPL, group="discovery", min_value=1.0,
+       note="max age (s) a pre-solved /slots token may be used at. reCAPTCHA tokens live ~120s; the "
+            "90s default keeps a safety margin so a cached token is never used past expiry."),
     _s("SLOT_CAPACITY_PER_PERIOD", L.BOOKING, str, "auto", group="discovery",
        note="how many concurrent apply-worker leases one (date, period) slot can absorb before "
             "it's exhausted -- 'auto' falls back to a per-slot Slot.capacity_estimate if the "
@@ -536,12 +675,6 @@ _TEMPLATE = [
     _s("KEEPALIVE_DECAY_MAX", L.TEMPLATE, float, 60.0, _WRK, "keepalive",
        note=
        "Upper bound (seconds) of that randomised decay. Keep above KEEPALIVE_DECAY_MIN."),
-    _s("REWARM_ESCALATE_AFTER", L.TEMPLATE, int, 3, _WRK, "keepalive", min_value=1.0,
-       note="consecutive failed in-place re-warms before the worker rebuilds its session on a fresh "
-            "proxy instead. A re-warm that keeps failing is usually a WAF/IP block, not a lapsed "
-            "form, and re-warming on the blocked proxy can never clear it (confirmed 2026-08-22: a "
-            "worker reached 7 consecutive failures, all quest steps 403, on a healthy auth session). "
-            "Only escalates once slot_found has fired -- before that the LOOSE HOLD rule applies."),
     _s("KEEPALIVE_NO_RESTORE", L.TEMPLATE, bool, False, _WRK, "keepalive",
        note=
        "Never rebuild the session from a failed keepalive -- just keep probing. Honours the LOOSE "
@@ -559,16 +692,28 @@ _TEMPLATE = [
        note=
        "Consecutive failed keepalive probes before the worker treats the session as dead and "
        "rebuilds. Low values burn logins on transient blips; high values leave a dead worker "
-       "displaying 'holding'."),
+       "displaying 'keeping'."),
+    _s("FORM_STATE_TTL", L.TEMPLATE, float, 240.0, _WRK, "keepalive", min_value=1.0,
+       note=
+       "Seconds a chain-verified booking form-state anchor (ScheduleController -> Schedule.jsp, "
+       "produced BY warmup) stays usable before a re-warm is required. Read by is_warmed(), which "
+       "gates the warm-on-signal steps and do_apply's per-round re-warm. CONTESTED, like "
+       "KEEPALIVE_INTERVAL: our own measurements say 4.17min alive / 6.12min dead (2026-08-27 "
+       "two-arm probe) and a 16.1-min median (2026-08-20, 28 cycles) -- see OPEN_QUESTIONS Q24, "
+       "which records that they disagree ~3x and are unreconciled. 240 is the conservative end of "
+       "the shorter measurement. The ~90-120s figure sometimes quoted is storm-auto's, was NEVER "
+       "measured here (Q3), and is deliberately NOT used. Resolve by repeating the Q24 probe, not "
+       "by editing this default."),
     _s("KEEPALIVE_PROBE", L.TEMPLATE, str, "home", _WRK, "keepalive",
        note=
-       "What a holding worker fetches to stay alive: 'home', or a full URL. Once warmed the worker "
-       "probes Schedule.jsp instead, because a bare home nav keeps the AUTH session alive and does "
-       "nothing for the booking form state -- which is the thing that actually lapses."),
+       "What a holding worker fetches to stay alive: 'home', or a full URL. Auth-only since "
+       "2026-09-09 (consolidated after the Test 0907/0907-auth A/B) -- keepalive only ever "
+       "verifies the AUTH session is alive, never the booking form-state, which do_apply/"
+       "do_discover establish fresh on demand instead of keepalive trying to keep it warm."),
     _s("KEEPALIVE_OFF", L.TEMPLATE, bool, False, _WRK, "keepalive",
        note=
        "Disable keepalive entirely. Diagnostic only: a holding worker then has NO portal traffic and "
-       "its form state lapses silently, which is the failure keepalive exists to prevent."),
+       "its session can silently die without anyone noticing until the next real signal."),
     _s("KEEPALIVE_JITTER", L.TEMPLATE, float, 30.0, _WRK, "keepalive",
        note="anti-herd: randomize keepalive timing so many workers don't probe in the same instant"),
     _s("CHECKPOINT_RESTORE_BUDGET", L.TEMPLATE, float, 90.0, _WRK, "keepalive",
@@ -580,25 +725,27 @@ _TEMPLATE = [
     _s("RESTORE_STAMPEDE_JITTER", L.TEMPLATE, float, 30.0, _WRK, "keepalive",
        note="anti-herd: stagger checkpoint-restore attempts after a mass relaunch"),
     # Hold / ISP swap
-    # Fires right after WARMUP completes (phases.py, between WARMED and HOLDING), NOT after a slot is
-    # actually found (PhaseMachine._warmup() calls do_swap() before await_slot_open() even begins).
-    # When OFF the swap step is skipped entirely and the worker stays on its phase-1 proxy for the
-    # whole run. Removed 2026-08-26 (Phase 6, DECISIONS.md D35): a deprecated alias,
-    # HOLD_SWAP_AFTER_FOUND, existed alongside this key and was found to be READ (not just carried for
-    # compatibility) by some Hub-side call sites while others read only this canonical name -- an
-    # inconsistency, not a supported dual-spelling design. The alias is gone; this is the only
-    # supported key.
-    _s("HOLD_SWAP_AFTER_WARMUP", L.TEMPLATE, bool, False, _TPL_BK, "hold_swap",
+    # Renamed 2026-09-09 from HOLD_SWAP_AFTER_WARMUP: fires right after LOGIN completes now
+    # (phases.py's _warmup(), between LOGGED_IN and KEEPING), not after warmup -- warmup itself is
+    # no longer done unconditionally at this point in the lifecycle, it's deferred to the moment
+    # it's actually needed (slot-open/assignment). Earlier history: this key was previously named
+    # HOLD_SWAP_AFTER_WARMUP because the swap used to fire right after warmup completed, and before
+    # that, a deprecated alias HOLD_SWAP_AFTER_FOUND was removed 2026-08-26 (Phase 6, DECISIONS.md
+    # D35) after being found inconsistently read by some Hub-side call sites -- straight renames
+    # only since then, no dual-spelling aliases. When OFF the swap step is skipped entirely and the
+    # worker stays on its phase-1 proxy for the whole run.
+    _s("HOLD_SWAP_AFTER_LOGIN", L.TEMPLATE, bool, False, _TPL_BK, "hold_swap",
        note="on/off switch for the phase-1->phase-2 proxy swap (LiveEngineOps.do_swap); off by "
             "default -- a worker just keeps its phase-1 (PROXY_PROVIDER) proxy for the whole run. "
-            "NAME IS LITERAL: the swap fires right after warmup finishes -- i.e. the instant a worker "
-            "is about to start its (potentially many-hour) hold. This is intentional: the operator's "
-            "design is soax (short, ~1h session) for the brief login/warmup, then a swap to webshare "
-            "(long, ~24h session) BEFORE the long hold starts, so the hold never outlives its proxy's "
-            "own session cap. When on, a second proxy is leased per HOLD_PROXY_PROVIDER/ "
-            "HOLD_PROXY_KIND. Booking-layer override is the dashboard's booking-settings shortcut "
-            "checkbox -- a per-booking operator choice, not something that should require editing a "
-            "worker template"),
+            "NAME IS LITERAL: the swap fires right after login finishes -- i.e. before the worker "
+            "starts its (potentially many-hour) hold, and before any warmup happens at all (warmup "
+            "is deferred until slot-open/assignment). This is intentional: the operator's design is "
+            "soax (short, ~1h session) for the brief login, then a swap to webshare (long, ~24h "
+            "session) BEFORE the long hold starts, so the hold never outlives its proxy's own "
+            "session cap. When on, a second proxy is leased per HOLD_PROXY_PROVIDER/HOLD_PROXY_KIND. "
+            "Booking-layer override is the dashboard's booking-settings shortcut checkbox -- a "
+            "per-booking operator choice, not something that should require editing a worker "
+            "template"),
     _s("HOLD_SWAP_RETRIES", L.TEMPLATE, int, 3, _WRK, "hold_swap",
        note="swap retry protocol (operator spec 2026-08-14): if the FIRST swap attempt fails (new "
             "session doesn't pass its post-swap health check, or launch itself fails), do_swap() "

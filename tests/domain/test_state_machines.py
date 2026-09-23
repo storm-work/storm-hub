@@ -104,7 +104,7 @@ def test_worker_substate_confirmed_book_path():
     seq = [
         WorkerSubstate.IDLE, WorkerSubstate.LOGGING_IN, WorkerSubstate.LOGGED_IN,
         WorkerSubstate.WARMING_UP, WorkerSubstate.WARMED, WorkerSubstate.SWAPPED,
-        WorkerSubstate.HOLDING, WorkerSubstate.DISCOVERING, WorkerSubstate.APPLYING,
+        WorkerSubstate.KEEPING, WorkerSubstate.DISCOVERING, WorkerSubstate.APPLYING,
         WorkerSubstate.BOOKED,
     ]
     for frm, to in zip(seq, seq[1:]):
@@ -135,3 +135,38 @@ def test_a_taken_slot_can_reopen_when_rediscovered():
     from libs.domain.state_machines import slot_transition
 
     assert slot_transition(SlotStatus.TAKEN, SlotStatus.AVAILABLE) == SlotStatus.AVAILABLE
+
+
+def test_the_substate_enum_is_declared_in_lifecycle_order():
+    """KEEPING comes BEFORE WARMING_UP, and this pins it.
+
+    Both the enum and the dashboard's run-summary grid listed WARMING_UP first until 2026-09-16 --
+    describing the lifecycle backwards on the two states an operator watches most during a run.
+    They had been wrong since 2026-09-09, when warmup became DEFERRED to the slot-open/slot-found
+    signal: a KEEPING worker is holding an AUTHENTICATED session and is by definition not warmed.
+
+    The enum's declaration order is documentation (nothing iterates it), which is exactly why it
+    drifted unnoticed -- so it gets an assertion instead of a comment.
+    """
+    from libs.domain.enums import WorkerSubstate as S
+
+    order = [s for s in S]
+    def before(a, b):
+        return order.index(a) < order.index(b)
+
+    assert before(S.LOGGING_IN, S.LOGGED_IN)
+    assert before(S.LOGGED_IN, S.KEEPING)
+    assert before(S.KEEPING, S.WARMING_UP), "KEEPING must precede WARMING_UP -- warmup is deferred"
+    assert before(S.WARMING_UP, S.WARMED)
+    assert before(S.WARMED, S.DISCOVERING)
+    assert before(S.APPLYING, S.BOOKED)
+
+
+def test_keeping_to_warming_up_is_a_legal_transition():
+    """The machine has always agreed warmup follows keeping -- it was only the DISPLAYS of the
+    order that were stale. Pinned so the table and the enum cannot disagree in future."""
+    from libs.domain.enums import WorkerSubstate as S
+    from libs.domain.state_machines import WORKER_SUBSTATE_TRANSITIONS
+
+    assert S.WARMING_UP in WORKER_SUBSTATE_TRANSITIONS[S.KEEPING]
+    assert S.KEEPING in WORKER_SUBSTATE_TRANSITIONS[S.LOGGED_IN]

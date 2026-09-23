@@ -15,7 +15,7 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 from ..enums import SettingsLayer as L
-from .catalog import CATALOG, Setting
+from .catalog import CATALOG, RETIRED_SETTINGS, Setting
 
 # Precedence: index = strength (higher wins).
 _PRECEDENCE = [L.GLOBAL, L.BOOKING, L.TEMPLATE, L.WORKER]
@@ -108,6 +108,12 @@ def validate_layer(layer: L, values: Mapping[str, Any]) -> dict[str, Any]:
     """
     out: dict[str, Any] = {}
     for key, raw in values.items():
+        if key in RETIRED_SETTINGS:
+            # A leftover row for a key that was deliberately removed from the catalog. Skipped, not
+            # raised: resolve() runs on the scheduler's per-tick path, so raising here turns one
+            # stale row into a host-wide outage -- which is precisely what happened on 2026-09-16
+            # (scheduler crash-loop, ~2h45m, no booking able to start). See catalog.RETIRED_SETTINGS.
+            continue
         setting = CATALOG.get(key)
         if setting is None:
             raise UnknownSetting(key, layer)

@@ -24,7 +24,7 @@ def test_defaults_populate_effective_config():
     eff = resolve({})
     assert eff["NAV_TIMEOUT_SCALE"] == 1.0
     assert eff["SCOUT_POOL"] is True
-    assert eff["DISCOVERY_MODE"] == "parallel"
+    assert eff["DISCOVERY_MIN_INTERVAL"] == 30.0   # rotation pacing (replaced DISCOVERY_MODE et al.)
     assert eff["auto_ops"] is False
 
 
@@ -33,13 +33,13 @@ def test_precedence_worker_beats_template_beats_booking_beats_global():
     eff = resolve({
         L.GLOBAL: {"HEADLESS_MODE": "old"},
         L.TEMPLATE: {"HEADLESS_MODE": "new"},
-        L.WORKER: {"HEADLESS_MODE": "headed"},
+        L.WORKER: {"HEADLESS_MODE": "headful"},
     })
-    assert eff["HEADLESS_MODE"] == "headed"
+    assert eff["HEADLESS_MODE"] == "headful"
     src = effective_source({
         L.GLOBAL: {"HEADLESS_MODE": "old"},
         L.TEMPLATE: {"HEADLESS_MODE": "new"},
-        L.WORKER: {"HEADLESS_MODE": "headed"},
+        L.WORKER: {"HEADLESS_MODE": "headful"},
     })
     assert src["HEADLESS_MODE"] == L.WORKER
 
@@ -66,23 +66,23 @@ def test_unknown_setting_rejected():
         validate_layer(L.GLOBAL, {"NOPE_NOT_A_KNOB": 1})
 
 
-def test_hold_swap_after_warmup_settable_at_booking_layer():
-    """Regression: HOLD_SWAP_AFTER_WARMUP's home layer is TEMPLATE, but the dashboard's Booking
+def test_hold_swap_after_login_settable_at_booking_layer():
+    """Regression: HOLD_SWAP_AFTER_LOGIN's home layer is TEMPLATE, but the dashboard's Booking
     Settings panel exposes it as a per-booking shortcut checkbox -- it must be settable at BOOKING
     without requiring a template edit, and a booking-level choice must actually take effect when
     no template/worker override is present."""
-    eff = resolve({L.BOOKING: {"HOLD_SWAP_AFTER_WARMUP": True}})
-    assert eff["HOLD_SWAP_AFTER_WARMUP"] is True
+    eff = resolve({L.BOOKING: {"HOLD_SWAP_AFTER_LOGIN": True}})
+    assert eff["HOLD_SWAP_AFTER_LOGIN"] is True
 
 
-def test_hold_swap_after_warmup_template_still_wins_over_booking():
+def test_hold_swap_after_login_template_still_wins_over_booking():
     # Precedence is WORKER > TEMPLATE > BOOKING > GLOBAL -- an explicit template override must
     # still beat the booking-level shortcut, matching every other layered setting's behavior.
     eff = resolve({
-        L.BOOKING: {"HOLD_SWAP_AFTER_WARMUP": True},
-        L.TEMPLATE: {"HOLD_SWAP_AFTER_WARMUP": False},
+        L.BOOKING: {"HOLD_SWAP_AFTER_LOGIN": True},
+        L.TEMPLATE: {"HOLD_SWAP_AFTER_LOGIN": False},
     })
-    assert eff["HOLD_SWAP_AFTER_WARMUP"] is False
+    assert eff["HOLD_SWAP_AFTER_LOGIN"] is False
 
 
 def test_hold_swap_after_found_is_no_longer_a_recognized_setting():
@@ -96,12 +96,12 @@ def test_hold_swap_after_found_is_no_longer_a_recognized_setting():
     assert "HOLD_SWAP_AFTER_FOUND" not in CATALOG
 
 
-def test_hold_swap_after_warmup_has_no_fallback_reading_from_the_old_key():
+def test_hold_swap_after_login_has_no_fallback_reading_from_the_old_key():
     """A layer setting ONLY the (now-nonexistent) old key must not silently resolve
-    HOLD_SWAP_AFTER_WARMUP to anything other than its catalog default -- there is no OR/fallback
+    HOLD_SWAP_AFTER_LOGIN to anything other than its catalog default -- there is no OR/fallback
     logic anywhere in the resolver; the old key simply does not exist."""
     eff = resolve({})
-    assert eff["HOLD_SWAP_AFTER_WARMUP"] is False   # catalog default, nothing implicitly enables it
+    assert eff["HOLD_SWAP_AFTER_LOGIN"] is False   # catalog default, nothing implicitly enables it
 
 
 def test_booking_knob_not_overridable_below_or_above():
@@ -224,12 +224,24 @@ def test_proxy_setting_settable_at_worker_layer(key):
     validate_layer(L.WORKER, {key: "x"})  # must not raise
 
 
-def test_proxy_setting_template_layer_still_rejected():
-    """These six are home=L.BOOKING, override={L.WORKER} only -- TEMPLATE was never requested and
-    must still be illegal, confirming the widen was exactly the six keys' override set, not a
-    blanket relaxation."""
-    with pytest.raises(WrongLayer):
-        validate_layer(L.TEMPLATE, {"PROXY_PROVIDER": "soax"})
+@pytest.mark.parametrize("key", _PROXY_WORKER_SETTINGS)
+def test_proxy_setting_settable_at_template_layer(key):
+    """2026-09-09: widened from override={L.WORKER} to {L.TEMPLATE, L.WORKER} -- a WorkerTemplate
+    can now carry these six, so several templates attached within one booking can each draw from a
+    different proxy pool. Confirms the widen landed for all six, not just PROXY_PROVIDER."""
+    validate_layer(L.TEMPLATE, {key: "x"})  # must not raise
+
+
+def test_proxy_setting_template_beats_booking_worker_beats_template():
+    """Precedence must stay WORKER > TEMPLATE > BOOKING > GLOBAL now that TEMPLATE is a real writer
+    for these keys too, not just BOOKING and WORKER."""
+    eff = resolve({L.BOOKING: {"PROXY_PROVIDER": "soax"},
+                   L.TEMPLATE: {"PROXY_PROVIDER": "webshare"}})
+    assert eff["PROXY_PROVIDER"] == "webshare"
+    eff = resolve({L.BOOKING: {"PROXY_PROVIDER": "soax"},
+                   L.TEMPLATE: {"PROXY_PROVIDER": "webshare"},
+                   L.WORKER: {"PROXY_PROVIDER": "soax"}})
+    assert eff["PROXY_PROVIDER"] == "soax"   # WORKER still outranks TEMPLATE
 
 
 def test_random_geo_is_omission_never_a_literal_string():

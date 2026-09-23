@@ -152,32 +152,37 @@ WORKER_SUBSTATE_TRANSITIONS = {
     WorkerSubstate.IDLE:        frozenset({WorkerSubstate.LOGGING_IN, WorkerSubstate.FAILED}),
     WorkerSubstate.LOGGING_IN:  frozenset({WorkerSubstate.LOGGED_IN, WorkerSubstate.LOGGING_IN,
                                            WorkerSubstate.FAILED}),
-    WorkerSubstate.LOGGED_IN:   frozenset({WorkerSubstate.WARMING_UP, WorkerSubstate.FAILED}),
+    # SWAPPED/KEEPING added 2026-09-09: warmup is no longer done unconditionally right after login
+    # (deferred to slot-open/assignment instead -- see libs/engine/phases.py's _warmup/
+    # _warm_if_needed), so the main-path sequence is now LOGGED_IN -> [SWAPPED ->] KEEPING directly.
+    # WARMING_UP stays legal too for warmup_only mode, which still warms immediately after login.
+    WorkerSubstate.LOGGED_IN:   frozenset({WorkerSubstate.WARMING_UP, WorkerSubstate.SWAPPED,
+                                           WorkerSubstate.KEEPING, WorkerSubstate.FAILED}),
     # WARMING_UP -> HOLDING added 2026-08-19: a re-warm that FAILS leaves the worker still holding
     # a live authed session, just unwarmed -- it drops back to holding so the recovery ladder can
     # escalate to a re-login from there (HOLDING -> LOGGING_IN). Routing that through FAILED would
     # be a lie about a session that is still alive.
     WorkerSubstate.WARMING_UP:  frozenset({WorkerSubstate.WARMED, WorkerSubstate.WARMING_UP,
-                                           WorkerSubstate.HOLDING, WorkerSubstate.FAILED}),
-    WorkerSubstate.WARMED:      frozenset({WorkerSubstate.SWAPPED, WorkerSubstate.HOLDING,
+                                           WorkerSubstate.KEEPING, WorkerSubstate.FAILED}),
+    WorkerSubstate.WARMED:      frozenset({WorkerSubstate.SWAPPED, WorkerSubstate.KEEPING,
                                            WorkerSubstate.DISCOVERING, WorkerSubstate.FAILED}),
-    WorkerSubstate.SWAPPED:     frozenset({WorkerSubstate.HOLDING, WorkerSubstate.DISCOVERING,
+    WorkerSubstate.SWAPPED:     frozenset({WorkerSubstate.KEEPING, WorkerSubstate.DISCOVERING,
                                            WorkerSubstate.FAILED}),
     # HOLDING -> LOGGING_IN added 2026-08-14: a held worker whose apply bounced to the questionnaire
     # page has a lapsed server-side workflow anchor, and past REWARM_MAX_ATTEMPTS only a fresh login
     # rebuilds it. That re-login happens IN-PROCESS on the same worker -- it is a first-class part of
     # the hold loop, not a failure -- so it must not have to route through FAILED to be legal.
-    WorkerSubstate.HOLDING:     frozenset({WorkerSubstate.HOLDING, WorkerSubstate.DISCOVERING,
+    WorkerSubstate.KEEPING:     frozenset({WorkerSubstate.KEEPING, WorkerSubstate.DISCOVERING,
                                            WorkerSubstate.POLLING, WorkerSubstate.APPLYING,
                                            WorkerSubstate.WARMING_UP, WorkerSubstate.LOGGING_IN,
                                            WorkerSubstate.FAILED}),
     WorkerSubstate.DISCOVERING: frozenset({WorkerSubstate.POLLING, WorkerSubstate.APPLYING,
-                                           WorkerSubstate.HOLDING, WorkerSubstate.DISCOVERING,
+                                           WorkerSubstate.KEEPING, WorkerSubstate.DISCOVERING,
                                            WorkerSubstate.FAILED}),
     WorkerSubstate.POLLING:     frozenset({WorkerSubstate.DISCOVERING, WorkerSubstate.APPLYING,
-                                           WorkerSubstate.HOLDING, WorkerSubstate.POLLING,
+                                           WorkerSubstate.KEEPING, WorkerSubstate.POLLING,
                                            WorkerSubstate.FAILED}),
-    WorkerSubstate.APPLYING:    frozenset({WorkerSubstate.BOOKED, WorkerSubstate.HOLDING,
+    WorkerSubstate.APPLYING:    frozenset({WorkerSubstate.BOOKED, WorkerSubstate.KEEPING,
                                            WorkerSubstate.POLLING, WorkerSubstate.FAILED}),
     WorkerSubstate.BOOKED:      frozenset(),
     WorkerSubstate.FAILED:      frozenset({WorkerSubstate.LOGGING_IN, WorkerSubstate.WARMING_UP}),

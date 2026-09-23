@@ -47,6 +47,24 @@ class SubAccountStatus(StrEnum):
     RETIRED = "retired"
 
 
+# The ONE definition of "this sub-account can actually attempt a live login". Anything outside this
+# set is not a weaker candidate, it is a login that cannot succeed: NEW was never registered at the
+# portal at all, and REGISTERED never confirmed its email, so there is no account behind those
+# credentials to log into -- while the attempt still costs a proxy lease, a CAPTCHA solve and a slot
+# in the sticky/rotating login budget. BOOKED is excluded because that account's mission
+# is over (a second appointment for the same person is a defect), BURNED because the portal ruled
+# it out, RETIRED because an operator did.
+#
+# Read by: _rank_live_sub_accounts (which sub-accounts a live launch may use and rotate through),
+# list_identities (IdentityOut.ready_sub_accounts, the field the attach panel filters on), and
+# tests/hub/test_sub_account_readiness_parity.py, which fails if those two ever disagree. Identity
+# status is NOT a substitute: IdentityStatus.ACTIVE means ">=1 sub-account row exists", which is
+# true the moment sub-accounts are GENERATED and says nothing about verification.
+READY_SUB_ACCOUNT_STATUSES = frozenset({
+    SubAccountStatus.VERIFIED, SubAccountStatus.LOGIN_OK, SubAccountStatus.HELD,
+})
+
+
 # ── Booking ───────────────────────────────────────────────────────────────────
 class BookingType(StrEnum):
     TEST = "test"
@@ -97,13 +115,31 @@ class WorkerStatus(StrEnum):
 
 
 class WorkerSubstate(StrEnum):
+    """Declared in LIFECYCLE ORDER, which is the order libs/engine/phases.py actually walks:
+
+        IDLE -> LOGGING_IN -> LOGGED_IN -> [SWAPPED] -> KEEPING
+             -> (slot-open / slot-found) -> WARMING_UP -> WARMED
+             -> DISCOVERING / POLLING / APPLYING -> BOOKED     (FAILED from anywhere)
+
+    KEEPING BEFORE WARMING_UP, and that is the whole point of the ordering being written down.
+    Warmup has been DEFERRED to the signal that needs it since 2026-09-09: a KEEPING worker is
+    holding an AUTHENTICATED session and is by definition not warmed yet. This enum, and the
+    dashboard's run-summary grid, both still listed WARMING_UP first -- describing the lifecycle
+    backwards on the exact two states an operator watches during a run. Fixed 2026-09-16.
+
+    (WARMING_UP precedes KEEPING only in `warmup_only` mode, a terminal diagnostic path that never
+    reaches KEEPING.)
+
+    Nothing iterates this enum in declaration order -- the order is documentation, and reordering
+    is safe for exactly that reason. Keep it honest.
+    """
     IDLE = "idle"
     LOGGING_IN = "logging_in"
     LOGGED_IN = "logged_in"
+    SWAPPED = "swapped"          # detail carries the ISP exit ip
+    KEEPING = "keeping"
     WARMING_UP = "warming_up"
     WARMED = "warmed"
-    SWAPPED = "swapped"          # detail carries the ISP exit ip
-    HOLDING = "holding"
     DISCOVERING = "discovering"
     POLLING = "polling"
     APPLYING = "applying"
