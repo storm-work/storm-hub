@@ -771,6 +771,12 @@ class PlaywrightSession:
                 headless=_launch_headless,
                 args=_args,
                 proxy=proxy_config,
+                # Pass the env EXPLICITLY so headful Chromium actually sees DISPLAY. Relying on
+                # inheritance failed live 2026-09-23: Xvfb sockets existed but Chromium still died
+                # "launched a headed browser without a XServer running" -- the DISPLAY set on
+                # os.environ mid-launch did not reach the Playwright-spawned browser. This is the
+                # env the browser process gets.
+                env=dict(os.environ),
             )
             # ALIGN THE ADVERTISED VERSION WITH THE BROWSER WE ARE ACTUALLY RUNNING.
             #
