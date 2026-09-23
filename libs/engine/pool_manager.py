@@ -140,7 +140,7 @@ def resolve_slot_capacity(setting: str, capacity_estimate: int | None) -> int:
 
 
 def plan_slot_assignments(slots: list[tuple[str, int]], holding_apply_worker_ids: list[str]) -> list[tuple[str, str]]:
-    """Pair HOLDING apply workers with slot CAPACITY -- BREADTH FIRST across slots, then depth.
+    """Pair KEEPING apply workers with slot CAPACITY -- BREADTH FIRST across slots, then depth.
 
     The bookable surface is an n x m matrix: n slots, each carrying m appointments. Priority runs
     slots-first, appointments-second (operator spec 2026-08-20): give every distinct slot one worker

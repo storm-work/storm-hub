@@ -1,16 +1,27 @@
 """Worker phase machine — the confirmed scout/apply control model (operator spec 2026-08-04).
 
 Browser logic is IDENTICAL for scout and apply (one EngineOps implementation); the ONLY difference
-is phase sequencing after the shared warm-up:
+is phase sequencing after the shared login:
 
-  common:  login -> warmup -> swap-to-ISP -> hold
-  apply :  hold -> (await slot ASSIGNMENT from the orchestrator) -> applying/book
-           fallback: if all scouts are invalid/dead -> self-discover -> book
-  scout :  hold -> (await slot-open) -> discovering -> push pool (on found) -> polling (loop)
-           until booking finishes / all apply workers closed / manual stop
+  common:  login -> swap-to-ISP -> KEEPING
+  apply :  KEEPING -> (slot-found) -> warmup -> (await slot ASSIGNMENT) -> applying/book
+           fallback: if all scouts are invalid/dead -> warmup -> self-discover -> book
+  scout :  KEEPING -> (slot-open) -> warmup -> discovering -> push pool (on found)
+           -> polling (loop) until booking finishes / all apply workers closed / manual stop
+
+KEEPING (renamed from HOLDING, 2026-09-11) is keeping the AUTHENTICATED session alive -- nothing
+more. It has never meant a warmed session, and since warmup became deferred it cannot: a KEEPING
+worker is by definition NOT warmed yet. Keepalive during KEEPING is auth-only (it probes the home
+page, never the booking form), so the state can be held for hours cheaply.
+
+WARMUP IS DEFERRED TO THE SIGNAL THAT NEEDS IT -- scouts warm on slot-open, apply workers on
+slot-found, self-scouting apply workers on the self-scout command. Warmup is what PRODUCES the
+booking form-state anchor (Questionnaire -> Formulario -> ScheduleController -> Schedule.jsp, i.e.
+`posto_pdf`); discovery and apply CONSUME it. That anchor expires (FORM_STATE_TTL), which is why
+`is_warmed()` gates on both its provenance and its age -- see LiveEngineOps.is_warmed.
 
 The orchestrator (hub+supervisor) owns: firing slot-open, firing slot-found (when a scout pushes),
-assigning pooled slots to holding apply workers, and tracking scout validity for the fallback.
+assigning pooled slots to KEEPING apply workers, and tracking scout validity for the fallback.
 
 Pure + injectable: the EngineOps calls block on real signals/assignments in production; stubs drive
 them in tests, so the whole control flow is unit-tested with no browser.
@@ -66,6 +77,13 @@ class EngineOps(Protocol):
     # "the portal is refusing everyone, come back later", which is not a verdict on this worker.
     def breaker_tripped(self) -> bool: ...
     def do_warmup(self) -> bool: ...
+    # Whether the booking form-state anchor (posto_pdf) is currently established. Warmup is
+    # deferred to the signal that needs it (slot-open for scouts, slot-found for apply) rather than
+    # done unconditionally before KEEPING -- this lets each call site skip a redundant re-warm when
+    # PREWARM_BEFORE_SLOT_OPEN (or a prior round) already did it. True only for an anchor this
+    # session's own chain built AND that is still inside FORM_STATE_TTL -- see
+    # LiveEngineOps.is_warmed for why neither half of that is optional.
+    def is_warmed(self) -> bool: ...
     def do_swap(self) -> str | None: ...          # ISP exit ip if swapped, else None
     def await_slot_open(self) -> str: ...         # block until the slot-open signal
 
@@ -163,14 +181,14 @@ class PhaseMachine:
         # slowness turns out to be systemic rather than this worker's bad luck.
         kind = getattr(self.ops, "warmup_failure_kind", lambda: "unknown")()
         if kind == "slow":
-            self._to(WorkerSubstate.HOLDING,
+            self._to(WorkerSubstate.KEEPING,
                      detail=f"portal slow, not broken -- holding rather than re-logging in: {why}")
             self.ops.poll_gap()
             return False
 
         # Re-warm alone has stopped rebuilding the anchor -- only a fresh login will (storm-auto
         # abc5). Still in-process: same worker, same proxy, same sub-account.
-        self._to(WorkerSubstate.HOLDING, detail=f"re-warm exhausted; re-login in place: {why}")
+        self._to(WorkerSubstate.KEEPING, detail=f"re-warm exhausted; re-login in place: {why}")
         self._to(WorkerSubstate.LOGGING_IN)
         if not self.ops.do_login():
             return False
@@ -178,7 +196,15 @@ class PhaseMachine:
         self._to(WorkerSubstate.WARMING_UP)
         return self.ops.do_warmup()
 
-    # ── shared warm-up: login -> warmup -> swap -> hold ───────────────────────
+    # ── shared warm-up: login -> swap -> hold ─────────────────────────────────
+    # Warmup itself is NOT done here on the main path (2026-09-09) -- it is deferred to the moment
+    # it's actually needed (slot-open for scouts, assignment for apply, see _run_scout/_run_apply),
+    # since do_apply already unconditionally re-warms every round regardless and a pre-hold warmup
+    # can simply go stale over a long hold for no benefit (confirmed live, "Test 3059": a scout
+    # warmed once before holding, the warm state went stale, and the first post-slot-open discover
+    # failed for 4.5 minutes before the reactive re-warm ladder in _run_scout recovered it -- see
+    # that function's own comment). `warmup_only` is the one exception: it's a diagnostic/capture
+    # mode that explicitly wants to stop once warmed and report that state.
     def _warmup(self) -> PhaseResult | None:
         self._to(WorkerSubstate.LOGGING_IN)
         # A TRIPPED BREAKER MEANS WAIT, NOT DIE.
@@ -213,25 +239,50 @@ class PhaseMachine:
                 # and the supervisor's own respawn accounting applies -- an unbounded wait would
                 # just move the invisible-worker problem somewhere else.
                 return self._fail("login")
-            # Stays in LOGGING_IN (a legal self-transition) rather than moving to HOLDING: this
-            # worker has NOT authenticated, and HOLDING means a warmed session is being kept alive.
+            # Stays in LOGGING_IN (a legal self-transition) rather than moving to KEEPING: this
+            # worker has NOT authenticated, and KEEPING means an AUTHENTICATED session is being kept
+            # alive (renamed from HOLDING 2026-09-11 to say that out loud -- it has never meant a
+            # WARMED session, and since the auth-only keepalive consolidation it cannot: warmup is
+            # deferred to the slot-open/slot-found signal, so a KEEPING worker is by definition not
+            # yet warmed).
             # The state machine rejects logging_in -> holding for exactly that reason, and it is
             # right to -- the detail carries the "why", the substate keeps telling the truth.
             self._to(WorkerSubstate.LOGGING_IN,
                      detail=f"waiting out the booking breaker ({waits}/{_BREAKER_WAIT_GAPS})")
             self.ops.poll_gap()
         self._to(WorkerSubstate.LOGGED_IN)
-        self._to(WorkerSubstate.WARMING_UP)
-        # NOT terminal on the first failure any more -- see _warm_with_recovery. Terminating here
-        # threw away a session that had just authenticated successfully.
-        if not self.ops.do_warmup() and not self._warm_with_recovery("initial warm-up failed"):
-            return self._fail("warmup")
-        self._to(WorkerSubstate.WARMED)
         if self.cfg.warmup_only:
+            self._to(WorkerSubstate.WARMING_UP)
+            # NOT terminal on the first failure any more -- see _warm_with_recovery. Terminating
+            # here threw away a session that had just authenticated successfully.
+            if not self.ops.do_warmup() and not self._warm_with_recovery("initial warm-up failed"):
+                return self._fail("warmup")
+            self._to(WorkerSubstate.WARMED)
             return PhaseResult("warmed", self._sub, "warmup_only", self.visited)
+        # HOLD_SWAP_AFTER_LOGIN (renamed 2026-09-09 from HOLD_SWAP_AFTER_LOGIN): swap now
+        # genuinely happens right after login, since warmup no longer runs at this point in the
+        # lifecycle on the main path.
         if self.ops.do_swap():
             self._to(WorkerSubstate.SWAPPED)
-        self._to(WorkerSubstate.HOLDING)
+        self._to(WorkerSubstate.KEEPING)
+        return None
+
+    def _warm_if_needed(self, why: str) -> PhaseResult | None:
+        """Warm up now, only if not already warmed (covers both: PREWARM_BEFORE_SLOT_OPEN or a
+        prior round already did it -- skip, no redundant work; or nothing did -- do it now, right
+        when it's actually needed). Returns a terminal PhaseResult on failure, None on success/
+        already-warmed, matching _warmup()'s own None-means-continue convention."""
+        # getattr, not a bare call -- same reason as _warmup's breaker_tripped probe below: EngineOps
+        # is a Protocol with many partial test doubles. An ops that cannot answer "am I warmed" has
+        # no anchor concept at all, so it keeps its pre-existing behaviour (this step is a no-op for
+        # it) rather than crashing or being forced through a warmup it never modelled.
+        _warmed = getattr(self.ops, "is_warmed", None)
+        if not callable(_warmed) or _warmed():
+            return None
+        self._to(WorkerSubstate.WARMING_UP)
+        if not self.ops.do_warmup() and not self._warm_with_recovery(why):
+            return self._fail("warmup")
+        self._to(WorkerSubstate.WARMED)
         return None
 
     def run(self) -> PhaseResult:
@@ -252,6 +303,12 @@ class PhaseMachine:
         # operator explicitly stopped.
         if self.ops.await_slot_open() == "stop":
             return PhaseResult("stopped", self._sub, "stopped before slot_open", self.visited)
+        # Warm up NOW (2026-09-09) rather than relying on a pre-hold warmup that may have gone
+        # stale over the hold -- see _warm_if_needed and _warmup's own comment. Skips cleanly if
+        # PREWARM_BEFORE_SLOT_OPEN already did it this round.
+        warm = self._warm_if_needed("slot-open warm-up failed")
+        if warm is not None:
+            return warm
         pushed_total = 0
         failed_rounds = 0
         # Operator-specified ladder (2026-08-20), and the FIRST round is deliberately cheaper:
@@ -283,7 +340,7 @@ class PhaseMachine:
                 # drop back to plain holding and wait for a genuinely new slot-open rather than
                 # grinding discovery (which risks rate-limiting for nothing). Not a stop: the
                 # session stays alive and this scout is fully reusable in the next window.
-                self._to(WorkerSubstate.HOLDING, "slot-open inactivated")
+                self._to(WorkerSubstate.KEEPING, "slot-open inactivated")
                 if self.ops.await_slot_open() == "stop":
                     return PhaseResult("stopped", self._sub, "stopped while re-holding after "
                                        "slot-open inactivation", self.visited)
@@ -294,15 +351,16 @@ class PhaseMachine:
             if found:
                 self.ops.push_slots(found)     # orchestrator fires slot-found on the first push
                 pushed_total += len(found)
-            # Only report when there is something to report. ops_live._no_report returns [] for a
-            # round that never asked the portal (a solver outage, or the /slots pacing gate), and
-            # report_dates([]) still emitted a dates_reported event carrying zero outcomes.
-            # MEASURED on the 2026-09-02 20:45 run: 73 of 96 dates_reported events (76%) were empty,
-            # all from one scout, roughly every 7 seconds -- pure stream noise that also made an
-            # idle scout look busy. The Hub's on_dates_reported iterates the list, so an empty one
-            # was already a no-op there; this just stops paying for the round trip.
-            if results:
-                self.ops.report_dates([{"date": r["date"], "outcome": r["outcome"]} for r in results])
+            # ALWAYS report round completion -- even an empty round. Under the ROTATION model
+            # (2026-09-21) the Hub's dates_reported drain is the ONLY signal that clears a scout's
+            # in-flight slot and advances the round-robin; a round that reported nothing left the
+            # Hub stuck on that scout until the 180s hang-timeout, which is exactly the "advance to
+            # the next one immediately on failure" the model is supposed to give. An empty list is
+            # classified as a failed round (advance now, no pacing wait) by on_round_reported. This
+            # was previously suppressed as stream noise (73/96 empty on the 2026-09-02 run), but the
+            # rotation runs one scout at a time paced by DISCOVERY_MIN_INTERVAL, so it is at most one
+            # report per round now, and the report is FUNCTIONAL rather than noise.
+            self.ops.report_dates([{"date": r["date"], "outcome": r["outcome"]} for r in results])
 
             # A round where EVERY date came back "failed" is a session-level problem, not news about
             # the calendar. Confirmed live 2026-08-14: a scout whose browser page had died span this
@@ -365,7 +423,7 @@ class PhaseMachine:
         # ladder never reached the re-login rung at all, and the worker sat in that loop for two
         # hours looking healthy. The escalation only ever fired when the re-warm happened to fail.
         if skip_rewarm:
-            self._to(WorkerSubstate.HOLDING, detail=f"re-warm cannot fix this; re-login: {why}")
+            self._to(WorkerSubstate.KEEPING, detail=f"re-warm cannot fix this; re-login: {why}")
             self._to(WorkerSubstate.LOGGING_IN)
             if not self.ops.do_login():
                 return False
@@ -374,18 +432,18 @@ class PhaseMachine:
             if not self.ops.do_warmup():
                 return False
             self._to(WorkerSubstate.WARMED)
-            self._to(WorkerSubstate.HOLDING)
+            self._to(WorkerSubstate.KEEPING)
             self.ops.poll_gap()
             return True
-        self._to(WorkerSubstate.HOLDING, detail=f"re-warming: {why}")
+        self._to(WorkerSubstate.KEEPING, detail=f"re-warming: {why}")
         self._to(WorkerSubstate.WARMING_UP)
         if self.ops.do_warmup():
             self._to(WorkerSubstate.WARMED)
-            self._to(WorkerSubstate.HOLDING)
+            self._to(WorkerSubstate.KEEPING)
             self.ops.poll_gap()
             return True
         # Re-warm couldn't rebuild the workflow anchor -- only a fresh login will (abc5).
-        self._to(WorkerSubstate.HOLDING, detail=f"re-warm failed; re-login: {why}")
+        self._to(WorkerSubstate.KEEPING, detail=f"re-warm failed; re-login: {why}")
         self._to(WorkerSubstate.LOGGING_IN)
         if not self.ops.do_login():
             return False
@@ -394,7 +452,7 @@ class PhaseMachine:
         if not self.ops.do_warmup():
             return False
         self._to(WorkerSubstate.WARMED)
-        self._to(WorkerSubstate.HOLDING)
+        self._to(WorkerSubstate.KEEPING)
         self.ops.poll_gap()
         return True
 
@@ -407,7 +465,7 @@ class PhaseMachine:
         """Session-preserving back-off. Keeps the authed session and the proxy; just stops this
         worker consuming (and bouncing) pooled slots for a few poll gaps. Paced entirely by
         poll_gap(), which carries the enforced minimum floor -- never a bare sleep."""
-        self._to(WorkerSubstate.HOLDING, detail=f"parked: {why}")
+        self._to(WorkerSubstate.KEEPING, detail=f"parked: {why}")
         for _ in range(_PARK_POLL_GAPS):
             if self.ops.is_stopped():
                 return
@@ -487,6 +545,18 @@ class PhaseMachine:
         while True:
             if self.ops.is_stopped():
                 return PhaseResult("stopped", self._sub, "stopped while holding", self.visited)
+            # WARM ON SLOT-FOUND (operator's stated model, 2026-09-11): an apply worker warms when
+            # slot-found fires, so it is READY when a slot lands -- not warming for ~40s with a
+            # leased slot already in hand and the clock running. The scout equivalent is the
+            # _warm_if_needed right after await_slot_open in _run_scout.
+            #
+            # _warm_if_needed is a no-op when the anchor is already chain-verified and inside
+            # FORM_STATE_TTL (see LiveEngineOps.is_warmed), so this neither double-warms alongside
+            # do_apply's own re-warm nor re-warms on every pass of this loop.
+            if self.ops.slot_found_seen():
+                warm = self._warm_if_needed("slot-found warm-up failed")
+                if warm is not None:
+                    return warm
             if slot is None:
                 slot = self.ops.await_assignment()
             if slot is None and self.ops.is_stopped():
@@ -511,6 +581,14 @@ class PhaseMachine:
                 #
                 # Same code path as the scouts_invalid fallback that was already here; MONO_BOOKING
                 # just stops it being conditional on the scouts having died first.
+                # Warm up before self-discovering (2026-09-09): do_discover's slots-mode path
+                # prefers posto_pdf and only degrades to bare posto_id when it's unset -- unlike
+                # do_apply, it has no unconditional re-warm of its own, so a self-scouting apply
+                # worker needs the same on-demand warmup a real scout gets before its first
+                # discover.
+                warm = self._warm_if_needed("self-scout warm-up failed")
+                if warm is not None:
+                    return warm
                 self._to(WorkerSubstate.DISCOVERING)
                 d = self.cfg.discovery
                 dates = pool_manager.default_date_window(
@@ -527,15 +605,15 @@ class PhaseMachine:
                     self.ops.push_slots(found)
                 slot = found[0] if found else None
             if slot is None:
-                # Nothing to apply right now. That is what HOLDING is for -- it is not a failure and
+                # Nothing to apply right now. That is what KEEPING is for -- it is not a failure and
                 # it is emphatically not a reason to discard a warm authed session. Wait and re-ask.
-                self._to(WorkerSubstate.HOLDING)
+                self._to(WorkerSubstate.KEEPING)
                 self.ops.poll_gap()
                 continue
 
             self._to(WorkerSubstate.APPLYING)
             if self.cfg.no_book:
-                self._to(WorkerSubstate.HOLDING)
+                self._to(WorkerSubstate.KEEPING)
                 return PhaseResult("dry_run", self._sub, "no_book: not submitted", self.visited)
             attempts += 1
             outcome = self.ops.do_apply(slot)
@@ -575,7 +653,7 @@ class PhaseMachine:
                     self._park(f"portal unreachable x{unreachable_streak}")
                     unreachable_streak = 0
                 else:
-                    self._to(WorkerSubstate.HOLDING, detail="portal unreachable; retrying")
+                    self._to(WorkerSubstate.KEEPING, detail="portal unreachable; retrying")
                 self.ops.poll_gap()
                 continue
 
@@ -589,7 +667,7 @@ class PhaseMachine:
                 self.ops.release_slot(slot, "session")
                 slot = None
                 session_streak += 1
-                self._to(WorkerSubstate.HOLDING, detail="re-warm failed; rebuilding session")
+                self._to(WorkerSubstate.KEEPING, detail="re-warm failed; rebuilding session")
                 if session_streak >= max_session_failures:
                     # The rebuild keeps claiming success and the session keeps failing. Stop
                     # churning slot leases over it -- respawn gets a clean process.
@@ -599,6 +677,20 @@ class PhaseMachine:
                     return self._fail("session unrecoverable")
                 self.ops.poll_gap()
                 continue
+
+            if outcome == "form_stale" and (slot or {}).get("blind"):
+                # BLIND SLOT: a form_stale verdict means "this combination is not bookable", never
+                # "our form lapsed, re-warm and retry it". The operator seeded this (date, period)
+                # on sight, not on evidence; most of a blind grid is phantom by construction, and
+                # apply_path_proven_healthy records that the portal rejects a WELL-FORMED submit
+                # for a slot that is gone -- which lands here, as form_stale with the cursor
+                # intact. Routing that through the stale ladder is the failure the operator named:
+                # stale_streak reaches max_rewarms and the worker re-logs in, spending a good
+                # session (and a reCAPTCHA strike) on a slot that never existed. So it takes the
+                # no_slot path below: release with the bounce penalty, get the next combination.
+                # The next round re-warms anyway (rewarm_every_round_is_mandatory), so a genuinely
+                # lapsed form costs nothing extra by being treated this way.
+                outcome = "no_slot"
 
             if outcome == "form_stale":
                 # storm-auto releases the lease here too -- with a DIFFERENT penalty, not by
@@ -615,7 +707,7 @@ class PhaseMachine:
                     # Re-warm alone has stopped rebuilding the anchor (storm-auto abc5); only a
                     # fresh login will. In-process: same worker, same proxy.
                     stale_streak = 0
-                    self._to(WorkerSubstate.HOLDING,
+                    self._to(WorkerSubstate.KEEPING,
                              detail="form_stale: re-login in place (re-warm not rebuilding anchor)")
                     self._to(WorkerSubstate.LOGGING_IN)
                     if not self.ops.do_login():
@@ -625,7 +717,7 @@ class PhaseMachine:
                     if not self.ops.do_warmup():
                         return self._fail("form_stale re-warm after re-login")
                     self._to(WorkerSubstate.WARMED)
-                self._to(WorkerSubstate.HOLDING, detail=f"form_stale x{stale_streak}: re-warming")
+                self._to(WorkerSubstate.KEEPING, detail=f"form_stale x{stale_streak}: re-warming")
                 self.ops.poll_gap()
                 continue          # do_apply re-warms on the way into the next attempt
 
@@ -636,7 +728,7 @@ class PhaseMachine:
             slot = None
             stale_streak = 0
             bounce_streak += 1
-            self._to(WorkerSubstate.HOLDING)
+            self._to(WorkerSubstate.KEEPING)
             if bounce_streak >= max_bounces:
                 bounce_streak = 0
                 self._park(f"{max_bounces} consecutive bounces")
@@ -650,5 +742,5 @@ class PhaseMachine:
                          detail=f"{bounce_streak} consecutive bounces: re-warming before the next try")
                 if self.ops.do_warmup():
                     self._to(WorkerSubstate.WARMED)
-                self._to(WorkerSubstate.HOLDING)
+                self._to(WorkerSubstate.KEEPING)
             self.ops.poll_gap()

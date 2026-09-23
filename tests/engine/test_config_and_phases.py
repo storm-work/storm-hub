@@ -23,7 +23,7 @@ def test_engine_config_from_resolved_settings():
     cfg = EngineConfig.from_settings(eff)
     assert cfg.role == WorkerRole.APPLY
     assert cfg.login.nav_timeout_scale == 4.0 and cfg.login.field_retries == 4
-    assert cfg.discovery.mode == "parallel" and cfg.pool.multi_capacity is True
+    assert cfg.discovery.source == "calendar" and cfg.pool.multi_capacity is True
 
 
 def test_scout_role_implies_capture_only_default():
@@ -56,7 +56,7 @@ def test_apply_with_no_assignment_holds_indefinitely_instead_of_terminating():
     res = PhaseMachine(_cfg(ROLE="apply"), ops).run()
     assert res.outcome == "stopped"              # NOT "held" -- holding is not an ending
     assert ops.applied == 0                      # never booked, never even tried
-    assert res.final_substate == WorkerSubstate.HOLDING
+    assert res.final_substate == WorkerSubstate.KEEPING
     assert WorkerSubstate.APPLYING not in res.visited
 
 
@@ -180,7 +180,7 @@ def test_scout_inactivate_returns_to_holding_then_resumes_on_a_new_slot_open():
     assert res.outcome == "discovered"       # ran to a normal end, never "stopped"
     assert len(ops.pushed) == 2               # discovered BOTH before and after the revert
     # POLLING (end of round 1) -> HOLDING (the revert) -> DISCOVERING (round 2, new window)
-    holding_idx = res.visited.index(WorkerSubstate.HOLDING, res.visited.index(WorkerSubstate.POLLING))
+    holding_idx = res.visited.index(WorkerSubstate.KEEPING, res.visited.index(WorkerSubstate.POLLING))
     assert res.visited[holding_idx + 1] == WorkerSubstate.DISCOVERING
 
 
@@ -230,9 +230,11 @@ def test_apply_form_stale_releases_with_the_no_penalty_reason_and_rewarms():
     assert ops.applied == 2
     assert ops.release_reasons == ["form_stale"]   # released, and NOT as a bounce
     assert ops.logins == 1                          # cost no new login below the re-warm cap
-    # No extra warm in the loop: do_apply re-warms at the top of every attempt (abc5 -- warming
-    # again here would replay steps 2-6 twice).
-    assert ops.warmups == 1
+    # No warm at all in this run: warmup is deferred to when a signal is actually acted on
+    # (2026-09-09) -- an immediately-assigned apply worker never calls do_warmup() on its own; and
+    # do_apply's own re-warm at the top of every attempt (abc5) is implicit in the sim's outcome,
+    # not a tracked do_warmup() call (warming again here would replay steps 2-6 twice).
+    assert ops.warmups == 0
 
 
 def test_apply_form_stale_escalates_to_a_fresh_login_in_process():
@@ -245,6 +247,37 @@ def test_apply_form_stale_escalates_to_a_fresh_login_in_process():
     assert res.outcome == "booked"
     assert ops.logins == 2                          # the escalation fired...
     assert ops.release_reasons == ["form_stale"]    # ...and the slot went back unpenalised
+
+
+def test_a_blind_slot_never_takes_the_form_stale_ladder():
+    """THE SEAM for blind apply (operator direction 2026-09-18). The test directly above proves that
+    form_stale past REWARM_MAX_ATTEMPTS escalates to a fresh LOGIN. For an operator-seeded BLIND
+    slot that is the failure the operator named: most of a blind grid is phantom by construction,
+    apply_path_proven_healthy records that the portal rejects a well-formed submit for a gone slot
+    (which lands as form_stale with the cursor intact), and routing that through the ladder spends
+    a good session and a reCAPTCHA strike on a combination that never existed.
+
+    Same harness, same REWARM_MAX_ATTEMPTS=1, same form_stale outcome -- the ONLY difference is
+    `blind: True` on the assignment. It must go down the no_slot path: release with the bounce
+    penalty (so the Hub can retire the combination), no second login, on to the next slot."""
+    ops = SimEngineOps(assignment={"date": "d1", "period": 3, "blind": True},
+                       apply_outcome=["form_stale", "booked"], stop_after_polls=8)
+    res = PhaseMachine(_cfg(ROLE="apply", REWARM_MAX_ATTEMPTS=1), ops).run()
+
+    assert res.outcome == "booked"
+    assert ops.logins == 1, "a blind form_stale must never escalate to re-login"
+    assert ops.release_reasons == ["bounce"], (
+        "released with the BOUNCE penalty so the Hub can retire a phantom combination, "
+        f"got {ops.release_reasons}")
+
+
+def test_a_discovered_slot_still_takes_the_form_stale_ladder():
+    """Control: the blind rule must not leak. Without `blind`, the identical scenario keeps the
+    proven behaviour (release as form_stale, escalate to re-login)."""
+    ops = SimEngineOps(assignment={"date": "d1", "period": 3},
+                       apply_outcome=["form_stale", "booked"], stop_after_polls=8)
+    PhaseMachine(_cfg(ROLE="apply", REWARM_MAX_ATTEMPTS=1), ops).run()
+    assert ops.logins == 2 and ops.release_reasons == ["form_stale"]
 
 
 def test_no_slot_bounce_releases_with_the_penalised_reason():
@@ -331,7 +364,10 @@ def test_a_failed_rewarm_is_a_session_problem_not_a_slot_bounce():
     assert res.outcome == "booked"
     assert ops.release_reasons == ["session"]     # released, and NOT as a bounce
     assert ops.logins == 1                        # rebuilt by RE-WARM -- no login burned
-    assert ops.warmups == 2
+    # Just the _rebuild_session rewarm -- no pre-hold warmup any more (2026-09-09, deferred to
+    # when a signal is actually acted on; this worker is assigned immediately so it never calls
+    # do_warmup() on its own before do_apply runs).
+    assert ops.warmups == 1
 
 
 def test_repeated_session_failures_never_park_the_worker_on_bounces():
@@ -367,7 +403,9 @@ def test_a_failed_rewarm_still_rebuilds_the_session():
     session really does need rebuilding."""
     ops = SimEngineOps(assignment={"date": "d1", "period": 3},
                        apply_outcome=["session", "booked"], stop_after_polls=8,
-                       warmup_ok=[True, False, True])      # the re-warm fails -> escalate
+                       # No pre-hold warmup call any more (2026-09-09) -- index 0 is now
+                       # _rebuild_session's own rewarm attempt, which must fail to escalate.
+                       warmup_ok=[False, True])      # the re-warm fails -> escalate
     PhaseMachine(_cfg(ROLE="apply"), ops).run()
     assert ops.logins == 2
 
@@ -756,11 +794,13 @@ def test_an_ordinary_failing_round_still_tries_the_cheap_rung_first():
 
 
 # ── a round that reported nothing must not emit an empty event (2026-09-02) ───────────────────
-def test_a_round_with_no_outcomes_emits_no_dates_reported():
-    """ops_live._no_report returns [] for a round that never asked the portal (a solver outage, or
-    the /slots pacing gate), and report_dates([]) still fired an event carrying zero outcomes.
-    MEASURED on the 20:45 run of "Test 0901": 73 of 96 dates_reported events (76%) were empty, all
-    from one scout, roughly every 7 seconds -- stream noise that also made an idle scout look busy."""
+def test_every_round_reports_completion_even_when_empty():
+    """ROTATION model (2026-09-21): the Hub's dates_reported drain is the ONLY signal that clears a
+    scout's in-flight slot and advances the round-robin, so EVERY round must report -- even an empty
+    one (classified as a failed round -> advance immediately). Before, an empty round reported
+    nothing and left the Hub stuck on that scout until the 180s hang-timeout. This inverts the old
+    'suppress empty reports as noise' behaviour: one scout runs at a time now, so it is at most one
+    report per round, and the report is functional rather than noise."""
     class _NothingOps(SimEngineOps):
         def __init__(self, *a, **kw):
             super().__init__(*a, **kw)
@@ -770,17 +810,14 @@ def test_a_round_with_no_outcomes_emits_no_dates_reported():
             return []
 
         def report_dates(self, outcomes):
-            # Counting CALLS, not accumulated outcomes: SimEngineOps.report_dates EXTENDS a list, so
-            # an empty call leaves no trace and an assertion on reported_dates passes either way.
-            # The first version of this test did exactly that and passed against the unfixed code.
             self.report_calls += 1
             super().report_dates(outcomes)
 
     ops = _NothingOps(discover_tasks=[["d1"], ["d2"], ["d3"]], discover_outcomes={})
     PhaseMachine(_cfg(ROLE="scout"), ops).run()
 
-    assert ops.report_calls == 0, \
-        f"emitted {ops.report_calls} dates_reported event(s) for rounds that had nothing to report"
+    assert ops.report_calls == 3, \
+        f"every round must report completion for the rotation to advance; got {ops.report_calls}"
 
 
 def test_a_round_with_real_outcomes_still_reports():

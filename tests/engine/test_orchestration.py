@@ -1,176 +1,100 @@
 from libs.engine import orchestration as orch
 
+MIN = 30.0
+HANG = 180.0
 
-def test_single_mode_picks_one_scout_per_tick():
+
+def _plan(state, healthy, now):
+    return orch.plan_rotation_round(state, healthy, now=now, min_interval=MIN, hang_timeout=HANG)
+
+
+def test_rotation_picks_one_scout_at_a_time_round_robin():
+    """One round in flight at a time; successive REAL rounds cycle through the healthy scouts in
+    order, each spaced MIN apart."""
     state = orch.ScoutPoolState()
-    tasks1 = orch.plan_initial_tasks(["s1", "s2", "s3"], ["d1", "d2"], state)
-    assert tasks1 == {"s1": ["d1", "d2"]}
-    tasks2 = orch.plan_initial_tasks(["s1", "s2", "s3"], ["d1", "d2"], state)
-    assert tasks2 == {"s2": ["d1", "d2"]}
+    scouts = ["s1", "s2", "s3"]
+    # first dispatch at t=0
+    assert _plan(state, scouts, now=0.0) == "s1"
+    # while s1 is in flight, nothing else may dispatch
+    assert _plan(state, scouts, now=1.0) is None
+    # s1 reports a real round -> next dispatch must wait MIN
+    orch.on_round_reported(state, "s1", [{"date": "d1", "outcome": "empty"}], now=2.0)
+    assert _plan(state, scouts, now=2.0 + MIN - 1) is None       # still inside the interval
+    assert _plan(state, scouts, now=2.0 + MIN) == "s2"           # next scout in rotation
+    orch.on_round_reported(state, "s2", [{"date": "d1", "outcome": "found"}], now=40.0)
+    assert _plan(state, scouts, now=40.0 + MIN) == "s3"
+    orch.on_round_reported(state, "s3", [{"date": "d1", "outcome": "empty"}], now=80.0)
+    assert _plan(state, scouts, now=80.0 + MIN) == "s1"          # wraps around
 
 
-def test_split_mode_yields_no_tasks_from_plan_initial_tasks():
-    """SPLIT mode's task assignment moved entirely into apps/hub/scheduler.py's _drive_scouts
-    (2026-08-14, needs wall-clock time + Redis state for the concurrency window this pure module
-    deliberately doesn't have) -- plan_initial_tasks is SINGLE-mode only now."""
+def test_failed_round_advances_immediately_without_pacing():
+    """A failed round (all-'failed', or an empty report) is not a real attempt: the rotation moves to
+    the next scout immediately, skipping the MIN pacing gate."""
     state = orch.ScoutPoolState()
-    orch.on_slots_found(state)
-    assert state.mode == "split"
-    assert orch.plan_initial_tasks(["s1", "s2"], ["d1", "d2", "d3", "d4"], state) == {}
+    scouts = ["s1", "s2", "s3"]
+    assert _plan(state, scouts, now=0.0) == "s1"
+    orch.on_round_reported(state, "s1", [{"date": "d1", "outcome": "failed"}], now=1.0)  # FAILED
+    # no MIN wait -- next scout may go right now
+    assert _plan(state, scouts, now=1.0) == "s2"
+    orch.on_round_reported(state, "s2", [], now=2.0)                                     # empty report = fail
+    assert _plan(state, scouts, now=2.0) == "s3"
 
 
-def test_no_scouts_or_no_dates_yields_no_tasks():
+def test_real_round_after_a_failure_restores_pacing():
     state = orch.ScoutPoolState()
-    assert orch.plan_initial_tasks([], ["d1"], state) == {}
-    assert orch.plan_initial_tasks(["s1"], [], state) == {}
+    scouts = ["s1", "s2"]
+    _plan(state, scouts, now=0.0)                                   # -> s1
+    orch.on_round_reported(state, "s1", [{"date": "d", "outcome": "failed"}], now=1.0)
+    assert _plan(state, scouts, now=1.0) == "s2"                    # failure -> immediate
+    orch.on_round_reported(state, "s2", [{"date": "d", "outcome": "empty"}], now=2.0)  # REAL
+    assert _plan(state, scouts, now=2.0 + MIN - 1) is None          # paced again
+    assert _plan(state, scouts, now=2.0 + MIN) == "s1"
 
 
-def test_ensure_awakened_caps_at_limit_and_supplements_on_death():
+def test_no_healthy_scouts_yields_nothing():
     state = orch.ScoutPoolState()
-    orch.ensure_awakened(state, ["s1", "s2", "s3", "s4", "s5"], limit=2)
-    assert state.awakened_scouts == ["s1", "s2"]
+    assert _plan(state, [], now=0.0) is None
+    # an in-flight scout that drops out of the healthy set is reclaimed, but with nobody to hand to
+    # the round still yields nothing this tick.
+    _plan(state, ["s1"], now=0.0)
+    assert _plan(state, [], now=1.0) is None
 
-    # s1 dies -- a spare (s3) is supplemented in, s2 (still alive) is untouched
-    orch.ensure_awakened(state, ["s2", "s3", "s4", "s5"], limit=2)
-    assert state.awakened_scouts == ["s2", "s3"]
 
-
-def test_ensure_awakened_limit_zero_or_negative_means_uncapped():
+def test_hung_round_is_reclaimed_after_the_hang_timeout():
+    """A round that never reports must not wedge the single in-flight slot forever."""
     state = orch.ScoutPoolState()
-    orch.ensure_awakened(state, ["s1", "s2", "s3"], limit=0)
-    assert state.awakened_scouts == ["s1", "s2", "s3"]
+    scouts = ["s1", "s2"]
+    assert _plan(state, scouts, now=0.0) == "s1"
+    assert _plan(state, scouts, now=HANG - 1) is None              # still within timeout
+    # past the timeout: s1 is reclaimed as failed, rotation advances immediately to s2
+    assert _plan(state, scouts, now=HANG) == "s2"
 
 
-def test_ensure_awakened_never_exceeds_available_scouts():
+def test_vanished_inflight_scout_is_reclaimed():
+    """A scout that dies/reaps while in flight (drops out of healthy_ids) frees the slot at once."""
     state = orch.ScoutPoolState()
-    orch.ensure_awakened(state, ["s1", "s2"], limit=10)
-    assert state.awakened_scouts == ["s1", "s2"]
+    assert _plan(state, ["s1", "s2"], now=0.0) == "s1"
+    # s1 gone from the healthy set -> reclaimed as failed, s2 dispatched with no pacing wait
+    assert _plan(state, ["s2"], now=1.0) == "s2"
 
 
-def test_on_dates_reported_does_not_prune_on_a_single_empty_report():
-    """Multi-strike retirement (default threshold 3, operator spec 2026-08-14): a lone empty report
-    must not prune the date anymore -- that was the old (too-eager) single-report behavior."""
-    state = orch.ScoutPoolState(remaining_by_scout={"s1": ["found_d", "empty_d", "failed_d"]})
-    orch.on_slots_found(state)   # retirement only applies in the slot-found phase
-    retired = orch.on_dates_reported(state, "s1", [
-        {"date": "found_d", "outcome": "found"},
-        {"date": "empty_d", "outcome": "empty"},
-        {"date": "failed_d", "outcome": "failed"},
-    ], retire_after_misses=3)
-    assert retired == []
-    assert sorted(state.remaining_by_scout["s1"]) == ["empty_d", "failed_d", "found_d"]
+def test_on_round_reported_only_frees_the_matching_scout():
+    state = orch.ScoutPoolState()
+    _plan(state, ["s1", "s2"], now=0.0)          # inflight = s1
+    orch.on_round_reported(state, "s2", [{"date": "d", "outcome": "found"}], now=1.0)  # stray report
+    assert state.inflight == "s1"                # s1 still in flight
+    orch.on_round_reported(state, "s1", [{"date": "d", "outcome": "found"}], now=1.0)
+    assert state.inflight is None
 
 
-def test_on_dates_reported_retires_after_enough_consecutive_misses():
-    state = orch.ScoutPoolState(remaining_by_scout={"s1": ["d1"]})
-    orch.on_slots_found(state)
-    for _ in range(2):
-        retired = orch.on_dates_reported(state, "s1", [{"date": "d1", "outcome": "empty"}],
-                                          retire_after_misses=3)
-        assert retired == []
-    retired = orch.on_dates_reported(state, "s1", [{"date": "d1", "outcome": "empty"}],
-                                     retire_after_misses=3)
-    assert retired == ["d1"]
-    assert state.remaining_by_scout["s1"] == []
-
-
-def test_on_dates_reported_zero_threshold_never_retires():
-    state = orch.ScoutPoolState(remaining_by_scout={"s1": ["d1"]})
-    orch.on_slots_found(state)
-    for _ in range(10):
-        retired = orch.on_dates_reported(state, "s1", [{"date": "d1", "outcome": "empty"}],
-                                          retire_after_misses=0)
-        assert retired == []
-    assert state.remaining_by_scout["s1"] == ["d1"]
-
-
-def test_on_dates_reported_found_resets_the_miss_streak():
-    state = orch.ScoutPoolState(remaining_by_scout={"s1": ["d1"]})
-    orch.on_slots_found(state)
-    orch.on_dates_reported(state, "s1", [{"date": "d1", "outcome": "empty"}], retire_after_misses=3)
-    orch.on_dates_reported(state, "s1", [{"date": "d1", "outcome": "empty"}], retire_after_misses=3)
-    orch.on_dates_reported(state, "s1", [{"date": "d1", "outcome": "found"}], retire_after_misses=3)
-    assert state.date_miss_counts["d1"] == 0
-    for _ in range(2):
-        retired = orch.on_dates_reported(state, "s1", [{"date": "d1", "outcome": "empty"}],
-                                          retire_after_misses=3)
-        assert retired == []
-    assert "d1" in state.remaining_by_scout["s1"]   # still not retired -- streak was reset
-
-
-def test_on_dates_reported_clears_busy_scouts():
-    state = orch.ScoutPoolState(remaining_by_scout={"s1": ["d1"]}, busy_scouts={"s1", "s2"})
-    orch.on_dates_reported(state, "s1", [{"date": "d1", "outcome": "found"}])
-    assert state.busy_scouts == {"s2"}
-
-
-def test_on_scout_died_rebalances_and_updates_state():
-    state = orch.ScoutPoolState(remaining_by_scout={"s1": ["d1"], "s2": ["d2", "d3"]})
-    out = orch.on_scout_died(state, "s2", alive_ids=["s1"])
-    assert "s2" not in out
-    assert sorted(out["s1"]) == ["d1", "d2", "d3"]
-    assert state.remaining_by_scout == out
-
-
-def test_on_scout_died_clears_busy_scouts():
-    state = orch.ScoutPoolState(remaining_by_scout={"s1": ["d1"]}, busy_scouts={"s1"})
-    orch.on_scout_died(state, "s1", alive_ids=[])
-    assert state.busy_scouts == set()
+def test_round_reached_portal_classification():
+    assert orch._round_reached_portal([{"date": "d", "outcome": "empty"}]) is True    # portal said 'none'
+    assert orch._round_reached_portal([{"date": "d", "outcome": "found"}]) is True
+    assert orch._round_reached_portal([{"date": "d", "outcome": "failed"}]) is False  # never reached
+    assert orch._round_reached_portal([]) is False                                    # nothing reported
 
 
 def test_should_send_assign_dedups_outstanding():
-    # Phase F2 -- the confirmed 56-unconsumed-commands bug's general fix: never resend to a worker
-    # that already has an outstanding, unacked assignment.
     outstanding = {"w1"}
     assert orch.should_send_assign("w1", outstanding) is False
     assert orch.should_send_assign("w2", outstanding) is True
-
-
-# ── retirement is a SLOT-FOUND-phase feature only (operator, 2026-08-14) ──────
-def test_pre_slot_open_empties_never_accrue_retirement_strikes():
-    """Before slot-found the scouts probe a portal that has not released its slots yet, so `empty`
-    is the expected answer for every date and says nothing about whether it is worth scanning
-    later. Counting those strikes was destructive: at the default threshold of 3, three single-mode
-    probe rounds put EVERY date at the limit, and the first split-mode report -- the instant
-    discovery starts mattering -- retired the whole range and left the scouts with empty slices."""
-    state = orch.ScoutPoolState()
-    dates = ["d1", "d2", "d3"]
-    for _ in range(5):
-        retired = orch.on_dates_reported(
-            state, "s1", [{"date": d, "outcome": "empty"} for d in dates], retire_after_misses=3)
-        assert retired == []
-    assert state.date_miss_counts == {}
-
-
-def test_slot_found_clears_strikes_carried_from_the_single_mode_phase():
-    """Belt to the braces above: even if a strike were recorded before the transition, entering the
-    slot-found phase starts retirement accounting from zero."""
-    state = orch.ScoutPoolState()
-    state.date_miss_counts.update({"d1": 9, "d2": 9})
-    orch.on_slots_found(state)
-    assert state.date_miss_counts == {}
-
-
-def test_retirement_takes_full_threshold_after_slot_found():
-    state = orch.ScoutPoolState()
-    dates = ["d1", "d2"]
-    for _ in range(4):                      # pre-slot-open: ignored entirely
-        orch.on_dates_reported(state, "s1", [{"date": d, "outcome": "empty"} for d in dates],
-                               retire_after_misses=3)
-    orch.on_slots_found(state)
-    state.remaining_by_scout = {"s1": list(dates)}
-
-    assert orch.on_dates_reported(state, "s1", [{"date": d, "outcome": "empty"} for d in dates],
-                                  retire_after_misses=3) == []
-    assert orch.on_dates_reported(state, "s1", [{"date": d, "outcome": "empty"} for d in dates],
-                                  retire_after_misses=3) == []
-    assert orch.on_dates_reported(state, "s1", [{"date": d, "outcome": "empty"} for d in dates],
-                                  retire_after_misses=3) == ["d1", "d2"]
-
-
-def test_busy_scouts_is_still_cleared_in_single_mode():
-    """The early return must not skip the concurrency-window bookkeeping -- a scout that reported
-    still has to be marked not-busy, or split mode would start with a poisoned window."""
-    state = orch.ScoutPoolState(busy_scouts={"s1", "s2"})
-    orch.on_dates_reported(state, "s1", [{"date": "d1", "outcome": "empty"}])
-    assert state.busy_scouts == {"s2"}

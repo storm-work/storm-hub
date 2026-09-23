@@ -41,22 +41,74 @@ IMPERSONATE = None   # None = primp built-in default; no "does not exist" warnin
 # ── P1 anti-detection flags (all default-OFF → current behavior unchanged; A/B one at a time) ──────────
 # HEADLESS_MODE: 'old' (default, headless=True) | 'new' (Chrome --headless=new, real render path) |
 #   'headful' (visible window; needs a display / xvfb-run). New-headless is far less detectable than old.
-HEADLESS_MODE    = os.environ.get("HEADLESS_MODE", "old").strip().lower()
-# DETERMINISTIC_FP=1: derive the browser fingerprint (UA/viewport/platform + canvas/WebGL noise) from a
-#   per-ACCOUNT seed so ONE account = ONE stable device across every login/resume (a real user has one
-#   device). Default OFF = random.choice per launch (the current, detectable behavior).
-DETERMINISTIC_FP = os.environ.get("DETERMINISTIC_FP", "").strip() == "1"
-# WEBRTC_BLOCK=1: force WebRTC through the proxy only (no STUN leak of the server's real datacenter IP
-#   behind the residential proxy). Keeps RTCPeerConnection present (no 'missing API' tell).
-WEBRTC_BLOCK     = os.environ.get("WEBRTC_BLOCK", "").strip() == "1"
-# STEALTH_HARDEN=1: make the fingerprint COHERENT — override navigator.platform + navigator.userAgentData
+# DEFAULT-ON anti-detection posture (2026-09-23). The portal runs Botd/DataDome-class bot detection
+# (confirmed: window.LoadBotd + obfuscated challenge fns), and a reference bot built from a real
+# successful-booking HAR insists the WAF BLOCKS a detectable browser -- our 2026-09-21 run went out
+# with ALL of this OFF (headless=old, no stealth, WebRTC unblocked) and drowned in 403 "try again
+# later". These now default ON; set the env var to "0" to disable one for an A/B.
+#
+# HEADLESS_MODE: 'new' (default) = Chrome --headless=new, the modern render path that is FAR less
+#   detectable than 'old' and needs NO display; 'old' = legacy headless=True (a strong bot tell);
+#   'headful' = a visible window, the reference's choice, which needs a real display / xvfb (installed
+#   here but DISPLAY is unset, so it must be launched under a virtual display -- see the supervisor).
+HEADLESS_MODE    = os.environ.get("HEADLESS_MODE", "new").strip().lower()
+# DETERMINISTIC_FP: derive the fingerprint (UA/viewport/platform + canvas/WebGL noise) from a per-
+#   ACCOUNT seed so ONE account = ONE stable device across every login/resume (a real user has one
+#   device). Default ON; "0" = random.choice per launch (the old, detectable behavior).
+DETERMINISTIC_FP = os.environ.get("DETERMINISTIC_FP", "1").strip() != "0"
+# WEBRTC_BLOCK: force WebRTC through the proxy only (no STUN leak of the server's real datacenter IP
+#   behind the residential proxy -- a first-order DataDome ban signal). Keeps RTCPeerConnection
+#   present (no 'missing API' tell). Default ON; "0" = allow the leak.
+WEBRTC_BLOCK     = os.environ.get("WEBRTC_BLOCK", "1").strip() != "0"
+# STEALTH_HARDEN: make the fingerprint COHERENT -- override navigator.platform + navigator.userAgentData
 #   (UA-CH) to MATCH the spoofed UA, and DELETE the webdriver property (not just null its getter). Without
 #   this the real Linux host + real Chromium version leak through and CONTRADICT the UA (audit 0730 found the
-#   browser claiming Windows+Linux+macOS at once = instant spoofed-bot flag). Default OFF for A/B.
-STEALTH_HARDEN   = os.environ.get("STEALTH_HARDEN", "").strip() == "1"
+#   browser claiming Windows+Linux+macOS at once = instant spoofed-bot flag). Default ON; "0" = leak.
+STEALTH_HARDEN   = os.environ.get("STEALTH_HARDEN", "1").strip() != "0"
 # HUMAN_BEHAVIOR=1: add human-like mouse movement + dwell around the login-form interactions (helps the
 #   behavioral scoring DataDome/reCAPTCHA collect). Typing cadence is already humanized. Default OFF.
 HUMAN_BEHAVIOR   = os.environ.get("HUMAN_BEHAVIOR", "").strip() == "1"
+
+
+def _ensure_headful_display():
+    """Return (display, xvfb_proc) for a headful browser on a possibly display-less host.
+
+    - If $DISPLAY is already set (operator ran under xvfb-run / a real X), reuse it: (disp, None).
+    - Else best-effort start a private Xvfb and return (":N", proc) so close() can terminate it.
+    - If no display can be had (no Xvfb binary, or it won't start), return (None, None) and let the
+      caller fall back to --headless=new rather than failing to launch.
+    """
+    disp = os.environ.get("DISPLAY", "").strip()
+    if disp:
+        return disp, None
+    import shutil
+    xvfb = shutil.which("Xvfb")
+    if not xvfb:
+        return None, None
+    import subprocess
+
+    def _die_with_parent():
+        # PR_SET_PDEATHSIG: the OS sends SIGTERM to this Xvfb the moment the worker process dies, so
+        # a crashed/killed worker (a flaky launch, an OOM kill) can never orphan a display server.
+        # close() still terminates it on the normal path; this covers every abnormal one.
+        try:
+            import ctypes, signal
+            ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGTERM)  # PR_SET_PDEATHSIG=1
+        except Exception:
+            pass
+
+    for _ in range(5):
+        num = random.randint(100, 9999)
+        try:
+            proc = subprocess.Popen(
+                [xvfb, f":{num}", "-screen", "0", "1280x1024x24", "-nolisten", "tcp"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, preexec_fn=_die_with_parent)
+        except Exception:
+            return None, None
+        time.sleep(0.6)
+        if proc.poll() is None:          # still alive -> the display is up
+            return f":{num}", proc
+    return None, None
 
 
 def _coherent_fp(ua: str) -> dict:
@@ -565,6 +617,7 @@ class PlaywrightSession:
     _CMD_SUBMIT_FORM_BINARY   = "submit_form_binary"  # like submit_page_form, but returns raw response bytes
     _CMD_DATADOME_UNBLOCK     = "datadome_unblock"  # solve DataDome challenge for a non-login endpoint
     _CMD_GET_ALL_COOKIES      = "get_all_cookies"   # dump the FULL ctx cookie jar (all domains, incl httpOnly)
+    _CMD_ADD_INIT             = "add_init"           # ctx.add_init_script(js) -- runs on every future nav
     _CMD_CLOSE           = "close"
 
     def __init__(self, proxy: str | None, inject_cookies: dict | None = None,
@@ -604,6 +657,8 @@ class PlaywrightSession:
         self._res_q = _StampedResultQueue(self)
         self._driver_pid = None    # Playwright driver (node) pid — its subtree is THIS session's chromium;
                                    # force-killed if a hung worker prevents graceful close (see _kill_proc_tree)
+        self._xvfb_proc = None     # a virtual display started for HEADLESS_MODE=headful on a display-less
+                                   # host; terminated in close() so it doesn't leak
         self._thread  = threading.Thread(target=self._worker, daemon=True)
         self._ready   = threading.Event()
         self._error: Exception | None = None
@@ -663,7 +718,20 @@ class PlaywrightSession:
             if HEADLESS_MODE == "new":
                 _launch_headless = False; _args.append("--headless=new")
             elif HEADLESS_MODE == "headful":
-                _launch_headless = False
+                # Headful needs a real display. Reuse $DISPLAY if the operator set one (e.g. ran the
+                # supervisor under xvfb-run); otherwise best-effort start a per-process Xvfb. If no
+                # display can be had, DON'T crash the worker -- fall back to --headless=new (which is
+                # still far less detectable than old) with a loud warning.
+                _disp, self._xvfb_proc = _ensure_headful_display()
+                if _disp:
+                    os.environ["DISPLAY"] = _disp
+                    _launch_headless = False
+                    print(f"[session] browser mode = headful on DISPLAY={_disp}"
+                          + ("  (auto-Xvfb)" if self._xvfb_proc is not None else "  ($DISPLAY)"))
+                else:
+                    print("[session] HEADLESS_MODE=headful but no display and no Xvfb available "
+                          "-- falling back to --headless=new")
+                    _launch_headless = False; _args.append("--headless=new")
             else:
                 _launch_headless = self._headless
             if HEADLESS_MODE in ("new", "headful"):
@@ -886,6 +954,16 @@ class PlaywrightSession:
                 elif cmd.get("action") == self._CMD_GET_ALL_COOKIES:
                     try:
                         self._res_q.put(("ok", ctx.cookies()))
+                    except Exception as exc:
+                        self._res_q.put(("err", str(exc)))
+
+                elif cmd.get("action") == self._CMD_ADD_INIT:
+                    # Register a script that Playwright runs at the START of every future navigation
+                    # in this context (before the page's own scripts) -- the only place to install a
+                    # fetch/XHR hook that must be present BEFORE a page-load-triggered request fires.
+                    try:
+                        ctx.add_init_script(cmd["js"])
+                        self._res_q.put(("ok", True))
                     except Exception as exc:
                         self._res_q.put(("err", str(exc)))
 
@@ -2427,6 +2505,20 @@ class PlaywrightSession:
             raise RuntimeError(f"browser_login failed: {result}")
         return result
 
+    def browser_add_init_script(self, js: str, timeout: int = 15) -> bool:
+        """Register JS to run at the start of EVERY future navigation in this context (before the
+        page's own scripts). Use for a fetch/XHR hook that must be in place before a page-load-
+        triggered request fires (e.g. the portal's getTables handshake). Idempotency is the caller's
+        responsibility -- Playwright STACKS init scripts, so add each one once per session."""
+        _seq = self._send({"action": self._CMD_ADD_INIT, "js": js})
+        try:
+            status, result = self._await(_seq, timeout)
+        except queue.Empty:
+            raise RuntimeError(f"browser_add_init_script timed out after {timeout}s")
+        if status == "err":
+            raise RuntimeError(f"browser_add_init_script failed: {result}")
+        return bool(result)
+
     def browser_eval(self, js: str, timeout: int = 30):
         """Execute arbitrary JS in the live browser page and return the result."""
         timeout = int(timeout * _nav_scale())   # storm tolerance (NAV_TIMEOUT_SCALE); increase-only
@@ -2612,6 +2704,13 @@ class PlaywrightSession:
             # graceful close timed out → worker is wedged in a hung browser op. SIGKILL the node+chromium
             # subtree; the wedged op then errors out and the thread unwinds.
             _kill_proc_tree(self._driver_pid)
+        # Terminate the private Xvfb (if this session started one for headful) so it doesn't leak.
+        if self._xvfb_proc is not None:
+            try:
+                self._xvfb_proc.terminate()
+            except Exception:
+                pass
+            self._xvfb_proc = None
 
 
 # -- External CAPTCHA solver (synchronous, for browser fallback) ---------------
