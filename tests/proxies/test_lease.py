@@ -673,6 +673,46 @@ def test_static_and_rotating_pools_coexist_only_the_unhealthy_static_row_is_cut(
     assert got.endpoint == "rot:80", "the unhealthy static row must be excluded, leaving only the rotating one"
 
 
+# ── all-ISP leasing (2026-09-24): provider=None leases across EVERY ISP provider ────────────────
+def test_provider_none_leases_across_every_isp_provider(db):
+    """The all-ISP option (PROXY_PROVIDER=all-isp -> provider=None): drawing capacity is the UNION
+    of every ISP pool, not one provider. Two different-provider static rows, one lease each, both
+    reachable without ever naming a provider."""
+    db.add_all([
+        M.Proxy(provider="capsolver", kind="static", resource_type="static", endpoint="cap:80",
+                credentials_ref="u:p", max_sessions=1, is_healthy=True),
+        M.Proxy(provider="thordata", kind="static", resource_type="static", endpoint="thor:80",
+                credentials_ref="u:p", max_sessions=1, is_healthy=True),
+    ])
+    db.commit()
+
+    seen = set()
+    got1, _ = lease_proxy(db, "w1", None, resource_type="static")
+    seen.add(got1.endpoint)
+    got2, _ = lease_proxy(db, "w2", None, resource_type="static")
+    seen.add(got2.endpoint)
+    assert seen == {"cap:80", "thor:80"}, "both ISP providers must be leasable without a provider filter"
+
+    # Union is exhausted now -- the third lease fails, and the message names ISP rather than a provider.
+    with pytest.raises(ProxyLeaseError, match="ISP"):
+        lease_proxy(db, "w3", None, resource_type="static")
+
+
+def test_provider_none_with_health_check_spans_providers(db):
+    """The probe path (health_check wired, as production does) must also span providers when
+    provider is None -- a dead capsolver row is skipped and a healthy thordata row leased."""
+    db.add_all([
+        M.Proxy(provider="capsolver", kind="static", resource_type="static", endpoint="capdead:80",
+                credentials_ref="u:p", max_sessions=1, is_healthy=True),
+        M.Proxy(provider="thordata", kind="static", resource_type="static", endpoint="thorok:80",
+                credentials_ref="u:p", max_sessions=1, is_healthy=True),
+    ])
+    db.commit()
+    probe = lambda url: (("thorok" in url), "ok" if "thorok" in url else "dead")
+    got, _ = lease_proxy(db, "w1", None, resource_type="static", health_check=probe)
+    assert got.endpoint == "thorok:80"
+
+
 # ── Phase 8 (D-NEW-1): static reactivation candidate query ─────────────────────────────────────
 def test_reactivation_candidates_selects_only_static_unhealthy_active(db):
     """The exact five-way matrix Phase 7/8 specified: only static+unhealthy+active is a candidate."""

@@ -250,19 +250,27 @@ def _candidate_query(provider: str, kind: str | None, exclude_ids: set[str] | No
         (and_(M.Proxy.health.is_(None), M.Proxy.last_used_at.is_(None)), 2),   # never established (~0.5%)
         else_=3,                                                            # known bad
     )
+    conds = [
+        M.Proxy.active.is_(True),
+        # Phase 3 (D32): everything above this line is correct ONLY for a rotating session
+        # template (D19) -- a static/ISP row is a genuinely finite resource, where a failed
+        # probe means THIS resource is bad, not "an exit behind it moved." Scope the
+        # never-filter-on-health rule to resource_type='rotating' explicitly; a static row with
+        # is_healthy=False is excluded. Every row in the pool is 'rotating' as of this change
+        # (no static inventory exists), so this is a no-op today and only takes effect once a
+        # static row is actually imported.
+        or_(M.Proxy.resource_type != "static", M.Proxy.is_healthy.is_(True)),
+    ]
+    # provider is OPTIONAL (2026-09-24): a falsy provider means "any provider", used by the
+    # all-ISP lease option -- lease the UNION of every ISP pool (capsolver + thordata + whatever
+    # is imported later) instead of one. resource_type="static" is what actually bounds selection
+    # to ISP in that case; the tier/LRU ordering above already spans providers correctly. Every
+    # pre-existing caller passes a concrete provider, so this changes nothing for them.
+    if provider:
+        conds.insert(0, M.Proxy.provider == provider)
     q = (
         select(M.Proxy)
-        .where(
-            M.Proxy.provider == provider, M.Proxy.active.is_(True),
-            # Phase 3 (D32): everything above this line is correct ONLY for a rotating session
-            # template (D19) -- a static/ISP row is a genuinely finite resource, where a failed
-            # probe means THIS resource is bad, not "an exit behind it moved." Scope the
-            # never-filter-on-health rule to resource_type='rotating' explicitly; a static row with
-            # is_healthy=False is excluded. Every row in the pool is 'rotating' as of this change
-            # (no static inventory exists), so this is a no-op today and only takes effect once a
-            # static row is actually imported.
-            or_(M.Proxy.resource_type != "static", M.Proxy.is_healthy.is_(True)),
-        )
+        .where(*conds)
         .order_by(_tier.asc(),
                   M.Proxy.last_used_at.asc().nullsfirst(),
                   M.Proxy.score.desc(), M.Proxy.created_at.asc())
@@ -318,7 +326,7 @@ def _claim_locked(db: Session, proxy_id: str, worker_id: str, is_pg: bool,
     return proxy, conn_url(proxy, geo=geo)
 
 
-def lease_proxy(db: Session, worker_id: str, provider: str, *, kind: str | None = None,
+def lease_proxy(db: Session, worker_id: str, provider: str | None, *, kind: str | None = None,
                 exclude_ids: set[str] | None = None, health_check=None,
                 max_probes: int = 5, geos: set[str] | None = None,
                 quick_screen=None, resource_type: str | None = None,
@@ -389,7 +397,7 @@ def lease_proxy(db: Session, worker_id: str, provider: str, *, kind: str | None 
         # pools do not cover the worker count, and the operator's next action is either to assign
         # another pool or to buy more -- neither of which "pool exhausted" tells them.
         raise ProxyLeaseError(
-            f"no free {provider} proxy available (pool exhausted)"
+            f"no free {provider or 'ISP'} proxy available (pool exhausted)"
             + (f" in pool(s) {', '.join(sorted(pool_names))}" if pool_names else "")
             + (f" for geo(s) {', '.join(sorted(geos))}" if geos else ""))
 
@@ -463,7 +471,7 @@ def lease_proxy(db: Session, worker_id: str, provider: str, *, kind: str | None 
     # Say WHICH of the two it was. "no healthy proxy" sent the last investigation looking at proxy
     # health for a contention bug, with the DB showing every named candidate as healthy.
     raise ProxyLeaseError(
-        f"no {provider} proxy leased after {probes} probe(s)"
+        f"no {provider or 'ISP'} proxy leased after {probes} probe(s)"
         + (f" in pool(s) {', '.join(sorted(pool_names))}" if pool_names else "")
         + f": {unhealthy} failed health, {lost_races} lost to a concurrent leaser "
         f"({', '.join(tried_ids[:5]) or 'none eligible'})"

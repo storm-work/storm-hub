@@ -242,6 +242,123 @@ def test_live_launch_sends_full_payload_and_marks_running(client, monkeypatch):
     assert got[0]["sub_account_id"] == captured["sub_account_id"]
 
 
+def _spy_launch(monkeypatch):
+    import apps.hub.main as hub_main
+    captured = {}
+    orig = hub_main._bus.send_command
+
+    def _spy(worker_id, type, **payload):
+        if type == "launch":
+            captured.update(payload)
+        return orig(worker_id, type, **payload)
+
+    monkeypatch.setattr(hub_main._bus, "send_command", _spy)
+    return captured
+
+
+def test_worker_geo_is_frozen_at_launch_from_the_booking_set(client, monkeypatch):
+    """A worker draws ONE country from the booking's PROXY_GEOS set, freezes it on the row, and mints
+    with it -- so the exit country is bound and durable (survives relaunch, since launch reads
+    proxy_geo before drawing). The reuse-of-a-bound-geo branch is covered by the override test."""
+    h = _operate_headers(client)
+    tpl = client.post("/templates", json={"name": "Geo", "role": "apply", "settings": {}},
+                      headers=h).json()
+    iid = client.post("/identities", json={"full_name": "Geo Test", "type": "real"},
+                      headers=h).json()["id"]
+    _gen_verified_subs(client, h, iid)
+    bid = client.post("/bookings", json={
+        "name": "geo", "type": "real", "posto_id": "5084",
+        # single-code set -> the frozen pick is deterministic, so the mint can be asserted exactly.
+        "settings": {"ENGINE_MODE": "live", "PROXY_PROVIDER": "soax", "PROXY_GEOS": "PT"}},
+        headers=h).json()["id"]
+    w = client.post(f"/bookings/{bid}/identities",
+                    json={"identity_id": iid, "template_id": tpl["id"]}, headers=h).json()
+
+    captured = _spy_launch(monkeypatch)
+    assert client.post(f"/workers/{w['id']}/launch", headers=h).status_code == 200
+    assert "-country-pt-" in captured["warm_proxy"], captured["warm_proxy"]
+    # Frozen on the row -> WorkerOut exposes it, and the next launch will read it before drawing.
+    assert client.get(f"/bookings/{bid}/workers", headers=h).json()[0]["proxy_geo"] == "PT"
+
+
+def test_operator_geo_override_persists_and_binds_the_mint(client, monkeypatch):
+    """PATCH /workers/{id}/geo sets the binding; the next launch mints with it, overriding the
+    booking default -- this is also the reuse path (launch reads an already-bound proxy_geo).
+    Clearing it (geo="") unbinds so the next launch re-draws from the set."""
+    h = _operate_headers(client)
+    tpl = client.post("/templates", json={"name": "GeoOv", "role": "apply", "settings": {}},
+                      headers=h).json()
+    iid = client.post("/identities", json={"full_name": "Geo Ov", "type": "real"},
+                      headers=h).json()["id"]
+    _gen_verified_subs(client, h, iid)
+    bid = client.post("/bookings", json={
+        "name": "geo-ov", "type": "real", "posto_id": "5084",
+        "settings": {"ENGINE_MODE": "live", "PROXY_PROVIDER": "soax", "PROXY_GEOS": "PT"}},
+        headers=h).json()["id"]
+    w = client.post(f"/bookings/{bid}/identities",
+                    json={"identity_id": iid, "template_id": tpl["id"]}, headers=h).json()
+
+    # Options come from the resolved provider (soax). List is empty until populated, so validation is
+    # permissive -- an override still takes and persists.
+    opts = client.get(f"/workers/{w['id']}/geo", headers=h).json()
+    assert opts["provider"] == "soax" and opts["current"] is None
+
+    r = client.patch(f"/workers/{w['id']}/geo", json={"geo": "es"}, headers=h)
+    assert r.status_code == 200 and r.json()["proxy_geo"] == "ES"   # normalized upper
+
+    captured = _spy_launch(monkeypatch)
+    assert client.post(f"/workers/{w['id']}/launch", headers=h).status_code == 200
+    assert "-country-es-" in captured["warm_proxy"], "the operator override must win over PROXY_GEOS=PT"
+
+    # Clearing unbinds (persisted): the next launch re-draws from PT.
+    assert client.patch(f"/workers/{w['id']}/geo", json={"geo": ""}, headers=h).json()["proxy_geo"] is None
+
+
+def test_all_isp_provider_leases_across_providers_without_a_kind(client, monkeypatch):
+    """PROXY_PROVIDER='all-isp' leases a STATIC row from ANY ISP provider -- no PROXY_KIND needed
+    (the sentinel forces the lease path), and the union spans providers. Two static rows of two
+    different providers; the worker leases one of them (endpoint carried, so LEASED not minted)."""
+    h = _operate_headers(client)
+    tpl = client.post("/templates", json={"name": "All ISP", "role": "apply", "settings": {}},
+                      headers=h).json()
+    iid = client.post("/identities", json={"full_name": "All ISP Test", "type": "real"},
+                      headers=h).json()["id"]
+    _gen_verified_subs(client, h, iid)
+    client.post("/proxies", json={"provider": "capsolver", "kind": "static", "endpoint": "cap:1",
+                                  "credentials_ref": "u:p", "max_sessions": 5,
+                                  "resource_type": "static"}, headers=h)
+    client.post("/proxies", json={"provider": "thordata", "kind": "static", "endpoint": "thor:1",
+                                  "credentials_ref": "u:p", "max_sessions": 5,
+                                  "resource_type": "static"}, headers=h)
+    bid = client.post(
+        "/bookings",
+        json={"name": "all-isp", "type": "real", "posto_id": "5084",
+              # No PROXY_KIND on purpose -- 'all-isp' alone must route to the lease path.
+              "settings": {"ENGINE_MODE": "live", "PROXY_PROVIDER": "all-isp"}},
+        headers=h,
+    ).json()["id"]
+    w = client.post(f"/bookings/{bid}/identities",
+                    json={"identity_id": iid, "template_id": tpl["id"]}, headers=h).json()
+
+    import apps.hub.main as hub_main
+    captured = {}
+    orig_send = hub_main._bus.send_command
+
+    def _spy(worker_id, type, **payload):
+        if type == "launch":
+            captured.update(payload)
+        return orig_send(worker_id, type, **payload)
+
+    monkeypatch.setattr(hub_main._bus, "send_command", _spy)
+    r = client.post(f"/workers/{w['id']}/launch", headers=h)
+    assert r.status_code == 200, r.text
+    # A leased static row carries its own endpoint -- and it is one of the two ISP providers, never
+    # a minted rotating credential.
+    assert captured["warm_proxy"].endswith(("cap:1", "thor:1")), captured["warm_proxy"]
+    assert "package-" not in captured["warm_proxy"] and "sodade2026-" not in captured["warm_proxy"], (
+        "all-isp must LEASE an ISP row, not mint a rotating credential")
+
+
 def test_launch_and_mid_hold_rotation_resolve_the_same_worker_override(client, monkeypatch):
     """Phase 5, end-to-end: booking-level PROXY_PROVIDER='soax' (A), worker-level override
     'webshare' (B). Proves BOTH halves of the invariant in one test -- launch resolves B (already

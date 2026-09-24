@@ -236,6 +236,10 @@ class WorkerTemplate(Base, PKMixin, TimestampMixin):
     orchestration_logic_ref: Mapped[str | None] = mapped_column(String(128))
     settings_json: Mapped[dict] = mapped_column(JSON, default=dict)
     logic_snapshot: Mapped[str] = mapped_column(String(64), default="latest", nullable=False)
+    # The default template for its ROLE, used by 'Auto (by role)' attach (main.py's attach_identity).
+    # At most one True per role -- the make-default endpoint clears the others. False = not default;
+    # with no default flagged for a role, attach falls back to oldest-by-created_at (legacy behavior).
+    is_default: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
 
 class TemplateVersion(Base, PKMixin, TimestampMixin):
@@ -273,6 +277,13 @@ class Worker(Base, PKMixin, TimestampMixin):
     # in sync by do_login()'s sticky-then-rotate loop (ops_live.py) via the "account_rotated" event,
     # since a worker can rotate off its launch-time pick after repeated login failures.
     sub_account_id: Mapped[str | None] = mapped_column(ForeignKey("sub_accounts.id"))
+    # The exit country this worker is BOUND to, kept consistent for the whole run and every
+    # self-mint exit rotation (both providers' roll() preserve the country segment). NULL = unbound:
+    # launch picks one uniformly from the booking's PROXY_GEOS set and freezes it here, so the choice
+    # survives relaunch. The operator can set/clear it per worker from the dashboard; it changes only
+    # when they change it. Stored as the provider-neutral code (mint lowercases for soax / uppercases
+    # for webshare) -- see libs/proxies/geos.py.
+    proxy_geo: Mapped[str | None] = mapped_column(String(16))
 
 
 class WorkerRun(Base, PKMixin, TimestampMixin):

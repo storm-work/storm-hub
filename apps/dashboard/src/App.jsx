@@ -963,6 +963,13 @@ function derivePoolOptions(poolRows) {
   // Only static rows contribute; a rotating row here is pre-migration residue and is already
   // represented above, so including it would duplicate the option.
   const staticRows = poolRows.filter((p) => p.resource_type === "static");
+  // "All ISP pools" -- lease the UNION of every ISP provider in one booking (PROXY_PROVIDER=all-isp).
+  // Now that the DB holds only ISP rows, a single purchase is routinely smaller than the worker
+  // count, so drawing from every pool at once is the common case, not an edge one. Offered whenever
+  // ANY static/ISP row exists, and listed first so it is the obvious default for an all-ISP DB.
+  if (staticRows.length > 0) {
+    out.push({ provider: "all-isp", kind: "static", label: "All ISP pools (leased, every provider)" });
+  }
   const providers = [...new Set(staticRows.map((p) => p.provider))].sort();
   for (const provider of providers) {
     const kinds = [...new Set(staticRows.filter((p) => p.provider === provider).map((p) => p.kind))].sort();
@@ -1047,6 +1054,50 @@ function IspPoolPicker({ label, value, onChange, disabled }) {
         </>
       )}
     </div>
+  );
+}
+
+// Per-worker exit-country binding. A chip showing the bound geo ("auto" = unbound -> drawn from the
+// booking's PROXY_GEOS set at launch); clicking it lazily fetches the countries the worker's PROVIDER
+// supports (GET /workers/{id}/geo, one fetch per interaction, not per row) and swaps to a <select>.
+// Picking a code PATCHes the binding; it holds for the whole run + every exit rotation and persists
+// across relaunch, taking effect at the NEXT launch. Empty option = unbind.
+function WorkerGeoCell({ worker, op, onChanged }) {
+  const [editing, setEditing] = useState(false);
+  const [opts, setOpts] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const cur = worker.proxy_geo || "";
+
+  async function open() {
+    if (!op) return;
+    setEditing(true);
+    if (opts === null) {
+      try { const r = await api(`/workers/${worker.id}/geo`); setOpts(r.options || []); }
+      catch { setOpts([]); }
+    }
+  }
+  async function change(v) {
+    setBusy(true);
+    try { await api(`/workers/${worker.id}/geo`, { method: "PATCH", body: { geo: v } }); onChanged && onChanged(); }
+    catch (e) { /* surfaced by the caller's poll; keep the cell responsive */ }
+    finally { setBusy(false); setEditing(false); }
+  }
+
+  if (!editing) {
+    return (
+      <span className="pill" title={op ? "click to set this worker's exit country" : cur || "auto"}
+        style={{ cursor: op ? "pointer" : "default", fontFamily: "monospace" }}
+        onClick={open}>{cur || "auto"}</span>
+    );
+  }
+  return (
+    <select value={cur} disabled={busy} autoFocus style={{ fontSize: 12 }}
+      onBlur={() => setEditing(false)}
+      onChange={(e) => change(e.target.value)}>
+      <option value="">auto (from booking set)</option>
+      {(opts || []).map((o) => <option key={o.code} value={o.code}>{o.code} — {o.label}</option>)}
+      {opts !== null && opts.length === 0 && <option disabled>no list configured yet</option>}
+    </select>
   );
 }
 
@@ -1294,7 +1345,9 @@ const _SETTING_SELECT_OPTIONS = {
   // a free-text box was the only thing making it look like a setting you could get wrong.
   EMAIL_PROVIDER: ["mailtm", "cloudflare"],
   ENGINE_MODE: ["sim", "live"],
-  PROXY_PROVIDER: ["soax", "webshare"],
+  // 'all-isp' leases across every ISP pool at once (apps/hub/main.py _all_isp). Not offered for
+  // HOLD_PROXY_PROVIDER: the post-swap pool must resolve to a SINGLE static provider.
+  PROXY_PROVIDER: ["soax", "webshare", "all-isp"],
   HOLD_PROXY_PROVIDER: ["soax", "webshare"],
   PROXY_KIND: ["", "rotating", "mobile"],
   HOLD_PROXY_KIND: ["", "rotating", "mobile"],
@@ -1564,8 +1617,9 @@ function BookingWorkers({ me, booking, events, workers, setRightPanel }) {
           <Sortable label="Passport" k="passport_no" sort={sort} setSort={setSort} w="11%" />
           <Sortable label="Role" k="role" sort={sort} setSort={setSort} w="7%" />
           <Sortable label="Status" k="status" sort={sort} setSort={setSort} w="9%" />
-          <Sortable label="Live substate" k="live_substate" sort={sort} setSort={setSort} w="14%" />
-          <th style={{ width: "31%" }}>Actions</th>
+          <Sortable label="Live substate" k="live_substate" sort={sort} setSort={setSort} w="12%" />
+          <Sortable label="Geo" k="proxy_geo" sort={sort} setSort={setSort} w="7%" />
+          <th style={{ width: "27%" }}>Actions</th>
         </tr></thead>
         <tbody>{shown.map((w, i) => {
           const live = events.byWorker[w.id] || {};   // log lines only -- status/substate come from workerView
@@ -1589,6 +1643,9 @@ function BookingWorkers({ me, booking, events, workers, setRightPanel }) {
                     <span className="pill err" style={{ marginLeft: 6, fontSize: 10 }}
                       title={w.substate_detail}>⚠ not-bookable</span>
                   )}
+                </td>
+                <td onClick={(e) => e.stopPropagation()}>
+                  <WorkerGeoCell worker={w} op={op} onChanged={() => workers.reload && workers.reload()} />
                 </td>
                 <td className="row" style={{ flexWrap: "nowrap", gap: 4 }}>
                   <button className="btn-sm btn" disabled={!op || !canWorkerAction("launch", w.status)}
@@ -1631,7 +1688,7 @@ function BookingWorkers({ me, booking, events, workers, setRightPanel }) {
                 </td>
               </tr>
               {logsFor === w.id && (
-                <tr><td colSpan={8} style={{ padding: 0 }}>
+                <tr><td colSpan={9} style={{ padding: 0 }}>
                   {/* The log box is positioned ABSOLUTELY inside this fixed-height relative wrapper,
                       so a very wide line (the Playwright launch command) is taken OUT of the table's
                       width calculation entirely. Without this, the workers table (table-nowrap: width
@@ -3694,9 +3751,18 @@ function Templates({ me }) {
         {err && <div className="banner err">{err}</div>}
         <table><thead><tr><th style={{ width: 36, whiteSpace: "nowrap" }}>#</th><th>Name</th><th>Role</th><th>Settings</th><th></th></tr></thead>
           <tbody>{rows.map((t, i) => (
-            <tr key={t.id}><td className="muted row-num">{i + 1}</td><td>{t.name}</td><td><span className="pill">{t.role}</span></td>
+            <tr key={t.id}><td className="muted row-num">{i + 1}</td>
+              <td>{t.name}{t.is_default && <span className="pill ok" style={{ marginLeft: 6, fontSize: 10 }}
+                title="Auto (by role) attach resolves to this template">default for {t.role}</span>}</td>
+              <td><span className="pill">{t.role}</span></td>
               <td className="muted" style={{ fontFamily: "monospace", fontSize: 12 }}>{JSON.stringify(t.settings_json)}</td>
               <td className="row">
+                <button className="btn ghost" disabled={!op || t.is_default}
+                  title={t.is_default ? "already the default for its role"
+                    : "make this the 'Auto (by role)' default for its role (clears the current one)"}
+                  onClick={async () => { setMsg(""); try { await api(`/templates/${t.id}/make-default`, { method: "POST" }); reload(); } catch (e) { setMsg(e.message); } }}>
+                  {t.is_default ? "✓ Default" : "Make default"}
+                </button>
                 <button className="btn ghost" disabled={!op} onClick={() => startEdit(t)}>Edit</button>
                 <button className="btn ghost" disabled={!op} onClick={() => del(t.id)}>Delete</button>
               </td></tr>

@@ -1598,11 +1598,11 @@ _SUBMIT_URL = "https://pedidodevistos.mne.gov.pt/VistosOnline/SubmeterVistoCriaP
 
 
 def test_home_dashboard_detected_by_url_when_the_portal_renders_in_english():
-    """storm-auto matches only the PORTUGUESE nav text. We send lang=ENG in both the warmup and the
-    booking payload, so those strings can be absent from an English dashboard and a genuine
-    form-state expiry gets mis-read as "the slot was taken" -- no re-warm, and the slot pool wrongly
-    blamed for our own lapsed session. Live: 20 of 24 bounces landed on the bare /VistosOnline/
-    root, and only 6 matched the Portuguese markers.
+    """storm-auto matches only the PORTUGUESE nav text. The PT-version branch sends lang=PT through
+    the whole flow, so the dashboard renders Portuguese and these markers match -- but the site-root
+    fallback is kept as belt-and-suspenders and this test locks it: a page served at the bare
+    /VistosOnline/ root IS the dashboard whatever language it rendered. Live (old ENG flow): 20 of 24
+    bounces landed on the bare /VistosOnline/ root, and only 6 matched the Portuguese markers.
 
     A page the portal served AT its own site root IS the dashboard, whatever language it rendered."""
     assert LiveEngineOps._classify_submit_response(
@@ -1753,7 +1753,7 @@ class _RaisingQuestSession(_WarmupSession):
         if "location.origin" in (js or ""): return _origin_reply(js)
         if "outerHTML" in js:
             return self._sched_html
-        if "lang=ENG&lang=PT" in js:
+        if "body:'lang=PT'" in js:
             return 200                      # the home-lang POST succeeds
         self.quest_calls += 1
         if self.quest_calls <= self.fail_n:
@@ -1783,7 +1783,7 @@ def test_persistent_in_page_fetch_failure_still_fails_the_warmup(monkeypatch):
 class _DeadHomeSession(_WarmupSession):
     def browser_eval(self, js, timeout=30):
         if "location.origin" in (js or ""): return _origin_reply(js)
-        if "lang=ENG&lang=PT" in js:
+        if "body:'lang=PT'" in js:
             raise RuntimeError("Page.evaluate: TypeError: Failed to fetch")
         return super().browser_eval(js, timeout)
 
@@ -1808,7 +1808,7 @@ class _FlakyHomeSession(_WarmupSession):
 
     def browser_eval(self, js, timeout=30):
         if "location.origin" in (js or ""): return _origin_reply(js)
-        if "lang=ENG&lang=PT" in js:
+        if "body:'lang=PT'" in js:
             self.home_calls += 1
             if self.home_calls <= self.fail_n:
                 raise RuntimeError("Page.evaluate: TypeError: Failed to fetch")

@@ -74,6 +74,7 @@ from libs.proxies.health import apply_result, check_proxy, provider_reachable, q
 from libs.proxies.health import check_proxy as _REAL_CHECK_PROXY
 from libs.proxies.lease import ProxyLeaseError, lease_proxy, release_proxy, conn_url
 from libs.proxies.rotating import RotatingPoolError, mint_rotating_url
+from libs.proxies import geos as proxy_geos
 
 from .config import settings
 from .config_store import get_config, seed_defaults, seed_templates, set_config
@@ -2205,6 +2206,26 @@ def update_template(template_id: str, body: TemplateCreate, db: Session = Depend
     return tpl
 
 
+@app.post("/templates/{template_id}/make-default", response_model=TemplateOut)
+def make_template_default(template_id: str, db: Session = Depends(get_db),
+                          _op: Principal = Depends(require_operator)) -> M.WorkerTemplate:
+    """Mark this template as the default for its role -- what 'Auto (by role)' attach resolves to.
+    At most one default per role: every OTHER template of the same role is un-flagged in the same
+    transaction, so there is never an ambiguous default."""
+    tpl = db.get(M.WorkerTemplate, template_id)
+    if not tpl:
+        raise HTTPException(404, "template not found")
+    db.execute(
+        update(M.WorkerTemplate).where(M.WorkerTemplate.role == tpl.role,
+                                       M.WorkerTemplate.id != tpl.id)
+        .values(is_default=False)
+    )
+    tpl.is_default = True
+    db.commit()
+    db.refresh(tpl)
+    return tpl
+
+
 @app.delete("/templates/{template_id}", status_code=204)
 def delete_template(template_id: str, db: Session = Depends(get_db),
                     _op: Principal = Depends(require_operator)) -> None:
@@ -2700,8 +2721,14 @@ def attach_identity(
         if tpl.role != role:
             raise HTTPException(400, f"template role {tpl.role} != worker role {role}")
     else:
-        tpl = db.scalars(select(M.WorkerTemplate).where(M.WorkerTemplate.role == role)
-                         .order_by(M.WorkerTemplate.created_at.asc())).first()
+        # 'Auto (by role)': prefer the template explicitly marked default for this role; fall back to
+        # the oldest of the role (legacy behavior) when none is flagged. Oldest-wins was an accident
+        # of creation order that silently picked the soax-pinned templates over a booking's own proxy
+        # setting -- is_default makes the choice explicit (operator request 2026-09-24).
+        tpl = db.scalars(
+            select(M.WorkerTemplate).where(M.WorkerTemplate.role == role)
+            .order_by(M.WorkerTemplate.is_default.desc(), M.WorkerTemplate.created_at.asc())
+        ).first()
         template_id = tpl.id if tpl else None
 
     alloc = M.IdentityAllocation(identity_id=ident.id, booking_id=bk.id, allocated_at=_now())
@@ -2851,6 +2878,20 @@ def _static_pool(kind: str | None) -> bool:
     return str(kind or "").strip().lower() in ("static", "isp")
 
 
+# The all-ISP sentinel for PROXY_PROVIDER (2026-09-24). Now that the DB holds ONLY ISP rows by
+# design, a booking often wants to draw from EVERY ISP pool at once rather than picking one provider
+# -- capacity is the union of capsolver + thordata (+ whatever is imported later), which matters when
+# any single purchase is smaller than the worker count. Selecting it (a) forces the lease path just
+# like PROXY_KIND=static does, and (b) drops the provider filter so lease_proxy spans all ISP
+# providers; resource_type="static" is what still bounds it to ISP. Case-insensitive; '*'/'all' are
+# accepted aliases so the value is guessable from either the dashboard or a raw settings PATCH.
+_ANY_ISP_PROVIDER = frozenset({"all-isp", "*", "all"})
+
+
+def _all_isp(provider: str | None) -> bool:
+    return str(provider or "").strip().lower() in _ANY_ISP_PROVIDER
+
+
 def _screen_tier1():
     """DISABLED: returns None. See libs/proxies/lease.py's TIER 1 comment.
 
@@ -2894,6 +2935,22 @@ def _pick_geo(geos: set[str] | None) -> str | None:
     these", not "each session may use any of them". Sorted before choosing so the draw does not
     depend on set iteration order."""
     return random.choice(sorted(geos)) if geos else None
+
+
+def _resolve_and_freeze_worker_geo(db: Session, w: M.Worker, allowed: set[str] | None) -> str | None:
+    """The exit country to bind this worker to, frozen onto w.proxy_geo so it survives relaunch.
+
+    Already bound (operator pick or an earlier frozen draw) -> keep it, whatever the booking set now
+    says: per-worker consistency is the contract, and the operator changes it only by changing it.
+    Unbound with a non-empty allowed set -> draw one uniformly and freeze it. Unbound with no set ->
+    None (no geo restriction), and nothing is frozen so a later PROXY_GEOS still takes effect. The
+    caller commits w as part of the launch, which persists the freeze."""
+    if w.proxy_geo:
+        return w.proxy_geo
+    if allowed:
+        w.proxy_geo = random.choice(sorted(allowed))
+        return w.proxy_geo
+    return None
 
 
 def _do_launch_worker(db: Session, w: M.Worker) -> None:
@@ -2977,19 +3034,35 @@ def _do_launch_worker(db: Session, w: M.Worker) -> None:
         w.sub_account_id = sub_account.id
         _prov = str(eff.get("PROXY_PROVIDER", "soax"))
         _kind = eff.get("PROXY_KIND") or None
-        if _static_pool(_kind):
+        # Bind this worker's exit country for the whole run. If it already has one (operator pick or
+        # a previously-frozen random draw), keep it -- consistency across relaunches is the point.
+        # Otherwise draw one uniformly from the booking's PROXY_GEOS set and FREEZE it on the row, so
+        # the choice is durable. Empty set -> None -> no geo restriction (unchanged). The worker
+        # self-rolls without changing the country segment, so this holds across every exit rotation.
+        _bound_geo = _resolve_and_freeze_worker_geo(db, w, _geos(eff.get("PROXY_GEOS")))
+        _geo_set = {_bound_geo} if _bound_geo else _geos(eff.get("PROXY_GEOS"))
+        if _static_pool(_kind) or _all_isp(_prov):
             # STATIC/ISP: a finite, individually-owned IP. It must be ASSIGNED by the one side with
             # DB access, held under a lease so two workers never share it, and screened per row --
             # a probe verdict here has a real subject. Unchanged.
+            #
+            # all-ISP: PROXY_PROVIDER=all-isp leases across EVERY ISP provider (provider filter
+            # dropped) instead of one -- resource_type="static" still bounds it to ISP. A concrete
+            # provider is passed through unchanged.
             try:
                 _proxy_row, warm_proxy = lease_proxy(
-                    db, w.id, provider=_prov, kind=_kind, health_check=check_proxy,
-                    quick_screen=_screen_tier1(), geos=_geos(eff.get("PROXY_GEOS")),
+                    db, w.id, provider=(None if _all_isp(_prov) else _prov), kind=_kind,
+                    health_check=check_proxy,
+                    quick_screen=_screen_tier1(), geos=_geo_set,
                     pool_names=_pools(eff.get("PROXY_POOLS")),
                     resource_type="static",
                 )
             except ProxyLeaseError as e:
                 raise HTTPException(409, f"worker {w.id}: {e}")
+            # Use the ACTUAL leased provider for the advisory gateway probe and logs below -- with
+            # all-ISP the sentinel is not a real provider, and the leased row knows which pool it
+            # came from.
+            _prov = _proxy_row.provider
         else:
             # ROTATING: MINTED, not leased (operator direction 2026-09-15). A rotating row was never
             # a resource -- it was a pre-generated session-id string, and the system kept 42,600 of
@@ -3005,7 +3078,7 @@ def _do_launch_worker(db: Session, w: M.Worker) -> None:
             try:
                 warm_proxy = mint_rotating_url(
                     _prov, _kind, settings=get_global(db),
-                    geo=_pick_geo(_geos(eff.get("PROXY_GEOS"))),
+                    geo=_bound_geo,
                 )
             except RotatingPoolError as e:
                 # 409, same shape a lease failure used: the operator has to go and configure the
@@ -3183,6 +3256,57 @@ def launch_worker(worker_id: str, db: Session = Depends(get_db),
         raise HTTPException(404, "worker not found")
     _require_worker_action(w, "launch")
     _do_launch_worker(db, w)
+    db.refresh(w)
+    return w
+
+
+def _worker_effective_provider(db: Session, w: M.Worker) -> str:
+    """The phase-1 proxy provider this worker resolves to (global<booking<template<worker) -- used to
+    filter its geo dropdown, since soax and webshare support different country sets."""
+    bk = db.get(M.Booking, w.booking_id)
+    tpl = db.get(M.WorkerTemplate, w.template_id) if w.template_id else None
+    layers = {L.GLOBAL: get_global(db), L.BOOKING: (bk.settings_json or {}) if bk else {}}
+    if tpl:
+        layers[L.TEMPLATE] = (tpl.settings_json or {})
+    if w.settings_json:
+        layers[L.WORKER] = w.settings_json
+    return str(resolve(layers).get("PROXY_PROVIDER", "soax"))
+
+
+@app.get("/workers/{worker_id}/geo")
+def get_worker_geo(worker_id: str, db: Session = Depends(get_db),
+                   _v: Principal = Depends(require_viewer)) -> dict:
+    """The worker's current exit-country binding plus the countries its provider supports -- what the
+    dashboard dropdown needs. Options are filtered to the worker's resolved provider."""
+    w = db.get(M.Worker, worker_id)
+    if not w:
+        raise HTTPException(404, "worker not found")
+    provider = _worker_effective_provider(db, w)
+    options = [{"code": c, "label": label} for c, label in
+               sorted(proxy_geos.supported_geos(provider).items())]
+    return {"provider": provider, "current": w.proxy_geo, "options": options}
+
+
+@app.patch("/workers/{worker_id}/geo", response_model=WorkerOut)
+def set_worker_geo(worker_id: str, body: dict, db: Session = Depends(get_db),
+                   _op: Principal = Depends(require_operator)) -> M.Worker:
+    """Bind (or clear) this worker's exit country. It holds for the whole run and every exit
+    rotation, and persists across relaunch, changing only when changed here. `{"geo": ""}` or null
+    clears it -> the next launch re-draws from the booking's PROXY_GEOS set. Validated against the
+    worker's provider so an unsupported country cannot be pinned (permissive until the provider's
+    list is populated -- see libs/proxies/geos.py). The binding takes effect at the NEXT launch; it
+    does not retro-move a worker already running on an exit."""
+    w = db.get(M.Worker, worker_id)
+    if not w:
+        raise HTTPException(404, "worker not found")
+    provider = _worker_effective_provider(db, w)
+    code = proxy_geos.normalize_geo(body.get("geo"))
+    if not proxy_geos.is_valid_geo(provider, code):
+        supported = ", ".join(sorted(proxy_geos.supported_geos(provider))) or "(none configured)"
+        raise HTTPException(400, f"geo {code!r} is not supported by provider {provider!r}; "
+                                 f"supported: {supported}")
+    w.proxy_geo = code or None
+    db.commit()
     db.refresh(w)
     return w
 

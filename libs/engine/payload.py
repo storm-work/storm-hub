@@ -25,8 +25,12 @@ different endpoints, each appending different trailing fields:
                       for. Revisit this specific split if a real submission shows it's wrong.
 
 `booking_payload()`: the SubmeterVistoCriaPDF (apply step 9) body is deliberately the minimal 5 fields
--- {"lang": "ENG", "txtHuman": "", "back": "", "f_date_c": ..., "cmbPeriodo": ...} -- confirmed by
-direct read of storm-auto's ACTUAL, currently-live submit code (batch_apply.py's SubmeterVisto
+-- {"lang": <PT on this branch>, "txtHuman": "", "back": "", "f_date_c": ..., "cmbPeriodo": ...}.
+The FIELD SET was confirmed by direct read of storm-auto's ACTUAL, currently-live submit code
+(batch_apply.py's SubmeterVisto section, which sent lang=ENG); the PT-version branch keeps the same
+five fields but sends lang=PT to match the confirmed completed-booking HAR (post id 3059 france),
+which is PT end to end. See booking_payload()'s own body comment. Original ENG citation
+(batch_apply.py's SubmeterVisto
 section, both the browser_form_post and primp-fallback paths: `client.post(SUBMIT_URL, ...,
 data={"lang": "ENG", "txtHuman": "", "back": "", "f_date_c": slot_date_form, "cmbPeriodo":
 slot_period})`), the code behind 113 confirmed real bookings. An earlier version of this function
@@ -106,6 +110,14 @@ def schedule_controller_payload(
     payload = _merge_base_fields(account, form_defaults, nationality=nationality, residence=residence)
     payload["f0sf1"] = posto_id
     payload["__RequestVerificationToken"] = csrf
+    # PT-version: the confirmed completed-booking HAR (data/ref/...COMPLETO BOOK...post id 3059
+    # france.har) POSTs ScheduleController with lang=PT -- the whole flow (home-lang POST ->
+    # Formulario -> ScheduleController -> SubmeterVistoCriaPDF) is PT end to end. form_defaults.json
+    # still carries the ENG default (it is the canonical config, unchanged on this branch), so we
+    # override lang here, exactly as booking_payload() hardcodes PT for the submit. Keeping the flow
+    # single-language also makes the portal render Portuguese, which is what our bounce/home markers
+    # (_HOME_MARKERS, _PORTAL_BUSY_MARKERS ...) are written for -- see ops_live's lang comment.
+    payload["lang"] = "PT"
     return payload
 
 

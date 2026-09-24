@@ -211,6 +211,10 @@ class WorkerOut(BaseModel):
     # worker was indistinguishable from a healthy one on the page (the "holding is a lie" gap).
     substate_detail: str | None = None
     sub_account_id: str | None = None
+    # The exit country this worker is bound to (consistent across the run + every rotation; persists
+    # across relaunch). NULL = unbound -> launch draws from the booking's PROXY_GEOS set. Set/cleared
+    # per worker via PATCH /workers/{id}/geo.
+    proxy_geo: str | None = None
 
     model_config = {"from_attributes": True}
 
@@ -404,6 +408,9 @@ class TemplateOut(BaseModel):
     role: WorkerRole
     settings_json: dict = Field(default_factory=dict)
     logic_snapshot: str = "latest"
+    # The default template for its role -- 'Auto (by role)' attach resolves to this one. At most one
+    # per role.
+    is_default: bool = False
     model_config = {"from_attributes": True}
 
 

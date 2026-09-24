@@ -74,7 +74,9 @@ def test_schedule_controller_static_fields_copied_verbatim(form_defaults, accoun
     payload = schedule_controller_payload(
         account, form_defaults, posto_id="5084", csrf="tok123", nationality="CPV", residence="IRL",
     )
-    assert payload["lang"] == "ENG"
+    # PT-version: the whole flow is lang=PT (confirmed completed-booking HAR, post id 3059 france).
+    # schedule_controller_payload overrides form_defaults.json's ENG default, same as booking_payload.
+    assert payload["lang"] == "PT"
     assert payload["tipo_visto"] == "C"
     assert payload["cmbReferencia"] == "individual"
 

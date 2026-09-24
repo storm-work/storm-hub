@@ -174,11 +174,13 @@ _BOUNCE_KEYWORDS = ("questionario", "getslots", "captchadiv", "authentication.js
 # having redirected us to the bare site root -- AND by the absence of any schedule marker. Never by
 # a single keyword.
 #
-# storm-auto matches only the PORTUGUESE nav text. We send lang=ENG in both the warmup and the
-# booking payload, so those strings can simply be absent from an English-rendered dashboard, and a
-# genuine form-state expiry then gets mis-read as "the slot was taken" -- no re-warm, and the pool
-# wrongly blamed. Confirmed live 2026-08-14: 20 of 24 bounces landed on the bare /VistosOnline/
-# root, but only 6 matched the Portuguese markers.
+# storm-auto matches only the PORTUGUESE nav text. This PT-version branch now sends lang=PT through
+# the WHOLE flow (home-lang POST, ScheduleController, and the SubmeterVistoCriaPDF submit -- confirmed
+# against the completed-booking HAR, post id 3059 france), so the dashboard renders Portuguese and
+# these markers actually match -- which is the whole point of moving off ENG. The site-root fallback
+# below is KEPT as belt-and-suspenders: on the old ENG flow, confirmed live 2026-08-14, 20 of 24
+# bounces landed on the bare /VistosOnline/ root and only 6 matched the Portuguese markers, so a page
+# the portal served AT its own root is still accepted as the dashboard whatever language it rendered.
 #
 # So the final URL is accepted as equivalent evidence: a page the portal served AT its own site root
 # IS the dashboard, whatever language it rendered in. The schedule-marker veto below stays absolute
@@ -1649,7 +1651,7 @@ class LiveEngineOps(EngineOps):
                     self.session.browser_eval(
                         "(async()=>{const r=await fetch('%s',{method:'POST',credentials:'include',"
                         "headers:{'Content-Type':'application/x-www-form-urlencoded'},"
-                        "body:'lang=ENG&lang=PT'});return r.status;})()" % HOME_URL
+                        "body:'lang=PT'});return r.status;})()" % HOME_URL
                     )
                     break
                 except Exception as e:
