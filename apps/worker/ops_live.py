@@ -3349,6 +3349,19 @@ class LiveEngineOps(EngineOps):
             #   markers ABSENT  -> something in that gap still destroys the cursor; hunt it.
             #   markers PRESENT -> the cursor is fine and form_stale means the slot really is taken,
             #                      which makes this a DISCOVERY problem, not an apply one.
+
+            # PT / EXPERIMENT C (2026-09-24): a REAL /slots ACTIVATES the booking cursor immediately
+            # before the submit. Confirmed across every successful-booking HAR (data/ref/*.har,
+            # data/new_booking.har): the flow is ...ScheduleController -> getTables -> POST /slots (a
+            # SOLVED SCHEDULE_EVISA token) -> SubmeterVistoCriaPDF. Our appliers skipped it, so the
+            # submit hit a cursor the portal had not activated and got the questionnaire back
+            # (form_stale). The primer this file removed sent captcha='' (rejected, reset the page);
+            # THIS is the scout's proven token-bearing /slots. We ignore the discovery RESULT -- it is
+            # only here to leave the session bookable for the submit that immediately follows.
+            try:
+                self._discover_via_slots([str(slot["date"])])
+            except Exception as e:
+                self._log(f"do_apply: /slots cursor activation raised ({str(e)[:90]})")
             try:
                 _pre = self.session.browser_eval("document.documentElement.outerHTML") or ""
                 _marks = [m for m in _SCHED_PAGE_MARKERS if m in _pre]
