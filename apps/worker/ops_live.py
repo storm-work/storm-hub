@@ -3361,10 +3361,26 @@ class LiveEngineOps(EngineOps):
 
             body = booking_payload(self.quest_steps, slot, residence=self.residence)
             submit_url = SUBMIT_URL + "?posto_id=" + str(self.posto_pdf)
+            # PT-VERSION EXPERIMENT (2026-09-24): submit as an in-page XHR from Schedule.jsp, exactly
+            # as the confirmed manual booking does (data/new_booking.har): X-Requested-With:
+            # XMLHttpRequest, urlencoded body, Referer Schedule.jsp -- NOT a full form NAVIGATION
+            # (browser_form_post) as the ENG version did. The HAR's successful submit is an AJAX call;
+            # our navigation-POST got the questionnaire back (form_stale). browser_fetch runs fetch()
+            # in the live Schedule.jsp context (Referer set automatically), so the origin must be the
+            # live schedule page -- which the round-start warmup establishes.
             try:
-                _final_url, html = self.session.browser_form_post(submit_url, body, timeout=100)
+                _res = self.session.browser_fetch(
+                    submit_url, body, method="POST",
+                    headers={"X-Requested-With": "XMLHttpRequest",
+                             "Referer": SCHED_JSP + "?posto_id=" + str(self.posto_pdf)},
+                    encode="form", timeout=100)
+                html = str(_res.get("body") or "") if isinstance(_res, dict) else str(_res or "")
+                _status = _res.get("status") if isinstance(_res, dict) else None
+                _final_url = submit_url        # XHR: no navigation, still on Schedule.jsp
+                self._log(f"do_apply: SubmeterVistoCriaPDF XHR -> status={_status} len={len(html)} "
+                          f"body[:200]={html[:200]!r}")
             except Exception as e:
-                self._log(f"do_apply: SubmeterVistoCriaPDF POST failed: {e}")
+                self._log(f"do_apply: SubmeterVistoCriaPDF XHR failed: {e}")
                 return "bounced"
 
             # storm-auto guards the submit response before classifying it, because a blank

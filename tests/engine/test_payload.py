@@ -36,9 +36,11 @@ def account():
 # proven submit code to be exactly these 5 fields, NOT a form_defaults merge. See
 # libs/engine/payload.py's module docstring for the direct-read citation. ──────────────────────
 def test_booking_payload_is_exactly_the_five_confirmed_fields(quest_steps):
+    # PT-version: the confirmed manual booking HAR submits lang=PT (ENG version is on
+    # apply-revert-proven). Five fields otherwise identical.
     payload = booking_payload(quest_steps, {"date": "2026-08-18", "period": 4}, residence="IRL")
     assert payload == {
-        "lang": "ENG",
+        "lang": "PT",
         "txtHuman": "",
         "back": "",
         "f_date_c": "2026/08/18",

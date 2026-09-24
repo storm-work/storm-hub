@@ -126,6 +126,20 @@ class _FakeSession:
     def close_browser(self):
         self.closed = True
 
+    def browser_fetch(self, url, data, method="POST", headers=None, timeout=30,
+                      params=None, encode="form", file_fields=None):
+        # PT-version do_apply submits SubmeterVistoCriaPDF as an XHR. Default: delegate to whatever
+        # browser_form_post the double defines (final_url, html) and adapt to the {status, body}
+        # shape, so every existing apply double works unchanged. Doubles needing a distinct XHR
+        # response override this directly (e.g. _SubmitSession).
+        try:
+            _url, html = self.browser_form_post(url, data)
+        except NotImplementedError:
+            raise
+        except Exception:
+            return {"status": 0, "body": ""}
+        return {"status": 200, "body": html}
+
 
 def test_do_swap_off_by_default_returns_none():
     ops = _make_ops()
@@ -1495,6 +1509,9 @@ class _SubmitSession(_FakeSession):
         self._pdf = pdf_bytes
 
     def browser_form_post(self, url, data, timeout=100):
+        # PT-version do_apply submits via browser_fetch, which the base _FakeSession.browser_fetch
+        # delegates to this method -- so the pdf-viewer shell response is exercised identically and
+        # _UrlRecordingSession still records the submit URL.
         return ("https://pedidodevistos.mne.gov.pt/VistosOnline/MostrarPdf?", _PDF_SHELL)
 
     def browser_eval(self, js, timeout=30):
@@ -4249,3 +4266,27 @@ def test_already_booked_is_a_terminal_completed_status_not_respawned():
     from apps.hub.events import _TERMINAL_STATUS
     from libs.domain.enums import WorkerStatus
     assert _TERMINAL_STATUS["already_booked"] == WorkerStatus.COMPLETED
+
+
+# ── PT version: submit is an in-page XHR (X-Requested-With) with lang=PT (2026-09-24) ──
+def test_pt_submit_is_an_xhr_with_lang_pt_and_xrw_header():
+    """The confirmed manual booking (data/new_booking.har) submits SubmeterVistoCriaPDF as an in-page
+    XHR (X-Requested-With: XMLHttpRequest, urlencoded, lang=PT) -- NOT a form navigation. Pin that
+    the PT-version do_apply calls browser_fetch with those, since a navigation-POST got the
+    questionnaire back (form_stale)."""
+    captured = {}
+    class _XHRSession(_SubmitSession):
+        def browser_fetch(self, url, data, method="POST", headers=None, timeout=30,
+                          params=None, encode="form", file_fields=None):
+            captured["url"] = url; captured["data"] = data
+            captured["headers"] = headers or {}; captured["encode"] = encode
+            return {"status": 200, "body": _PDF_SHELL}
+    ops = _apply_ops(b"%PDF-1.4 real", [])
+    ops.session = _XHRSession(b"%PDF-1.4 real")
+    ops._save_pdf = lambda b: "/tmp/x.pdf"
+    assert ops.do_apply({"date": "2026-09-01", "period": 4}) == "booked"
+    assert "SubmeterVistoCriaPDF" in captured["url"]
+    assert captured["encode"] == "form", "urlencoded body, matching the HAR"
+    assert captured["headers"].get("X-Requested-With") == "XMLHttpRequest"
+    assert captured["data"]["lang"] == "PT", "the HAR submit sends lang=PT"
+    assert captured["data"]["f_date_c"] == "2026/09/01" and captured["data"]["cmbPeriodo"] == "4"

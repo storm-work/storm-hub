@@ -121,7 +121,11 @@ def booking_payload(quest_steps: dict[str, list[dict]], slot: dict[str, Any], *,
             "questionnaire path is a real bug, not something to silently paper over"
         )
     return {
-        "lang": "ENG",
+        # PT, matching the confirmed manual booking HAR (data/new_booking.har): the successful
+        # SubmeterVistoCriaPDF sends lang=PT, and the portal then renders responses in Portuguese --
+        # which is what our detection markers (_HOME_MARKERS etc.) are written for. (ENG version is
+        # on branch apply-revert-proven.)
+        "lang": "PT",
         "txtHuman": "",
         "back": "",
         "f_date_c": str(slot["date"]).replace("-", "/"),
