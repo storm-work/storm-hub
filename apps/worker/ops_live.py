@@ -644,6 +644,12 @@ class LiveEngineOps(EngineOps):
         # Last _run_warmup_steps exception message; lets do_apply distinguish a dead-exit re-warm
         # failure (roll the exit) from a portal rejection (keep it). See _run_warmup_steps.
         self._warmup_last_error: str = ""
+        # Set when the portal says this applicant ALREADY HAS a request ("Este requerente já tem um
+        # pedido registado" -- a JS alert). The identity is permanently unusable for this run (a
+        # competitor booked it, or it applied within the last 5 days), so the worker must STOP and
+        # the identity be retired, not retried forever. Read by the phase machine via
+        # identity_unavailable().
+        self._identity_unavailable: bool = False
         # /slots pacing + recovery state (2026-09-02). _slots_backoff_until gates the next attempt
         # so we stop buying tokens the endpoint will refuse; _slots_needs_relogin tells phases.py
         # that the ladder's cheap rung (re-warm) cannot help this failure.
@@ -1381,6 +1387,28 @@ class LiveEngineOps(EngineOps):
             "failed to fetch",
         ))
 
+    def identity_unavailable(self) -> bool:
+        """True when the portal reported this applicant ALREADY HAS a request -- the identity is
+        permanently unusable for this run, so the phase machine must terminate the worker (not
+        respawn) rather than grind a doomed sub-account. See _already_booked_signal."""
+        return self._identity_unavailable
+
+    def _already_booked_signal(self, *bodies: str) -> str | None:
+        """Return the portal's 'already has a request' text if it appears in the last JS dialog or in
+        any of the given response bodies, else None. The portal delivers this ("Este requerente já
+        tem um pedido registado. Poderá inserir novo 5 dias após o pedido anterior.") as a JS alert,
+        which the session's dialog handler captures -- our fetch/nav flow otherwise never sees it and
+        re-ran the blocked identity forever (0 occurrences in logs before the handler)."""
+        try:
+            dlg = self.session.browser_last_dialog() if self.session is not None else None
+        except Exception:
+            dlg = None
+        for text in ((dlg or ""), *(b or "" for b in bodies)):
+            low = text.lower()
+            if any(m in low for m in _ALREADY_BOOKED_MARKERS):
+                return text[:300]
+        return None
+
     def _is_dead_exit_response(self, page: str, final_url: str) -> bool:
         """True when a nav 'succeeded' (raised nothing) but LANDED on a dead-tunnel page -- Chrome's
         chrome-error://chromewebdata shell carrying 'This site can't be reached' /
@@ -1585,6 +1613,12 @@ class LiveEngineOps(EngineOps):
         # the exit) from a portal rejection (do not). Cleared each run; only the except path below
         # sets it, so a plain `return False` (quest_state_stale, csrf, sc-rejected) leaves it empty.
         self._warmup_last_error = ""
+        # Clear any stale JS-dialog text from a prior round so an already-booked signal we detect
+        # below is from THIS warmup, not a previous one.
+        try:
+            self.session.clear_last_dialog()
+        except Exception:
+            pass
         try:
             # Every step below is an in-page fetch. If a prior failed navigation left the page on
             # chrome-error, all three retries of the home-lang POST are guaranteed to raise
@@ -1793,6 +1827,20 @@ class LiveEngineOps(EngineOps):
             # in response to a booking submit.
             self.session.browser_nav(SCHED_JSP + "?posto_id=" + self.posto_id, timeout=30)
             sched_html = self.session.browser_eval("document.documentElement.outerHTML") or ""
+            # ALREADY-HAS-A-REQUEST is TERMINAL for this identity, checked BEFORE the markers guard
+            # because the portal delivers it as a JS alert ("Este requerente já tem um pedido
+            # registado") that can fire while Schedule.jsp still renders with markers -- so a
+            # markers-only guard would pass it as warmed and the worker would grind a permanently
+            # blocked sub-account forever (a competitor booked it, or it applied within 5 days).
+            # Retire the identity and stop the run (operator, 2026-09-24, with the exact alert text).
+            booked_sig = self._already_booked_signal(sc_body, sched_html)
+            if booked_sig:
+                self._identity_unavailable = True
+                self._log(f"do_warmup: portal says this applicant ALREADY HAS a request "
+                          f"({booked_sig[:120]!r}) -- retiring the identity and STOPPING this worker")
+                if self._emit is not None:
+                    self._emit("already_booked", detail=booked_sig)
+                return False
             if not any(m in sched_html for m in _SCHED_PAGE_MARKERS):
                 title = re.search(r"<title[^>]*>(.*?)</title>", sched_html, re.S | re.I)
                 # SAY WHY. ScheduleController answers 200 whether it accepted the form or bounced
@@ -3246,6 +3294,13 @@ class LiveEngineOps(EngineOps):
                 # re-warm failed on a dead-exit exception (chrome-error/tunnel), not a portal
                 # rejection (quest_state_stale/csrf/sc-rejected leave _warmup_last_error empty), so a
                 # live exit with a portal hiccup is not needlessly discarded.
+                # ALREADY-BOOKED is TERMINAL, not a session problem: the warmup detected the portal
+                # saying this applicant already has a request. Don't roll the exit, don't retry --
+                # hand the slot back untouched and tell the caller to STOP and retire the identity.
+                if self._identity_unavailable:
+                    self._log("do_apply: identity is unavailable (already has a request) -- "
+                              "releasing the slot and stopping the worker")
+                    return "already_booked"
                 if self._is_transient_login_failure(getattr(self, "_warmup_last_error", "")):
                     self._roll_exit("apply: dead exit at round-start re-warm")
                 self._log("do_apply: re-warm at round start failed -- session problem, not the slot")

@@ -4207,3 +4207,45 @@ def test_recaptcha_verdict_rolls_the_exit_and_does_not_burn_the_account(monkeypa
     # 3 uncharged rolls + then it charges the account (budget exhausted) -> at most sticky_max attempts,
     # NOT an immediate rotate on the first verdict. The point: the account was not burned on attempt 1.
     assert calls["n"] >= 4, f"expected 3 uncharged roll-retries before charging, got {calls['n']}"
+
+
+# ── already-has-a-request: retire the identity and STOP the worker (2026-09-24) ──
+def test_already_booked_signal_detects_the_portal_alert():
+    """The portal delivers 'Este requerente já tem um pedido registado' as a JS alert, captured by
+    the session dialog handler and read via browser_last_dialog(). _already_booked_signal must catch
+    it there (and in a response body), so the worker can retire the identity instead of grinding it."""
+    ops = _make_ops()
+    class _S:
+        def __init__(self, dlg): self._dlg = dlg
+        def browser_last_dialog(self): return self._dlg
+    ops.session = _S("Este requerente já tem um pedido registado. Poderá inserir novo 5 dias após o pedido anterior.")
+    assert ops._already_booked_signal("") is not None
+    # also detectable in a response body when there is no dialog
+    ops.session = _S(None)
+    assert ops._already_booked_signal("<html>... já tem um pedido registado ...</html>") is not None
+    # and a normal page is not a false positive
+    assert ops._already_booked_signal("<html>Schedule</html>") is None
+
+
+def test_do_apply_returns_already_booked_when_identity_unavailable():
+    """When warmup flags the identity unavailable (already has a request), do_apply must return the
+    terminal 'already_booked' -- NOT 'session' (which would roll the exit and retry the doomed
+    sub-account forever)."""
+    events = []
+    ops = _apply_ops(b"", events)
+    ops.is_warmed = lambda: False
+    def _warm_fail():
+        ops._identity_unavailable = True     # warmup detected already-booked
+        return False
+    ops._run_warmup_steps = _warm_fail
+    rolls = []
+    ops._roll_exit = lambda why="": rolls.append(why) or True
+    assert ops.do_apply({"date": "2026-09-01", "period": 4}) == "already_booked"
+    assert rolls == [], "already-booked must NOT roll the exit (identity, not exit, is the problem)"
+
+
+def test_already_booked_is_a_terminal_completed_status_not_respawned():
+    """The worker terminates as COMPLETED on already_booked (never HELD/FAILED, which respawn)."""
+    from apps.hub.events import _TERMINAL_STATUS
+    from libs.domain.enums import WorkerStatus
+    assert _TERMINAL_STATUS["already_booked"] == WorkerStatus.COMPLETED

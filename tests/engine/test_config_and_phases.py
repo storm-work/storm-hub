@@ -773,3 +773,22 @@ def test_a_round_with_real_outcomes_still_reports():
 
     got = {r["date"]: r["outcome"] for r in ops.reported_dates}
     assert got == {"d1": "failed", "d2": "empty"}, got
+
+
+# ── already-has-a-request terminates the worker, never respawns (2026-09-24) ──
+def test_an_already_booked_warmup_terminates_and_does_not_respawn():
+    """When warmup finds the portal saying the applicant already has a request, the phase machine
+    must return the TERMINAL 'already_booked' outcome (-> COMPLETED, never HELD/FAILED which
+    respawn), so a permanently-blocked identity isn't ground forever."""
+    class _AlreadyBookedOps(SimEngineOps):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self._unavail = False
+        def do_warmup(self) -> bool:
+            self._unavail = True          # the portal said "already has a request"
+            return False
+        def identity_unavailable(self) -> bool:
+            return self._unavail
+    ops = _AlreadyBookedOps(discover_tasks=[["d1"]], discover_outcomes={})
+    res = PhaseMachine(_cfg(ROLE="scout"), ops).run()
+    assert res.outcome == "already_booked", f"expected terminal already_booked, got {res.outcome!r}"

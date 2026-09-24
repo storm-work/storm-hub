@@ -72,6 +72,9 @@ class EngineOps(Protocol):
     # Legacy stub, always False since the booking breaker was removed 2026-09-23. Kept so _warmup's
     # getattr(ops, "breaker_tripped") still resolves to a callable across the Protocol's test doubles.
     def breaker_tripped(self) -> bool: ...
+    # True when the portal reported this applicant ALREADY HAS a request -- the identity is unusable
+    # for this run, so the phase machine terminates (never respawns) instead of grinding it.
+    def identity_unavailable(self) -> bool: ...
     def do_warmup(self) -> bool: ...
     # Whether the booking form-state anchor (posto_pdf) is currently established. Warmup is
     # deferred to the signal that needs it (slot-open for scouts, slot-found for apply) rather than
@@ -241,6 +244,13 @@ class PhaseMachine:
             return None
         self._to(WorkerSubstate.WARMING_UP)
         if not self.ops.do_warmup() and not self._warm_with_recovery(why):
+            # ALREADY-BOOKED is terminal: the warmup found the portal saying this applicant already
+            # has a request, so the identity is unusable and re-warming/respawning only grinds it.
+            # do_warmup already emitted `already_booked` (Hub retires the identity); STOP, never fail
+            # (a failure respawns). Both scouts and appliers reach warmup through here.
+            if getattr(self.ops, "identity_unavailable", lambda: False)():
+                return PhaseResult("already_booked", self._sub,
+                                   "portal: applicant already has a request", self.visited)
             return self._fail("warmup")
         self._to(WorkerSubstate.WARMED)
         return None
@@ -588,6 +598,17 @@ class PhaseMachine:
             if outcome == "booked":
                 self._to(WorkerSubstate.BOOKED)
                 return PhaseResult("booked", self._sub, str(slot), self.visited)
+
+            if outcome == "already_booked":
+                # The portal reports this applicant ALREADY HAS a request (a competitor booked it, or
+                # it applied within 5 days). The identity is permanently unusable for this run, so
+                # STOP -- terminal, never respawn (respawning re-runs the same doomed sub-account).
+                # do_warmup already emitted `already_booked` so the Hub retires the identity. The slot
+                # is untouched and blameless: hand it back WITHOUT a penalty.
+                if slot is not None:
+                    self.ops.release_slot(slot, "session")
+                return PhaseResult("already_booked", self._sub,
+                                   "portal: applicant already has a request", self.visited)
 
             if outcome == "portal_unreachable":
                 # The request never left the machine (Chrome network-error page / blank / DataDome).

@@ -32,6 +32,9 @@ _TERMINAL_STATUS = {
     "discovered": WorkerStatus.COMPLETED,
     "dry_run": WorkerStatus.COMPLETED,
     "warmed": WorkerStatus.COMPLETED,
+    # The portal reported this applicant already has a request -- the identity is retired (via the
+    # already_booked event) and the worker is DONE, not respawned (COMPLETED, never HELD/FAILED).
+    "already_booked": WorkerStatus.COMPLETED,
     "held": WorkerStatus.HELD,
     "stopped": WorkerStatus.STOPPED,
     "failed": WorkerStatus.FAILED,

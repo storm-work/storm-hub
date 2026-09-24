@@ -674,6 +674,12 @@ class PlaywrightSession:
                                    # force-killed if a hung worker prevents graceful close (see _kill_proc_tree)
         self._xvfb_proc = None     # a virtual display started for HEADLESS_MODE=headful on a display-less
                                    # host; terminated in close() so it doesn't leak
+        # Last JS alert()/confirm() message the portal raised, captured by a page dialog handler and
+        # read from the main thread. The portal signals "this applicant already has a request" as a
+        # JS ALERT ("Este requerente já tem um pedido registado"), which Playwright auto-dismisses --
+        # so a fetch-based flow never saw it (0 occurrences in logs). Set in the worker thread, read
+        # via browser_last_dialog(); a plain str assignment is atomic enough across the GIL.
+        self._last_dialog = None
         self._thread  = threading.Thread(target=self._worker, daemon=True)
         self._ready   = threading.Event()
         self._error: Exception | None = None
@@ -848,6 +854,28 @@ class PlaywrightSession:
                 print(f"[session] pre-injected {len(self._inject_cookies)} cookies (verify mode)")
 
             page = ctx.new_page()
+
+            # CAPTURE JS DIALOGS. The portal raises "Este requerente já tem um pedido registado"
+            # (this applicant already has a request) as a JS alert(); with no handler Playwright
+            # auto-dismisses it and the message is lost, so the worker only saw an opaque warmup
+            # failure and re-ran the same permanently-blocked identity forever. Record the message
+            # (read by the worker via browser_last_dialog) and accept the dialog so the flow proceeds.
+            def _on_dialog(dialog):
+                try:
+                    self._last_dialog = dialog.message or ""
+                except Exception:
+                    self._last_dialog = ""
+                try:
+                    dialog.accept()
+                except Exception:
+                    try:
+                        dialog.dismiss()
+                    except Exception:
+                        pass
+            try:
+                page.on("dialog", _on_dialog)
+            except Exception as _de:
+                print(f"[session] dialog handler not installed: {_de}")
 
             # Apply playwright-stealth for comprehensive bot-detection evasion.
             # Patches 20+ signals: canvas getImageData noise, audio fingerprint,
@@ -2560,6 +2588,15 @@ class PlaywrightSession:
         if status == "err":
             raise RuntimeError(f"browser_eval failed: {result}")
         return result
+
+    def browser_last_dialog(self) -> str | None:
+        """The last JS alert()/confirm() message the portal raised on this page (or None). Captured
+        by the page dialog handler in the worker thread; used to detect the 'já tem um pedido
+        registado' (already-has-a-request) rejection, which the portal delivers as a JS alert."""
+        return self._last_dialog
+
+    def clear_last_dialog(self) -> None:
+        self._last_dialog = None
 
     def browser_nav(self, url: str, timeout: int = 60, fast_nav: bool = False,
                     skip_cookie_sync: bool = False) -> str:
