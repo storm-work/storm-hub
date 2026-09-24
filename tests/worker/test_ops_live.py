@@ -4171,3 +4171,39 @@ def test_do_apply_rewarms_unconditionally_even_when_is_warmed():
     ops._run_warmup_steps = _count
     ops.do_apply({"date": "2026-09-01", "period": 4})
     assert calls["n"] >= 1, "do_apply must re-warm before the submit regardless of is_warmed()"
+
+
+# ── a bad-but-stable exit's reCAPTCHA rolls the exit, never burns the account (2026-09-24) ──
+_RECAPTCHA_BODY = '{"type":"error","description":"Por favor, confirma o reCAPTCHA."}'
+
+
+def test_recaptcha_verdict_rolls_the_exit_and_does_not_burn_the_account(monkeypatch):
+    """CONFIRMED live (PEDRO RODRIGUES): a bad-but-STABLE exit returns 'confirma o reCAPTCHA' for
+    every sub-account, while a good exit logs the same accounts in. The old code only rolled when the
+    exit demonstrably MOVED, so a stable-flagged exit fell through and charged/rotated the accounts,
+    burning them. Now the verdict rolls to a fresh exit (uncharged) whether or not a move is seen."""
+    import apps.worker.ops_live as ops_live_mod
+
+    calls = {"n": 0}
+    class _AlwaysRecaptcha(_FakeSession):
+        def browser_login(self, *a, **k):
+            calls["n"] += 1
+            return {"status": 200, "body": _RECAPTCHA_BODY}
+    monkeypatch.setattr(ops_live_mod, "get_session", lambda **kw: _AlwaysRecaptcha())
+    ops = _make_ops(cfg=_cfg(STICKY_RETRY_MAX=2, LOGIN_TRANSIENT_RETRY_MAX=0,
+                             LOGIN_PORTAL_BUSY_ROLLS=0, LOGIN_RECAPTCHA_ROLLS=3))
+    ops._backoff = lambda n: None
+    ops._backoff_seconds = lambda s: None
+    ops._note_exit_ip = lambda when="": False          # exit did NOT detectably move (stable-bad)
+    ops._liveness = _RecordingLiveness()
+    rolls = []
+    ops._roll_exit = lambda why="": rolls.append(why) or True
+
+    ok = ops._sticky_login_attempts(ops.cfg.login.sticky_retry_max)
+    assert ok is False
+    recaptcha_rolls = [w for w in rolls if "recaptcha" in str(w).lower()]
+    assert len(recaptcha_rolls) == 3, \
+        f"a reCAPTCHA verdict must roll to a fresh exit (3 budgeted), got rolls={rolls}"
+    # 3 uncharged rolls + then it charges the account (budget exhausted) -> at most sticky_max attempts,
+    # NOT an immediate rotate on the first verdict. The point: the account was not burned on attempt 1.
+    assert calls["n"] >= 4, f"expected 3 uncharged roll-retries before charging, got {calls['n']}"

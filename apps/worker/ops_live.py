@@ -1117,10 +1117,15 @@ class LiveEngineOps(EngineOps):
         max_transient = max(0, int(self.cfg.login.transient_retry_max))
         captcha_fails = 0
         captcha_budget = max(1, int(self.cfg.raw.get("CAPTCHA_FAILURE_BUDGET", 1)))
-        # Rejections attributable to OUR exit moving across the solve window. Bounded like
-        # `transient` and, like it, not charged to the sub-account -- see the use site below.
-        ip_moves = 0
-        max_ip_moves = max(0, int(self.cfg.raw.get("LOGIN_IP_MISMATCH_RETRIES", 2)))
+        # "Por favor, confirma o reCAPTCHA" verdicts, each answered by rolling to a FRESH exit before
+        # the account is ever charged. This is an EXIT/token problem (the exit moved across the solve
+        # window OR is simply flagged/bad for reCAPTCHA), never the account's fault -- CONFIRMED
+        # 2026-09-24 (PEDRO RODRIGUES): one exit returned it for BOTH sub-accounts while another
+        # logged the SAME accounts in seconds. Bounded like `transient`/`busy_rolls` and, like them,
+        # not charged to the sub-account. Replaces the old ip_moves budget, which only rolled when
+        # the exit demonstrably MOVED and so burned accounts on a stable-but-flagged exit.
+        recaptcha_rolls = 0
+        max_recaptcha_rolls = max(0, int(self.cfg.raw.get("LOGIN_RECAPTCHA_ROLLS", 3)))
         # "Try again later" refusals, each answered by rolling to a DIFFERENT exit before the fleet
         # is told anything. Bounded like `transient` and `ip_moves`, and like them not charged to
         # the sub-account. Its own counter rather than sharing `transient`: a dead tunnel and a
@@ -1239,25 +1244,27 @@ class LiveEngineOps(EngineOps):
             # OUR FAULT, NOT THE ACCOUNT'S -- and therefore checked HERE, beside `transient` and
             # before `attempt` is charged, not after.
             #
-            # "Por favor, confirma o reCAPTCHA" is the token/IP mismatch signature: the token was
-            # minted against one exit and submitted from another, so the portal cannot verify it.
-            # When the exit demonstrably moved across the ~6s solve window, that is the cause, and
-            # spending the account's two-strike budget on it spends a sub-account on our own
-            # rotation -- at two strikes the portal blocks the account permanently. MEASURED
-            # 2026-08-25: PEDRO TEIXEIRA RAMOS burned 3 of 3 candidates and AMILCAR WANDERSON 2 of
-            # 2, every one on this verdict with "exit IP CHANGED" logged immediately before, and
-            # both ended FAILED with no accounts left while slots sat open.
-            #
-            # Bounded by max_ip_moves: past the cap we stop making excuses and charge it, because at
-            # that point we genuinely cannot tell an unstable exit from a failing account.
-            if (_is_recaptcha_verdict(reason) and ip_moves < max_ip_moves
-                    and self._note_exit_ip("after reCAPTCHA rejection")):
-                ip_moves += 1
-                self._log(f"login: reCAPTCHA rejection coincided with the exit moving "
-                          f"({ip_moves}/{max_ip_moves}) -- token/IP mismatch, NOT charged to "
-                          f"{self.sub_account_id[:8]}; rotating to a fresh exit and retrying")
-                self._roll_exit("recaptcha token/ip mismatch")
-                self._backoff(ip_moves)
+            # "Por favor, confirma o reCAPTCHA" is an EXIT/token problem, NOT an account problem.
+            # The token was minted against one exit and rejected -- either the exit MOVED across the
+            # ~6s solve window (token/IP mismatch) or the exit is simply flagged/bad for reCAPTCHA.
+            # Either way the answer is a FRESH EXIT, never the account's 2-strike budget (two strikes
+            # and the portal blocks the account permanently). CONFIRMED 2026-09-24 (PEDRO RODRIGUES):
+            # exit 184.146.35.41 returned this verdict for BOTH sub-accounts, while 166.113.97.67
+            # logged the SAME accounts in seconds -- but because the exit did not detectably MOVE,
+            # the old ip_moves gate (which required a detected move) fell through and CHARGED it to
+            # the accounts, burning both and failing the worker. So roll to a fresh exit and retry,
+            # bounded and uncharged, whether or not a move is observed. (_note_exit_ip is still
+            # called for its logging of a detected move; it no longer GATES the roll.) Only past this
+            # budget do we charge it below -- at that point several different exits have said the same
+            # thing and we genuinely cannot tell a bad-exit streak from a failing account.
+            if _is_recaptcha_verdict(reason) and recaptcha_rolls < max_recaptcha_rolls:
+                recaptcha_rolls += 1
+                moved = self._note_exit_ip("after reCAPTCHA rejection")
+                self._log(f"login: reCAPTCHA verdict ({recaptcha_rolls}/{max_recaptcha_rolls}) -- "
+                          f"{'exit moved' if moved else 'bad/flagged exit'}, NOT charged to "
+                          f"{self.sub_account_id[:8]}; rolling to a fresh exit and retrying")
+                self._roll_exit("recaptcha -- fresh exit")
+                self._backoff_seconds(float(self.cfg.raw.get("LOGIN_THROTTLE_BACKOFF", 0.5)))
                 continue          # deliberately does NOT advance `attempt` or `captcha_fails`
             if _is_maintenance(reason):
                 # The portal is EXPLICITLY down (maintenance / 'Serviço Indisponível'). Unlike the

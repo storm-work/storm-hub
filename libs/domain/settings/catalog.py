@@ -92,6 +92,11 @@ RETIRED_SETTINGS = frozenset({
     "BREAKER_TRIP_THRESHOLD", "BREAKER_COOLDOWN",
     "BREAKER_BUSY_DISTINCT_ACCOUNTS", "BREAKER_BUSY_WINDOW",
     "BREAKER_MAINT_DISTINCT_ACCOUNTS", "BREAKER_MAINT_WINDOW",
+    # Replaced by LOGIN_RECAPTCHA_ROLLS 2026-09-24. The old knob only excused a reCAPTCHA verdict
+    # when the exit DEMONSTRABLY moved, so a stable-but-flagged exit (same IP, same rejection for
+    # every sub-account) fell through and burned the accounts. The replacement rolls to a fresh exit
+    # on the verdict whether or not a move is detected, uncharged, since it is always an exit problem.
+    "LOGIN_IP_MISMATCH_RETRIES",
 })
 
 
@@ -613,14 +618,15 @@ _TEMPLATE = [
             "fresh exit. Default 0.5. The throttle is a global lottery, not our-rate-limiting, so "
             "this is deliberately near-zero to MAXIMISE login shots -- raise it only if a near-zero "
             "retry rate is causing a different problem (it does not reduce the portal's throttle)."),
-    _s("LOGIN_IP_MISMATCH_RETRIES", L.TEMPLATE, int, 2, _WRK, "login_resilience", min_value=0.0,
-       note="reCAPTCHA rejections that may be excused as OUR exit moving rather than charged to "
-            "the sub-account, per login. 'Por favor, confirma o reCAPTCHA' is the token/IP mismatch "
-            "signature -- the token is minted against one exit and submitted from another -- so "
-            "when the exit demonstrably moved across the solve window the account did nothing "
-            "wrong. Measured 2026-08-25: two workers burned 3/3 and 2/2 candidate sub-accounts on "
-            "this verdict, each preceded by 'exit IP CHANGED', and both ended FAILED with slots "
-            "open. Set 0 to disable the excuse and charge every rejection."),
+    _s("LOGIN_RECAPTCHA_ROLLS", L.TEMPLATE, int, 3, _WRK, "login_resilience", min_value=0.0,
+       note="fresh exits to roll through on a 'Por favor, confirma o reCAPTCHA' verdict before the "
+            "rejection is charged to the sub-account. This verdict is an EXIT/token problem, not the "
+            "account's fault -- the exit moved across the solve window OR is flagged/bad for "
+            "reCAPTCHA -- so the answer is a fresh exit, never the account's 2-strike budget "
+            "(two strikes = permanent block). CONFIRMED 2026-09-24 (PEDRO RODRIGUES): one exit "
+            "returned it for BOTH sub-accounts while another logged the SAME accounts in seconds. "
+            "Replaces LOGIN_IP_MISMATCH_RETRIES, which only rolled when the exit DEMONSTRABLY moved "
+            "and so burned accounts on a stable-but-flagged exit. Set 0 to charge every rejection."),
     _s("QUEST_STEP_GAP", L.TEMPLATE, float, 1.0, _WRK, "login_resilience",
        note="seconds (+-30%% jitter) paced before each warm-up questionnaire step and before the "
             "Questionario nav. Ported from storm-auto and then NEVER READ -- the classic unwired "
