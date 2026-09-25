@@ -91,3 +91,31 @@ def test_provider_reachable_never_touches_the_portal(monkeypatch):
     health.provider_reachable("soax", "http://u:p@proxy.soax.com:5000")
     assert not any("pedidodevistos" in s for s in seen), \
         "the provider screen reached for the portal -- that is the bug, not the check"
+
+
+# ── check_proxy_lease_verdict: a throttling portal must NOT condemn a live ISP row ──────────────
+# Confirmed live 2026-09-25 (booking 0924-3018): feeding check_proxy's PORTAL verdict into
+# apply_result condemned all 51 capsolver ISP rows during a login run, while the IPs were fine.
+def test_lease_verdict_healthy_when_portal_nav_succeeds(monkeypatch):
+    from libs.proxies import health
+    monkeypatch.setattr(health, "check_proxy", lambda u, timeout=20.0: (True, "ok"))
+    ok, _ = health.check_proxy_lease_verdict("http://x")
+    assert ok is True
+
+
+def test_lease_verdict_does_not_condemn_when_portal_fails_but_exit_is_alive(monkeypatch):
+    from libs.proxies import health
+    # Portal times out (throttle/WAF), but the exit reaches a neutral URL -> NOT dead, keep it.
+    monkeypatch.setattr(health, "check_proxy", lambda u, timeout=20.0: (False, "TimeoutError: nav timed out"))
+    monkeypatch.setattr(health, "connectivity_probe", lambda u, timeout=8.0: (True, "alive (status=200)"))
+    ok, detail = health.check_proxy_lease_verdict("http://x")
+    assert ok is True, "a throttling portal must not condemn a live ISP exit"
+    assert "not condemning" in detail
+
+
+def test_lease_verdict_condemns_a_genuinely_dead_exit(monkeypatch):
+    from libs.proxies import health
+    monkeypatch.setattr(health, "check_proxy", lambda u, timeout=20.0: (False, "Error: ERR_TUNNEL"))
+    monkeypatch.setattr(health, "connectivity_probe", lambda u, timeout=8.0: (False, "dead: refused"))
+    ok, detail = health.check_proxy_lease_verdict("http://x")
+    assert ok is False and "dead exit" in detail

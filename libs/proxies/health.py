@@ -114,6 +114,35 @@ def check_proxy(conn_url: str, timeout: float = 20.0) -> tuple[bool, str]:
                 pass
 
 
+def check_proxy_lease_verdict(conn_url: str, timeout: float = 20.0) -> tuple[bool, str]:
+    """The health verdict for a STATIC/ISP lease -- like check_proxy, but it never condemns a row
+    just because the PORTAL is unreachable.
+
+    check_proxy navigates the real portal, and lease_proxy feeds its verdict straight into
+    apply_result, which sets is_healthy=False on failure. During a login run the portal throttles /
+    WAF-challenges / times out for EVERYONE, so that path condemns perfectly good exits. Confirmed
+    live 2026-09-25 (booking 0924-3018): all 51 capsolver ISP rows went is_healthy=False this way and
+    the whole pool became unleasable, while the IPs themselves were fine. This is the same
+    false-condemnation probe_tiers already warns about -- "the portal's availability is not a
+    property of the proxy" -- so the LIVENESS verdict must come from the transport tier, not the
+    portal.
+
+    So: run the browser portal nav (diagnostic, and it still catches transport-dead errors like
+    ERR_TUNNEL). If it succeeds, healthy. If it fails, DON'T condemn on the portal result -- confirm
+    deadness with a raw neutral-URL check (connectivity_probe) and condemn ONLY if the exit is dead
+    at the transport layer. The neutral probe runs AFTER the browser probe, never before, so it
+    cannot poison the exit for a browse (tier-1-poisons-the-exit) -- this lease attempt already
+    failed, and the next lease browses it fresh.
+    """
+    ok, detail = check_proxy(conn_url, timeout)
+    if ok:
+        return True, detail
+    alive, tdetail = connectivity_probe(conn_url)
+    if alive:
+        return True, f"portal unreachable but exit alive -- not condemning ({detail[:100]})"
+    return False, f"dead exit: {tdetail[:150]}"
+
+
 def connectivity_probe(conn_url: str, timeout: float = 8.0) -> tuple[bool, str]:
     """TIER 1 -- "is this proxy alive at all". Raw request to a NEUTRAL url. `(alive, reason)`.
 

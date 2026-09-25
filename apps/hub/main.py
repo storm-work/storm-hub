@@ -70,7 +70,7 @@ from libs.domain.settings import resolve
 
 from libs.domain.enums import (READY_SUB_ACCOUNT_STATUSES, RegistrationMode,
                                RegistrationStatus, SubAccountStatus)
-from libs.proxies.health import apply_result, check_proxy, provider_reachable, quick_screen
+from libs.proxies.health import apply_result, check_proxy, check_proxy_lease_verdict, provider_reachable, quick_screen
 from libs.proxies.health import check_proxy as _REAL_CHECK_PROXY
 from libs.proxies.lease import ProxyLeaseError, lease_proxy, release_proxy, conn_url
 from libs.proxies.rotating import RotatingPoolError, mint_rotating_url
@@ -311,6 +311,14 @@ def _sched_on_slot_open(db: Session, bk: M.Booking) -> None:
     that starts/respawns after this fires still gets notified (the confirmed 2026-08-07 bug's fix)."""
     from libs.domain.state_machines import IllegalTransition, booking_transition
     _bus.publish_signal(bk.id, "slot_open")
+    # DISCOVER FIRST, THEN WAIT -- not wait-then-discover. Slot-open makes every scout re-warm, which
+    # ABANDONS whatever discovery round was in flight before, without reporting it. ScoutPoolState
+    # still points `inflight` at that scout, so plan_rotation_round blocks ALL new dispatch until the
+    # phantom round hits hang_timeout (180s) -- confirmed live 2026-09-25 (booking 0924-3018): scouts
+    # warmed by 03:37:55 but the pool's first discovery was 03:40:09, exactly 03:37:07 + 180s. Reset
+    # the pool here so the fresh discovery burst dispatches immediately: the rotation is discover ->
+    # pace -> discover, with no stale in-flight round or carried-over pacing gating the FIRST round.
+    scheduler.reset_scout_pool(bk.id)
     try:
         bk.status = booking_transition(bk.status, BookingStatus.RUNNING)
     except IllegalTransition:
@@ -3052,7 +3060,7 @@ def _do_launch_worker(db: Session, w: M.Worker) -> None:
             try:
                 _proxy_row, warm_proxy = lease_proxy(
                     db, w.id, provider=(None if _all_isp(_prov) else _prov), kind=_kind,
-                    health_check=check_proxy,
+                    health_check=check_proxy_lease_verdict,
                     quick_screen=_screen_tier1(), geos=_geo_set,
                     pool_names=_pools(eff.get("PROXY_POOLS")),
                     resource_type="static",
@@ -3141,7 +3149,7 @@ def _do_launch_worker(db: Session, w: M.Worker) -> None:
                 # phase-1 lease consuming the sole matching rotating row) -- not a real guarantee.
                 _hold_proxy_row, hold_proxy = lease_proxy(
                     db, w.id, provider=str(eff.get("HOLD_PROXY_PROVIDER", "soax")),
-                    kind=eff.get("HOLD_PROXY_KIND") or None, health_check=check_proxy, quick_screen=_screen_tier1(),
+                    kind=eff.get("HOLD_PROXY_KIND") or None, health_check=check_proxy_lease_verdict, quick_screen=_screen_tier1(),
                     geos=_geos(eff.get("HOLD_PROXY_GEOS")),
                     pool_names=_pools(eff.get("HOLD_PROXY_POOLS")), resource_type="static",
                 )
@@ -3653,6 +3661,9 @@ def stop_booking(booking_id: str, db: Session = Depends(get_db),
         _bus.send_command(w.id, "stop")
         supervisor.stop(w.id)
         _set_worker_status(w, WorkerStatus.STOPPED)
+        # Release the proxy lease -- same leak fix as stop_worker: a STOPPED worker must not keep
+        # holding a finite static/ISP IP. No-op for rotating workers.
+        release_proxy(db, w.id)
         # Reset now, not just at requeue time (start_booking) -- see _reset_worker_bus_state's
         # docstring -- so a single-worker restart right after this stop is safe too.
         _reset_worker_bus_state(booking_id, w.id)
@@ -3759,6 +3770,12 @@ def stop_worker(worker_id: str, db: Session = Depends(get_db),
     _bus.send_command(worker_id, "stop")
     supervisor.stop(worker_id)
     _set_worker_status(w, WorkerStatus.STOPPED)
+    # Release the proxy lease: a STOPPED worker is not using its exit, and a STATIC/ISP lease is a
+    # finite, individually-owned IP that another worker needs. Confirmed leak 2026-09-25 (booking
+    # 0924-3018): 13 STOPPED workers still held 13/13 of the host's active thordata leases forever,
+    # because stop set status=STOPPED but never released. Safe for rotating workers too -- they hold
+    # no lease, so this is a no-op. The launch-failure and detach paths already release; stop didn't.
+    release_proxy(db, worker_id)
     _reset_worker_bus_state(w.booking_id, worker_id)   # see its docstring -- never leave a stale
     db.commit()                                        # command/signal-latch state behind
     db.refresh(w)

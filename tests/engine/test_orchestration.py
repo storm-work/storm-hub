@@ -98,3 +98,23 @@ def test_should_send_assign_dedups_outstanding():
     outstanding = {"w1"}
     assert orch.should_send_assign("w1", outstanding) is False
     assert orch.should_send_assign("w2", outstanding) is True
+
+
+def test_a_stale_inflight_round_wedges_all_dispatch_until_hang_timeout():
+    """Root cause of the slot-open discovery delay (booking 0924-3018, 2026-09-25): slot-open makes
+    every scout re-warm, ABANDONING the in-flight round without reporting it. inflight stays set, so
+    NO scout can be dispatched until hang_timeout (180s) reclaims the phantom round -- a ~3-minute
+    'wait, then discover' where warmed scouts sit idle. This is why _sched_on_slot_open resets the
+    pool: a fresh ScoutPoolState dispatches immediately ('discover, then wait')."""
+    state = orch.ScoutPoolState()
+    scouts = ["s1", "s2", "s3"]
+    assert _plan(state, scouts, now=0.0) == "s1"           # s1 dispatched, now in flight
+    # s1 re-warms on slot-open and never reports. Every subsequent tick is blocked...
+    for t in (5.0, 30.0, 100.0, HANG - 1):
+        assert _plan(state, scouts, now=t) is None, f"still wedged at t={t}"
+    # ...until hang_timeout finally reclaims it.
+    assert _plan(state, scouts, now=HANG) == "s2"
+
+    # The slot-open reset (fresh state) is the fix: dispatch is IMMEDIATE, no stale wedge.
+    fresh = orch.ScoutPoolState()
+    assert _plan(fresh, scouts, now=1000.0) == "s1", "a reset pool discovers immediately"

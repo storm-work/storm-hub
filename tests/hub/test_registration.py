@@ -648,3 +648,17 @@ def test_registration_mints_rotating_proxies_instead_of_querying_rows(client, mo
     assert all(p["url"].startswith("http://package-352438-") for p in proxies), proxies[:1]
     assert all(p["url"].endswith("@proxy.soax.com:5000") for p in proxies), proxies[:1]
     assert len({p["url"] for p in proxies}) == len(proxies), "exits must be distinct"
+
+
+def test_recaptcha_fail_budget_stays_within_the_portals_hard_limit():
+    """Safety invariant. The portal blocks E-VISA access on the 3rd reCAPTCHA failure ('apenas
+    permite falhar o processo de ReCaptcha 2 vezes'). The registrar now rolls to a fresh exit and
+    retries on a reCAPTCHA rejection (a verdict on the EXIT, not the account -- same reason login
+    rolls), but that budget must NEVER exceed 2, or the retry itself would get accounts blocked.
+    This test fails loudly if anyone raises it."""
+    from apps.registrar.__main__ import RECAPTCHA_FAIL_BUDGET
+
+    assert RECAPTCHA_FAIL_BUDGET <= 2, (
+        "the portal blocks access after 2 reCAPTCHA failures -- the budget must never exceed 2")
+    assert RECAPTCHA_FAIL_BUDGET >= 2, (
+        "budget < 2 means no fresh-exit retry at all -- a single flagged exit would kill the account")

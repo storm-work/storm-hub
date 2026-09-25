@@ -197,11 +197,30 @@ def default_date_window(*, start_date: str, end_date: str, num_days: int, today:
     """
     start = date.fromisoformat(start_date) if start_date else today + timedelta(days=1)
     end = date.fromisoformat(end_date) if end_date else None
-    n = num_days or 20
     cur = max(today + timedelta(days=1), start)
     out: list[str] = []
-    while len(out) < n and (end is None or cur <= end):
-        if cur.weekday() < 5:
-            out.append(cur.isoformat())
-        cur += timedelta(days=1)
+    # When BOTH a start AND an end date are defined, that pair fully specifies the window -- scan the
+    # whole [start, end] range and IGNORE CAL_NUM_DAYS entirely (operator preference 2026-09-25).
+    # Capping at 20 while both bounds are set silently truncated the window: confirmed live (booking
+    # 0924-3018, CAL_START=2026-10-05 CAL_END=2026-11-30, CAL_NUM_DAYS unset -> defaulted 20). The
+    # window stopped at ~Oct 30, but ALL availability was in November -- /slots returned 297 dated
+    # slots, none of which fell in the 20-day window, so every date reported 'empty' and slot_found
+    # never fired even though the portal handed back months of openings. For the /slots path this is
+    # pure loss (the full payload arrives in ONE call regardless of the window). A generous hard cap
+    # guards against a pathological range on the per-date calendar path.
+    #
+    # Otherwise num_days applies: an open-ended window (no end date) is a rolling N-weekday lookahead
+    # from the start; a lone end date with no start still caps at num_days but is bounded by end.
+    _HARD_CAP = 200
+    if start_date and end is not None:
+        while cur <= end and len(out) < _HARD_CAP:
+            if cur.weekday() < 5:
+                out.append(cur.isoformat())
+            cur += timedelta(days=1)
+    else:
+        n = num_days or 20
+        while len(out) < n and (end is None or cur <= end):
+            if cur.weekday() < 5:
+                out.append(cur.isoformat())
+            cur += timedelta(days=1)
     return out

@@ -195,6 +195,21 @@ def test_default_date_window_respects_end_date():
     assert out == ["2026-08-17", "2026-08-18"]
 
 
+def test_default_date_window_covers_the_whole_range_when_end_is_beyond_num_days():
+    """Regression (booking 0924-3018, 2026-09-25): CAL_START=Oct5 CAL_END=Nov30 with CAL_NUM_DAYS
+    unset (defaulted 20) truncated the window at ~Oct 30, so November availability (297 /slots dates
+    starting Nov 3) fell OUTSIDE the scan, every date reported 'empty', and slot_found never fired.
+    An explicit end date must scan the WHOLE range -- num_days must not cap it."""
+    out = pm.default_date_window(
+        start_date="2026-10-05", end_date="2026-11-30", num_days=20, today=date(2026, 9, 25)
+    )
+    assert len(out) > 20, "the window must not be truncated to num_days when an end date is set"
+    assert out[0] == "2026-10-05"
+    assert out[-1] == "2026-11-30"        # 2026-11-30 is a Monday (weekday)
+    assert "2026-11-03" in out            # the availability the old window missed
+    assert all(date.fromisoformat(d).weekday() < 5 for d in out)   # weekdays only, still
+
+
 def test_default_date_window_default_start_is_tomorrow():
     out = pm.default_date_window(start_date="", end_date="", num_days=1, today=date(2026, 8, 12))
     assert out == ["2026-08-13"]   # 2026-08-13 is a Thursday, a weekday

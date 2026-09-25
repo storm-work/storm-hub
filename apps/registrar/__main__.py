@@ -36,6 +36,14 @@ VERIFY_URL = BASE + "/VistosOnline/VerificarEmail"
 INSERT_TOKEN_JSP = BASE + "/VistosOnline/partials/insertToken.jsp"
 
 MAX_PROXY_RETRIES = 5
+# How many reCAPTCHA REJECTIONS one sub-account may incur before we stop. The portal blocks platform
+# access on the 3rd reCAPTCHA failure ("apenas permite falhar o processo de ReCaptcha 2 vezes"), so 2
+# is the hard ceiling. We use exactly 2 = one rejection PLUS one fresh-exit retry: a reCAPTCHA verdict
+# is almost always the EXIT being flagged, not the account (the same finding that made login roll to a
+# fresh exit on 'confirma o reCAPTCHA', commit 9df5937), so giving up after the FIRST rejection threw
+# away accounts a clean exit would have registered. Never raise this above 2 -- the 3rd failure is the
+# one the portal punishes.
+RECAPTCHA_FAIL_BUDGET = 2
 MAX_VERIFY_RETRIES = 3
 EMAIL_POLL_TIMEOUT = 240
 
@@ -121,6 +129,7 @@ async def _register_one(acct: dict, proxies_cycle, capsolver_keys: list[str], la
     reg_token_raw = ""
     proxy_success = False
     reg_result_detail = ""
+    recaptcha_fails = 0        # reCAPTCHA REJECTIONS so far -- capped at RECAPTCHA_FAIL_BUDGET
 
     for attempt in range(MAX_PROXY_RETRIES):
         proxy_entry = next(proxies_cycle)
@@ -250,10 +259,21 @@ async def _register_one(acct: dict, proxies_cycle, capsolver_keys: list[str], la
             # untouched -- they never reached the portal's CAPTCHA check). A reCAPTCHA REJECTION is
             # the portal's verdict on the token, and repeating it is the one thing it warns about.
             if is_recaptcha_rejection(str(reg_type), reg_desc):
-                progress("STOPPING: portal allows only 2 reCAPTCHA failures before blocking access "
-                         "-- not retrying this sub-account")
-                result("failed", detail=reg_result_detail)
-                return "failed"
+                recaptcha_fails += 1
+                # A reCAPTCHA rejection is the portal's verdict on the TOKEN, and that verdict tracks
+                # the EXIT far more than the account -- so roll to a fresh exit and try ONCE more,
+                # exactly as login does on 'confirma o reCAPTCHA'. But never spend more than the
+                # portal's 2-failure budget: the 3rd reCAPTCHA failure blocks platform access, so we
+                # stop AT 2. (Non-reCAPTCHA failures still `continue` above; they never reached the
+                # portal's reCAPTCHA check and so are not counted here.)
+                if recaptcha_fails >= RECAPTCHA_FAIL_BUDGET:
+                    progress(f"STOPPING: {recaptcha_fails} reCAPTCHA rejections -- portal blocks "
+                             f"access after {RECAPTCHA_FAIL_BUDGET}, not risking another")
+                    result("failed", detail=reg_result_detail)
+                    return "failed"
+                progress(f"reCAPTCHA rejected on this exit ({recaptcha_fails}/{RECAPTCHA_FAIL_BUDGET}) "
+                         "-- rolling to a fresh exit and trying once more")
+                continue    # next(proxies_cycle) at the loop top = a fresh minted exit
 
     if not proxy_success:
         progress("FAIL exhausted proxy retries")

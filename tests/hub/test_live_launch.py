@@ -57,6 +57,9 @@ def client(monkeypatch):
     # A live-mode launch now runs a real-portal health probe before leasing a proxy (P4) -- fake it
     # healthy so these tests stay fast/hermetic, no real browser/network involved.
     monkeypatch.setattr(hub_main, "check_proxy", lambda conn_url, timeout=20.0: (True, "ok"))
+    # Static/ISP leases now use check_proxy_lease_verdict (never condemns a live exit on a portal
+    # throttle) -- fake it healthy too, same reason.
+    monkeypatch.setattr(hub_main, "check_proxy_lease_verdict", lambda conn_url, timeout=20.0: (True, "ok"))
     # _launch_worker_fleet (POST /bookings/{id}/start) opens its own SessionLocal() per background
     # thread instead of using Depends(get_db) -- point it at this test's isolated engine too.
     monkeypatch.setattr(hub_main, "SessionLocal", TestSession)
@@ -312,6 +315,39 @@ def test_operator_geo_override_persists_and_binds_the_mint(client, monkeypatch):
 
     # Clearing unbinds (persisted): the next launch re-draws from PT.
     assert client.patch(f"/workers/{w['id']}/geo", json={"geo": ""}, headers=h).json()["proxy_geo"] is None
+
+
+def test_stopping_a_worker_releases_its_static_proxy_lease(client, monkeypatch):
+    """A STOPPED worker must not keep holding a finite ISP lease. Confirmed leak 2026-09-25
+    (booking 0924-3018): 13 STOPPED workers held 13/13 of the host's active leases forever, because
+    stop set status=STOPPED but never released the lease."""
+    from libs.db import models as M
+    h = _operate_headers(client)
+    tpl = client.post("/templates", json={"name": "StopRel", "role": "apply", "settings": {}},
+                      headers=h).json()
+    iid = client.post("/identities", json={"full_name": "Stop Rel", "type": "real"},
+                      headers=h).json()["id"]
+    _gen_verified_subs(client, h, iid)
+    client.post("/proxies", json={"provider": "capsolver", "kind": "static", "endpoint": "cap:1",
+                                  "credentials_ref": "u:p", "max_sessions": 1,
+                                  "resource_type": "static"}, headers=h)
+    bid = client.post("/bookings", json={
+        "name": "stop-rel", "type": "real", "posto_id": "5084",
+        "settings": {"ENGINE_MODE": "live", "PROXY_PROVIDER": "capsolver", "PROXY_KIND": "static"}},
+        headers=h).json()["id"]
+    w = client.post(f"/bookings/{bid}/identities",
+                    json={"identity_id": iid, "template_id": tpl["id"]}, headers=h).json()
+    assert client.post(f"/workers/{w['id']}/launch", headers=h).status_code == 200
+
+    db = client._Session()
+    active = lambda: db.query(M.ProxyLease).filter(M.ProxyLease.worker_id == w["id"],
+                                                   M.ProxyLease.released_at.is_(None)).count()
+    assert active() == 1, "a launched static worker must hold exactly one active lease"
+
+    assert client.post(f"/workers/{w['id']}/stop", headers=h).status_code == 200
+    db.expire_all()
+    assert active() == 0, "stopping the worker must release its lease"
+    db.close()
 
 
 def test_all_isp_provider_leases_across_providers_without_a_kind(client, monkeypatch):
