@@ -2456,6 +2456,12 @@ class LiveEngineOps(EngineOps):
     # How long to wait for the portal's widget script to register window.onCaptchaSuccess. Checked
     # BEFORE the solve, so a page that never registers it costs seconds rather than a wasted token.
     _CALLBACK_WAIT_MS = 20000
+    # How many times to RELOAD Schedule.jsp when the callback never registers but the schedule form
+    # IS present (a stale widget render, recoverable). 1 = one extra fetch. An interstitial (no
+    # schedule markers) is never reloaded -- re-nav would serve the same block. Kept at 1 because a
+    # stale render usually recovers on the first re-fetch and /slots is rate-limited (~1 grant/100s),
+    # so a blind retry loop would burn the budget without adding real coverage.
+    _SLOTS_STALE_RELOADS = 1
     # How long the keepalive probe waits for the home page to SETTLE before reading it. The home
     # page runs reCAPTCHA + async JS and keeps navigating for a beat after load, so an immediate
     # read races it: "Execution context was destroyed" (the outer handler counted this as a dead
@@ -2676,21 +2682,6 @@ class LiveEngineOps(EngineOps):
             return self._no_report(
                 f"/slots grants about one response per {self._SLOTS_MIN_INTERVAL:.0f}s and the last "
                 f"one was too recent ({_wait:.0f}s to go) -- not spending a solve")
-        # Install the getTables capture hook BEFORE navigating -- getTables fires during the page
-        # load, so the fetch/XHR wrapper must already be registered as an init script.
-        self._ensure_gettables_hook()
-        try:
-            self.session.browser_nav(SCHED_JSP + "?posto_id=" + str(self.posto_pdf or self.posto_id),
-                                     timeout=30)
-        except Exception as e:
-            self._log(f"do_discover[slots]: could not reach Schedule.jsp ({str(e)[:90]})")
-            return [{"date": d, "outcome": "failed"} for d in dates]
-
-        # WAF handshake: wait for getTables to confirm before spending a solve / firing /slots. The
-        # reference calls this the mandatory pre-/slots handshake; posto-optional, so it proceeds
-        # either way (see _await_gettables).
-        self._await_gettables()
-
         # WAIT FOR THE CALLBACK TO EXIST BEFORE SPENDING A SOLVE.
         #
         # browser_nav returns when the document loads, but window.onCaptchaSuccess is registered by
@@ -2707,18 +2698,52 @@ class LiveEngineOps(EngineOps):
                     "    if (typeof window.onCaptchaSuccess === 'function') return true;"
                     "    await new Promise(r => setTimeout(r, 250)); }"
                     "  return false; })()" % self._CALLBACK_WAIT_MS)
-        try:
-            ready = self.session.browser_eval(ready_js, timeout=45)
-        except Exception as e:
-            self._log(f"do_discover[slots]: could not probe for onCaptchaSuccess ({str(e)[:80]})")
-            ready = False
-        if not (ready is True or str(ready).lower() == "true"):
-            # Deliberately `failed`, not _no_report: unlike a solver outage, we DID reach the
-            # portal here -- it served a page that never registered the widget. That is evidence
-            # about the session/page (an interstitial or a stale render both look like this), so it
-            # should keep feeding phases.py's rebuild counter.
+        # SMART RELOAD (2026-09-25, operator: rely on /slots harder -- it is the ground truth; the
+        # calendar path manufactures phantoms). When the callback never registers, the page is either
+        # a STALE RENDER (the schedule form IS there -- _SCHED_PAGE_MARKERS present -- but the widget
+        # script hasn't run) or a WAF INTERSTITIAL (a wrong page, no markers). A stale render is
+        # recoverable by re-fetching the page; an interstitial is not (re-nav serves the same block).
+        # So reload ONCE for a stale render, skip immediately for an interstitial -- never a blind
+        # retry loop. Each reload re-installs the getTables hook and re-runs the handshake.
+        ready = False
+        for _try in range(self._SLOTS_STALE_RELOADS + 1):
+            # Install the getTables capture hook BEFORE navigating -- getTables fires during the page
+            # load, so the fetch/XHR wrapper must already be registered as an init script.
+            self._ensure_gettables_hook()
+            try:
+                self.session.browser_nav(
+                    SCHED_JSP + "?posto_id=" + str(self.posto_pdf or self.posto_id), timeout=30)
+            except Exception as e:
+                self._log(f"do_discover[slots]: could not reach Schedule.jsp ({str(e)[:90]})")
+                return [{"date": d, "outcome": "failed"} for d in dates]
+            # WAF handshake: wait for getTables to confirm before spending a solve / firing /slots.
+            # Posto-optional, so it proceeds either way (see _await_gettables).
+            self._await_gettables()
+            try:
+                ready = self.session.browser_eval(ready_js, timeout=45)
+            except Exception as e:
+                self._log(f"do_discover[slots]: could not probe for onCaptchaSuccess ({str(e)[:80]})")
+                ready = False
+            if ready is True or str(ready).lower() == "true":
+                ready = True
+                break
+            # Callback missing -- classify the page to decide whether a reload can help.
+            try:
+                _html = self.session.browser_eval("document.documentElement.outerHTML") or ""
+            except Exception:
+                _html = ""
+            _stale = any(m in _html for m in _SCHED_PAGE_MARKERS)
+            if _stale and _try < self._SLOTS_STALE_RELOADS:
+                self._log("do_discover[slots]: onCaptchaSuccess missing but Schedule.jsp markers "
+                          "present (stale widget render) -- reloading once")
+                continue
+            # Deliberately `failed`, not _no_report: we DID reach the portal; it served a page that
+            # never registered the widget. That is evidence about the session/page, so it should keep
+            # feeding phases.py's rebuild counter.
             self._log(f"do_discover[slots]: window.onCaptchaSuccess never appeared within "
-                      f"{self._CALLBACK_WAIT_MS // 1000}s (no solve spent)")
+                      f"{self._CALLBACK_WAIT_MS // 1000}s -- "
+                      f"{'stale render, reload did not recover' if _stale else 'no schedule markers (interstitial), not reloading'} "
+                      f"(no solve spent)")
             return [{"date": d, "outcome": "failed"} for d in dates]
         try:
             # HONOUR RECAPTCHA_SOLVE_PROXY, exactly as the login path does

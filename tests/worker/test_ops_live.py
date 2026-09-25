@@ -4294,3 +4294,55 @@ def test_pt_submit_is_an_xhr_with_lang_pt_and_xrw_header():
     assert captured["headers"].get("X-Requested-With") == "XMLHttpRequest"
     assert captured["data"]["lang"] == "PT", "the HAR submit sends lang=PT"
     assert captured["data"]["f_date_c"] == "2026/09/01" and captured["data"]["cmbPeriodo"] == "4"
+
+
+# ── /slots smart reload (operator 2026-09-25: rely on /slots harder, it is the ground truth) ────
+class _SlotsCallbackSession:
+    """onCaptchaSuccess never registers; the page HTML decides stale-render vs interstitial."""
+    def __init__(self, page_html):
+        self._html = page_html
+        self.navs = 0
+
+    def browser_nav(self, url, timeout=30):
+        self.navs += 1
+
+    def browser_eval(self, js, timeout=30):
+        if "onCaptchaSuccess === 'function'" in js:
+            return False               # the callback never appears
+        if "outerHTML" in js:
+            return self._html
+        return None
+
+
+def _slots_callback_ops(page_html):
+    ops = _make_ops()
+    ops.session = _SlotsCallbackSession(page_html)
+    ops.posto_pdf = "3059"
+    ops.logs = []
+    ops._log = ops.logs.append
+    ops._ensure_gettables_hook = lambda: None
+    ops._await_gettables = lambda: None
+    ops._maybe_presolve_slots = lambda *a, **k: None
+    ops.is_stopped = lambda: False
+    ops._slots_backoff_until = 0.0
+    ops._slots_last_grant_at = 0.0
+    return ops
+
+
+def test_slots_reloads_once_on_a_stale_widget_render():
+    """Callback missing but Schedule.jsp markers present = stale render -> reload exactly once, then
+    give up cheaply (no solve) if still not ready."""
+    ops = _slots_callback_ops("<html> getSlots cmbPeriodo f_date_c </html>")   # has _SCHED_PAGE_MARKERS
+    out = ops._discover_via_slots(["2026-11-03"])
+    assert ops.session.navs == 2, "a stale render must be reloaded exactly once"
+    assert out == [{"date": "2026-11-03", "outcome": "failed"}]
+    assert any("stale widget render" in m for m in ops.logs), ops.logs
+
+
+def test_slots_does_not_reload_an_interstitial():
+    """No schedule markers = a WAF interstitial; re-nav serves the same block, so never reload."""
+    ops = _slots_callback_ops("<html>Access Denied / please try again later</html>")   # no markers
+    out = ops._discover_via_slots(["2026-11-03"])
+    assert ops.session.navs == 1, "an interstitial must NOT be reloaded"
+    assert out == [{"date": "2026-11-03", "outcome": "failed"}]
+    assert any("interstitial" in m for m in ops.logs), ops.logs
