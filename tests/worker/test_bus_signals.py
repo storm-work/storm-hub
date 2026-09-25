@@ -119,6 +119,36 @@ def test_wait_discover_task_returns_dates():
     assert sig.wait_discover_task(timeout=2) == ["2026-08-18", "2026-08-19"]
 
 
+def test_a_discover_drained_while_warming_is_stashed_not_lost():
+    """The 'warmed but never discovers' 180s wedge (booking 0924-3018, 2026-09-25). The scheduler
+    dispatches `discover` the instant it picks a scout -- typically while the scout is still WARMING,
+    i.e. inside wait_slot_open, not yet in wait_discover_task. _drain acks the whole batch, so before
+    this fix the discover was acked and DROPPED, the scout blocked forever, and the Hub held its
+    rotation inflight for the full 180s hang-timeout. It must be STASHED and still delivered."""
+    bus = _bus()
+    sig = BusSignals(bus, "w1", "c1")
+    bus.send_command("w1", "discover", dates=["2026-11-03"], special_days={"2026-11-03": [5]})
+    bus.send_command("w1", "signal", name="slot_open")
+    # Warm-up phase drains BOTH (returns on the signal, acks the discover too).
+    assert sig.wait_slot_open(timeout=2) == "slot_open"
+    assert bus.has_pending_commands("w1") is False   # the whole batch was acked
+    # After warm-up: the discover must STILL be deliverable, carrying its special_days side channel.
+    assert sig.wait_discover_task(timeout=2) == ["2026-11-03"]
+    assert sig.last_discover_special_days == {"2026-11-03": [5]}
+
+
+def test_a_stashed_discover_is_consumed_once():
+    """Consumed exactly once -- a second wait_discover_task must not re-return the same stashed task
+    (it would re-scan a stale window and, worse, never let the rotation advance)."""
+    bus = _bus()
+    sig = BusSignals(bus, "w1", "c1")
+    bus.send_command("w1", "discover", dates=["2026-11-03"])
+    bus.send_command("w1", "signal", name="slot_open")
+    sig.wait_slot_open(timeout=2)
+    assert sig.wait_discover_task(timeout=2) == ["2026-11-03"]
+    assert sig.wait_discover_task(timeout=1) is None   # nothing left to consume
+
+
 def test_wait_discover_task_stop_returns_none():
     bus = _bus()
     sig = BusSignals(bus, "w1", "c1")

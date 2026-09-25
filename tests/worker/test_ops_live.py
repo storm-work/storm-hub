@@ -4346,3 +4346,29 @@ def test_slots_does_not_reload_an_interstitial():
     assert ops.session.navs == 1, "an interstitial must NOT be reloaded"
     assert out == [{"date": "2026-11-03", "outcome": "failed"}]
     assert any("interstitial" in m for m in ops.logs), ops.logs
+
+
+def test_slots_rolls_the_exit_after_two_consecutive_interstitials():
+    """Operator 2026-09-25: a flagged exit never un-flags, so grinding it wastes rounds. First
+    interstitial keeps the cheap skip; the SECOND rolls the exit (like login does)."""
+    ops = _slots_callback_ops("<html>Access Denied / please try again later</html>")  # no markers
+    rolls = []
+    ops._roll_exit = lambda why: rolls.append(why)
+    ops._discover_via_slots(["2026-11-03"])            # 1st interstitial -> no roll
+    assert rolls == []
+    ops._discover_via_slots(["2026-11-03"])            # 2nd consecutive -> roll
+    assert len(rolls) == 1 and "interstitial" in rolls[0].lower(), rolls
+
+
+def test_slots_rolls_the_exit_after_repeated_recaptcha(monkeypatch):
+    """A ReCaptchaError that repeats on the same exit past the rate-limit window is a FLAGGED exit,
+    not rate-limiting -- roll it, exactly as login rolls on the same reCAPTCHA verdict."""
+    ops = _slots_ops({"probe": {"status": 200, "body": '{"error":"ReCaptchaError"}'}},
+                     "slots", monkeypatch)
+    rolls = []
+    ops._roll_exit = lambda why: rolls.append(why)
+    ops._discover_via_slots(["2026-11-03"])            # 1st -> backoff, no roll
+    assert rolls == []
+    ops._slots_backoff_until = 0.0                     # clear the backoff so the 2nd round runs
+    ops._discover_via_slots(["2026-11-03"])            # 2nd consecutive -> roll
+    assert len(rolls) == 1 and "recaptcha" in rolls[0].lower(), rolls

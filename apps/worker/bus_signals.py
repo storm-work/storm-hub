@@ -59,6 +59,17 @@ class BusSignals:
         # -- and that assign was silently discarded, stranding its lease forever. One worker
         # accumulated 120 stranded leases, consuming every slot in the booking.
         self.pending_assignment = TIMEOUT   # TIMEOUT = "nothing stashed" (None is a legal slot)
+        # A `discover` that arrives while some OTHER wait_* is blocked -- the SAME drop bug as
+        # `assign`/`slot_open` above, and the one that actually mattered for scouts: the scheduler
+        # dispatches `discover` the instant it picks a scout, which is typically while that scout is
+        # still WARMING (in wait_slot_open / the warm-up path, not yet in wait_discover_task). _drain
+        # acks the whole batch, so the discover was acked and dropped, the scout then blocked in
+        # wait_discover_task forever, and the Hub held its rotation `inflight` on it for the full 180s
+        # hang-timeout before advancing -- the "scout warmed but never discovers" delay (confirmed
+        # live 2026-09-25, booking 0924-3018). Stash it (newest wins; the scheduler only has one
+        # outstanding discover per worker) so wait_discover_task picks it up whenever it runs.
+        self.pending_discover = TIMEOUT
+        self.last_discover_special_days = None
         bus.ensure_command_group(worker_id)
 
     def _drain(self, block_ms: int | None = 2000) -> list:
@@ -105,6 +116,12 @@ class BusSignals:
                 # (Phase F2's one-active-lease rule, enforced in _assign_slots).
                 self.pending_assignment = m.payload.get("slot")
                 self._last_scouts_invalid = bool(m.payload.get("scouts_invalid", False))
+            if m.type == "discover":
+                # Stash rather than drop -- wait_discover_task consumes it. Same one-outstanding
+                # guarantee (F2 dedup in _drive_scouts), so newest wins. The special_days cache rides
+                # the same command (side channel, like launch_payload).
+                self.pending_discover = m.payload.get("dates") or []
+                self.last_discover_special_days = m.payload.get("special_days")
             if m.type == "signal" and m.payload.get("name") == "inactivate":
                 self.inactivated = True
                 # A re-fired slot_open is a genuinely new window -- clear the stale slot_found so a
@@ -245,14 +262,17 @@ class BusSignals:
         (apps/hub/scheduler.py's _drive_scouts), when fresh, rides along on the SAME `discover`
         command so a scout given a cache hit never needs its own gettime fetch at all."""
         deadline = time.time() + timeout
+        # Check the stash FIRST: a discover dispatched while this scout was still warming was drained
+        # (and acked) by wait_slot_open / the warm-up path, and is sitting in pending_discover -- not
+        # in any batch this loop will read (`>` never redelivers an acked entry). Missing this was the
+        # "warmed but never discovers" 180s wedge.
         while time.time() < deadline and not self.stopped:
-            for m in self._drain():
-                if m.type == "discover":
-                    self.last_discover_special_days = m.payload.get("special_days")
-                    return m.payload.get("dates") or []
-                if m.type in ("stop", "shutdown"):
-                    self.stopped = True
-                    return None
+            self._drain()   # acks the batch; records discover/stop/inactivate passively
+            if self.stopped:
+                return None
+            if self.pending_discover is not TIMEOUT:
+                dates, self.pending_discover = self.pending_discover, TIMEOUT
+                return dates
             if self.take_inactivated():
                 return INACTIVATE   # false slot-open -- caller returns to await_slot_open, not stop
         return None

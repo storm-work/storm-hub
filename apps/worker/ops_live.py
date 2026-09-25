@@ -662,6 +662,16 @@ class LiveEngineOps(EngineOps):
         self._presolved_slots: tuple[str, float] | None = None
         self._slots_last_grant_at: float = 0.0
         self._slots_needs_relogin: bool = False
+        # Consecutive same-exit failures that mean the EXIT is flagged, not the request/session:
+        # a WAF interstitial (page never rendered the widget) and a ReCaptchaError (token refused).
+        # Login already rolls its exit on the identical reCAPTCHA verdict (token_ip_mismatch_burns_
+        # accounts); discovery historically stayed put and re-ran the same flagged exit round after
+        # round (confirmed live 2026-09-25, booking 0924-3018: 6/9 interstitials + repeated
+        # ReCaptchaError 9 min apart, well past the rate-limit window, 0 real slots). Roll on the
+        # SECOND consecutive so the first keeps today's cheaper behaviour (backoff / skip). A real
+        # grant, a fresh login, or any exit roll resets the streaks.
+        self._slots_interstitial_streak: int = 0
+        self._slots_recaptcha_streak: int = 0
         # getTables handshake state (2026-09-23, ref-confirmed). getTables is a page-fired POST on
         # Schedule.jsp that the WAF wants confirmed ("success":"true") before it serves /slots -- but
         # it is POSTO-OPTIONAL (posto 5084 has none yet serves slots). _posto_gettables: None=unknown,
@@ -2462,6 +2472,11 @@ class LiveEngineOps(EngineOps):
     # stale render usually recovers on the first re-fetch and /slots is rate-limited (~1 grant/100s),
     # so a blind retry loop would burn the budget without adding real coverage.
     _SLOTS_STALE_RELOADS = 1
+    # Roll the exit after this many CONSECUTIVE exit-flagged failures (interstitial / ReCaptchaError)
+    # on the same exit. 2 = the first keeps the cheap path (backoff/skip), the second rolls -- a
+    # flagged exit never un-flags itself, so grinding it is wasted rounds (login rolls on the same
+    # reCAPTCHA verdict). Reset by a real grant, a fresh login, or any roll.
+    _SLOTS_ROLL_AFTER = 2
     # How long the keepalive probe waits for the home page to SETTLE before reading it. The home
     # page runs reCAPTCHA + async JS and keeps navigating for a beat after load, so an immediate
     # read races it: "Execution context was destroyed" (the outer handler counted this as a dead
@@ -2744,6 +2759,16 @@ class LiveEngineOps(EngineOps):
                       f"{self._CALLBACK_WAIT_MS // 1000}s -- "
                       f"{'stale render, reload did not recover' if _stale else 'no schedule markers (interstitial), not reloading'} "
                       f"(no solve spent)")
+            # A page that never brings up the widget is a flagged/blocked EXIT, not a fixable
+            # session state -- and it does not un-flag itself, so re-running the same exit next round
+            # just repeats it (6/9 rounds, booking 0924-3018). Roll off it on the second consecutive.
+            self._slots_recaptcha_streak = 0
+            self._slots_interstitial_streak += 1
+            if self._slots_interstitial_streak >= self._SLOTS_ROLL_AFTER:
+                self._log(f"do_discover[slots]: {self._slots_interstitial_streak} consecutive "
+                          "interstitials -- the exit is flagged; rolling off it")
+                self._roll_exit("slots interstitial")
+                self._slots_interstitial_streak = 0
             return [{"date": d, "outcome": "failed"} for d in dates]
         try:
             # HONOUR RECAPTCHA_SOLVE_PROXY, exactly as the login path does
@@ -2870,9 +2895,20 @@ class LiveEngineOps(EngineOps):
         self._log(f"do_discover[slots]: endpoint said {_fmt_slots_probe(res.get('probe'))}")
         kind = _classify_slots_response(res)
         if kind == SLOTS_RATE_LIMITED:
-            # Not a session fault and not news about the calendar: the token was refused because we
-            # asked too soon. Reporting `failed` here is what drove the re-warm ladder over a
-            # response that has nothing to do with the session.
+            # A ReCaptchaError on the FIRST occurrence is treated as a rate-limit ("asked too soon"):
+            # back off a window and retry the SAME exit -- the token was refused, not the session.
+            # But if it REPEATS on the same exit past that window it is not rate-limiting, it is a
+            # FLAGGED EXIT -- the exact signal login rolls on (token_ip_mismatch_burns_accounts).
+            # Confirmed live 2026-09-25 (089ebd: ReCaptchaError at 06:12 AND 06:21, 9 min apart, 0
+            # slots). So roll on the second consecutive rather than backing off onto a dead exit.
+            self._slots_interstitial_streak = 0
+            self._slots_recaptcha_streak += 1
+            if self._slots_recaptcha_streak >= self._SLOTS_ROLL_AFTER:
+                self._log(f"do_discover[slots]: {self._slots_recaptcha_streak} consecutive "
+                          "ReCaptchaError on this exit -- flagged, not rate-limited; rolling off it")
+                self._roll_exit("slots recaptcha -- fresh exit")
+                self._slots_recaptcha_streak = 0
+                return self._no_report("rolled off a flagged exit after repeated ReCaptchaError")
             self._slots_backoff_until = time.time() + self._SLOTS_MIN_INTERVAL
             return self._no_report(
                 f"the endpoint refused the token (rate limit); next attempt in "
@@ -2881,6 +2917,7 @@ class LiveEngineOps(EngineOps):
             # Only a fresh LOGIN clears this. Flagged for phases.py so the rebuild ladder skips
             # straight past the re-warm rung, which is measured to never help here.
             self._slots_needs_relogin = True
+            self._slots_interstitial_streak = self._slots_recaptcha_streak = 0   # relogin resets
             self._log("do_discover[slots]: the endpoint returned an empty object -- this SESSION is "
                       "burned for /slots; a re-warm cannot fix it, only a fresh login")
             return [{"date": d, "outcome": "failed"} for d in dates]
@@ -2888,6 +2925,7 @@ class LiveEngineOps(EngineOps):
             # The exit is done, not the session. Roll it and let the next round try from elsewhere.
             self._log("do_discover[slots]: the endpoint blocked this exit -- rolling off it")
             self._roll_exit("slots blocked")
+            self._slots_interstitial_streak = self._slots_recaptcha_streak = 0   # fresh exit
             return self._no_report("the endpoint blocked this exit")
         if res.get("err"):
             self._log(f"do_discover[slots]: {res['err']}")
@@ -2902,6 +2940,7 @@ class LiveEngineOps(EngineOps):
         # A real array is the grant the rate limit meters, and proof the session is fine.
         self._slots_last_grant_at = time.time()
         self._slots_needs_relogin = False
+        self._slots_interstitial_streak = self._slots_recaptcha_streak = 0   # this exit works
         found, capacity = {}, {}
         for entry in (res.get("data") or []):
             if not isinstance(entry, dict):
