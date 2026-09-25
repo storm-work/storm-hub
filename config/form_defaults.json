@@ -2,7 +2,7 @@
   "_comment": "Form field defaults for ScheduleController POST. Three sections: static (never changes), dynamic (computed at runtime), from_account (read from accounts.csv row). Fields in from_account that have a non-empty account value win over dynamic defaults.",
 
   "static": {
-    "lang":                        "ENG",
+    "lang":                        "PT",
     "txtHuman":                    "",
     "RGPDAccepted":                "",
     "posto_representacao":         "null",

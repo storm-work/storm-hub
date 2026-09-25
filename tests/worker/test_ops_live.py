@@ -4371,3 +4371,38 @@ def test_slots_rolls_the_exit_after_repeated_recaptcha(monkeypatch):
     ops._slots_backoff_until = 0.0                     # clear the backoff so the 2nd round runs
     ops._discover_via_slots(["2026-11-03"])            # 2nd consecutive -> roll
     assert len(rolls) == 1 and "recaptcha" in rolls[0].lower(), rolls
+
+
+def test_an_unhealthy_keeping_worker_leaves_keeping_for_warming_up():
+    """keeping = healthy (operator 2026-09-26): a holding worker whose session is dead / rebuilding
+    must NOT show KEEPING -- it shows WARMING_UP, so _assign_slots (which selects substate==KEEPING)
+    excludes it by the SUBSTATE alone. A recovery returns it to KEEPING with a cleared detail."""
+    from libs.domain.enums import NOT_BOOKABLE_PREFIX
+    ops = _make_ops()
+    events = []
+    ops._emit = lambda typ, **p: events.append((typ, p))
+
+    ops._mark_keep_bookable(False, "keepalive dead-trip")
+    ops._mark_keep_bookable(True)
+
+    sc = [p for t, p in events if t == "status_change"]
+    assert sc[0]["substate"] == "warming_up", "an unhealthy holder must leave KEEPING"
+    assert sc[0]["detail"].startswith(NOT_BOOKABLE_PREFIX)
+    assert sc[1]["substate"] == "keeping" and sc[1]["detail"] == "", "recovery returns to KEEPING"
+    assert ops._keep_unbookable is False
+
+
+def test_do_discover_prefers_the_hub_pushed_source_over_frozen_cfg(monkeypatch):
+    """The Hub-pushed DISCOVERY_SOURCE (self._pending_discover_source, set from the discover command)
+    overrides the launch-frozen cfg -- so a scout that launched in 'calendar' switches to 'slots' on
+    its next round with no restart (2026-09-26, Booking 0925)."""
+    ops = _slots_ops({"ok": True, "data": [{"date": "2026-09-14", "periods": [5]}]},
+                     "calendar", monkeypatch)          # frozen cfg = calendar
+    ops._pending_discover_source = "slots"             # Hub pushed slots on the command
+    called = {"slots": 0, "cal": 0}
+    ops._discover_via_slots = lambda dates: called.__setitem__("slots", called["slots"] + 1) or [
+        {"date": d, "outcome": "empty"} for d in dates]
+    ops._discover_via_calendar = lambda dates: called.__setitem__("cal", called["cal"] + 1) or [
+        {"date": d, "outcome": "empty"} for d in dates]
+    ops.do_discover(["2026-09-14"])
+    assert called["slots"] == 1 and called["cal"] == 0, "must honour the pushed 'slots', not frozen 'calendar'"

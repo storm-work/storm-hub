@@ -40,7 +40,7 @@ if (!window.chrome) window.chrome={{}};
 window.chrome.runtime = window.chrome.runtime || {{}};
 try {{ Object.defineProperty(navigator,'plugins',{{get:()=>[{{name:'PDF Viewer'}},{{name:'Chrome PDF Viewer'}},{{name:'Chromium PDF Viewer'}}]}}); }} catch(e){{}}
 try {{ Object.defineProperty(navigator,'pdfViewerEnabled',{{get:()=>true}}); }} catch(e){{}}
-try {{ Object.defineProperty(navigator,'languages',{{get:()=>['en-US','en']}}); }} catch(e){{}}
+try {{ Object.defineProperty(navigator,'languages',{{get:()=>['pt-PT','pt','en-US','en']}}); }} catch(e){{}}
 try {{ navigator.mediaDevices.enumerateDevices=()=>Promise.resolve([
   {{deviceId:'default',kind:'audioinput',label:'',groupId:'g1'}},
   {{deviceId:'default',kind:'audiooutput',label:'',groupId:'g1'}},

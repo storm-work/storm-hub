@@ -4,7 +4,9 @@ Browser logic is IDENTICAL for scout and apply (one EngineOps implementation); t
 is phase sequencing after the shared login:
 
   common:  login -> swap-to-ISP -> KEEPING
-  apply :  KEEPING -> (slot-found) -> warmup -> (await slot ASSIGNMENT) -> applying/book
+  apply :  KEEPING -> (slot-found) -> (await slot ASSIGNMENT) -> applying/book
+           (warm-up is INSIDE do_apply now -- it re-warms unconditionally right before the submit,
+            so the separate slot-found _warm_if_needed was removed 2026-09-26 to avoid a double warm)
            fallback: if all scouts are invalid/dead -> warmup -> self-discover -> book
   scout :  KEEPING -> (slot-open) -> warmup -> discovering -> push pool (on found)
            -> polling (loop) until booking finishes / all apply workers closed / manual stop

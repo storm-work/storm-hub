@@ -70,6 +70,7 @@ class BusSignals:
         # outstanding discover per worker) so wait_discover_task picks it up whenever it runs.
         self.pending_discover = TIMEOUT
         self.last_discover_special_days = None
+        self.last_discover_source = None      # DISCOVERY_SOURCE the Hub pushed on the discover cmd
         bus.ensure_command_group(worker_id)
 
     def _drain(self, block_ms: int | None = 2000) -> list:
@@ -122,6 +123,7 @@ class BusSignals:
                 # the same command (side channel, like launch_payload).
                 self.pending_discover = m.payload.get("dates") or []
                 self.last_discover_special_days = m.payload.get("special_days")
+                self.last_discover_source = m.payload.get("source")
             if m.type == "signal" and m.payload.get("name") == "inactivate":
                 self.inactivated = True
                 # A re-fired slot_open is a genuinely new window -- clear the stale slot_found so a

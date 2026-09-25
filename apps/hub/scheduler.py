@@ -834,6 +834,47 @@ class Scheduler:
                     bk.id, bounces, "available/leased")
         return True
 
+    def revert_slot_open(self, db, bk: M.Booking) -> int:
+        """MANUAL revert of a fired slot-open (operator 2026-09-26). The same effect as
+        _maybe_inactivate_slot_open but without its false-open guards -- an explicit operator undo,
+        including of a MANUAL fire (which the auto-guard deliberately leaves alone). Sends every
+        RUNNING worker an `inactivate` signal (scouts drop out of discovery back to KEEPING; apply
+        workers were already holding), clears the fired timestamps + the signal-latch 'already
+        notified' sets + the manual-open flag, resets the scout pool, and puts the booking back to
+        WARMING. Returns how many workers were signalled. Runs INSIDE the Hub so the scout pool's
+        in-memory reset actually takes effect."""
+        from libs.domain.state_machines import IllegalTransition, booking_transition
+        running = db.scalars(select(M.Worker).where(
+            M.Worker.booking_id == bk.id, M.Worker.status == WorkerStatus.RUNNING)).all()
+        if self._bus is not None:
+            for w in running:
+                try:
+                    self._bus.send_command(w.id, "signal", name="inactivate")
+                except Exception:
+                    pass
+        if self._redis is not None:
+            for signal_name in ("slot_open", "slot_found"):
+                self._redis.delete(notified_key(bk.id, signal_name))
+            self._redis.delete(manual_open_key(bk.id))
+        self.reset_scout_pool(bk.id)
+        bk.slot_open_fired_at = None
+        bk.slot_found_fired_at = None
+        # ALSO clear the scheduled trigger. plan_booking_actions re-fires slot-open the instant
+        # status is WARMING/ARMED and slot_open_at <= now -- so a revert that leaves a past
+        # slot_open_at in place is undone on the very next tick (confirmed live 2026-09-26: Booking
+        # 0925 re-fired ~1 min after the revert). Clearing it holds the booking until an explicit
+        # re-fire / re-schedule; a still-future slot_open_at is left alone.
+        if bk.slot_open_at is not None and _aware(bk.slot_open_at) <= datetime.now(timezone.utc):
+            bk.slot_open_at = None
+        try:
+            bk.status = booking_transition(bk.status, BookingStatus.WARMING)
+        except IllegalTransition:
+            pass
+        db.commit()
+        logger.warning("booking %s: slot-open MANUALLY REVERTED by operator -- %d worker(s) sent "
+                       "inactivate, scouts back to holding, booking -> WARMING", bk.id, len(running))
+        return len(running)
+
     def _maybe_inactivate_slot_open(self, db, bk: M.Booking, now: datetime) -> bool:
         """False-slot-open guard (operator spec 2026-08-14): "if there are no slots during slot-open
         phase for a long time (e.g. 20 mins) then acknowledge the slot-open is false, then revert to
@@ -991,10 +1032,17 @@ class Scheduler:
             cache_secs = float(self._effective_booking_setting(db, bk, "GETTIME_CACHE_SECS", 300.0))
             cached_special_days = self._event_hub.get_gettime_cache(bk.id, cache_secs)
 
+        # DISCOVERY_SOURCE rides the discover command (2026-09-26), so changing it on the booking
+        # takes effect on a RUNNING scout's NEXT round -- no restart / re-login needed. The worker's
+        # frozen effective_settings_json is launch-time; this pushes the LIVE booking value each
+        # dispatch. do_discover honours it over its own cfg when present (a scout with no bus source
+        # keeps its frozen value, so tests/older workers are unaffected).
+        source = str(self._effective_booking_setting(db, bk, "DISCOVERY_SOURCE", "calendar") or "calendar")
         if cached_special_days is not None:
-            self._bus.send_command(chosen, "discover", dates=dates, special_days=cached_special_days)
+            self._bus.send_command(chosen, "discover", dates=dates,
+                                   special_days=cached_special_days, source=source)
         else:
-            self._bus.send_command(chosen, "discover", dates=dates)
+            self._bus.send_command(chosen, "discover", dates=dates, source=source)
 
     def _maybe_prewarm(self, db, bk: M.Booking, now: datetime) -> None:
         """Tell holding workers to re-warm shortly before a SCHEDULED slot-open.

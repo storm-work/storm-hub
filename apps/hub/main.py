@@ -3460,6 +3460,25 @@ def fire_slot_open(booking_id: str, db: Session = Depends(get_db),
     return {"fired": True, "booking_status": str(bk.status)}
 
 
+@app.post("/bookings/{booking_id}/revert-slot-open")
+def revert_slot_open(booking_id: str, db: Session = Depends(get_db),
+                     _op: Principal = Depends(require_operator)) -> dict:
+    """Undo a fired slot-open: every RUNNING worker is sent `inactivate` (scouts drop out of
+    discovery back to KEEPING), the fired timestamps + signal latches + the manual-open flag are
+    cleared, the scout pool is reset, and the booking goes back to WARMING. Works on a MANUAL fire
+    too (unlike the scheduler's auto false-open guard, which leaves manual fires alone). Re-fire with
+    /fire-slot-open when ready. If AVAILABLE slots are still in the pool they can re-trigger
+    slot-found on the next tick -- clear them (DELETE .../slots) first if you want a clean hold."""
+    bk = db.get(M.Booking, booking_id)
+    if not bk:
+        raise HTTPException(404, "booking not found")
+    if bk.slot_open_fired_at is None:
+        return {"reverted": False, "reason": "slot-open is not fired", "booking_status": str(bk.status)}
+    n = scheduler.revert_slot_open(db, bk)
+    db.refresh(bk)
+    return {"reverted": True, "workers_inactivated": n, "booking_status": str(bk.status)}
+
+
 @app.post("/bookings/{booking_id}/fire-slot-found")
 def fire_slot_found(booking_id: str, db: Session = Depends(get_db),
                     _op: Principal = Depends(require_operator)) -> dict:

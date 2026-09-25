@@ -17,6 +17,46 @@ from __future__ import annotations
 
 import os
 import sys
+from datetime import datetime, timezone
+
+
+def _ts() -> str:
+    """UTC HH:MM:SS.mmm -- prefixed onto every log line so a worker log is timeline-readable."""
+    return datetime.now(timezone.utc).strftime("%H:%M:%S.%f")[:-3]
+
+
+class _TimestampedStream:
+    """Wrap a text stream so every LINE it writes is prefixed with a UTC timestamp. The vendored
+    engine prints its `[session]` diagnostics with no timestamps of their own, which made a worker
+    log file impossible to correlate in time (2026-09-26). Line-aware: a write that does not end in a
+    newline leaves the line open so the next write continues it, and only the START of each line is
+    stamped. Delegates flush/fileno/etc. to the wrapped stream so buffering behaviour is unchanged."""
+    def __init__(self, wrapped):
+        self._w = wrapped
+        self._new_line = True
+
+    def write(self, s: str) -> int:
+        if not s:
+            return 0
+        parts = s.split("\n")
+        buf = []
+        for i, part in enumerate(parts):
+            last = i == len(parts) - 1
+            if self._new_line and (part or not last):
+                buf.append(_ts() + " ")
+                self._new_line = False
+            buf.append(part)
+            if not last:
+                buf.append("\n")
+                self._new_line = True
+        self._w.write("".join(buf))
+        return len(s)
+
+    def flush(self):
+        self._w.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._w, name)
 
 from libs.bus import Bus, connect
 from libs.engine import vendor_env
@@ -94,13 +134,17 @@ def _build_ops(engine_kind: str, cfg: EngineConfig, payload: dict, bus: Bus, wor
         # and there was NO way to find out why from any log the Hub or journalctl retained. Wired to
         # the same `log_line` event WorkerRuntime's own transition logging already uses, so the
         # dashboard's existing per-worker log view picks these up with no further changes.
-        ops._log = lambda t: emit("log_line", text=t)
+        ops._log = lambda t: emit("log_line", text=f"{_ts()} {t}")
         return ops
     step_delay = float(os.environ.get("SIM_STEP_DELAY", "1.2"))
     return SimEngineOps(step_delay=step_delay, signals=signals, emit=emit)
 
 
 def main() -> int:
+    # Timestamp every line the worker writes to its log file (the vendored engine's [session] prints
+    # + the launch banner + any stray print). Done first so nothing is written un-stamped.
+    sys.stdout = _TimestampedStream(sys.stdout)
+    sys.stderr = _TimestampedStream(sys.stderr)
     if len(sys.argv) < 2:
         print("usage: python -m apps.worker <worker_id>", file=sys.stderr)
         return 2

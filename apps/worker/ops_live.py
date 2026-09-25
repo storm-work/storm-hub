@@ -628,6 +628,9 @@ class LiveEngineOps(EngineOps):
         # Hub's shared gettime cache (special_days), stashed by await_discover_task() from the
         # discover command payload, consumed once by the next do_discover() call.
         self._pending_special_days: dict | None = None
+        # DISCOVERY_SOURCE pushed on the discover command (Hub-live value), consumed by do_discover
+        # so a booking-setting change reaches a RUNNING scout without a restart. None = use frozen cfg.
+        self._pending_discover_source: str | None = None
 
         # P3 -- proxy rotation: which pool a rotation request should draw from. do_swap() flips this
         # to "hold" unconditionally the moment warmup finishes, regardless of whether
@@ -2077,6 +2080,10 @@ class LiveEngineOps(EngineOps):
                 # the SAME `discover` command when fresh -- stash it for the next do_discover() call
                 # so a cache hit skips the real gettime fetch entirely.
                 self._pending_special_days = getattr(self._signals, "last_discover_special_days", None)
+                # DISCOVERY_SOURCE the Hub pushed on this discover command (2026-09-26). Lets a
+                # config change take effect on the NEXT round of a RUNNING scout with no restart --
+                # do_discover honours it over its own frozen cfg when present.
+                self._pending_discover_source = getattr(self._signals, "last_discover_source", None)
                 return result
             self._do_keepalive("await_discover_task")
 
@@ -2190,26 +2197,30 @@ class LiveEngineOps(EngineOps):
         return moved
 
     def _mark_keep_bookable(self, bookable: bool, why: str = "") -> None:
-        """Publish whether this KEEPING worker can actually take a slot.
+        """Reflect whether this holding worker has a LIVE, bookable session -- and make KEEPING mean
+        HEALTHY (operator 2026-09-26).
 
-        Emits the same `status_change` event the PhaseMachine's on_transition emits, so it flows
-        through the existing events.py -> Worker.substate/substate_detail path with no new plumbing.
-        The substate stays KEEPING (a keeping -> keeping transition is legal, and the worker really
-        is still holding -- authenticated, keepalive-ing, recoverable in place); only the DETAIL
-        changes, carrying apps/hub/scheduler.py's NOT_BOOKABLE_PREFIX marker that _assign_slots
-        filters on. Same machine-readable-prefix convention as LAUNCH_FAILED_PREFIX.
+        Before, a holding worker whose keepalive found the session dead, or that was mid-rebuild,
+        STAYED substate=KEEPING and only carried a NOT_BOOKABLE_PREFIX detail. That was the "holding
+        is a lie": a dead worker showed KEEPING, looked like ready capacity, and (until _assign_slots
+        learned to read the detail) got handed a real slot it then failed on. Now an unhealthy /
+        rebuilding worker LEAVES KEEPING and shows WARMING_UP (it is re-establishing the bookable
+        session -- re-login + re-warm); only a live, bookable session shows KEEPING. So KEEPING is
+        healthy by construction, and _assign_slots (which selects substate==KEEPING) excludes an
+        unhealthy worker by the SUBSTATE alone, not only by the detail (kept as belt-and-suspenders +
+        a human-readable reason). Emits the same `status_change` event on_transition uses, so it
+        flows through events.py -> Worker.substate/substate_detail with no new plumbing.
         """
         # Tracked, not just emitted: the recovery path has to know whether ANYTHING marked this
-        # worker unbookable. It used to clear the marker only when `_rewarm_fail_streak > 0`, which
-        # was fine while the re-warm branch was the only writer -- but the dead-trip branch now
-        # marks too, and that leaves the streak at 0, so a recovered worker would have stayed
-        # unbookable forever. A permanently-unbookable holding worker is worse than the bug being
-        # fixed: it is invisible capacity loss.
+        # worker unbookable, so a recovered worker is returned to KEEPING (not left stuck).
         self._keep_unbookable = not bookable
         if self._emit is None:
             return
-        detail = f"{NOT_BOOKABLE_PREFIX} {why}" if not bookable else ""
-        self._emit("status_change", substate="keeping", detail=detail)
+        if bookable:
+            self._emit("status_change", substate="keeping", detail="")
+        else:
+            # WARMING_UP, not KEEPING: the session is not a live hold -- it is being rebuilt.
+            self._emit("status_change", substate="warming_up", detail=f"{NOT_BOOKABLE_PREFIX} {why}")
 
     def _keepalive_read_page(self) -> str:
         """Read the probe page ONCE it has settled, so a still-navigating home page is not misread
@@ -2409,13 +2420,12 @@ class LiveEngineOps(EngineOps):
             self._emit("log_line", text=f"keepalive: attempting restore "
                                          f"(attempt {self._keepalive_restore_attempts}/"
                                          f"{_MAX_KEEPALIVE_RESTORE_ATTEMPTS}, {context})")
-        # THE WORKER IS NOT BOOKABLE FOR THE DURATION OF THIS REBUILD.
-        #
-        # The substate stays KEEPING throughout -- correctly, the worker really is still keeping --
-        # but the chain below closes the browser and runs a full checkpoint-restore-or-login, which
-        # can take minutes. _assign_slots selects on `substate == KEEPING` and nothing else, so
-        # until now the Hub happily handed a real slot to a worker in the middle of rebuilding its
-        # session. CONFIRMED LIVE 2026-09-02 (20:45 run of "Test 0901"): the pool's ONLY available
+        # THE WORKER IS NOT BOOKABLE FOR THE DURATION OF THIS REBUILD -- and now LEAVES KEEPING for
+        # WARMING_UP while it rebuilds (keeping = healthy, 2026-09-26), so _assign_slots excludes it
+        # by substate. The chain below closes the browser and runs a full checkpoint-restore-or-login,
+        # which can take minutes. _assign_slots selects on `substate == KEEPING`, so before this a
+        # worker mid-rebuild still showed KEEPING and the Hub handed it a real slot. CONFIRMED LIVE
+        # 2026-09-02 (20:45 run of "Test 0901"): the pool's ONLY available
         # slot, 2026-09-30 p5, was leased at 22:22:04 to worker 41f656e6, which was inside this
         # very chain and did not reach `applying` until 22:24:41 -- 2m37s later -- whereupon its
         # warm-up failed with csrf_missing and it released the slot as `session`. The other lease
@@ -3014,7 +3024,12 @@ class LiveEngineOps(EngineOps):
         booking -- while the calendar path is the one this project has actually booked with.
         Preferring slots and back-filling from calendar takes the better answer without giving up
         the proven one."""
-        source = str(getattr(self.cfg.discovery, "source", "calendar") or "calendar").strip().lower()
+        # PREFER the Hub-pushed live value (self._pending_discover_source, set from the discover
+        # command) over the launch-frozen cfg -- this is what lets a DISCOVERY_SOURCE change reach a
+        # RUNNING scout without a restart. Fall back to the frozen cfg when the Hub sent none.
+        _pushed = (self._pending_discover_source or "").strip().lower()
+        source = _pushed or str(getattr(self.cfg.discovery, "source", "calendar")
+                                or "calendar").strip().lower()
         if source not in _DISCOVERY_SOURCES:
             # SAY SO. The dashboard renders this as free text (the settings catalog has no enum
             # type), so `slot`, `Slots-only` or a typo is a realistic operator input. Silently

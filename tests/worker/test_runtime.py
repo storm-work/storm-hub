@@ -92,3 +92,23 @@ def test_checkpoint_saved_repeatedly_during_scout_polling(bus):
     WorkerRuntime(bus, "s2").run(_cfg(template={"ROLE": "scout"}), ops)
     # HOLDING (pre-discover) + POLLING (post-discover) -> at least 2 saves for one round
     assert ops.checkpoint_calls >= 2
+
+
+def test_timestamped_stream_prefixes_each_line():
+    """Worker log lines (incl. the vendored [session] prints) are prefixed with a UTC timestamp so a
+    log file is timeline-readable (2026-09-26). Partial writes stay on one line."""
+    import io
+    import re
+
+    from apps.worker.__main__ import _TimestampedStream
+
+    buf = io.StringIO()
+    s = _TimestampedStream(buf)
+    s.write("[session] one\n")
+    s.write("part "); s.write("two\n")          # one logical line across two writes
+    s.write("a\nb\n")                            # two lines in one write
+    lines = [l for l in buf.getvalue().split("\n") if l]
+
+    assert all(re.match(r"^\d\d:\d\d:\d\d\.\d\d\d ", l) for l in lines), lines
+    assert any("part two" in l for l in lines), "a partial write must stay on one line"
+    assert len(lines) == 4

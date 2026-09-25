@@ -15,7 +15,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from apps.hub.scheduler import Scheduler, should_timeout_booking
-from libs.bus.names import notified_key
+from libs.bus.names import manual_open_key, notified_key
 from libs.db import metadata
 from libs.db import models as M
 from libs.engine import orchestration as orch
@@ -829,6 +829,32 @@ def test_inactivate_slot_open_disabled_by_zero_setting(db):
     assert bk.slot_open_fired_at is not None
 
 
+def test_manual_revert_slot_open_signals_workers_even_for_a_manual_fire(db):
+    """Operator manual revert (2026-09-26): unlike the auto-guard, it undoes a MANUAL fire too and
+    needs no timeout -- inactivate every RUNNING worker (scouts -> KEEPING), clear the fired stamps +
+    latch sets + manual flag, reset the pool, booking -> WARMING."""
+    bus = _FakeBus()
+    redis = fakeredis.FakeStrictRedis(decode_responses=True)
+    sched = _scheduler(bus=bus, redis_client=redis)
+    bk = _make_booking(db, slot_open_fired_at=NOW - timedelta(seconds=10),
+                       slot_open_at=NOW - timedelta(seconds=20))   # a PAST scheduled trigger
+    ident = _make_identity(db)
+    w = _make_worker(db, bk, ident, role=WorkerRole.SCOUT)
+    redis.sadd(notified_key(bk.id, "slot_open"), w.id)
+    redis.set(manual_open_key(bk.id), "1")           # a MANUAL fire the auto-guard would skip
+    sched._scout_pools[bk.id] = orch.ScoutPoolState()
+
+    n = sched.revert_slot_open(db, bk)
+
+    assert n == 1
+    assert bk.slot_open_fired_at is None and bk.status == BookingStatus.WARMING
+    assert bk.slot_open_at is None, "a PAST slot_open_at must be cleared or it re-fires next tick"
+    assert (w.id, "signal", {"name": "inactivate"}) in bus.sent
+    assert redis.smembers(notified_key(bk.id, "slot_open")) == set()
+    assert not redis.get(manual_open_key(bk.id))       # manual flag cleared -> re-fire is clean
+    assert bk.id not in sched._scout_pools
+
+
 def test_assign_slots_skips_worker_with_outstanding_command(db):
     bus = _FakeBus()
     sched = _scheduler(bus=bus)
@@ -1088,7 +1114,7 @@ def test_false_slot_revert_ignores_bounces_off_blind_slots(db):
     the whole pool, ending blind apply after one pass. Blind slots retire individually via
     BLIND_MAX_BOUNCES instead."""
     import fakeredis
-    from libs.bus.names import notified_key
+    from libs.bus.names import manual_open_key, notified_key
     from libs.engine import orchestration as orch
 
     bus = _FakeBus()
@@ -1117,7 +1143,7 @@ def test_seeding_blind_slots_disables_the_false_slot_revert(db):
     freshly-seeded blind grid, clear slot-found, and inactivate the fleet the operator just pointed
     at it. Once blind slots exist the operator owns the pool: the automatic revert must stand down."""
     import fakeredis
-    from libs.bus.names import notified_key
+    from libs.bus.names import manual_open_key, notified_key
     from libs.engine import orchestration as orch
 
     bus = _FakeBus()

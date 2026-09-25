@@ -346,3 +346,13 @@ def test_poll_is_safe_and_quiet_when_there_is_nothing_to_read():
     for _ in range(5):
         sig.poll()                     # non-blocking: must not hang, must not raise
     assert sig.stopped is False
+
+
+def test_discover_command_carries_the_source_side_channel():
+    """DISCOVERY_SOURCE rides the discover command so a booking-setting change reaches a RUNNING
+    scout with no restart (2026-09-26)."""
+    bus = _bus()
+    sig = BusSignals(bus, "w1", "c1")
+    bus.send_command("w1", "discover", dates=["2026-11-03"], source="slots")
+    assert sig.wait_discover_task(timeout=2) == ["2026-11-03"]
+    assert sig.last_discover_source == "slots"

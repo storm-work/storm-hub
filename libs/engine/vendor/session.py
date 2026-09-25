@@ -222,7 +222,10 @@ HOME_URL = BASE + "/VistosOnline/"
 _HEADERS_BASE = {
     "User-Agent":         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                           "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
-    "Accept-Language":    "en-US,en;q=0.9",
+    # PT-consistent (2026-09-26): we submit lang=PT to a Portuguese government portal, so the browser
+    # must present as a Portuguese speaker -- an en-US Accept-Language against a PT-chosen session is
+    # an incoherent story a WAF can score. pt-PT first, en kept as a secondary (a plausible bilingual).
+    "Accept-Language":    "pt-PT,pt;q=0.9,en-US;q=0.8,en;q=0.7",
     "Accept-Encoding":    "gzip, deflate, br",
     "Cache-Control":      "no-cache",
     "Pragma":             "no-cache",
@@ -821,7 +824,7 @@ class PlaywrightSession:
                 user_agent=ua,
                 viewport={"width": vp_w, "height": vp_h},
                 screen={"width": vp_w, "height": vp_h},
-                locale="en-US",
+                locale="pt-PT",   # PT-consistent: lang=PT session -> Portuguese-speaking browser
                 timezone_id=tz,
                 extra_http_headers={
                     "sec-ch-ua":          sec_ch_ua,
