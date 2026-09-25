@@ -642,6 +642,56 @@ def test_a_confirmed_booking_marks_the_identity_booked_and_logs_it(slots_db):
     db.close()
 
 
+def test_a_booking_without_a_pdf_flags_the_identity_pdf_missing(slots_db):
+    """A submit-confirmed booking with no captured PDF (route_never_captured) must flag the identity
+    'PDF missing' so the operator verifies it -- a booking without %PDF proof is not certain
+    (operator 2026-09-26, confirmed live on d1c93ae4)."""
+    from sqlalchemy import select
+
+    import apps.hub.events as ev
+    from libs.db import models as M
+    from libs.domain.enums import IdentityStatus, SlotStatus
+
+    bid, wid = _seed_apply_worker(slots_db)
+    db = slots_db()
+    db.scalars(select(M.Identity)).one().status = IdentityStatus.ACTIVE
+    db.add(M.Slot(booking_id=bid, posto_id="3018", date="2026-09-14", period=3,
+                  status=SlotStatus.LEASED))
+    db.commit(); db.close()
+
+    ev.EventHub.__new__(ev.EventHub)._persist_booking(wid, {"date": "2026-09-14", "period": 3})  # no pdf
+
+    db = slots_db()
+    assert "PDF missing" in (db.scalars(select(M.Identity)).one().comment or "")
+    db.close()
+
+
+def test_a_later_pdf_clears_the_pdf_missing_flag(slots_db, tmp_path):
+    """A healthy booking does not stay flagged: when the booked_pdf follows and attaches the
+    artifact, the provisional 'PDF missing' comment is cleared."""
+    from sqlalchemy import select
+
+    import apps.hub.events as ev
+    from libs.db import models as M
+    from libs.domain.enums import IdentityStatus, SlotStatus
+
+    bid, wid = _seed_apply_worker(slots_db)
+    db = slots_db()
+    db.scalars(select(M.Identity)).one().status = IdentityStatus.ACTIVE
+    db.add(M.Slot(booking_id=bid, posto_id="3018", date="2026-09-14", period=3,
+                  status=SlotStatus.LEASED))
+    db.commit(); db.close()
+
+    hub = ev.EventHub.__new__(ev.EventHub)
+    hub._persist_booking(wid, {"date": "2026-09-14", "period": 3})               # booked, no pdf -> flag
+    pdf = tmp_path / "visa.pdf"; pdf.write_bytes(b"%PDF-1.4 x")
+    hub._persist_booked_pdf(wid, str(pdf), {"date": "2026-09-14", "period": 3})  # pdf arrives -> clear
+
+    db = slots_db()
+    assert not (db.scalars(select(M.Identity)).one().comment or ""), "PDF missing flag must clear"
+    db.close()
+
+
 def test_identity_bookkeeping_never_costs_the_booking_record(slots_db, monkeypatch):
     """If the status/history write fails, the APPOINTMENT must still be recorded -- it is the thing
     the system exists to produce, and bookkeeping is not allowed to take it down."""

@@ -3416,18 +3416,15 @@ class LiveEngineOps(EngineOps):
             #   markers PRESENT -> the cursor is fine and form_stale means the slot really is taken,
             #                      which makes this a DISCOVERY problem, not an apply one.
 
-            # PT / EXPERIMENT C (2026-09-24): a REAL /slots ACTIVATES the booking cursor immediately
-            # before the submit. Confirmed across every successful-booking HAR (data/ref/*.har,
-            # data/new_booking.har): the flow is ...ScheduleController -> getTables -> POST /slots (a
-            # SOLVED SCHEDULE_EVISA token) -> SubmeterVistoCriaPDF. Our appliers skipped it, so the
-            # submit hit a cursor the portal had not activated and got the questionnaire back
-            # (form_stale). The primer this file removed sent captcha='' (rejected, reset the page);
-            # THIS is the scout's proven token-bearing /slots. We ignore the discovery RESULT -- it is
-            # only here to leave the session bookable for the submit that immediately follows.
-            try:
-                self._discover_via_slots([str(slot["date"])])
-            except Exception as e:
-                self._log(f"do_apply: /slots cursor activation raised ({str(e)[:90]})")
+            # EXPERIMENT C (the pre-submit /slots "cursor activation") WAS REMOVED 2026-09-26. Live
+            # measurement (booking "Prev 0924-3018 copy") retired its premise: the apply-time /slots
+            # returned {"error":"ReCaptchaError"} on EVERY round (it never activated anything), added
+            # ~20-40s per attempt (getTables + a wasted CAPTCHA solve + the reject), and a real
+            # booking (d1c93ae4) landed WITHOUT it working. So it was pure latency on the apply round,
+            # and apply latency is what loses the form_stale slot races. The submit stands on the
+            # round-start warm-up alone (the PRE-SUBMIT read below confirms an intact cursor); form_
+            # stale with that intact cursor is a DISCOVERY/slot-taken problem, not an apply one
+            # (see [[pt_apply_path_confirmed_live]]).
             try:
                 _pre = self.session.browser_eval("document.documentElement.outerHTML") or ""
                 _marks = [m for m in _SCHED_PAGE_MARKERS if m in _pre]
@@ -3539,21 +3536,29 @@ class LiveEngineOps(EngineOps):
             # making the Hub's record depend on it lost real bookings.
             if self._emit is not None:
                 self._emit("booked", slot=slot)
+            pdf_body = b""
             try:
-                pdf = self.session.submit_form_binary(action_contains="MostrarPdf", timeout=45)
-                self._log(f"MostrarPdf: status={pdf.get('status')} ct={pdf.get('content_type')} "
-                          f"len={len(pdf.get('body', b''))}")
-                pdf_body = pdf.get("body") or b""
-                if pdf_body[:4] != b"%PDF" and "application/pdf" not in (pdf.get("content_type") or ""):
-                    # storm-auto's josand5837 scar: a 58KB HTML fallback page was once saved as a
-                    # "PDF". Don't persist a non-PDF -- but the booking itself is already confirmed
-                    # by the auto-submit form, so this never changes the outcome.
-                    self._log(f"do_apply: MostrarPdf returned a non-PDF ({len(pdf_body)}B) -- "
-                              f"booking still confirmed by the auto-submit form; not saving")
-                    pdf_body = b""
-                if pdf_body and self._emit is not None:
-                    pdf_path = self._save_pdf(pdf_body)
-                    self._emit("booked_pdf", pdf_path=pdf_path, slot=slot)
+                # PT flow: the MostrarPdf form is in the XHR RESPONSE BODY, not the live DOM -- parse
+                # it out and fetch directly (fixes route_never_captured, 2026-09-26).
+                pdf_body = self._fetch_pdf_from_submit_body(html)
+                if pdf_body[:4] != b"%PDF":
+                    # ENG/nav fallback: the live page MIGHT carry the auto-submit form.
+                    pdf = self.session.submit_form_binary(action_contains="MostrarPdf", timeout=45)
+                    self._log(f"MostrarPdf(form): status={pdf.get('status')} "
+                              f"ct={pdf.get('content_type')} len={len(pdf.get('body', b''))}")
+                    _b = pdf.get("body") or b""
+                    if _b[:4] == b"%PDF" or "application/pdf" in (pdf.get("content_type") or ""):
+                        pdf_body = _b
+                    else:
+                        # storm-auto's josand5837 scar: never save a non-PDF as a "PDF".
+                        pdf_body = b""
+                if pdf_body:
+                    self._log(f"do_apply: MostrarPdf PDF captured ({len(pdf_body)}B)")
+                    if self._emit is not None:
+                        self._emit("booked_pdf", pdf_path=self._save_pdf(pdf_body), slot=slot)
+                else:
+                    self._log("do_apply: no %PDF from the submit body or the live form -- "
+                              "booking IS confirmed, PDF missing")
             except Exception as e:
                 # NEVER let PDF retrieval downgrade the outcome -- the appointment is already made.
                 self._log(f"do_apply: PDF retrieval failed (booking IS confirmed, PDF missing): {e}")
@@ -3563,6 +3568,36 @@ class LiveEngineOps(EngineOps):
         finally:
             if self._apply_sem is not None:
                 self._apply_sem.release(self.identity_id)
+
+    def _fetch_pdf_from_submit_body(self, html: str) -> bytes:
+        """Fetch the visa PDF referenced by the SubmeterVistoCriaPDF response body.
+
+        The PT submit is an in-page XHR, so its response (which carries the MostrarPdf auto-submit
+        form) is NEVER navigated to -- the live page is still Schedule.jsp. session.submit_form_binary
+        queries the LIVE DOM, finds no MostrarPdf form, falls back to the wrong form, and reports
+        `route_never_captured` (confirmed live 2026-09-26 on d1c93ae4: a real booking that lost its
+        PDF). So parse the MostrarPdf form OUT of the response body and fetch it directly. MostrarPdf
+        answers a GET (confirmed HAR), so the form's hidden inputs ride the query string."""
+        m = re.search(r'<form[^>]*action\s*=\s*["\']([^"\']*MostrarPdf[^"\']*)["\'][^>]*>(.*?)</form>',
+                      html, re.I | re.S)
+        action, inner = (m.group(1), m.group(2)) if m else ("", "")
+        if not action:
+            m2 = re.search(r'["\']([^"\']*MostrarPdf[^"\']*)["\']', html, re.I)  # bare url fallback
+            if not m2:
+                return b""
+            action, inner = m2.group(1), ""
+        params = dict(re.findall(
+            r'<input[^>]*name\s*=\s*["\']([^"\']+)["\'][^>]*value\s*=\s*["\']([^"\']*)["\']',
+            inner, re.I))
+        if action.startswith("http"):
+            url = action
+        elif action.startswith("/"):
+            url = "https://pedidodevistos.mne.gov.pt" + action
+        else:
+            url = BASE + "/" + action.lstrip("/")
+        if params:
+            url += ("&" if "?" in url else "?") + urlencode(params)
+        return self._fetch_pdf_in_page(url)
 
     def _fetch_pdf_in_page(self, url: str) -> bytes:
         """Read a PDF the browser is already displaying. page.content() only yields Chromium's

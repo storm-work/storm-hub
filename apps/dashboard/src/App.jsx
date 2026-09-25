@@ -1634,8 +1634,18 @@ function BookingWorkers({ me, booking, events, workers, setRightPanel }) {
                 <td className="muted" style={{ fontFamily: "monospace", fontSize: 12 }}>
                   {w.passport_no || "—"}</td>
                 <td><span className="pill">{w.role}</span></td>
-                <td className={w.status === "completed" ? "ok" : w.status === "failed" ? "err" : ""}
-                    title={w.substate_detail || ""}>{w.status}</td>
+                {/* "By Others" = the portal reported an EXISTING appointment we did NOT make (a
+                    competitor booked this applicant). It comes through as COMPLETED, but it is not a
+                    booking WE achieved -- show it distinctly so "completed" stays our own successes. */}
+                {w.status === "completed" && /already has a request/i.test(w.substate_detail || "") ? (
+                  <td title={w.substate_detail || ""}>
+                    <span className="pill" style={{ background: "#8a6d1f", color: "#fff", fontSize: 11 }}>
+                      By Others</span>
+                  </td>
+                ) : (
+                  <td className={w.status === "completed" ? "ok" : w.status === "failed" ? "err" : ""}
+                      title={w.substate_detail || ""}>{w.status}</td>
+                )}
                 <td className={w.live_outcome === "booked" ? "ok" : w.live_outcome === "failed" ? "err" : ""}
                     title={w.substate_detail || ""}>
                   {w.live_substate}{w.live_outcome ? ` (${w.live_outcome})` : ""}

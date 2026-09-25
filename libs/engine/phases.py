@@ -515,18 +515,16 @@ class PhaseMachine:
         while True:
             if self.ops.is_stopped():
                 return PhaseResult("stopped", self._sub, "stopped while holding", self.visited)
-            # WARM ON SLOT-FOUND (operator's stated model, 2026-09-11): an apply worker warms when
-            # slot-found fires, so it is READY when a slot lands -- not warming for ~40s with a
-            # leased slot already in hand and the clock running. The scout equivalent is the
-            # _warm_if_needed right after await_slot_open in _run_scout.
-            #
-            # _warm_if_needed is a no-op when the anchor is already chain-verified and inside
-            # FORM_STATE_TTL (see LiveEngineOps.is_warmed), so this neither double-warms alongside
-            # do_apply's own re-warm nor re-warms on every pass of this loop.
-            if self.ops.slot_found_seen():
-                warm = self._warm_if_needed("slot-found warm-up failed")
-                if warm is not None:
-                    return warm
+            # NO slot-found pre-warm here (removed 2026-09-26). It was meant to have the worker READY
+            # when a slot lands, but do_apply ALREADY re-warms UNCONDITIONALLY right before the submit
+            # (keeping-is-authed-only: the Schedule-page cursor is NAVIGATION-bound, and the keepalive
+            # navs between here and the submit destroy it -- so a pre-warm's cursor is dead by submit
+            # time and provides no readiness). Keeping both meant a genuine DOUBLE warm-up whenever
+            # is_warmed() was false at slot-found (measured ~47s each = ~94s), which only slows the
+            # apply and loses more slot races. do_apply's own re-warm is the authoritative one and
+            # also detects already-booked (returned as the "already_booked" outcome, handled below),
+            # so nothing is lost. The self-scout path below KEEPS its _warm_if_needed -- do_discover
+            # has no unconditional re-warm of its own.
             if slot is None:
                 slot = self.ops.await_assignment()
             if slot is None and self.ops.is_stopped():

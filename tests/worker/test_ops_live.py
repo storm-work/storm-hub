@@ -2788,21 +2788,20 @@ class _UrlRecordingSession(_SubmitSession):
         return super().browser_form_post(url, data, timeout)
 
 
-def test_the_apply_round_activates_the_cursor_via_slots_before_the_submit():
-    """PT / Experiment C: REVERSES the old 'never post /slots' rule. Every successful-booking HAR
-    does a REAL /slots (solved SCHEDULE_EVISA token) between ScheduleController and the submit -- it
-    ACTIVATES the booking cursor. do_apply must call _discover_via_slots before the submit (the old
-    removed primer was broken because it sent captcha=''; this is the scout's token-bearing path)."""
+def test_the_apply_round_does_not_post_slots_before_the_submit():
+    """Experiment C REMOVED 2026-09-26. Live measurement retired its premise: the apply-time /slots
+    returned ReCaptchaError every round (activated nothing), added ~20-40s of latency, and a real
+    booking landed without it -- pure cost on the round, and apply latency is what loses slot races.
+    do_apply must NOT call _discover_via_slots; the submit stands on the round-start warm-up alone."""
     ops = _apply_ops(b"%PDF-1.4 real", [])
     ops.session = _UrlRecordingSession(b"%PDF-1.4 real")
     ops._save_pdf = lambda b: "/tmp/x.pdf"
     activated = {"n": 0}
-    _orig = ops._discover_via_slots
     ops._discover_via_slots = lambda dates: (activated.__setitem__("n", activated["n"] + 1), [])[1]
 
     ops.do_apply({"date": "2026-09-01", "period": 4})
 
-    assert activated["n"] == 1, "do_apply must activate the cursor via a real /slots before submitting"
+    assert activated["n"] == 0, "do_apply must NOT post /slots before the submit (Experiment C removed)"
 
 
 def test_the_apply_round_still_submits_exactly_once():

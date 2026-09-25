@@ -596,12 +596,20 @@ class EventHub:
                 event=IdentityEvent.BOOKED, step="already_booked_at_portal",
                 detail=detail[:500], ts=datetime.now(timezone.utc),
             ))
+            # BY OTHERS, not BOOKED (operator 2026-09-26). The portal says an appointment EXISTS,
+            # but we did not make it and hold no BookedAppointment for it -- so it is a competitor's
+            # booking, not ours. Marking it BOOKED (as before) both inflated our own booked count and
+            # mislabelled the worker/identity as a success we achieved. RETIRE it instead (it is
+            # unusable -- the portal blocks a second appointment) and record WHY in the comment, so
+            # the dashboard can show "By Others" and COMPLETED stays reserved for bookings WE made.
             try:
-                ident.status = identity_transition(ident.status, IdentityStatus.BOOKED)
-                logger.warning("identity %s (%s) retired: the portal reports an existing future "
-                               "appointment", ident.id, ident.full_name)
+                ident.status = identity_transition(ident.status, IdentityStatus.RETIRED)
+                logger.warning("identity %s (%s) retired as BY OTHERS: the portal reports an "
+                               "existing appointment we did not make", ident.id, ident.full_name)
             except IllegalTransition:
                 pass    # already booked/retired/archived -- leave the stronger state alone
+            ident.comment = ("By Others — portal reports this applicant already holds an "
+                             "appointment; not booked by us (no BookedAppointment).")[:512]
             db.commit()
         except Exception:
             logger.exception("mark_already_booked failed for worker %s", worker_id)
@@ -690,6 +698,10 @@ class EventHub:
                 # attach what it adds, never insert a duplicate appointment.
                 if artifact is not None and existing.pdf_artifact_id is None:
                     existing.pdf_artifact_id = artifact.id
+                    # The PDF finally arrived -- clear the provisional "PDF missing" flag set below.
+                    _idn = db.get(M.Identity, w.identity_id)
+                    if _idn is not None and _idn.comment and "PDF missing" in _idn.comment:
+                        _idn.comment = None
                 if existing.slot_id is None:
                     existing.slot_id = slot_id
             else:
@@ -700,6 +712,16 @@ class EventHub:
                     booked_at=datetime.now(timezone.utc),
                 ))
                 booked_now = (w, sub_account_id, slot_id)
+                if artifact is None:
+                    # PDF MISSING (operator 2026-09-26). The submit confirmed the booking (do_apply's
+                    # "booking IS confirmed, PDF missing" -- e.g. route_never_captured on the MostrarPdf
+                    # fetch), but we captured no %PDF, so the appointment has no proof. Flag the
+                    # identity so the operator VERIFIES it on the portal; cleared above if a later
+                    # booked_pdf attaches the artifact.
+                    _idn = db.get(M.Identity, w.identity_id)
+                    if _idn is not None:
+                        _idn.comment = ("PDF missing — submit confirmed the booking but no PDF "
+                                        "was captured; VERIFY this appointment on the portal.")[:512]
             db.commit()
             # AFTER the commit, in its own transaction. The appointment is the thing this system
             # exists to produce; identity bookkeeping must not be able to take it down, and

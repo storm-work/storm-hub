@@ -382,10 +382,10 @@ def test_type_switch_refused_while_workers_running(client):
     assert r.status_code == 409 and "RUNNING" in r.json()["detail"]
 
 
-def test_already_booked_event_retires_the_identity(client):
-    """The portal reporting an existing future appointment must retire the identity so it stops
-    consuming a worker slot, a proxy and a LOGIN every run -- but must NOT invent a booking record,
-    since we have no idea when that appointment is."""
+def test_already_booked_event_marks_the_identity_by_others_not_booked(client):
+    """The portal reporting an existing appointment we did NOT make = booked BY OTHERS. Retire the
+    identity (it can't be reused) and label it via the comment, but NEVER mark it BOOKED (that is
+    reserved for bookings WE made) and NEVER invent a booking record."""
     from sqlalchemy import select
 
     from libs.db import models as M
@@ -418,7 +418,9 @@ def test_already_booked_event_retires_the_identity(client):
 
     db = TestSession()
     try:
-        assert db.get(M.Identity, iid).status == "booked"
+        ident = db.get(M.Identity, iid)
+        assert ident.status == "retired", "by-others = RETIRED, never BOOKED"
+        assert ident.comment and "By Others" in ident.comment
         assert db.scalar(select(M.BookedAppointment).where(
             M.BookedAppointment.identity_id == iid)) is None, "must not invent an appointment"
         ev = db.scalars(select(M.IdentityEvent).where(M.IdentityEvent.identity_id == iid)).all()
