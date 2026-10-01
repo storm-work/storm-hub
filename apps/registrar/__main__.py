@@ -210,6 +210,24 @@ async def _register_one(acct: dict, proxies_cycle, capsolver_keys: list[str], la
                 "email": email_addr, "language": lang, "rgpd": "Y", "captchaResponse": token,
             }
             progress("form filled")
+            # RE-ANCHOR BEFORE THE POST (2026-10-01). The pre-solve origin check above passes, yet the
+            # register POST still throws 'Failed to fetch' -- because during the ~15-25s solve the
+            # BROWSER's page slips to a chrome-error/interstitial (opaque origin) while the exit itself
+            # is fine (MEASURED: fresh soax exits survive nav+15s+POST 6/6 via a raw client). The
+            # register POST is a DIRECT in-page fetch -- it needs the portal ORIGIN, not the form in
+            # the DOM -- so one cheap nav restores it. Mirrors do_apply's _ensure_portal_origin. If it
+            # can't be restored, the exit is genuinely dead: roll to a fresh one.
+            try:
+                if not await loop.run_in_executor(executor, _portal_origin_live, s):
+                    progress("off-origin before register POST -- re-anchoring")
+                    await loop.run_in_executor(executor, lambda: s.browser_nav(AUTH_URL, timeout=30))
+                    if not await loop.run_in_executor(executor, _portal_origin_live, s):
+                        progress("re-anchor failed (dead exit) -- rolling to a fresh exit")
+                        try: s.close()
+                        except Exception: pass
+                        continue
+            except Exception as _re:
+                progress(f"re-anchor check error ({str(_re)[:60]}) -- proceeding")
             progress("submitting registration")
             try:
                 # browser_fetch, not s.post: the raw primp client shares the sticky proxy session
