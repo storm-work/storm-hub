@@ -757,6 +757,7 @@ _TEMPLATE = [
        "verifies the AUTH session is alive, never the booking form-state, which do_apply/"
        "do_discover establish fresh on demand instead of keepalive trying to keep it warm."),
     _s("KEEPALIVE_MODE", L.BOOKING, str, "auth_only", _WRK, "keepalive",
+       choices=("auth_only", "schedule"),
        note=
        "Keepalive strategy for a holding worker. 'auth_only' (DEFAULT, the proven model): probe the "
        "authenticated HOME page; booking form-state is NEVER kept warm (do_apply re-warms every round "
