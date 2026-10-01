@@ -30,6 +30,7 @@ from libs.bus import Bus, connect
 from apps.worker.bus_signals import BusSignals
 
 BASE = "https://pedidodevistos.mne.gov.pt"
+PORTAL_ORIGIN = "https://pedidodevistos.mne.gov.pt"
 REGISTER_URL = BASE + "/VistosOnline/register"
 AUTH_URL = BASE + "/VistosOnline/Authentication.jsp"
 VERIFY_URL = BASE + "/VistosOnline/VerificarEmail"
@@ -81,6 +82,24 @@ def _mk_mail(email_provider: str, email_cfg: dict, proxy: str | None = None):
                               worker_url=email_cfg.get("cf_worker_url"),
                               secret=email_cfg.get("cf_worker_secret"))
     return MailTM(proxy=proxy)
+
+
+def _portal_origin_live(s) -> bool:
+    """Is the browser actually sitting on a LIVE portal origin right now?
+
+    get_session navigates HOME->AUTH but only RAISES on a DataDome challenge -- a DEAD exit
+    (chrome-error / dropped tunnel) leaves the page on an OPAQUE origin and get_session returns
+    'successfully' anyway. The register POST is an in-page same-origin fetch(), so from an opaque
+    origin it throws 'TypeError: Failed to fetch' every time (confirmed live on reg-8f1715ab0ae7:
+    0/11 registered, every submit failed that way). Same class as the apply path's
+    opaque_origin_poisons_apply. Checking location.origin here, BEFORE the ~15-25s captcha solve,
+    turns a doomed attempt from ~25s (solve then fail) into ~1s (detect, roll the exit)."""
+    try:
+        raw = s.browser_eval("JSON.stringify({o:location.origin,h:location.href})")
+        st = json.loads(raw) if isinstance(raw, str) else (raw or {})
+    except Exception:
+        return False
+    return str(st.get("o") or "") == PORTAL_ORIGIN and str(st.get("h") or "").startswith(BASE)
 
 
 async def _register_one(acct: dict, proxies_cycle, capsolver_keys: list[str], lang: str,
@@ -141,6 +160,19 @@ async def _register_one(acct: dict, proxies_cycle, capsolver_keys: list[str], la
                 s = await loop.run_in_executor(executor, lambda p=proxy: get_session(p, headless=True))
             except Exception as e:
                 progress(f"FAIL get_session ({proxy}): {e}")
+                continue
+            # DEAD-EXIT GUARD (2026-10-01): verify the exit actually reached the LIVE portal before
+            # spending a solve on it. get_session only raised on a DataDome challenge, so a dead
+            # exit (chrome-error/opaque origin) passed and every register POST then threw 'Failed to
+            # fetch' -- 0/11 registered on reg-8f1715ab0ae7. Roll to the next exit instead, cheaply.
+            try:
+                _live = await loop.run_in_executor(executor, _portal_origin_live, s)
+            except Exception:
+                _live = False
+            if not _live:
+                progress("dead exit after nav (off-origin) -- rolling to a fresh exit, skipping solve")
+                try: s.close()
+                except Exception: pass
                 continue
             progress("register form loaded")
 
