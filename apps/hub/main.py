@@ -2827,6 +2827,7 @@ def detach_identity(booking_id: str, identity_id: str, db: Session = Depends(get
     if bi:
         db.delete(bi)
     db.commit()
+    _cmd_log(booking_id, _op, f"✖ detach identity {identity_id[:8]}")
     return {"detached": True}
 
 
@@ -3435,6 +3436,7 @@ def start_booking(booking_id: str, db: Session = Depends(get_db),
     # `launching` False with workers queued means a fleet launch for this booking was ALREADY in
     # flight -- the click was a no-op, not a failure. The dashboard surfaces that rather than
     # leaving the operator to guess (and click again).
+    _cmd_log(booking_id, _op, f"▶ start ({len(workers)} worker(s) launching)")
     return {"started": len(workers), "booking_status": str(bk.status),
             "launching": launching, "already_launching": bool(workers) and not launching}
 
@@ -3463,6 +3465,7 @@ def fire_slot_open(booking_id: str, db: Session = Depends(get_db),
     except Exception:
         pass
     _sched_on_slot_open(db, bk)
+    _cmd_log(booking_id, _op, "⚡ fire slot-open")
     return {"fired": True, "booking_status": str(bk.status)}
 
 
@@ -3482,6 +3485,7 @@ def revert_slot_open(booking_id: str, db: Session = Depends(get_db),
         return {"reverted": False, "reason": "slot-open is not fired", "booking_status": str(bk.status)}
     n = scheduler.revert_slot_open(db, bk)
     db.refresh(bk)
+    _cmd_log(booking_id, _op, f"↩ revert slot-open ({n} worker(s) inactivated)")
     return {"reverted": True, "workers_inactivated": n, "booking_status": str(bk.status)}
 
 
@@ -3501,6 +3505,7 @@ def fire_slot_found(booking_id: str, db: Session = Depends(get_db),
     if bk.slot_open_fired_at is None:
         raise HTTPException(409, "cannot fire slot-found before slot-open")
     scheduler.fire_slot_found_manual(db, bk)
+    _cmd_log(booking_id, _op, "🔔 fire slot-found")
     return {"fired": True, "booking_status": str(bk.status)}
 
 
@@ -3588,6 +3593,7 @@ def blind_apply(booking_id: str, body: BlindApplyRequest, db: Session = Depends(
                       discovered_by=None, first_seen=now, last_seen=now))
         seeded.append({"date": d, "period": p})
     db.commit()
+    _cmd_log(booking_id, _op, f"🎯 blind-apply seed ({len(seeded)} slot(s))")
     return {"seeded": len(seeded), "skipped_existing": len(dates) * len(periods) - len(seeded),
             "dates": dates, "periods": periods, "slots": seeded}
 
@@ -3626,6 +3632,7 @@ def force_self_scout(booking_id: str, db: Session = Depends(get_db),
         _bus.send_command(w.id, "assign", slot=None, scouts_invalid=True)
         sent.append(w.id)
     logger.warning("operator forced self-scout on booking %s: %d apply worker(s)", bk.id, len(sent))
+    _cmd_log(booking_id, _op, f"🔎 self-scout ({len(sent)} worker(s))")
     return {"commanded": len(sent), "worker_ids": sent}
 
 
@@ -3668,6 +3675,7 @@ def schedule_booking(booking_id: str, db: Session = Depends(get_db),
     bk.status = BookingStatus.SCHEDULED
     db.commit()
     db.refresh(bk)
+    _cmd_log(booking_id, _op, f"⏱ schedule run (warmup @{bk.warmup_start_at})")
     return bk
 
 
@@ -3698,6 +3706,7 @@ def stop_booking(booking_id: str, db: Session = Depends(get_db),
         except IllegalTransition as e:
             raise HTTPException(409, str(e))
     db.commit()
+    _cmd_log(booking_id, _op, f"■ stop ({len(running)} worker(s))")
     return {"stopped": len(running), "booking_status": str(bk.status)}
 
 
@@ -3723,6 +3732,25 @@ def booking_summary(booking_id: str, db: Session = Depends(get_db),
         "warmup_start_at": bk.warmup_start_at.isoformat() if bk.warmup_start_at else None,
         "slot_open_at": bk.slot_open_at.isoformat() if bk.slot_open_at else None,
     }
+
+
+def _cmd_log(target_id: str, actor: "Principal | None", text: str) -> None:
+    """Record a MANUAL dashboard command into the shared event stream so the human-triggered command
+    flow (start/stop/schedule, the slot-open/slot-found signal fires, self-scout, blind-apply, and
+    per-worker stop/restart/detach) shows up in the target's log view interleaved with the automated
+    activity -- which is exactly what a post-run analysis needs. `target_id` is a worker_id (lands in
+    that worker's log, GET /workers/{id}/logs) or a booking_id (lands in the booking command log,
+    GET /bookings/{id}/logs). ISO-timestamped to match the worker log format. Best-effort: a logging
+    failure must NEVER fail the command it is describing."""
+    try:
+        who = getattr(getattr(actor, "user", None), "username", "") or ""
+    except Exception:
+        who = ""
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    try:
+        _bus.emit_event(target_id, "log_line", text=f"{ts} [CMD{(' ' + who) if who else ''}] {text}")
+    except Exception:
+        pass
 
 
 @app.get("/workers/{worker_id}/logs")
@@ -3785,6 +3813,40 @@ def worker_logs(worker_id: str, limit: int = 200, all_runs: bool = False,
             "run_started_at": run_started, "hidden_from_earlier_runs": hidden}
 
 
+@app.get("/bookings/{booking_id}/logs")
+def booking_logs(booking_id: str, limit: int = 200, all_runs: bool = False,
+                 db: Session = Depends(get_db),
+                 _v: Principal = Depends(require_viewer)) -> dict:
+    """The booking-level COMMAND LOG: manual dashboard commands + signal fires, recorded by _cmd_log
+    keyed by the booking_id (not any worker). Mirrors /workers/{id}/logs -- same stream, same
+    run-scoping by Booking.started_at -- so the operator can read the human command flow for a run
+    (start, slot-open/slot-found fires, reverts, self-scout, blind-apply, stop) in one place,
+    interleaved in time with the per-worker logs. Best-effort recent history, capped by the stream."""
+    bk = db.get(M.Booking, booking_id)
+    if not bk:
+        raise HTTPException(404, "booking not found")
+    run_started = _aware(bk.started_at).timestamp() if (not all_runs and bk.started_at) else None
+    out: list[dict] = []
+    hidden = 0
+    try:
+        for _eid, fields in _bus.r.xrevrange(EVENT_STREAM, count=5000):
+            payload = json.loads(fields.get("data", "{}") or "{}")
+            if payload.get("worker_id") != booking_id:
+                continue
+            if run_started is not None and float(fields.get("ts") or 0) < run_started:
+                hidden += 1
+                continue
+            if fields.get("type") == "log_line" and payload.get("text"):
+                out.append({"ts": float(fields.get("ts") or 0), "text": payload["text"]})
+            if len(out) >= limit:
+                break
+    except Exception as e:
+        raise HTTPException(503, f"could not read event stream: {e}")
+    out.reverse()
+    return {"booking_id": booking_id, "lines": out, "truncated": len(out) >= limit,
+            "run_started_at": run_started, "hidden_from_earlier_runs": hidden}
+
+
 @app.post("/workers/{worker_id}/stop", response_model=WorkerOut)
 def stop_worker(worker_id: str, db: Session = Depends(get_db),
                 _op: Principal = Depends(require_operator)) -> M.Worker:
@@ -3792,6 +3854,7 @@ def stop_worker(worker_id: str, db: Session = Depends(get_db),
     if not w:
         raise HTTPException(404, "worker not found")
     _require_worker_action(w, "stop")
+    _cmd_log(worker_id, _op, "■ stop worker")
     _bus.send_command(worker_id, "stop")
     supervisor.stop(worker_id)
     _set_worker_status(w, WorkerStatus.STOPPED)
@@ -3881,6 +3944,7 @@ def restart_worker(worker_id: str, db: Session = Depends(get_db),
     if not w:
         raise HTTPException(404, "worker not found")
     _require_worker_action(w, "restart")
+    _cmd_log(worker_id, _op, "↻ restart worker")
     if w.status == WorkerStatus.RUNNING:
         _bus.send_command(worker_id, "stop")
         supervisor.stop(worker_id)

@@ -1248,11 +1248,14 @@ function BookingOpsTabs({ me, booking, events, workers, setRightPanel, onBooking
         <button className={tab === "slots" ? "active" : ""} onClick={() => setTab("slots")}>Slots</button>
         <button className={tab === "appointments" ? "active" : ""} onClick={() => setTab("appointments")}>Appointments</button>
         <button className={tab === "settings" ? "active" : ""} onClick={() => setTab("settings")}>Settings</button>
+        <button className={tab === "commandlog" ? "active" : ""} onClick={() => setTab("commandlog")}>Command log</button>
       </div>
       {tab === "workers" && <BookingWorkers me={me} booking={booking} events={events} workers={workers} setRightPanel={setRightPanel} />}
       {tab === "slots" && <BookingSlots booking={booking} me={me} />}
       {tab === "appointments" && <BookingAppointments booking={booking} />}
       {tab === "settings" && <BookingFullSettingsPanel me={me} booking={booking} onSaved={onBookingChanged} />}
+      {tab === "commandlog" && <BookingCommandLog booking={booking}
+                                 liveLogs={(events.byWorker[booking.id] || {}).logs} />}
     </div>
   );
 }
@@ -1865,6 +1868,68 @@ function WorkerLog({ workerId, liveLogs, fill }) {
           </a>
         </div>
       )}
+    </div>
+  );
+}
+
+
+// Booking-level COMMAND LOG: the manual dashboard commands + signal fires recorded by the Hub's
+// _cmd_log (keyed by booking_id). Mirrors WorkerLog -- replayed history from /bookings/{id}/logs,
+// merged with live lines from the WS (events.byWorker[booking.id].logs), tailing like a terminal.
+function BookingCommandLog({ booking, liveLogs }) {
+  const [history, setHistory] = useState(null);
+  const [err, setErr] = useState("");
+  const [allRuns, setAllRuns] = useState(false);
+  const [hidden, setHidden] = useState(0);
+  useEffect(() => {
+    let alive = true;
+    api(`/bookings/${booking.id}/logs${allRuns ? "?all_runs=true" : ""}`)
+      .then((r) => { if (!alive) return; setHistory((r.lines || []).map((l) => l.text)); setHidden(r.hidden_from_earlier_runs || 0); })
+      .catch((e) => { if (alive) { setHistory([]); setErr(e.message); } });
+    return () => { alive = false; };
+  }, [booking.id, allRuns]);
+
+  const hist = history || [];
+  const live = liveLogs || [];
+  let overlap = 0;
+  for (let n = Math.min(hist.length, live.length); n > 0; n--) {
+    if (hist.slice(-n).join(" ") === live.slice(0, n).join(" ")) { overlap = n; break; }
+  }
+  const lines = [...hist, ...live.slice(overlap)];
+
+  const boxRef = useRef(null);
+  const stick = useRef(true);
+  const onScroll = () => {
+    const el = boxRef.current;
+    if (el) stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
+  };
+  useEffect(() => { const el = boxRef.current; if (el && stick.current) el.scrollTop = el.scrollHeight; }, [lines.length]);
+
+  return (
+    <div className="card">
+      <div className="row" style={{ marginBottom: 6, gap: 10, alignItems: "center" }}>
+        <b>Command log</b>
+        <span className="muted" style={{ fontSize: 12 }}>manual dashboard commands + signal fires for this booking</span>
+        <span className="grow" />
+        <label className="muted" style={{ fontSize: 12 }}>
+          <input type="checkbox" checked={allRuns} onChange={(e) => setAllRuns(e.target.checked)} /> all runs
+        </label>
+      </div>
+      <div ref={boxRef} onScroll={onScroll}
+           style={{ background: "var(--panel2)", border: "1px solid var(--border)", borderRadius: 8,
+                    padding: 8, maxHeight: 360, overflowY: "auto", overflowX: "auto",
+                    fontFamily: "monospace", fontSize: 12, whiteSpace: "pre", lineHeight: 1.5 }}>
+        {err && <div className="err">could not load history: {err}</div>}
+        {history === null ? <span className="muted">loading log…</span>
+          : lines.length ? lines.map((l, i) => <div key={i}>{l}</div>)
+          : <span className="muted">{allRuns ? "no commands recorded for this booking yet"
+                                             : "no commands in this run yet"}</span>}
+        {hidden > 0 && !allRuns && (
+          <div className="muted" style={{ marginTop: 6, paddingTop: 6, borderTop: "1px solid var(--border)" }}>
+            {hidden} line(s) from earlier runs hidden — tick “all runs” to show them.
+          </div>
+        )}
+      </div>
     </div>
   );
 }
