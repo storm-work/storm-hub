@@ -167,15 +167,31 @@ class Scheduler:
     def stop(self) -> None:
         self._stop.set()
 
+    # A healthy tick is a few ms. Anything approaching the tick interval means timed actions
+    # (slot-open, launch) will fire late, so the duration is logged when it crosses this budget.
+    _SLOW_TICK_MS = 2000.0
+
     def _run(self) -> None:
         while not self._stop.is_set():
+            _t0 = time.monotonic()
+            crashed = False
             try:
                 self._tick_once()
             except Exception:
                 # NEVER silent. A persistent fault here (a naive datetime, a bad column, anything)
                 # stops scheduling for EVERY booking on EVERY tick, and swallowing it meant the
                 # only symptom was "nothing happens" -- indistinguishable from an idle system.
+                # (Per-booking + per-phase fault isolation lives in _tick_once; reaching HERE means
+                # the tick scaffolding itself failed, which should now be rare.)
+                crashed = True
                 logger.exception("scheduler tick failed")
+            # TICK LATENCY INSTRUMENTATION (2026-10-01): a time-critical scheduler must make its own
+            # timing observable. A tick that approaches the tick interval is why a scheduled event
+            # fires late, so surface the duration the moment it crosses the budget.
+            dur_ms = (time.monotonic() - _t0) * 1000.0
+            if dur_ms >= self._SLOW_TICK_MS and not crashed:
+                logger.warning("scheduler tick took %.0fms (budget %.0fms) -- timed actions may be "
+                               "late; something in the tick is blocking", dur_ms, self._SLOW_TICK_MS)
             self._stop.wait(self._tick)
 
     def _tick_once(self) -> None:
@@ -186,98 +202,105 @@ class Scheduler:
                 M.Booking.status.notin_([BookingStatus.COMPLETED, BookingStatus.ABORTED,
                                          BookingStatus.DRAFT]))).all()
             for bk in live:
-                # _aware(): a column that hands back a tz-naive datetime makes these comparisons
-                # raise TypeError, which kills the whole tick for every booking (see _aware's own
-                # docstring -- this is the third comparison site to need it).
-                for action in plan_booking_actions(bk.status, _aware(bk.warmup_start_at),
-                                                   _aware(bk.slot_open_at), now):
-                    if action == "start":
-                        bk.started_at = bk.started_at or now
-                        db.commit()
-                        self._on_start(db, bk)
-                    elif action == "slot_open":
-                        self._fire_slot_open(db, bk, now)
-                # BLIND-APPLY MODE: no discovery, so nothing waits on a timer. The instant the
-                # booking is warming/armed, fire slot-open -> RUNNING; slot-found then fires off the
-                # seeded blind pool below and apply workers go straight to warmup -> apply.
-                if (bk.status in (BookingStatus.WARMING, BookingStatus.ARMED)
-                        and bk.slot_open_fired_at is None and self._is_blind_mode(db, bk)):
-                    self._fire_slot_open(db, bk, now)
+                # FAULT ISOLATION (2026-10-01): drive each booking independently so a failure on
+                # ONE booking cannot abort the tick and skip the CRITICAL scheduling (slot-open /
+                # start) of every OTHER booking. Before this, any exception in the loop body killed
+                # the whole tick -- which is how one supervisor race (dictionary-changed-size in
+                # running_ids, reached via _hold_respawn/_reap) made a scheduled slot-open fire 20
+                # min late. See scheduler_tick_pids_race.
+                try:
+                    self._drive_booking(db, bk, now)
+                except Exception:
+                    logger.exception("scheduler: driving booking %s failed this tick (isolated -- "
+                                     "other bookings and maintenance still run)", bk.id)
+                    try:
+                        db.rollback()   # leave the session usable for the remaining bookings
+                    except Exception:
+                        pass
 
-                # CROSS-BOOKING DISCOVERY FEED (2026-10-01): mirror a DETECTOR booking's finds into
-                # this (main) booking's pool and fire slot-open, so a disposable detector run drives
-                # the precious main fleet without a restart. Runs BEFORE the RUNNING branch below so
-                # the slots it injects are assigned the same tick. No-op when no feeder is linked.
-                self._mirror_feeder_slots(db, bk, now)
-
-                self._maybe_prewarm(db, bk, now)
-
-                if self._settings_timeout_hours(db, bk) and should_timeout_booking(
-                    bk.status, bk.started_at, self._settings_timeout_hours(db, bk), now
-                ):
-                    self._stop_booking_core(db, bk, reason="timeout")
-                    continue
-
-                if bk.status == BookingStatus.RUNNING and self._maybe_complete_booking(db, bk):
-                    continue   # target reached -- workers stopped, nothing further to drive
-                if bk.status == BookingStatus.RUNNING:
-                    self._reclaim_stale_slot_leases(db, bk, now)
-                    self._fire_slot_found_if_new(db, bk, now)
-                    if self._is_blind_mode(db, bk):
-                        # Blind mode SUPPLEMENTS discovery, it does not replace it. A booking can carry
-                        # scouts alongside a seeded pool -- confirmed live 2026-09-21 "0921-3059": the
-                        # operator cleared the seed, attached 7 scouts, and restarted expecting a
-                        # discovery run, but this branch's old "skip all scout driving" left every
-                        # scout idle (warmed, awaiting a discover task that never came). So:
-                        #   - _assign_slots     hand any AVAILABLE slot (seeded OR scout-discovered)
-                        #                        to a KEEPING apply worker.
-                        #   - _drive_scouts      keep the scout fleet discovering; its finds become
-                        #                        AVAILABLE slots and fire slot_found via
-                        #                        _fire_slot_found_if_new above. A clean no-op when the
-                        #                        booking has no scouts, so pure-blind is unaffected.
-                        #   - _latch_signals     the ONLY per-tick delivery of slot_open/slot_found to
-                        #                        a worker that reached KEEPING after the broadcast --
-                        #                        without it, workers block in await_slot_open() forever
-                        #                        while holding a leased slot (confirmed live: 25 workers
-                        #                        KEEPING, 25 leases, 0 applies).
-                        #   - _hold_respawn      same as the non-blind tail.
-                        # What blind mode DOES skip: _maybe_inactivate_slot_open and
-                        # _maybe_revert_false_slot_found (both judge a DISCOVERED pool phantom and would
-                        # wrongly retire an operator-seeded one), and _maybe_self_scout (it turns a
-                        # holding APPLY worker into a discoverer, which is exactly wrong when apply
-                        # workers must work the seed).
-                        self._assign_slots(db, bk)
-                        self._drive_scouts(db, bk)
-                        self._latch_signals(db, bk, now)
-                        self._hold_respawn(db, bk, now)
-                        continue
-                    if self._maybe_inactivate_slot_open(db, bk, now):
-                        continue   # reverted to WARMING -- no discovery/assignment work this tick
-                    if self._maybe_revert_false_slot_found(db, bk, now):
-                        continue   # pool declared false -- don't assign the slots we just wiped
-                    self._assign_slots(db, bk)
-                    self._drive_scouts(db, bk)
-                    self._maybe_self_scout(db, bk, now)
-
-                # CONFIRMED LIVE 2026-08-14: these two ran for ANY non-terminal booking, including
-                # a STOPPED one -- so the operator stopped "Test 3018", every worker went STOPPED,
-                # and the next tick's _hold_respawn relaunched a scout anyway (GILSON TAVARES, a
-                # process younger than the stop itself). That is the "stop button doesn't work"
-                # class all over again, one layer up from the two earlier instances: stop must mean
-                # stop, and a booking that is not actively driving workers must not be re-signalled
-                # or re-populated behind the operator's back.
-                if bk.status in _ACTIVE_BOOKING_STATUSES:
-                    self._latch_signals(db, bk, now)
-                    self._hold_respawn(db, bk, now)
-
-            self._reap_dead_workers(db, now)
-            self._reap_stalled_workers(db, now)
-            self._reap_runaway_workers(db, now)
-            self._sweep_orphan_streams(db, now)
-            self._reprobe_static_proxies(db, now)
-            self._reconcile_orphaned_leases(db, now)
+            # Maintenance phases, each fault-isolated: a maintenance failure must never stop the
+            # NEXT maintenance phase, and (being after the critical per-booking loop) never the
+            # scheduling itself. Non-critical work may be skipped for a tick; a scheduled event may not.
+            for _phase in (self._reap_dead_workers, self._reap_stalled_workers,
+                           self._reap_runaway_workers, self._sweep_orphan_streams,
+                           self._reprobe_static_proxies, self._reconcile_orphaned_leases):
+                try:
+                    _phase(db, now)
+                except Exception:
+                    logger.exception("scheduler: maintenance %s failed this tick (isolated)",
+                                     getattr(_phase, "__name__", _phase))
+                    try:
+                        db.rollback()
+                    except Exception:
+                        pass
         finally:
             db.close()
+
+    def _drive_booking(self, db, bk: M.Booking, now: datetime) -> None:
+        """Drive ONE booking for one tick: timed transitions (start/slot-open), the cross-booking
+        feed, prewarm, timeout/complete, assignment, discovery and worker respawn. Extracted from
+        _tick_once so the per-booking loop can isolate a failure to a single booking. `continue` in
+        the old inline loop is `return` here -- identical control flow, one booking's worth."""
+        for action in plan_booking_actions(bk.status, _aware(bk.warmup_start_at),
+                                           _aware(bk.slot_open_at), now):
+            if action == "start":
+                _late = (now - _aware(bk.warmup_start_at)).total_seconds() if bk.warmup_start_at else 0
+                logger.info("booking %s: START scheduled=%s fired=%s lateness=%.1fs",
+                            bk.id, bk.warmup_start_at, now.isoformat(), _late)
+                bk.started_at = bk.started_at or now
+                db.commit()
+                self._on_start(db, bk)
+            elif action == "slot_open":
+                # Scheduled-vs-actual lateness for the single most time-critical event. A big value
+                # means the scheduler was blocked/crashing around the scheduled instant (see the
+                # tick-duration warning and [[scheduler_tick_pids_race]]), NOT that the fire itself
+                # was slow.
+                _late = (now - _aware(bk.slot_open_at)).total_seconds() if bk.slot_open_at else 0
+                lvl = logger.warning if _late >= 5 else logger.info
+                lvl("booking %s: SLOT-OPEN scheduled=%s fired=%s lateness=%.1fs",
+                    bk.id, bk.slot_open_at, now.isoformat(), _late)
+                self._fire_slot_open(db, bk, now)
+        # BLIND-APPLY MODE: no discovery waits on a timer, so fire slot-open the instant the booking
+        # is warming/armed; slot-found then fires off the seeded pool below.
+        if (bk.status in (BookingStatus.WARMING, BookingStatus.ARMED)
+                and bk.slot_open_fired_at is None and self._is_blind_mode(db, bk)):
+            self._fire_slot_open(db, bk, now)
+        # Cross-booking feed: mirror a detector booking's finds into this pool (BEFORE the RUNNING
+        # branch so injected slots are assignable the same tick). No-op without a feeder.
+        self._mirror_feeder_slots(db, bk, now)
+        self._maybe_prewarm(db, bk, now)
+        if self._settings_timeout_hours(db, bk) and should_timeout_booking(
+            bk.status, bk.started_at, self._settings_timeout_hours(db, bk), now
+        ):
+            self._stop_booking_core(db, bk, reason="timeout")
+            return
+        if bk.status == BookingStatus.RUNNING and self._maybe_complete_booking(db, bk):
+            return   # target reached -- workers stopped, nothing further to drive
+        if bk.status == BookingStatus.RUNNING:
+            self._reclaim_stale_slot_leases(db, bk, now)
+            self._fire_slot_found_if_new(db, bk, now)
+            if self._is_blind_mode(db, bk):
+                # Blind mode SUPPLEMENTS discovery (a booking can carry scouts alongside a seeded
+                # pool): assign seeded-or-discovered slots, keep scouts discovering, latch signals to
+                # late-joining workers, respawn. Skips only the discovered-pool-phantom reverts and
+                # self-scout, which would wrongly retire an operator-seeded pool.
+                self._assign_slots(db, bk)
+                self._drive_scouts(db, bk)
+                self._latch_signals(db, bk, now)
+                self._hold_respawn(db, bk, now)
+                return
+            if self._maybe_inactivate_slot_open(db, bk, now):
+                return   # reverted to WARMING -- no discovery/assignment work this tick
+            if self._maybe_revert_false_slot_found(db, bk, now):
+                return   # pool declared false -- don't assign the slots we just wiped
+            self._assign_slots(db, bk)
+            self._drive_scouts(db, bk)
+            self._maybe_self_scout(db, bk, now)
+        # Only latch/respawn for an ACTIVELY-driving booking -- never a STOPPED one (that was the
+        # "stop button doesn't work" class: a stopped booking's _hold_respawn relaunched a worker).
+        if bk.status in _ACTIVE_BOOKING_STATUSES:
+            self._latch_signals(db, bk, now)
+            self._hold_respawn(db, bk, now)
 
     # ── F1: Redis state must not outlive the workers it belongs to ────────────
     _STREAM_SWEEP_EVERY = 300.0      # seconds; this is reconciliation, not a hot path

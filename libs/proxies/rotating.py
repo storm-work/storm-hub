@@ -25,6 +25,8 @@ health scoring and Hub-side assignment, in libs/proxies/lease.py.
 """
 from __future__ import annotations
 
+import re
+
 from . import providers
 from .providers import ProviderError, new_session_id
 
@@ -33,7 +35,32 @@ from .providers import ProviderError, new_session_id
 RotatingPoolError = ProviderError
 
 __all__ = ["RotatingPoolError", "ProviderError", "mint_rotating_url", "roll_rotating_url",
-           "rotating_session_id", "new_session_id"]
+           "rotating_session_id", "new_session_id", "reseat_geo"]
+
+
+def reseat_geo(url: str, geo: str | None, *, provider: str = "") -> str:
+    """Return `url` with its exit COUNTRY changed to `geo` (None/'' = drop the country = any exit),
+    keeping the session id and credentials intact.
+
+    Unlike libs/proxies/lease._inject_geo (which only ADDS a country and no-ops when one is already
+    present), this REPLACES it. A worker uses this to vary its exit geo on each exit roll, so it is
+    never bound to a single (possibly throttled) country for its whole run -- the worst case for the
+    login throttle (2026-10-01, operator direction).
+
+    Implemented for soax (the rotating production provider), whose country is a URL parameter
+    `-country-cc`. Webshare carries geo inside a provider-specific username prefix that string
+    surgery cannot reseat safely, so a webshare URL is returned UNCHANGED (its geo stays whatever it
+    was minted with). Any unrecognised URL is returned unchanged too (D2: never corrupt a credential
+    we do not understand)."""
+    u = url or ""
+    if not (provider == "soax" or "soax" in u):
+        return u
+    cc = (geo or "").strip().lower()
+    if not cc:
+        return re.sub(r"-country-[a-z]{2}", "", u, count=1, flags=re.I)
+    if re.search(r"-country-[a-z]{2}", u, flags=re.I):
+        return re.sub(r"-country-[a-z]{2}", f"-country-{cc}", u, count=1, flags=re.I)
+    return re.sub(r"(package-[A-Za-z0-9]+)", rf"\1-country-{cc}", u, count=1)
 
 
 def mint_rotating_url(provider: str, kind: str | None = None, *, settings: dict | None = None,

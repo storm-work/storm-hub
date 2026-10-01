@@ -60,3 +60,10 @@ def manual_open_key(booking_id: str) -> str:
     not silently undo a deliberate decision. Set by POST /bookings/{id}/fire-slot-open; cleared
     wherever the slot-open latch itself is reset (a fresh /start)."""
     return f"manual_open:{booking_id}"
+
+
+def token_pool_key(action: str) -> str:
+    """The Redis list holding pre-solved reCAPTCHA tokens for `action` (e.g. LOGIN_EVISA). A login
+    token is sitekey/action-based and solved ProxyLess, so it is not bound to any worker's session
+    and one shared pool serves the whole fleet. See libs/bus/token_pool.py."""
+    return f"tokenpool:{action}"

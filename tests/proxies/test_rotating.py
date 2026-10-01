@@ -136,3 +136,32 @@ def test_soax_ttls_are_configurable_but_default_to_the_generators_values():
     tuned = {**SETTINGS, "SOAX_SESSIONLENGTH": 600, "SOAX_BINDTTL": 120, "SOAX_IDLETTL": 300}
     assert "-sessionlength-600-bindttl-120-idlettl-300-" in mint_rotating_url(
         "soax", "rotating", env=ENV, settings=tuned)
+
+
+# ── reseat_geo: vary the exit country on a roll, so a worker is never bound to one geo (2026-10-01) ──
+from libs.proxies.rotating import reseat_geo
+
+_SOAX = ("http://package-352438-country-de-sessionid-ABC123-sessionlength-3600-bindttl-600-"
+         "idlettl-900-opt-wb:pw@proxy.soax.com:5000")
+
+
+def test_reseat_geo_replaces_the_soax_country_keeping_session_and_creds():
+    out = reseat_geo(_SOAX, "IT")
+    assert "-country-it-" in out and "-country-de-" not in out
+    assert "sessionid-ABC123-" in out              # session id preserved
+    assert out.endswith("opt-wb:pw@proxy.soax.com:5000")   # creds preserved
+
+
+def test_reseat_geo_inserts_a_country_when_absent():
+    bare = _SOAX.replace("-country-de", "")
+    assert "-country-it-" in reseat_geo(bare, "it")
+
+
+def test_reseat_geo_none_drops_the_country_any_exit():
+    assert "-country-" not in reseat_geo(_SOAX, None)
+
+
+def test_reseat_geo_leaves_webshare_and_unknown_urls_unchanged():
+    ws = "http://sodade2026-DE-17:pw@p.webshare.io:80"
+    assert reseat_geo(ws, "IT") == ws               # webshare: minted geo stays, not string-surgered
+    assert reseat_geo("", "IT") == ""

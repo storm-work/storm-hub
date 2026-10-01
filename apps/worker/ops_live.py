@@ -571,6 +571,7 @@ class LiveEngineOps(EngineOps):
         form_defaults: dict,
         capsolver_keys: list[str],
         warm_proxy: str,
+        proxy_geos: list[str] | None = None,
         headless: bool = True,
         sub_account_id: str,
         accounts: list[dict] | None = None,
@@ -591,6 +592,10 @@ class LiveEngineOps(EngineOps):
         self.form_defaults = form_defaults
         self.capsolver_keys = capsolver_keys
         self.warm_proxy = warm_proxy
+        # Exit countries this (rotating) worker varies across on each roll, so it is never bound to
+        # one possibly-throttled geo for the whole run (2026-10-01). {pin} if the operator pinned a
+        # single geo, else the booking's whole PROXY_GEOS set; None/empty = no geo constraint.
+        self._proxy_geos = [g.strip().upper() for g in (proxy_geos or []) if g and g.strip()]
         # phase-2 (hold/apply/discovery) proxy -- only used when HOLD_SWAP_AFTER_LOGIN is on
         # (do_swap() below). None is the correct/expected value when swap is off; the Hub only
         # leases and passes this when the setting is actually enabled (apps/hub/main.py).
@@ -695,6 +700,7 @@ class LiveEngineOps(EngineOps):
         # WHICH session object carries the capture hook, so a rebuilt session gets it re-installed.
         self._posto_gettables: bool | None = None
         self._gt_hook_session: object | None = None
+        self._redis = redis_client   # for the shared login-token pool (consumer side)
         if redis_client is not None and booking_id:
             from libs.bus.semaphore import make_gate, make_provider_gate
             self._login_sem = make_gate(redis_client, booking_id, "login", cfg.raw.get("LOGIN_CONCURRENCY", 10))
@@ -920,6 +926,16 @@ class LiveEngineOps(EngineOps):
         rolled = roll_sticky_session(self.warm_proxy)
         if rolled == self.warm_proxy:
             return False
+        # PER-ROLL GEO (2026-10-01): a roll starts a FRESH sticky session, so it is the safe moment
+        # to also change the exit COUNTRY (no mid-session geo change that would trip a 'confirma o
+        # reCAPTCHA' exit-moved verdict). Pick a fresh random country from the booking's set so the
+        # worker samples all allowed geos over its retries instead of dying on one throttled country.
+        if self._proxy_geos:
+            try:
+                from libs.proxies.rotating import reseat_geo
+                rolled = reseat_geo(rolled, random.choice(self._proxy_geos))
+            except Exception:
+                pass
         self.warm_proxy = rolled
         self._exit_ip = None          # a new exit: the next observation is a baseline, not a change
         self._log(f"proxy: rolled to a fresh sticky exit [{_proxy_label(rolled)}] ({why})")
@@ -1308,6 +1324,20 @@ class LiveEngineOps(EngineOps):
                 # chrome-error navigation failures, each of those is classified transient, and every
                 # transient retry leaks another tree. The host had memory and CPU to spare the whole
                 # time -- this was never starvation, it was accumulation.
+                # SHARED PRE-SOLVED TOKEN POOL (2026-10-01): grab a READY login reCAPTCHA token so
+                # browser_login injects it instead of solving inline (~15-25s). The token is sitekey/
+                # action-based and ProxyLess, so it is not bound to this session -- any worker can use
+                # one. Empty holder -> browser_login solves inline, exactly as before (fallback).
+                _pre_token = [""]
+                try:
+                    if self._redis is not None:
+                        from libs.bus.token_pool import TokenPool
+                        _tok = TokenPool(self._redis).acquire()
+                        if _tok:
+                            _pre_token[0] = _tok
+                            self._log(f"login: using pre-solved token from pool (len {len(_tok)})")
+                except Exception:
+                    pass   # pool is an optimisation; a failure must never block a login
                 self._close_session_quietly()
                 self.session = get_session(proxy=self.warm_proxy, headless=self.headless,
                                            fp_seed=self.account.get("username"))
@@ -1323,6 +1353,7 @@ class LiveEngineOps(EngineOps):
                 result = self.session.browser_login(
                     self.account["username"], self.account["password"],
                     capsolver_keys=self.capsolver_keys,
+                    pre_token=_pre_token,
                 )
             except Exception as e:
                 if transient < max_transient and self._is_transient_login_failure(str(e)):

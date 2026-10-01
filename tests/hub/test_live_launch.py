@@ -259,10 +259,11 @@ def _spy_launch(monkeypatch):
     return captured
 
 
-def test_worker_geo_is_frozen_at_launch_from_the_booking_set(client, monkeypatch):
-    """A worker draws ONE country from the booking's PROXY_GEOS set, freezes it on the row, and mints
-    with it -- so the exit country is bound and durable (survives relaunch, since launch reads
-    proxy_geo before drawing). The reuse-of-a-bound-geo branch is covered by the override test."""
+def test_unpinned_worker_mints_from_the_set_and_is_NOT_frozen_to_one_geo(client, monkeypatch):
+    """An UNPINNED worker is no longer bound to a single country (2026-10-01): it mints with a geo
+    from the booking's PROXY_GEOS set and carries the WHOLE set in its launch payload so it can vary
+    its exit country on every roll (ops_live._roll_exit). So w.proxy_geo stays NULL (not frozen), and
+    launch ships proxy_geos. The old per-worker freeze was the login-throttle worst case."""
     h = _operate_headers(client)
     tpl = client.post("/templates", json={"name": "Geo", "role": "apply", "settings": {}},
                       headers=h).json()
@@ -271,7 +272,7 @@ def test_worker_geo_is_frozen_at_launch_from_the_booking_set(client, monkeypatch
     _gen_verified_subs(client, h, iid)
     bid = client.post("/bookings", json={
         "name": "geo", "type": "real", "posto_id": "5084",
-        # single-code set -> the frozen pick is deterministic, so the mint can be asserted exactly.
+        # single-code set -> the mint pick is deterministic, so the mint can be asserted exactly.
         "settings": {"ENGINE_MODE": "live", "PROXY_PROVIDER": "soax", "PROXY_GEOS": "PT"}},
         headers=h).json()["id"]
     w = client.post(f"/bookings/{bid}/identities",
@@ -280,8 +281,9 @@ def test_worker_geo_is_frozen_at_launch_from_the_booking_set(client, monkeypatch
     captured = _spy_launch(monkeypatch)
     assert client.post(f"/workers/{w['id']}/launch", headers=h).status_code == 200
     assert "-country-pt-" in captured["warm_proxy"], captured["warm_proxy"]
-    # Frozen on the row -> WorkerOut exposes it, and the next launch will read it before drawing.
-    assert client.get(f"/bookings/{bid}/workers", headers=h).json()[0]["proxy_geo"] == "PT"
+    assert captured["proxy_geos"] == ["PT"], captured.get("proxy_geos")   # whole set shipped
+    # NOT frozen on the row -> the worker varies, it is not bound to one country.
+    assert client.get(f"/bookings/{bid}/workers", headers=h).json()[0]["proxy_geo"] is None
 
 
 def test_operator_geo_override_persists_and_binds_the_mint(client, monkeypatch):

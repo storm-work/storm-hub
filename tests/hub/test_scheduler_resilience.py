@@ -2428,3 +2428,36 @@ def test_mirror_feeder_is_a_noop_without_feeders_or_when_inactive(db):
     done = _mk_booking(db, status=BookingStatus.COMPLETED, feeders=[detector.id])
     assert sch._mirror_feeder_slots(db, done, _utcnow()) == 0
     assert db.scalars(select(M.Slot).where(M.Slot.booking_id == done.id)).all() == []
+
+
+# ── tick fault isolation (2026-10-01): one failure must not abort the whole tick ──
+def test_tick_isolates_a_failing_booking_and_still_runs_maintenance(db):
+    b1 = _mk_booking(db, status=BookingStatus.RUNNING)
+    b2 = _mk_booking(db, status=BookingStatus.RUNNING)
+    sch = _scheduler(session_local=lambda: db)
+    driven = []
+    def fake_drive(d, bk, now):
+        if bk.id == b1.id:
+            raise RuntimeError("boom in b1")      # one booking blows up
+        driven.append(bk.id)
+    sch._drive_booking = fake_drive
+    ran = []
+    for name in ("_reap_dead_workers", "_reap_stalled_workers", "_reap_runaway_workers",
+                 "_sweep_orphan_streams", "_reprobe_static_proxies", "_reconcile_orphaned_leases"):
+        setattr(sch, name, (lambda n: (lambda d, now: ran.append(n)))(name))
+    sch._tick_once()      # must NOT raise
+    assert b2.id in driven, "a failing booking must not skip the others' scheduling"
+    assert len(ran) == 6, "all maintenance phases must still run after a booking failure"
+
+
+def test_tick_isolates_a_failing_maintenance_phase_from_the_rest(db):
+    _mk_booking(db, status=BookingStatus.RUNNING)
+    sch = _scheduler(session_local=lambda: db)
+    sch._drive_booking = lambda d, bk, now: None
+    ran = []
+    sch._reap_dead_workers = lambda d, now: (_ for _ in ()).throw(RuntimeError("reap boom"))
+    for name in ("_reap_stalled_workers", "_reap_runaway_workers", "_sweep_orphan_streams",
+                 "_reprobe_static_proxies", "_reconcile_orphaned_leases"):
+        setattr(sch, name, (lambda n: (lambda d, now: ran.append(n)))(name))
+    sch._tick_once()      # must NOT raise
+    assert len(ran) == 5, "a failing maintenance phase must not stop the following phases"

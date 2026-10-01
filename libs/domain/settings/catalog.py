@@ -117,6 +117,17 @@ _GLOBAL = [
     _s("CAPSOLVER_KEYS", L.GLOBAL, str, group="credentials",
        note=
        "Comma-separated CapSolver API keys. Credential -- never commit it to source."),
+    _s("LOGIN_TOKEN_POOL_TARGET", L.GLOBAL, int, 0, group="credentials", min_value=0.0,
+       note=
+       "Depth of the SHARED pre-solved login reCAPTCHA token pool kept full by a Hub background "
+       "factory. 0 = OFF (default): every login solves inline (~15-25s). >0: a login pops a READY "
+       "token and fires at browser-launch speed instead of solve speed -- the login THROUGHPUT lever "
+       "(bookings scale with SHOTS taken, ~1% of identical requests served). The token is sitekey/"
+       "ProxyLess, not session-bound, so one pool serves the whole fleet. CapSolver BILLS PER SOLVE: "
+       "size to demand (~ one wave of login workers); tokens live ~110s, so an oversized pool wastes "
+       "solves on expiry. See libs/bus/token_pool.py."),
+    _s("LOGIN_TOKEN_POOL_BATCH", L.GLOBAL, int, 4, group="credentials", min_value=1.0,
+       note="Max concurrent CapSolver solves per factory cycle when refilling the login token pool."),
     # ── rotating-pool credentials: DELIBERATELY ABSENT ───────────────────────────────────────
     # ROTATING CREDENTIALS ARE NOT SETTINGS (operator direction 2026-09-16). SOAX_ROTATING_PACKAGE
     # /_PASSWORD, SOAX_MOBILE_*, WEBSHARE_PREFIX/_PASSWORD were briefly catalogued here and have

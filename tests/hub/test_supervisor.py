@@ -237,8 +237,10 @@ def test_spawned_workers_get_unbuffered_stdout():
     orig = sup.subprocess.Popen
     sup.subprocess.Popen = _spy
     try:
+        import threading
         s = sup.Supervisor.__new__(sup.Supervisor)
         s._procs, s._pids = {}, {}
+        s._lock = threading.RLock()
         s.redis_url = "redis://localhost:6379/0"
         s._reap_finished = lambda: None
         s._spawn_module("w-test-unbuffered", "apps.worker")
@@ -247,3 +249,41 @@ def test_spawned_workers_get_unbuffered_stdout():
 
     assert captured["env"].get("PYTHONUNBUFFERED") == "1", (
         "worker stdout must be unbuffered or its diagnostics are invisible while a run is live")
+
+
+def test_running_ids_is_threadsafe_under_concurrent_mutation(monkeypatch):
+    """CONFIRMED LIVE 2026-10-01: running_ids() iterated self._pids while a concurrent spawn/stop
+    mutated it -> 'RuntimeError: dictionary changed size during iteration', which aborted the WHOLE
+    scheduler tick (1234 crashes in a day) and made timed actions like slot-open fire late. The lock
+    + snapshot must make running_ids() never raise under churn."""
+    import threading
+    from apps.hub.supervisor import Supervisor
+
+    sup = Supervisor("redis://x")
+    monkeypatch.setattr("apps.hub.supervisor._alive", lambda pid: True)
+    stop = threading.Event()
+    errors = []
+
+    def churn():
+        i = 0
+        while not stop.is_set():
+            i += 1
+            # mimic spawn/stop mutating the tracking dict, through the same lock they use
+            with sup._lock:
+                sup._pids[f"w{i % 64}"] = 10000 + (i % 64)
+            with sup._lock:
+                sup._pids.pop(f"w{(i + 32) % 64}", None)
+
+    t = threading.Thread(target=churn)
+    t.start()
+    try:
+        for _ in range(5000):
+            try:
+                sup.running_ids()
+            except Exception as e:   # the bug raised RuntimeError here
+                errors.append(e)
+                break
+    finally:
+        stop.set()
+        t.join()
+    assert not errors, f"running_ids raced the mutation: {errors[:1]}"

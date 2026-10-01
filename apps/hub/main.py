@@ -449,6 +449,55 @@ scheduler = Scheduler(
 )
 
 
+_token_factory_stop = threading.Event()
+_token_factory_thread: "threading.Thread | None" = None
+
+
+def _start_token_factory() -> None:
+    """Start the shared login-token factory IF LOGIN_TOKEN_POOL_TARGET > 0. Solves LOGIN_EVISA tokens
+    (ProxyLess) in the background and keeps the Redis pool full so workers pop ready tokens and fire
+    logins at browser-launch speed. OFF by default (target 0) -- CapSolver bills per solve. Uses the
+    vendored solver (the Hub already applies the vendor env at startup) and the global CapSolver keys.
+    Best-effort: a failure here never blocks the Hub."""
+    global _token_factory_thread
+    if _token_factory_thread is not None and _token_factory_thread.is_alive():
+        return
+    try:
+        db = SessionLocal()
+        try:
+            g = get_global(db)
+        finally:
+            db.close()
+        target = int(g.get("LOGIN_TOKEN_POOL_TARGET", 0) or 0)
+        caps = [k.strip() for k in str(g.get("CAPSOLVER_KEYS", "")).split(",") if k.strip()]
+        if target <= 0 or not caps:
+            return
+        batch = int(g.get("LOGIN_TOKEN_POOL_BATCH", 4) or 4)
+        import libs.engine.vendor.solver as _solver
+        from libs.bus.token_pool import run_token_factory
+
+        def _login_solve() -> str:
+            try:
+                return _solver.race_all(caps, [], [], [], "LOGIN_EVISA", proxy=None) or ""
+            except Exception:
+                return ""
+
+        _token_factory_stop.clear()
+        _token_factory_thread = threading.Thread(
+            target=run_token_factory, name="token-factory", daemon=True,
+            kwargs=dict(redis_client=_bus.r, solve_fn=_login_solve, stop_event=_token_factory_stop,
+                        action="LOGIN_EVISA", target=target, interval=3.0, batch=batch,
+                        log=lambda m: logger.info("%s", m)))
+        _token_factory_thread.start()
+        logger.info("login token factory started (target=%d, batch=%d)", target, batch)
+    except Exception:
+        logger.exception("login token factory: failed to start")
+
+
+def _stop_token_factory() -> None:
+    _token_factory_stop.set()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
@@ -486,10 +535,12 @@ async def lifespan(app: FastAPI):
     audit_writer.start()       # background thread owning ALL audit writes -- see apps/hub/audit.py
     event_hub.start()          # background thread tailing the evt stream -> DB + WS
     scheduler.start()          # auto-ops: scheduled start + slot-open + slot assignment
+    _start_token_factory()     # shared pre-solved login-token pool (OFF unless LOGIN_TOKEN_POOL_TARGET>0)
     yield
     # Release open dashboard sockets FIRST: uvicorn will not complete shutdown while one is still
     # being served, and ws_events blocks forever on its queue by construction.
     event_hub.close_subscribers()
+    _stop_token_factory()
     scheduler.stop()
     event_hub.stop()
     audit_writer.stop()        # flushes whatever is still queued before the process goes away
@@ -2953,19 +3004,17 @@ def _pick_geo(geos: set[str] | None) -> str | None:
 
 
 def _resolve_and_freeze_worker_geo(db: Session, w: M.Worker, allowed: set[str] | None) -> str | None:
-    """The exit country to bind this worker to, frozen onto w.proxy_geo so it survives relaunch.
+    """The exit country to PIN this worker to, or None to let it vary across the booking's geo set.
 
-    Already bound (operator pick or an earlier frozen draw) -> keep it, whatever the booking set now
-    says: per-worker consistency is the contract, and the operator changes it only by changing it.
-    Unbound with a non-empty allowed set -> draw one uniformly and freeze it. Unbound with no set ->
-    None (no geo restriction), and nothing is frozen so a later PROXY_GEOS still takes effect. The
-    caller commits w as part of the launch, which persists the freeze."""
-    if w.proxy_geo:
-        return w.proxy_geo
-    if allowed:
-        w.proxy_geo = random.choice(sorted(allowed))
-        return w.proxy_geo
-    return None
+    OPERATOR PIN ONLY (changed 2026-10-01). This used to draw ONE geo uniformly from PROXY_GEOS and
+    FREEZE it onto w.proxy_geo for the worker's whole run. That bound a worker to a single country --
+    the measured worst case for the login throttle: a worker whose frozen geo was throttled/flagged
+    could never escape it, even across exit rolls. Now an UNPINNED worker (w.proxy_geo not set)
+    carries the full PROXY_GEOS set and varies its exit country on every roll
+    (ops_live._roll_exit + rotating.reseat_geo). An OPERATOR PIN (w.proxy_geo set via the per-worker
+    geo endpoint) is still honoured as a deliberate single-geo choice. `allowed` is unused now; kept
+    for call-site compatibility."""
+    return w.proxy_geo or None
 
 
 def _do_launch_worker(db: Session, w: M.Worker) -> None:
@@ -3056,6 +3105,10 @@ def _do_launch_worker(db: Session, w: M.Worker) -> None:
         # self-rolls without changing the country segment, so this holds across every exit rotation.
         _bound_geo = _resolve_and_freeze_worker_geo(db, w, _geos(eff.get("PROXY_GEOS")))
         _geo_set = {_bound_geo} if _bound_geo else _geos(eff.get("PROXY_GEOS"))
+        # The geo set the ROTATING worker varies across on each exit roll ({pin} if pinned, else the
+        # whole PROXY_GEOS set). None for static/ISP (those IPs don't roll geo). Set in the rotating
+        # branch below; reseat_geo no-ops on a non-soax URL so it is harmless even if it leaks.
+        _worker_proxy_geos = None
         if _static_pool(_kind) or _all_isp(_prov):
             # STATIC/ISP: a finite, individually-owned IP. It must be ASSIGNED by the one side with
             # DB access, held under a lease so two workers never share it, and screened per row --
@@ -3090,10 +3143,14 @@ def _do_launch_worker(db: Session, w: M.Worker) -> None:
             # our own soax params are sessionlength=3600 / idlettl=900, and 0 of 42,600 rows had
             # been used inside EITHER window. No pooled row held a live provider-side session, so
             # there was no established-session advantage to lose. See libs/proxies/rotating.py.
+            # Initial exit country: the pin if pinned, else a RANDOM pick from the set (the worker
+            # then varies per roll). Not the old frozen single geo -- see _resolve_and_freeze_worker_geo.
+            _init_geo = _bound_geo or (random.choice(sorted(_geo_set)) if _geo_set else None)
+            _worker_proxy_geos = sorted(_geo_set) if _geo_set else None
             try:
                 warm_proxy = mint_rotating_url(
                     _prov, _kind, settings=get_global(db),
-                    geo=_bound_geo,
+                    geo=_init_geo,
                 )
             except RotatingPoolError as e:
                 # 409, same shape a lease failure used: the operator has to go and configure the
@@ -3188,6 +3245,7 @@ def _do_launch_worker(db: Session, w: M.Worker) -> None:
             form_defaults=form_defaults,
             capsolver_keys=capsolver_keys,
             warm_proxy=warm_proxy,
+            proxy_geos=_worker_proxy_geos,   # rotating: the geo set the worker varies across per roll
             hold_proxy=hold_proxy,
             # Phase 5: a hold_proxy is only ever leased inside the HOLD_SWAP_AFTER_LOGIN branch above,
             # and (as of this phase) is now always resource_type='static' when it is. Carrying this

@@ -117,6 +117,7 @@ def _build_ops(engine_kind: str, cfg: EngineConfig, payload: dict, bus: Bus, wor
             form_defaults=payload["form_defaults"],
             capsolver_keys=payload["capsolver_keys"],
             warm_proxy=payload["warm_proxy"],
+            proxy_geos=payload.get("proxy_geos"),
             hold_proxy=payload.get("hold_proxy"),
             hold_proxy_static=bool(payload.get("hold_proxy_static", False)),
             sub_account_id=payload["sub_account_id"],

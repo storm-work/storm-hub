@@ -4746,3 +4746,74 @@ def test_discover_inactivate_is_ignored_as_false_slot_open():
     ops._log = lambda t: logs.append(t)
     assert ops.await_discover_task() is INACTIVATE
     assert any("event=signal_ignored" in l and "reason=false_slot_open" in l for l in logs), logs
+
+
+# ── per-roll geo: a worker varies its exit country across the booking set, never bound to one ──
+_SOAX_WARM = ("http://package-352438-country-de-sessionid-ABC123-sessionlength-3600-bindttl-600-"
+              "idlettl-900-opt-wb:pw@proxy.soax.com:5000")
+
+
+def test_roll_exit_varies_the_exit_geo_across_the_booking_set(monkeypatch):
+    import apps.worker.ops_live as m
+    monkeypatch.setattr(m.random, "choice", lambda seq: "IT")   # deterministic pick
+    ops = _make_ops(warm_proxy=_SOAX_WARM, proxy_geos=["IT", "ES"])
+    ops._log = lambda t: None
+    assert ops._roll_exit("test") is True
+    assert "-country-it-" in ops.warm_proxy and "-country-de-" not in ops.warm_proxy
+    assert "sessionid-ABC123-" not in ops.warm_proxy   # the session id was also rolled
+
+
+def test_roll_exit_keeps_geo_when_no_set_given():
+    ops = _make_ops(warm_proxy=_SOAX_WARM)   # proxy_geos unset -> no geo constraint, don't re-geo
+    ops._log = lambda t: None
+    assert ops._roll_exit("test") is True
+    assert "-country-de-" in ops.warm_proxy   # country unchanged; only the session id rolled
+
+
+# ── login consumes a pooled pre-solved token (throughput lever, 2026-10-01) ──
+def test_login_consumes_a_pooled_token_as_pre_token(monkeypatch):
+    import fakeredis
+    import apps.worker.ops_live as m
+    from libs.bus.token_pool import TokenPool
+    r = fakeredis.FakeStrictRedis(decode_responses=True)
+    TokenPool(r).push("POOLTOKEN")
+    captured = {}
+
+    class _LoginSess:
+        def browser_login(self, user, pw, capsolver_keys=None, pre_token=None):
+            captured["pre_token"] = list(pre_token or [])
+            return {"status": 200, "body": '{"type":"success"}'}
+        def close_browser(self): pass
+        def get_all_cookies(self): return [{"name": "Vistos_sid", "value": "x"}]
+
+    monkeypatch.setattr(m, "get_session", lambda **kw: _LoginSess())
+    ops = _make_ops(redis_client=r)
+    ops._log = lambda t: None
+    ops._note_exit_ip = lambda *a, **k: None
+    ops._close_session_quietly = lambda: None
+    ops._save_checkpoint = lambda *a, **k: None
+    assert ops._fresh_login() is True
+    assert captured["pre_token"] == ["POOLTOKEN"]
+
+
+def test_login_falls_back_to_inline_solve_when_pool_empty(monkeypatch):
+    import fakeredis
+    import apps.worker.ops_live as m
+    r = fakeredis.FakeStrictRedis(decode_responses=True)   # empty pool
+    captured = {}
+
+    class _LoginSess:
+        def browser_login(self, user, pw, capsolver_keys=None, pre_token=None):
+            captured["pre_token"] = list(pre_token or [])
+            return {"status": 200, "body": '{"type":"success"}'}
+        def close_browser(self): pass
+        def get_all_cookies(self): return [{"name": "Vistos_sid", "value": "x"}]
+
+    monkeypatch.setattr(m, "get_session", lambda **kw: _LoginSess())
+    ops = _make_ops(redis_client=r)
+    ops._log = lambda t: None
+    ops._note_exit_ip = lambda *a, **k: None
+    ops._close_session_quietly = lambda: None
+    ops._save_checkpoint = lambda *a, **k: None
+    assert ops._fresh_login() is True
+    assert captured["pre_token"] == [""]   # empty holder -> browser_login solves inline

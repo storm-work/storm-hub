@@ -17,6 +17,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -128,6 +129,15 @@ class Supervisor:
         self.redis_url = redis_url
         self._procs: dict[str, subprocess.Popen] = {}
         self._pids: dict[str, int] = {}
+        # _pids / _procs are touched from several threads: the scheduler tick (running_ids/
+        # is_running via _reap_dead_workers), FastAPI request handlers (spawn/stop on start/stop/
+        # restart/detach), and the background fleet-launch tasks. Without this lock, running_ids()
+        # iterating self._pids raced a concurrent spawn/stop mutating it and raised
+        # "RuntimeError: dictionary changed size during iteration" -- which aborted the WHOLE
+        # scheduler tick (CONFIRMED LIVE 2026-10-01, 1234 crashes in a day under worker churn),
+        # so timed actions like slot-open fired late/erratically (a scheduled 09:48 open fired at
+        # 10:08). Reentrant so a lock-holding method can call another.
+        self._lock = threading.RLock()
 
     def _reap_finished(self) -> None:
         """Non-blocking reap of any of THIS instance's own children that have already exited on
@@ -139,9 +149,10 @@ class Supervisor:
         only via reconcile() (self._pids but no self._procs entry) has no Popen here and isn't
         this instance's to reap -- its real parent (or init) owns that, matching stop()'s own
         existing distinction between owned and merely-tracked processes."""
-        for key, proc in list(self._procs.items()):
-            if proc.poll() is not None:
-                del self._procs[key]
+        with self._lock:
+            for key, proc in list(self._procs.items()):
+                if proc.poll() is not None:
+                    self._procs.pop(key, None)
 
     def spawn(self, worker_id: str) -> int:
         """Start the worker subprocess (idempotent — a live one is left running)."""
@@ -154,7 +165,8 @@ class Supervisor:
 
     def _spawn_module(self, key: str, module: str) -> int:
         self._reap_finished()
-        existing_pid = self._pids.get(key)
+        with self._lock:
+            existing_pid = self._pids.get(key)
         if existing_pid is not None and _alive(existing_pid):
             return existing_pid
         # PYTHONUNBUFFERED: the sink below is opened with buffering=0, but that only makes the
@@ -198,8 +210,9 @@ class Supervisor:
         )
         if sink is not subprocess.DEVNULL:
             sink.close()   # the child holds its own dup; the parent must not keep this fd open
-        self._procs[key] = proc
-        self._pids[key] = proc.pid
+        with self._lock:
+            self._procs[key] = proc
+            self._pids[key] = proc.pid
         return proc.pid
 
     def reconcile(self, keys_by_module: dict[str, str]) -> None:
@@ -212,14 +225,18 @@ class Supervisor:
         added -- the existing dead/stall reap paths already handle a DB-RUNNING row with no live
         process behind it, once running_ids() can actually see the truth."""
         for key, module in keys_by_module.items():
-            if key in self._pids:
+            with self._lock:
+                already = key in self._pids
+            if already:
                 continue
-            pid = _find_pid_by_cmdline(module, key)
+            pid = _find_pid_by_cmdline(module, key)   # /proc scan -- deliberately NOT under the lock
             if pid is not None:
-                self._pids[key] = pid
+                with self._lock:
+                    self._pids[key] = pid
 
     def stop(self, worker_id: str) -> bool:
-        pid = self._pids.get(worker_id)
+        with self._lock:
+            pid = self._pids.get(worker_id)
         if pid is None:
             # Not reconciled/tracked yet -- last-resort direct lookup (covers a key that arrived
             # after the one-time startup reconcile(), e.g. a worker whose row predates this Hub
@@ -232,18 +249,21 @@ class Supervisor:
             return False
         if _alive(pid):
             kill_tree(pid)
-        proc = self._procs.pop(worker_id, None)
+        with self._lock:
+            proc = self._procs.pop(worker_id, None)
         if proc is not None:
             try:
                 proc.wait(timeout=5)   # reap so it doesn't linger as a zombie (only valid for OUR
             except subprocess.TimeoutExpired:  # own child -- a foreign/reconciled pid isn't ours to
                 pass                            # wait() on; its real parent or init(1) reaps it)
-        self._pids.pop(worker_id, None)
+        with self._lock:
+            self._pids.pop(worker_id, None)
         return True
 
     def is_running(self, worker_id: str) -> bool:
         self._reap_finished()
-        pid = self._pids.get(worker_id)
+        with self._lock:
+            pid = self._pids.get(worker_id)
         return pid is not None and _alive(pid)
 
     def running_ids(self) -> list[str]:
@@ -251,8 +271,14 @@ class Supervisor:
         # that finished naturally actually gets reaped in steady-state production use, piggybacking
         # on a cadence that already exists rather than adding a new one.
         self._reap_finished()
-        return [wid for wid, pid in self._pids.items() if _alive(pid)]
+        # SNAPSHOT under the lock, then probe liveness outside it: iterating self._pids directly
+        # raced a concurrent spawn/stop and crashed the whole scheduler tick (see __init__).
+        with self._lock:
+            items = list(self._pids.items())
+        return [wid for wid, pid in items if _alive(pid)]
 
     def shutdown_all(self) -> None:
-        for wid in list(self._pids):
+        with self._lock:
+            wids = list(self._pids)
+        for wid in wids:
             self.stop(wid)
