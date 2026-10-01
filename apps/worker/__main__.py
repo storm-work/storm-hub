@@ -21,8 +21,10 @@ from datetime import datetime, timezone
 
 
 def _ts() -> str:
-    """UTC HH:MM:SS.mmm -- prefixed onto every log line so a worker log is timeline-readable."""
-    return datetime.now(timezone.utc).strftime("%H:%M:%S.%f")[:-3]
+    """UTC ISO-8601 with millisecond precision + Z (e.g. 2026-10-01T14:32:18.421Z), prefixed onto
+    every worker log line so a log is both timeline-readable AND machine-parseable across days
+    (Phase-K structured logging, 2026-10-01; was time-only HH:MM:SS.mmm before)."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
 class _TimestampedStream:
@@ -135,6 +137,12 @@ def _build_ops(engine_kind: str, cfg: EngineConfig, payload: dict, bus: Bus, wor
         # the same `log_line` event WorkerRuntime's own transition logging already uses, so the
         # dashboard's existing per-worker log view picks these up with no further changes.
         ops._log = lambda t: emit("log_line", text=f"{_ts()} {t}")
+        # Correlation context (2026-10-01): one line naming role/keepalive-mode/booking so a worker
+        # log can be read without cross-referencing the launch payload. See the hot-period report.
+        emit("log_line", text=(
+            f"{_ts()} worker context: role={getattr(cfg.role, 'value', cfg.role)} "
+            f"keepalive_mode={getattr(cfg.keepalive, 'mode', 'auth_only')} "
+            f"booking={payload.get('booking_id')} identity={payload.get('identity_id')}"))
         return ops
     step_delay = float(os.environ.get("SIM_STEP_DELAY", "1.2"))
     return SimEngineOps(step_delay=step_delay, signals=signals, emit=emit)

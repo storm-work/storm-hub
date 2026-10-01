@@ -473,6 +473,14 @@ class PhaseMachine:
         if not self.ops.slot_found_seen():
             if self.ops.await_slot_open() == "stop":
                 return PhaseResult("stopped", self._sub, "stopped before slot_open", self.visited)
+        else:
+            # slot-found already observed for this booking (a mid-run respawn), so this worker
+            # deliberately skips the slot_open handshake it has already missed -- record it in the
+            # signal trace rather than leaving a silent gap. getattr-guarded: SimEngineOps and other
+            # partial doubles have no _slog.
+            _slog = getattr(self.ops, "_slog", None)
+            if callable(_slog):
+                _slog("signal_ignored", signal="slot_open", reason="slot_found_already_seen")
         # A bounce must NEVER end the run, and must never cost the warm session. Operator, 2026-08-14:
         # "each process should keep running just retying, rewarm - against the failures. logged in
         # auth session is very precious - why close the process for a failure?"
@@ -601,6 +609,12 @@ class PhaseMachine:
                 return PhaseResult("dry_run", self._sub, "no_book: not submitted", self.visited)
             attempts += 1
             outcome = self.ops.do_apply(slot)
+            # Terminal event of the assignment signal round (shares the `sig` minted when the
+            # assignment was received): the booked/form_stale/no_slot/session/... verdict, so one
+            # round traces received -> accepted -> warmup -> apply_submit -> result end to end.
+            _slog = getattr(self.ops, "_slog", None)
+            if callable(_slog):
+                _slog("signal_result", signal="assignment", outcome=outcome)
             # `portal_unreachable` is EXCLUDED from this reset on purpose. The comment this replaces
             # read "any other answer means the session reached the portal" -- which is exactly
             # inverted for that one outcome: it means the request never reached the portal at all,

@@ -124,17 +124,19 @@ def test_live_engine_log_wired_to_log_line_event():
     ops._log("do_swap: new session failed health check -- reverting to phase-1 proxy")
 
     msgs = bus.read_events(last_id="0", block_ms=10, count=10)
-    # _build_ops also emits its own "vendor env applied: {...}" line on a live build (see
-    # _export_vendor_env) -- match on the one under test rather than asserting a total count.
+    # _build_ops also emits its own "vendor env applied: {...}" line and a "worker context: ..."
+    # correlation line on a live build -- match on the one under test rather than a total count.
     log_lines = [m for m in msgs if m.type == "log_line"
-                 and not m.payload["text"].startswith("vendor env applied:")]
+                 and not m.payload["text"].startswith("vendor env applied:")
+                 and "worker context:" not in m.payload["text"]]
     assert len(log_lines) == 1
-    # ops._log prefixes a UTC timestamp (HH:MM:SS.mmm) onto every line (2026-09-26) so a worker log
-    # is timeline-readable -- assert on the message after that prefix rather than the raw equality.
+    # ops._log prefixes a UTC ISO-8601 timestamp onto every line (Phase-K, 2026-10-01) so a worker
+    # log is timeline-readable AND machine-parseable -- assert after that prefix, not raw equality.
     text = log_lines[0].payload["text"]
     assert text.endswith(
         "do_swap: new session failed health check -- reverting to phase-1 proxy")
-    assert re.match(r"^\d{2}:\d{2}:\d{2}\.\d{3} ", text), f"missing timestamp prefix: {text!r}"
+    assert re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z ", text), \
+        f"missing timestamp prefix: {text!r}"
     assert log_lines[0].payload["worker_id"] == "w1"
 
 

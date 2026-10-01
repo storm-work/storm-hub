@@ -756,6 +756,18 @@ _TEMPLATE = [
        "2026-09-09 (consolidated after the Test 0907/0907-auth A/B) -- keepalive only ever "
        "verifies the AUTH session is alive, never the booking form-state, which do_apply/"
        "do_discover establish fresh on demand instead of keepalive trying to keep it warm."),
+    _s("KEEPALIVE_MODE", L.BOOKING, str, "auth_only", _WRK, "keepalive",
+       note=
+       "Keepalive strategy for a holding worker. 'auth_only' (DEFAULT, the proven model): probe the "
+       "authenticated HOME page; booking form-state is NEVER kept warm (do_apply re-warms every round "
+       "regardless). 'schedule': probe Schedule.jsp instead and RECORD whether the booking form "
+       "cursor is still present -- a NON-DESTRUCTIVE measurement mode to test, on live infra, the "
+       "2026-08-21 finding that a keepalive nav VERIFIES the schedule page but does not RENEW the "
+       "cursor (147 lapses vs 42 restores). It does NOT re-warm and does NOT let do_apply skip its "
+       "mandatory re-warm -- the cursor is navigation-bound, so 'schedule' cannot make an apply "
+       "worker pre-bookable; it only measures. Deliberately at the BOOKING layer (not TEMPLATE) so a "
+       "template cannot silently override the operator's per-booking choice. See docs/engineering/"
+       "REPORT_2026-10-01_hot_period_reliability.md."),
     _s("KEEPALIVE_OFF", L.TEMPLATE, bool, False, _WRK, "keepalive",
        note=
        "Disable keepalive entirely. Diagnostic only: a holding worker then has NO portal traffic and "

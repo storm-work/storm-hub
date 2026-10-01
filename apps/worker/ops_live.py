@@ -54,7 +54,7 @@ from libs.engine.payload import booking_payload, schedule_controller_payload
 from libs.engine.phases import EngineOps
 from libs.engine.vendor import get_session
 
-from .bus_signals import TIMEOUT
+from .bus_signals import INACTIVATE, TIMEOUT
 
 BASE = "https://pedidodevistos.mne.gov.pt/VistosOnline"
 _PORTAL_ORIGIN = "https://pedidodevistos.mne.gov.pt"
@@ -545,6 +545,19 @@ def _form_error_text(html: str, limit: int = 5) -> list[str]:
     return out
 
 
+def _kv(fields: dict) -> str:
+    """Render an ordered dict as a `key=value` log line (Phase-K structured logging, 2026-10-01).
+    Values with a space, quote or `=` are wrapped in double quotes (inner double-quotes downgraded to
+    single) so the line stays unambiguously parseable; None renders empty. Never pass credentials."""
+    parts = []
+    for k, v in fields.items():
+        s = "" if v is None else str(v)
+        if any(c in s for c in ' "='):
+            s = '"' + s.replace('"', "'") + '"'
+        parts.append(f"{k}={s}")
+    return " ".join(parts)
+
+
 class LiveEngineOps(EngineOps):
     def __init__(
         self,
@@ -911,6 +924,54 @@ class LiveEngineOps(EngineOps):
         self._exit_ip = None          # a new exit: the next observation is a baseline, not a change
         self._log(f"proxy: rolled to a fresh sticky exit [{_proxy_label(rolled)}] ({why})")
         return True
+
+    def _slog(self, event: str, **fields) -> None:
+        """Emit a structured `key=value` lifecycle log line (Phase-K, 2026-10-01). Standard
+        correlation context (event/role/booking/identity/keepalive-mode) is attached automatically so
+        a single line is back-traceable without cross-referencing the launch payload; event-specific
+        fields follow. Routes through self._log, which prefixes the ISO-8601 timestamp. Used for the
+        back-traceable lifecycle (signal receipt, warm-up, discovery, apply, keepalive) ALONGSIDE the
+        existing free-text diagnostics -- it does not replace them."""
+        # Defensive on every field: EngineOps has many partial test doubles that don't set cfg/
+        # booking_id, and a log helper must never be the thing that raises.
+        cfg = getattr(self, "cfg", None)
+        role = getattr(getattr(cfg, "role", None), "value", getattr(cfg, "role", "")) if cfg else ""
+        ka = getattr(getattr(cfg, "keepalive", None), "mode", "auth_only") if cfg else "auth_only"
+        ctx = {
+            "event": event,
+            "role": role,
+            "booking": getattr(self, "booking_id", None),
+            "identity": getattr(self, "identity_id", None),
+            "ka_mode": ka,
+        }
+        # sig: the correlation id of the signal-handling round in flight (minted by _new_sig_id when
+        # a signal is received), so every lifecycle line of ONE round -- received/accepted -> warmup
+        # -> discover/apply -> result -- shares an id and a single round is greppable end to end.
+        sig = getattr(self, "_sig_id", "")
+        if sig:
+            ctx["sig"] = sig
+        ctx.update(fields)
+        log = getattr(self, "_log", None)
+        if callable(log):
+            log(_kv(ctx))
+
+    def _new_sig_id(self) -> str:
+        """Mint a fresh correlation id for a signal-handling round and make it the one _slog stamps
+        onto every subsequent line until the next signal is received. 6 hex chars is plenty to
+        disambiguate the rounds interleaved in a single worker's log."""
+        self._sig_id = f"{random.randrange(16 ** 6):06x}"
+        return self._sig_id
+
+    def _warmup_kind(self, ok: bool) -> str:
+        """The warmup failure classification for a structured log, or "" on success. Defensive --
+        warmup_failure_kind reads health state that partial test doubles don't model, and a log
+        helper must never raise."""
+        if ok:
+            return ""
+        try:
+            return self.warmup_failure_kind()
+        except Exception:
+            return "unknown"
 
     def _on_portal_origin(self) -> bool:
         """Is the browser sitting on a live portal page RIGHT NOW?
@@ -1560,7 +1621,13 @@ class LiveEngineOps(EngineOps):
         # is no restored form-state to trust -- warmup must actually establish the Schedule-page form
         # cursor. The restore path no longer claims "alive/bookable" (see _try_restore_from_checkpoint),
         # so nothing sets those stages to skip on any more; this is belt-and-suspenders.
-        return self._run_warmup_steps()
+        self._slog("warmup_start", phase="signal")
+        _t = time.time()
+        ok = self._run_warmup_steps()
+        self._slog("warmup_end", result=("ok" if ok else "fail"),
+                   duration_ms=int((time.time() - _t) * 1000),
+                   kind=self._warmup_kind(ok))
+        return ok
 
     def is_warmed(self) -> bool:
         """EngineOps surface for whether the booking form-state anchor is established AND VERIFIED
@@ -2122,8 +2189,21 @@ class LiveEngineOps(EngineOps):
         if self._signals is None:
             return "slot_open"
         while True:
+            # Was slot_open ALREADY known before this wait? If so the delivery that returns below is
+            # a redelivery (the Hub's _latch_signals re-sends to a worker not yet confirmed notified),
+            # i.e. duplicated rather than fresh -- see the signal taxonomy.
+            _already = getattr(self._signals, "slot_open_seen", False)
             result = self._signals.wait_slot_open(timeout=self._keepalive_window())
-            if result in ("slot_open", "stop"):
+            if result == "slot_open":
+                self._new_sig_id()
+                if _already:
+                    self._slog("signal_duplicated", signal="slot_open")
+                else:
+                    self._slog("signal_received", signal="slot_open")
+                    self._slog("signal_accepted", signal="slot_open")
+                return result
+            if result == "stop":
+                self._slog("signal_ignored", signal="slot_open", reason="stop")
                 return result
             if getattr(self._signals, "prewarm_requested", False):
                 # The Hub says slot-open is imminent. Re-warm NOW rather than waiting for this
@@ -2154,6 +2234,18 @@ class LiveEngineOps(EngineOps):
                 # config change take effect on the NEXT round of a RUNNING scout with no restart --
                 # do_discover honours it over its own frozen cfg when present.
                 self._pending_discover_source = getattr(self._signals, "last_discover_source", None)
+                if self._signals.stopped:
+                    self._slog("signal_ignored", signal="discover", reason="stop")
+                elif result is INACTIVATE:
+                    # False slot-open: the Hub told this scout to drop back to holding -- a real
+                    # signal the worker deliberately declines to act on as discovery.
+                    self._new_sig_id()
+                    self._slog("signal_ignored", signal="discover", reason="false_slot_open")
+                else:
+                    self._new_sig_id()
+                    self._slog("signal_received", signal="discover",
+                               dates=(len(result) if isinstance(result, list) else result))
+                    self._slog("signal_accepted", signal="discover")
                 return result
             self._do_keepalive("await_discover_task")
 
@@ -2354,10 +2446,46 @@ class LiveEngineOps(EngineOps):
         # slot-open/assignment signal rather than done proactively before hold -- so there is no
         # form-state to verify here even in principle. SESSION_EXPIRED and dead-trip detection
         # below are unaffected: they never depended on this.
+        mode = (getattr(self.cfg.keepalive, "mode", "auth_only") or "auth_only").strip().lower()
         probe = self.cfg.keepalive.probe or "home"
+        if mode == "schedule" and probe == "home":
+            # KEEPALIVE_MODE='schedule' (2026-10-01): probe Schedule.jsp instead of home and RECORD
+            # whether the booking form cursor survived. NON-DESTRUCTIVE measurement of the 147-vs-42
+            # "the nav verifies but does not renew the cursor" finding on live infra. It does NOT
+            # re-warm and do_apply still re-warms unconditionally, so this cannot make an apply worker
+            # pre-bookable -- it only measures. See docs REPORT_2026-10-01_hot_period_reliability.md.
+            probe = SCHED_JSP + "?posto_id=" + str(self.posto_pdf or self.posto_id)
         url = HOME_URL if probe == "home" else probe
         try:
             final_url = self.session.browser_nav(url, timeout=30)
+            if mode == "schedule" and probe != "home":
+                # Schedule.jsp carries DIFFERENT markers than home, so classify it on its own terms:
+                # auth loss = Authentication.jsp redirect; dead exit = chrome-error; otherwise record
+                # cursor present/absent. Reuses the auth-only path's dead/expired handling verbatim.
+                if "Authentication.jsp" in (final_url or ""):
+                    self._log(f"keepalive[schedule]: session expired (auth redirect, {context}) -- "
+                              f"re-authenticating")
+                    self._attempt_keepalive_restore(context)
+                    return
+                page = self._keepalive_read_page()
+                if self._is_dead_exit_response(page, final_url):
+                    self._log(f"keepalive[schedule]: DEAD EXIT / chrome-error ({len(page)}B, "
+                              f"{context}) -- rolling to a fresh exit and re-authenticating")
+                    self._roll_exit("keepalive: dead exit (schedule probe)")
+                    self._attempt_keepalive_restore(context)
+                    return
+                cursor_present = any(m in page for m in _SCHED_PAGE_MARKERS)
+                self._keepalive_dead_streak = 0
+                if getattr(self, "_keep_unbookable", False):
+                    self._mark_keep_bookable(True)
+                if self._emit is not None:
+                    self._emit("log_line", text=(
+                        f"keepalive[schedule]: probe OK cursor="
+                        f"{'present' if cursor_present else 'ABSENT'} ({len(page)}B, {context})"))
+                self._slog("keepalive", result="ok", mode="schedule",
+                           cursor=("present" if cursor_present else "absent"), bytes=len(page),
+                           ctx=context)
+                return
             if probe != "home":
                 # A custom KEEPALIVE_PROBE URL: no positive/negative content evidence is known for
                 # an arbitrary operator-chosen page, so this stays exactly what it was -- a
@@ -2393,6 +2521,7 @@ class LiveEngineOps(EngineOps):
                     self._mark_keep_bookable(True)
                 if self._emit is not None:
                     self._emit("log_line", text=f"keepalive: probe OK ({context})")
+                self._slog("keepalive", result="ok", mode="auth_only", ctx=context)
                 return
             if state == SessionState.SESSION_EXPIRED:
                 # F22/F24's fix: a dead session must never be re-warmed (there is no session left
@@ -2401,6 +2530,7 @@ class LiveEngineOps(EngineOps):
                 # machinery.
                 self._log(f"keepalive: session expired ({len(page)}B, exit={getattr(self, '_exit_ip', None)}, "
                           f"{context}) -- re-authenticating rather than re-warming a dead session")
+                self._slog("keepalive", result="expired", bytes=len(page), ctx=context)
                 self._attempt_keepalive_restore(context)
                 return
             if state == SessionState.PORTAL_ERROR:
@@ -2424,6 +2554,7 @@ class LiveEngineOps(EngineOps):
                 self._log(f"keepalive: DEAD EXIT / chrome-error ({len(page)}B, "
                           f"exit={getattr(self, '_exit_ip', None)}, {context}) -- rolling to a fresh "
                           f"exit and re-authenticating rather than re-probing a dead tunnel")
+                self._slog("keepalive", result="dead_exit", bytes=len(page), ctx=context)
                 self._roll_exit("keepalive: dead exit (chrome-error/tunnel)")
                 self._attempt_keepalive_restore(context)
                 return
@@ -2432,12 +2563,15 @@ class LiveEngineOps(EngineOps):
             # the next cycle" now, never a re-warm trigger.
             self._log(f"keepalive: unrecognised pre-warm response ({len(page)}B, {context}) -- "
                       f"inconclusive, will re-probe")
+            self._slog("keepalive", result="inconclusive", bytes=len(page), ctx=context)
         except Exception as e:
             self._keepalive_dead_streak = getattr(self, "_keepalive_dead_streak", 0) + 1
             dead_trip = max(1, int(self.cfg.keepalive.dead_trip))
             if self._emit is not None:
                 self._emit("log_line", text=f"keepalive: probe FAILED ({e}) "
                                              f"streak={self._keepalive_dead_streak}/{dead_trip} ({context})")
+            self._slog("keepalive", result="probe_failed", error_type=type(e).__name__,
+                       streak=f"{self._keepalive_dead_streak}/{dead_trip}", ctx=context)
             if self._keepalive_dead_streak >= dead_trip:
                 self._keepalive_dead_streak = 0
                 # NOT BOOKABLE, for the same reason the re-warm branch above already says so: at
@@ -3069,6 +3203,16 @@ class LiveEngineOps(EngineOps):
                 out.append({"date": d, "outcome": "empty"})
         return out
 
+    def _discover_done(self, out: list[dict], source: str) -> list[dict]:
+        """Emit the structured discovery-round summary (Phase-K) and pass the result through, so every
+        do_discover return site is back-traceable without threading timing through each branch."""
+        found = sum(1 for r in out if r.get("outcome") == "found")
+        empty = sum(1 for r in out if r.get("outcome") == "empty")
+        failed = sum(1 for r in out if r.get("outcome") == "failed")
+        self._slog("discover_end", source=source, dates=len(out),
+                   found=found, empty=empty, failed=failed)
+        return out
+
     def do_discover(self, dates: list[str]) -> list[dict]:
         """Bug fix #6: 3-way per-date outcome (found/empty/failed). Uses gettime + real-browser-nav
         getPeriodosOcupados per confirmed_pipeline_path.md -- never browser_fetch/primp for these
@@ -3111,10 +3255,11 @@ class LiveEngineOps(EngineOps):
                       f"{sorted(_DISCOVERY_SOURCES)} -- REFUSING it and using 'calendar'. "
                       f"Fix the booking setting; this run is NOT testing what you configured.")
             source = "calendar"
+        self._slog("discover_start", dates=len(dates), source=source)
         if source in ("slots", "both"):
             res = self._discover_via_slots(dates)
             if source == "slots":
-                return res
+                return self._discover_done(res, source)
             # UNRESOLVED = every date /slots did not DEFINITIVELY answer. A definitive answer is
             # `found` or `empty` (the portal told us about that date); everything else -- a per-date
             # `failed`, OR a date missing from `res` entirely -- is unresolved and gets the calendar.
@@ -3127,14 +3272,14 @@ class LiveEngineOps(EngineOps):
             answered = {r["date"] for r in res if r.get("outcome") in ("found", "empty")}
             unresolved = [d for d in dates if d not in answered]
             if not unresolved:
-                return res
+                return self._discover_done(res, source)
             self._log(f"do_discover[both]: slots resolved {len(answered)}/{len(dates)} date(s); "
                       f"falling back to calendar for the other {len(unresolved)}")
             by_date = {r["date"]: r for r in res}
             for r in self._discover_via_calendar(unresolved):
                 by_date[r["date"]] = r
-            return [by_date[d] for d in dates if d in by_date]
-        return self._discover_via_calendar(dates)
+            return self._discover_done([by_date[d] for d in dates if d in by_date], source)
+        return self._discover_done(self._discover_via_calendar(dates), source)
 
     def _discover_via_calendar(self, dates: list[str]) -> list[dict]:
         """gettime + getPeriodosOcupados -- the confirmed path, logic untouched. Split out of
@@ -3381,6 +3526,17 @@ class LiveEngineOps(EngineOps):
         while True:
             result = self._signals.wait_assignment(timeout=self._keepalive_window())
             if result is not TIMEOUT:
+                if getattr(self._signals, "stopped", False):
+                    self._slog("signal_ignored", signal="assignment", reason="stop")
+                elif isinstance(result, dict):
+                    self._new_sig_id()
+                    self._slog("signal_received", signal="assignment", slot=result)
+                    self._slog("signal_accepted", signal="assignment")
+                else:
+                    # result is None but not stopped: the scouts_invalid self-scout fallback trigger.
+                    self._new_sig_id()
+                    self._slog("signal_received", signal="assignment", slot=None)
+                    self._slog("signal_accepted", signal="assignment", reason="self_scout_fallback")
                 return result   # a real assign (slot dict or the scouts_invalid slot=None) or stop
             self._do_keepalive("await_assignment")
 
@@ -3444,6 +3600,7 @@ class LiveEngineOps(EngineOps):
         if self._apply_sem is not None:
             if not self._apply_sem.acquire(self.identity_id, timeout=60):
                 return "portal_unreachable"
+        _t_apply = time.time()   # round-start -> submit latency (the hot-period metric; see report)
         try:
             # (The booking breaker's is_tripped gate here was removed 2026-09-23 -- do_apply no
             # longer refuses fleet-wide; a down portal is shown on the dashboard, not gated.)
@@ -3468,7 +3625,14 @@ class LiveEngineOps(EngineOps):
             if self._emit is not None:
                 self._emit("status_change", substate="warming_up",
                            detail="apply: round-start re-warm (mandatory)")
-            if not self._run_warmup_steps():
+            self._slog("warmup_start", phase="apply_round", slot=slot)
+            _t_warm = time.time()
+            _warm_ok = self._run_warmup_steps()
+            self._slog("warmup_end", phase="apply_round",
+                       result=("ok" if _warm_ok else "fail"),
+                       duration_ms=int((time.time() - _t_warm) * 1000),
+                       kind=self._warmup_kind(_warm_ok))
+            if not _warm_ok:
                 # NOT "bounced". This is OUR session failing before we ever spoke to the portal
                 # about this slot, and calling it a bounce blames the slot for our dead proxy:
                 # the lease is released WITH a penalty, that penalty feeds the Hub's false-slot
@@ -3582,8 +3746,13 @@ class LiveEngineOps(EngineOps):
                 html = str(_res.get("body") or "") if isinstance(_res, dict) else str(_res or "")
                 _status = _res.get("status") if isinstance(_res, dict) else None
                 _final_url = submit_url        # XHR: no navigation, still on Schedule.jsp
+                _round_ms = int((time.time() - _t_apply) * 1000)
                 self._log(f"do_apply: SubmeterVistoCriaPDF XHR -> status={_status} len={len(html)} "
-                          f"body[:200]={html[:200]!r}")
+                          f"round_ms={_round_ms} body[:200]={html[:200]!r}")
+                # Structured, back-traceable submit event: len is the booked(~1.5KB) vs
+                # form_stale(~66KB questionnaire) discriminator, round_ms is the hot-period latency.
+                self._slog("apply_submit", status=_status, len=len(html), round_ms=_round_ms,
+                           slot=slot)
             except Exception as e:
                 self._log(f"do_apply: SubmeterVistoCriaPDF XHR failed: {e}")
                 return "bounced"

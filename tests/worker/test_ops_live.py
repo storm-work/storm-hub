@@ -4551,3 +4551,198 @@ def test_do_apply_makes_its_mandatory_rewarm_visible():
     substates = [p.get("substate") for t, p in events if t == "status_change"]
     assert "warming_up" in substates and "applying" in substates
     assert substates.index("warming_up") < substates.index("applying")
+
+
+# ── KEEPALIVE_MODE='schedule': non-destructive cursor-survival measurement (cp000-adjacent, 2026-10-01) ──
+def _schedule_keepalive_ops(page, events, session=None):
+    # KEEPALIVE_MODE is a BOOKING-layer setting (so a template can't silently override the operator's
+    # per-booking choice), so it must be set at L.BOOKING, not via _cfg's TEMPLATE-only helper.
+    cfg = EngineConfig.from_settings(
+        resolve({L.TEMPLATE: {"ROLE": "apply"}, L.BOOKING: {"KEEPALIVE_MODE": "schedule"}}))
+    ops = _make_ops(cfg=cfg, emit=lambda t, **p: events.append((t, p)))
+    ops.session = session or _KeepaliveSession(page)
+    ops.posto_pdf = "3018"
+    return ops
+
+
+def test_keepalive_schedule_mode_probes_schedule_jsp_and_never_rewarms():
+    events = []
+    ops = _schedule_keepalive_ops(_SCHED_OK, events)
+    ops._run_warmup_steps = lambda: pytest.fail("schedule keepalive must MEASURE, never re-warm")
+    ops._do_keepalive("test")
+    assert ops.session.navs and "Schedule.jsp" in ops.session.navs[0], ops.session.navs
+
+
+def test_keepalive_schedule_mode_records_cursor_present():
+    events = []
+    ops = _schedule_keepalive_ops(_SCHED_OK, events)   # _SCHED_OK carries cmbPeriodo + SubmeterVistoCriaPDF
+    ops._do_keepalive("test")
+    lines = [p["text"] for t, p in events if t == "log_line"]
+    assert any("keepalive[schedule]" in x and "cursor=present" in x for x in lines), lines
+
+
+def test_keepalive_schedule_mode_records_cursor_absent():
+    events = []
+    ops = _schedule_keepalive_ops(
+        "<html><title>E-VISA</title>authenticated_index -- no scheduling markers</html>", events)
+    ops._do_keepalive("test")
+    lines = [p["text"] for t, p in events if t == "log_line"]
+    assert any("keepalive[schedule]" in x and "cursor=ABSENT" in x for x in lines), lines
+
+
+def test_keepalive_schedule_mode_still_detects_auth_loss_and_restores():
+    events = []
+    sess = _RedirectingKeepaliveSession(
+        "<html>gone</html>", final_url="https://pedidodevistos.mne.gov.pt/VistosOnline/Authentication.jsp")
+    ops = _schedule_keepalive_ops(None, events, session=sess)
+    ops._run_warmup_steps = lambda: pytest.fail("must not re-warm a dead session")
+    restores = []
+    ops._attempt_keepalive_restore = lambda context="": restores.append(context)
+    ops._do_keepalive("test")
+    assert restores == ["test"]
+
+
+def test_keepalive_defaults_to_auth_only_and_probes_home():
+    events = []
+    ops = _make_ops(emit=lambda t, **p: events.append((t, p)))   # default cfg -> auth_only
+    ops.session = _KeepaliveSession("<html>solicitar pedido de visto ... consultar pedidos</html>")
+    ops.posto_pdf = "3018"
+    ops._do_keepalive("test")
+    assert ops.session.navs and "Schedule.jsp" not in ops.session.navs[0], ops.session.navs
+
+
+# ── Phase-K structured logging: key=value lifecycle lines + ISO timestamps (2026-10-01) ──
+def test_kv_renders_key_value_and_quotes_spaces():
+    from apps.worker.ops_live import _kv
+    assert _kv({"a": 1, "b": "two words", "c": None, "d": "x=y"}) == 'a=1 b="two words" c= d="x=y"'
+
+
+def test_slog_emits_structured_line_with_standard_context():
+    logs = []
+    ops = _make_ops()
+    ops._log = lambda t: logs.append(t)
+    ops._slog("warmup_end", result="ok", duration_ms=1234)
+    assert len(logs) == 1
+    line = logs[0]
+    for frag in ("event=warmup_end", "result=ok", "duration_ms=1234",
+                 "role=apply", "booking=", "ka_mode=auth_only"):
+        assert frag in line, (frag, line)
+
+
+def test_do_apply_emits_structured_apply_submit_with_latency():
+    logs = []
+    ops = _apply_ops(b"%PDF-1.4\nreal", [])
+    ops._log = lambda t: logs.append(t)
+    ops.do_apply({"date": "2026-09-01", "period": 4})
+    assert any("event=apply_submit" in l and "round_ms=" in l and "len=" in l for l in logs), logs
+
+
+def test_do_apply_emits_warmup_start_and_end_for_the_round():
+    logs = []
+    ops = _apply_ops(b"%PDF-1.4\nreal", [])
+    ops._log = lambda t: logs.append(t)
+    ops.do_apply({"date": "2026-09-01", "period": 4})
+    assert any("event=warmup_start" in l and "phase=apply_round" in l for l in logs), logs
+    assert any("event=warmup_end" in l and "result=ok" in l for l in logs), logs
+
+
+def test_do_discover_emits_structured_discover_end():
+    logs = []
+    ops = _make_ops()
+    ops._log = lambda t: logs.append(t)
+    ops.session = _RecordingSession()
+    ops.do_discover(["2026-08-16"])
+    assert any("event=discover_start" in l and "source=calendar" in l for l in logs), logs
+    assert any("event=discover_end" in l and "found=1" in l for l in logs), logs
+
+
+def test_do_warmup_emits_structured_warmup_lifecycle():
+    logs = []
+    ops = _warmup_ops(_SCHED_OK)
+    ops._log = lambda t: logs.append(t)
+    assert ops.do_warmup() is True
+    assert any("event=warmup_start" in l for l in logs), logs
+    assert any("event=warmup_end" in l and "result=ok" in l for l in logs), logs
+
+
+# ── signal lifecycle taxonomy + per-signal correlation id (Phase-K item 1 completion, 2026-10-01) ──
+import re as _re_sig
+
+
+def test_signal_received_then_accepted_share_a_correlation_id():
+    logs = []
+    ops = _make_ops(signals=_FakeSignals(timeouts=0, final="slot_open"))
+    ops.session = _FakeSession()
+    ops._log = lambda t: logs.append(t)
+    assert ops.await_slot_open() == "slot_open"
+    recv = [l for l in logs if "event=signal_received" in l and "signal=slot_open" in l]
+    acc = [l for l in logs if "event=signal_accepted" in l and "signal=slot_open" in l]
+    assert recv and acc, logs
+    m = _re_sig.search(r"sig=([0-9a-f]{6})", recv[0])
+    assert m, recv[0]
+    assert f"sig={m.group(1)}" in acc[0]   # same round id on both lines
+
+
+def test_slot_open_redelivery_is_duplicated_not_accepted():
+    logs = []
+    sig = _FakeSignals(timeouts=0, final="slot_open")
+    sig.slot_open_seen = True   # already known before the wait -> a redelivery
+    ops = _make_ops(signals=sig)
+    ops.session = _FakeSession()
+    ops._log = lambda t: logs.append(t)
+    ops.await_slot_open()
+    assert any("event=signal_duplicated" in l and "signal=slot_open" in l for l in logs), logs
+    assert not any("event=signal_accepted" in l for l in logs), logs
+
+
+def test_slot_open_stop_is_logged_as_ignored():
+    logs = []
+    ops = _make_ops(signals=_FakeSignals(timeouts=0, final="stop"))
+    ops.session = _FakeSession()
+    ops._log = lambda t: logs.append(t)
+    assert ops.await_slot_open() == "stop"
+    assert any("event=signal_ignored" in l and "reason=stop" in l for l in logs), logs
+
+
+def test_correlation_id_threads_from_assignment_into_the_apply_round():
+    logs = []
+    ops = _apply_ops(b"%PDF-1.4\nreal", [])
+    ops._log = lambda t: logs.append(t)
+    ops._signals = _FakeSignals(timeouts=0, final={"date": "2026-09-01", "period": 4})
+    slot = ops.await_assignment()
+    ops.do_apply(slot)
+    recv = [l for l in logs if "event=signal_received" in l and "signal=assignment" in l]
+    assert recv, logs
+    sig = _re_sig.search(r"sig=([0-9a-f]{6})", recv[0]).group(1)
+    assert any("event=warmup_start" in l and f"sig={sig}" in l for l in logs), logs
+    assert any("event=apply_submit" in l and f"sig={sig}" in l for l in logs), logs
+
+
+class _DiscoverSignals:
+    def __init__(self, result):
+        self._result = result
+        self.stopped = False
+        self.last_discover_special_days = None
+        self.last_discover_source = None
+
+    def wait_discover_task(self, timeout=900):
+        return self._result
+
+
+def test_discover_task_received_is_accepted():
+    logs = []
+    ops = _make_ops(signals=_DiscoverSignals(["2026-10-20", "2026-10-21"]))
+    ops._log = lambda t: logs.append(t)
+    assert ops.await_discover_task() == ["2026-10-20", "2026-10-21"]
+    assert any("event=signal_received" in l and "signal=discover" in l and "dates=2" in l
+               for l in logs), logs
+    assert any("event=signal_accepted" in l and "signal=discover" in l for l in logs), logs
+
+
+def test_discover_inactivate_is_ignored_as_false_slot_open():
+    from apps.worker.bus_signals import INACTIVATE
+    logs = []
+    ops = _make_ops(signals=_DiscoverSignals(INACTIVATE))
+    ops._log = lambda t: logs.append(t)
+    assert ops.await_discover_task() is INACTIVATE
+    assert any("event=signal_ignored" in l and "reason=false_slot_open" in l for l in logs), logs

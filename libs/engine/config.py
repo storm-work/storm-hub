@@ -41,6 +41,10 @@ class KeepaliveConfig:
     dead_trip: int = 3
     probe: str = "home"
     jitter: float = 30.0
+    # KEEPALIVE_MODE (2026-10-01): "auth_only" (default, proven) | "schedule" (non-destructive
+    # cursor-survival measurement -- probes Schedule.jsp and records whether the booking cursor
+    # survived, never re-warms). See ops_live._do_keepalive and the hot-period report.
+    mode: str = "auth_only"
 
 
 @dataclass(frozen=True)
@@ -136,6 +140,7 @@ class EngineConfig:
                 dead_trip=int(g("KEEPALIVE_DEAD_TRIP", 3)),
                 probe=str(g("KEEPALIVE_PROBE", "home") or "home"),
                 jitter=float(g("KEEPALIVE_JITTER", 30.0)),
+                mode=str(g("KEEPALIVE_MODE", "auth_only") or "auth_only").strip().lower(),
             ),
             hold_swap=HoldSwapConfig(
                 swap_after_login=bool(g("HOLD_SWAP_AFTER_LOGIN", False)),

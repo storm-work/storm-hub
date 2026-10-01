@@ -109,6 +109,6 @@ def test_timestamped_stream_prefixes_each_line():
     s.write("a\nb\n")                            # two lines in one write
     lines = [l for l in buf.getvalue().split("\n") if l]
 
-    assert all(re.match(r"^\d\d:\d\d:\d\d\.\d\d\d ", l) for l in lines), lines
+    assert all(re.match(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d\d\dZ ", l) for l in lines), lines
     assert any("part two" in l for l in lines), "a partial write must stay on one line"
     assert len(lines) == 4
