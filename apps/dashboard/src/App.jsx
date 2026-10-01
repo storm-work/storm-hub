@@ -656,6 +656,7 @@ function BookingOverview({ me, booking, events, workers, onBookingChanged, onDel
     name: booking.name, type: booking.type, posto_id: booking.posto_id || "",
     nationality: booking.nationality || "", residence: booking.residence || "",
     warmup_start_at: isoToDatetimeLocal(booking.warmup_start_at), slot_open_at: isoToDatetimeLocal(booking.slot_open_at),
+    discovery_feeder_booking_ids: (booking.discovery_feeder_booking_ids || []).join(", "),
   }));
 
   useEffect(() => {
@@ -664,6 +665,7 @@ function BookingOverview({ me, booking, events, workers, onBookingChanged, onDel
       name: booking.name, type: booking.type, posto_id: booking.posto_id || "",
       nationality: booking.nationality || "", residence: booking.residence || "",
       warmup_start_at: isoToDatetimeLocal(booking.warmup_start_at), slot_open_at: isoToDatetimeLocal(booking.slot_open_at),
+      discovery_feeder_booking_ids: (booking.discovery_feeder_booking_ids || []).join(", "),
     });
   }, [booking.id]);
 
@@ -784,6 +786,9 @@ function BookingOverview({ me, booking, events, workers, onBookingChanged, onDel
         residence: edit.residence,
         warmup_start_at: edit.warmup_start_at ? new Date(edit.warmup_start_at).toISOString() : null,
         slot_open_at: edit.slot_open_at ? new Date(edit.slot_open_at).toISOString() : null,
+        // Comma/space-separated detector booking ids -> array ([] clears the feed).
+        discovery_feeder_booking_ids: (edit.discovery_feeder_booking_ids || "")
+          .split(/[\s,]+/).map((x) => x.trim()).filter(Boolean),
       },
     });
     setEditing(false);
@@ -843,6 +848,11 @@ function BookingOverview({ me, booking, events, workers, onBookingChanged, onDel
               <input type="datetime-local" value={edit.warmup_start_at} onChange={(e) => setEdit({ ...edit, warmup_start_at: e.target.value })} /></div>
             <div className="field" style={{ margin: 0 }}><label>Slot-open</label>
               <input type="datetime-local" value={edit.slot_open_at} onChange={(e) => setEdit({ ...edit, slot_open_at: e.target.value })} /></div>
+            <div className="field" style={{ margin: 0, flexBasis: "100%" }}>
+              <label>Feeder booking IDs (detector runs that inject slots into this pool — same posto)</label>
+              <input value={edit.discovery_feeder_booking_ids}
+                     onChange={(e) => setEdit({ ...edit, discovery_feeder_booking_ids: e.target.value })}
+                     placeholder="comma-separated booking ids; blank = none" style={{ width: "100%" }} /></div>
             <button className="btn" disabled={!op || !edit.name} onClick={saveEdit}>Save</button>
             <button className="btn ghost" onClick={() => setEditing(false)}>Cancel</button>
           </div>

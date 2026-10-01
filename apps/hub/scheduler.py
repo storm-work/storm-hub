@@ -204,6 +204,12 @@ class Scheduler:
                         and bk.slot_open_fired_at is None and self._is_blind_mode(db, bk)):
                     self._fire_slot_open(db, bk, now)
 
+                # CROSS-BOOKING DISCOVERY FEED (2026-10-01): mirror a DETECTOR booking's finds into
+                # this (main) booking's pool and fire slot-open, so a disposable detector run drives
+                # the precious main fleet without a restart. Runs BEFORE the RUNNING branch below so
+                # the slots it injects are assigned the same tick. No-op when no feeder is linked.
+                self._mirror_feeder_slots(db, bk, now)
+
                 self._maybe_prewarm(db, bk, now)
 
                 if self._settings_timeout_hours(db, bk) and should_timeout_booking(
@@ -944,6 +950,57 @@ class Scheduler:
             pass
         db.commit()
         return True
+
+    def _mirror_feeder_slots(self, db, bk: M.Booking, now: datetime) -> int:
+        """Cross-booking discovery feed (operator idea 2026-10-01). Mirror a DETECTOR booking's
+        discovered AVAILABLE slots into THIS (main) booking's pool, so a disposable detector run
+        (fake identities, freely restartable) drives the precious main fleet without a restart.
+
+        A discovered {date, period, posto} is a PORTAL FACT -- bookable by anyone warmed on that
+        posto -- so this is INJECTION, not a bare wake-up: apply workers get real pool slots to lease
+        immediately, and slot-open is fired to wake idle scouts too. One-directional; returns the
+        number of slots injected.
+
+        Guards:
+          * only mirrors into an ACTIVE main booking (WARMING/ARMED/RUNNING);
+          * POSTO MUST MATCH -- a slot is only bookable by main if main targets the same consulate;
+          * dedupe is by the main pool's existing rows of ANY status. The false-slot-found revert
+            marks a bounced slot CLOSED (not deleted), so a phantom injected once and reverted is NOT
+            re-injected next tick -- no oscillation. Main's OWN scouts can still reopen a CLOSED row
+            the normal way (a genuine rediscovery).
+          * safe under A<->B feeder cycles: a slot mirrored into main already exists there, so
+            mirroring back is skipped.
+        """
+        feeders = bk.discovery_feeder_booking_ids or []
+        if not feeders:
+            return 0
+        if bk.status not in (BookingStatus.WARMING, BookingStatus.ARMED, BookingStatus.RUNNING):
+            return 0
+        feeder_rows = db.scalars(select(M.Slot).where(
+            M.Slot.booking_id.in_(feeders),
+            M.Slot.status == SlotStatus.AVAILABLE)).all()
+        injected = 0
+        for s in feeder_rows:
+            if s.posto_id and bk.posto_id and s.posto_id != bk.posto_id:
+                continue   # different consulate -- not bookable by this booking's sessions
+            exists = db.scalar(select(M.Slot).where(
+                M.Slot.booking_id == bk.id, M.Slot.date == s.date, M.Slot.period == s.period))
+            if exists is not None:
+                continue   # already in main's pool (AVAILABLE/LEASED/TAKEN or reverted-CLOSED)
+            db.add(M.Slot(booking_id=bk.id, posto_id=bk.posto_id, date=s.date, period=s.period,
+                          status=SlotStatus.AVAILABLE, source="feeder",
+                          discovered_by=f"feeder:{s.booking_id}", first_seen=now, last_seen=now))
+            injected += 1
+        if injected:
+            db.commit()
+            logger.info("booking %s: injected %d slot(s) from feeder booking(s) %s",
+                        bk.id, injected, feeders)
+            # Wake the main fleet: fire slot-open so idle scouts discover and the booking goes
+            # RUNNING; the RUNNING branch's _fire_slot_found_if_new + _assign_slots (same tick) then
+            # hand the injected slots to the apply workers.
+            if bk.slot_open_fired_at is None:
+                self._fire_slot_open(db, bk, now)
+        return injected
 
     def _fire_slot_found_if_new(self, db, bk: M.Booking, now: datetime) -> None:
         if bk.slot_found_fired_at is not None:

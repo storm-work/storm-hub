@@ -2304,6 +2304,7 @@ def create_booking(
         warmup_start_at=body.warmup_start_at,
         slot_open_at=body.slot_open_at,
         settings_json=clean,
+        discovery_feeder_booking_ids=body.discovery_feeder_booking_ids or [],
     )
     db.add(bk)
     db.commit()
@@ -2441,6 +2442,11 @@ def update_booking(booking_id: str, body: BookingUpdate, db: Session = Depends(g
         val = getattr(body, field)
         if val is not None:
             setattr(bk, field, val)
+    # Cross-booking feed (cp000): [] clears it, None leaves it unchanged. A booking can never feed
+    # itself, so drop its own id defensively.
+    if body.discovery_feeder_booking_ids is not None:
+        bk.discovery_feeder_booking_ids = [
+            fid for fid in body.discovery_feeder_booking_ids if fid != bk.id]
     db.commit()
     db.refresh(bk)
     return bk

@@ -218,6 +218,13 @@ class Booking(Base, PKMixin, TimestampMixin):
     # that is precisely what an operator browsing old runs wants to see. Archiving must hide a
     # booking without rewriting its outcome. NULL = not archived.
     archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Cross-booking discovery feed (migration cp000, 2026-10-01): booking_ids of DETECTOR bookings
+    # whose discovered slots are mirrored into THIS booking's pool each scheduler tick. Lets a
+    # disposable detector run (fake identities, freely restartable) feed the precious main fleet
+    # without ever restarting it. One-directional (detector -> this booking); see
+    # scheduler._mirror_feeder_slots. NULL/empty = no feed (the default), so existing bookings are
+    # unchanged until an operator links a detector.
+    discovery_feeder_booking_ids: Mapped[list | None] = mapped_column(JSON, default=list)
 
 
 class BookingIdentity(Base, PKMixin):

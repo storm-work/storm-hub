@@ -146,6 +146,9 @@ class BookingCreate(BaseModel):
     warmup_start_at: datetime | None = None
     slot_open_at: datetime | None = None
     settings: dict = Field(default_factory=dict)  # BOOKING-layer settings (validated by resolver)
+    # DETECTOR booking ids whose discovered slots are injected into this booking's pool (cross-
+    # booking feed, migration cp000). Empty = no feed.
+    discovery_feeder_booking_ids: list[str] | None = None
 
 
 class BookingUpdate(BaseModel):
@@ -157,6 +160,8 @@ class BookingUpdate(BaseModel):
     warmup_start_at: datetime | None = None
     slot_open_at: datetime | None = None
     settings: dict | None = None
+    # Pass [] to clear the feed; None (default) leaves it unchanged.
+    discovery_feeder_booking_ids: list[str] | None = None
 
 
 class BookingOut(BaseModel):
@@ -182,6 +187,8 @@ class BookingOut(BaseModel):
     started_at: datetime | None = None
     slot_open_fired_at: datetime | None = None
     slot_found_fired_at: datetime | None = None
+    # Cross-booking feed (cp000): the DETECTOR booking ids feeding this pool. [] / null = none.
+    discovery_feeder_booking_ids: list[str] | None = None
 
     model_config = {"from_attributes": True}
 

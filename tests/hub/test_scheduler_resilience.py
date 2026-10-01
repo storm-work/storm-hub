@@ -2335,3 +2335,96 @@ class _SingletonSession:
     def __call__(self): return self
     def __getattr__(self, n): return getattr(self._db, n)
     def close(self): pass
+
+
+# CROSS-BOOKING DISCOVERY FEED tests (cp000, 2026-10-01)
+def _utcnow():
+    return datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
+
+
+def _add_slot(db, bk, date, period, status=SlotStatus.AVAILABLE, source="scout", posto=None):
+    db.add(M.Slot(booking_id=bk.id, posto_id=posto or bk.posto_id, date=date, period=period,
+                  status=status, source=source))
+    db.commit()
+
+
+def _mk_booking(db, *, posto="5084", status=BookingStatus.RUNNING, feeders=None):
+    # _make_booking hardcodes name/type/posto_id/status/settings_json, so set what we vary here
+    # via attributes after creation rather than as colliding kwargs.
+    bk = _make_booking(db)
+    bk.posto_id = posto
+    bk.status = status
+    if feeders is not None:
+        bk.discovery_feeder_booking_ids = feeders
+    db.commit()
+    return bk
+
+
+def _detector_and_main(db, *, detector_posto="5084", main_status=BookingStatus.RUNNING):
+    detector = _mk_booking(db, posto=detector_posto, status=BookingStatus.RUNNING)
+    main = _mk_booking(db, posto="5084", status=main_status, feeders=[detector.id])
+    return detector, main
+
+
+def test_mirror_feeder_injects_matching_posto_and_fires_slot_open(db):
+    detector, main = _detector_and_main(db, main_status=BookingStatus.WARMING)
+    _add_slot(db, detector, "2026-10-20", 3)
+    opened = []
+    sch = _scheduler(on_slot_open=lambda db, bk: opened.append(bk.id))
+
+    n = sch._mirror_feeder_slots(db, main, _utcnow())
+
+    assert n == 1
+    rows = db.scalars(select(M.Slot).where(M.Slot.booking_id == main.id)).all()
+    assert [(r.date, r.period, r.source) for r in rows] == [("2026-10-20", 3, "feeder")]
+    assert main.slot_open_fired_at is not None
+    assert opened == [main.id]
+
+
+def test_mirror_feeder_skips_a_different_posto(db):
+    detector, main = _detector_and_main(db, detector_posto="9999")
+    _add_slot(db, detector, "2026-10-20", 3)
+
+    n = _scheduler()._mirror_feeder_slots(db, main, _utcnow())
+
+    assert n == 0
+    assert db.scalars(select(M.Slot).where(M.Slot.booking_id == main.id)).all() == []
+
+
+def test_mirror_feeder_is_idempotent_and_does_not_re_inject_a_reverted_slot(db):
+    detector, main = _detector_and_main(db)
+    _add_slot(db, detector, "2026-10-20", 3)
+    sch = _scheduler()
+
+    assert sch._mirror_feeder_slots(db, main, _utcnow()) == 1
+    assert sch._mirror_feeder_slots(db, main, _utcnow()) == 0
+
+    row = db.scalar(select(M.Slot).where(M.Slot.booking_id == main.id))
+    row.status = SlotStatus.CLOSED
+    db.commit()
+    assert sch._mirror_feeder_slots(db, main, _utcnow()) == 0
+
+
+def test_mirror_feeder_only_mirrors_available_detector_slots(db):
+    detector, main = _detector_and_main(db)
+    _add_slot(db, detector, "2026-10-20", 3, status=SlotStatus.AVAILABLE)
+    _add_slot(db, detector, "2026-10-21", 3, status=SlotStatus.TAKEN)
+    _add_slot(db, detector, "2026-10-22", 3, status=SlotStatus.CLOSED)
+
+    assert _scheduler()._mirror_feeder_slots(db, main, _utcnow()) == 1
+    rows = db.scalars(select(M.Slot).where(M.Slot.booking_id == main.id)).all()
+    assert [(r.date, r.period) for r in rows] == [("2026-10-20", 3)]
+
+
+def test_mirror_feeder_is_a_noop_without_feeders_or_when_inactive(db):
+    detector = _mk_booking(db, status=BookingStatus.RUNNING)
+    _add_slot(db, detector, "2026-10-20", 3)
+    sch = _scheduler()
+
+    plain = _mk_booking(db, status=BookingStatus.RUNNING)
+    assert sch._mirror_feeder_slots(db, plain, _utcnow()) == 0
+    assert plain.slot_open_fired_at is None
+
+    done = _mk_booking(db, status=BookingStatus.COMPLETED, feeders=[detector.id])
+    assert sch._mirror_feeder_slots(db, done, _utcnow()) == 0
+    assert db.scalars(select(M.Slot).where(M.Slot.booking_id == done.id)).all() == []
