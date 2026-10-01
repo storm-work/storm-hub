@@ -956,6 +956,40 @@ function BookingOverview({ me, booking, events, workers, allBookings, onBookingC
           <span className="pill ok">slot-found fired @{booking.slot_found_fired_at.slice(0, 16).replace("T", " ")}Z</span>
         )}
       </div>
+      {(() => {
+        // Cross-booking feed linkage (both directions), resolved against the live bookings list.
+        const all = allBookings || [];
+        const byId = Object.fromEntries(all.map((b) => [b.id, b]));
+        const feederIds = booking.discovery_feeder_booking_ids || [];
+        const fedBy = feederIds.map((id) => byId[id]).filter(Boolean);
+        const unknown = feederIds.filter((id) => !byId[id]);           // deleted/archived feeder
+        const feeds = all.filter((b) => (b.discovery_feeder_booking_ids || []).includes(booking.id));
+        if (!fedBy.length && !feeds.length && !unknown.length) return null;
+        const pill = (b) => {
+          const mismatch = b.posto_id !== booking.posto_id;
+          return (
+            <span key={b.id} className="pill" style={{ cursor: "pointer" }}
+                  onClick={() => onSelectBooking && onSelectBooking(b.id)}
+                  title={`posto ${b.posto_id} · ${b.status}${mismatch ? " — different posto, slots will NOT mirror" : ""}`}>
+              {b.name}{mismatch ? " ⚠ posto≠" : ""}
+            </span>
+          );
+        };
+        return (
+          <div className="row" style={{ fontSize: 13, marginBottom: 12, gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+            <span className="muted">feed:</span>
+            {fedBy.length > 0 && <span className="muted">⬇ fed by</span>}
+            {fedBy.map(pill)}
+            {unknown.length > 0 && (
+              <span className="pill" title="feeder booking id(s) no longer found — deleted or inaccessible">
+                {unknown.length} unknown feeder{unknown.length > 1 ? "s" : ""}
+              </span>
+            )}
+            {feeds.length > 0 && <span className="muted" style={{ marginLeft: fedBy.length || unknown.length ? 10 : 0 }}>⬆ feeds</span>}
+            {feeds.map(pill)}
+          </div>
+        );
+      })()}
       <BookingRunSummary workers={workers} events={events} />
       {msg && <div className="banner err">{msg}</div>}
       <BookingShortcutSettings me={me} booking={booking} onSaved={onBookingChanged} />
