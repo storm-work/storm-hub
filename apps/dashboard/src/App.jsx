@@ -392,6 +392,7 @@ function Bookings({ me, events, setLeftPanel, setRightPanel }) {
       {booking ? (
         <>
           <BookingOverview me={me} booking={booking} events={events} workers={workers}
+            allBookings={rows}
             onBookingChanged={reload} onDeleted={() => { setSelectedId(null); reload(); }}
             onSelectBooking={(id) => { setSelectedId(id); reload(); }} />
           <BookingOpsTabs me={me} booking={booking} events={events} workers={workers}
@@ -644,7 +645,7 @@ function BookingRunSummary({ workers, events }) {
   );
 }
 
-function BookingOverview({ me, booking, events, workers, onBookingChanged, onDeleted, onSelectBooking }) {
+function BookingOverview({ me, booking, events, workers, allBookings, onBookingChanged, onDeleted, onSelectBooking }) {
   const op = me.is_operating;
   // Portal liveness (alive/down/unknown) -- what workers report about the portal itself. Replaced
   // the booking breaker (removed 2026-09-23): the portal's state is SHOWN here, not acted on by
@@ -656,7 +657,7 @@ function BookingOverview({ me, booking, events, workers, onBookingChanged, onDel
     name: booking.name, type: booking.type, posto_id: booking.posto_id || "",
     nationality: booking.nationality || "", residence: booking.residence || "",
     warmup_start_at: isoToDatetimeLocal(booking.warmup_start_at), slot_open_at: isoToDatetimeLocal(booking.slot_open_at),
-    discovery_feeder_booking_ids: (booking.discovery_feeder_booking_ids || []).join(", "),
+    discovery_feeder_booking_ids: (booking.discovery_feeder_booking_ids || []),
   }));
 
   useEffect(() => {
@@ -665,7 +666,7 @@ function BookingOverview({ me, booking, events, workers, onBookingChanged, onDel
       name: booking.name, type: booking.type, posto_id: booking.posto_id || "",
       nationality: booking.nationality || "", residence: booking.residence || "",
       warmup_start_at: isoToDatetimeLocal(booking.warmup_start_at), slot_open_at: isoToDatetimeLocal(booking.slot_open_at),
-      discovery_feeder_booking_ids: (booking.discovery_feeder_booking_ids || []).join(", "),
+      discovery_feeder_booking_ids: (booking.discovery_feeder_booking_ids || []),
     });
   }, [booking.id]);
 
@@ -786,9 +787,8 @@ function BookingOverview({ me, booking, events, workers, onBookingChanged, onDel
         residence: edit.residence,
         warmup_start_at: edit.warmup_start_at ? new Date(edit.warmup_start_at).toISOString() : null,
         slot_open_at: edit.slot_open_at ? new Date(edit.slot_open_at).toISOString() : null,
-        // Comma/space-separated detector booking ids -> array ([] clears the feed).
-        discovery_feeder_booking_ids: (edit.discovery_feeder_booking_ids || "")
-          .split(/[\s,]+/).map((x) => x.trim()).filter(Boolean),
+        // Multi-selected detector booking ids ([] clears the feed).
+        discovery_feeder_booking_ids: edit.discovery_feeder_booking_ids || [],
       },
     });
     setEditing(false);
@@ -849,10 +849,37 @@ function BookingOverview({ me, booking, events, workers, onBookingChanged, onDel
             <div className="field" style={{ margin: 0 }}><label>Slot-open</label>
               <input type="datetime-local" value={edit.slot_open_at} onChange={(e) => setEdit({ ...edit, slot_open_at: e.target.value })} /></div>
             <div className="field" style={{ margin: 0, flexBasis: "100%" }}>
-              <label>Feeder booking IDs (detector runs that inject slots into this pool — same posto)</label>
-              <input value={edit.discovery_feeder_booking_ids}
-                     onChange={(e) => setEdit({ ...edit, discovery_feeder_booking_ids: e.target.value })}
-                     placeholder="comma-separated booking ids; blank = none" style={{ width: "100%" }} /></div>
+              <label>Feeder bookings (detector runs whose found slots are injected into this pool — same posto only)</label>
+              {(() => {
+                // Other ACTIVE bookings (not self, not draft, not archived) as multi-select options.
+                // The backend only mirrors slots whose posto matches THIS booking, so same-posto ones
+                // are listed first and a different-posto pick is labelled so a mismatch is obvious.
+                const opts = (allBookings || [])
+                  .filter((b) => b.id !== booking.id && !b.archived_at && b.status !== "draft")
+                  .sort((a, b) => (a.posto_id === booking.posto_id ? -1 : 1)
+                                  - (b.posto_id === booking.posto_id ? -1 : 1));
+                return (
+                  <>
+                    <select multiple value={edit.discovery_feeder_booking_ids || []}
+                            disabled={!op}
+                            onChange={(e) => setEdit({ ...edit, discovery_feeder_booking_ids:
+                              Array.from(e.target.selectedOptions, (o) => o.value) })}
+                            style={{ width: "100%", minHeight: 84 }}>
+                      {opts.map((b) => (
+                        <option key={b.id} value={b.id}>
+                          {b.name} — posto {b.posto_id} ({b.status})
+                          {b.posto_id !== booking.posto_id ? "  ⚠ different posto — won't feed" : ""}
+                        </option>
+                      ))}
+                    </select>
+                    <div className="muted" style={{ fontSize: 12 }}>
+                      Ctrl/Cmd-click to select multiple; deselect all to clear the feed.
+                      {opts.length === 0 && " No other active bookings to feed from."}
+                    </div>
+                  </>
+                );
+              })()}
+            </div>
             <button className="btn" disabled={!op || !edit.name} onClick={saveEdit}>Save</button>
             <button className="btn ghost" onClick={() => setEditing(false)}>Cancel</button>
           </div>
