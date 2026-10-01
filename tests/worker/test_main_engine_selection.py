@@ -1,6 +1,8 @@
 """apps.worker.__main__._build_ops -- engine selection. _engine defaults to 'sim' (never live by
 accident); 'live' constructs LiveEngineOps only when the Hub explicitly opted in via the launch
 payload."""
+import re
+
 import fakeredis
 import pytest
 
@@ -127,8 +129,12 @@ def test_live_engine_log_wired_to_log_line_event():
     log_lines = [m for m in msgs if m.type == "log_line"
                  and not m.payload["text"].startswith("vendor env applied:")]
     assert len(log_lines) == 1
-    assert log_lines[0].payload["text"] == \
-        "do_swap: new session failed health check -- reverting to phase-1 proxy"
+    # ops._log prefixes a UTC timestamp (HH:MM:SS.mmm) onto every line (2026-09-26) so a worker log
+    # is timeline-readable -- assert on the message after that prefix rather than the raw equality.
+    text = log_lines[0].payload["text"]
+    assert text.endswith(
+        "do_swap: new session failed health check -- reverting to phase-1 proxy")
+    assert re.match(r"^\d{2}:\d{2}:\d{2}\.\d{3} ", text), f"missing timestamp prefix: {text!r}"
     assert log_lines[0].payload["worker_id"] == "w1"
 
 

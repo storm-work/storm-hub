@@ -590,10 +590,17 @@ _TEMPLATE = [
             "fails the worker over proxy weather -- confirmed live 2026-08-14, six workers "
             "permanently FAILED that way. 0 makes every failure count against the sub-account, "
             "i.e. the old (broken) behaviour."),
-    _s("QUEST_STEP_RETRIES", L.TEMPLATE, int, 10, _WRK, "login_resilience",
+    _s("QUEST_STEP_RETRIES", L.TEMPLATE, int, 3, _WRK, "login_resilience", min_value=1.0,
        note=
        "Retries per questionnaire step. The chain must complete or the booking cursor is never "
-       "built, so this is worth more than most retry budgets."),
+       "built, so this is worth more than most retry budgets. UNWIRED until 2026-10-01: the code "
+       "hardcoded _QUEST_STEP_RETRIES=3 and never read this (default was a never-validated 10) -- "
+       "corrected to 3 to match the proven value and wired to a real read site in "
+       "ops_live._run_warmup_steps. On retry-EXHAUSTION the warm-up now ABORTS the whole chain "
+       "(the questionnaire is a stateful server-side sequence; advancing past a failed step only "
+       "surfaces later as the vaguer csrf_missing/quest_state_stale), so raise this only with "
+       "QUEST_STEP_BACKOFF in mind -- more retries x longer backoff = a slower warm-up that loses "
+       "slot races."),
     _s("CAPTCHA_FAILURE_BUDGET", L.TEMPLATE, int, 1, _WRK, "login_resilience", min_value=1.0,
        note="reCAPTCHA rejections to spend on ONE sub-account before rotating to another. The "
             "portal states its own rule -- 'apenas permite falhar o processo de ReCaptcha 2 vezes' "
@@ -640,6 +647,15 @@ _TEMPLATE = [
             "Wired to a real read site in ops_live._run_warmup_steps on 2026-08-22 and defaulted to "
             "1.0. Costs ~7s per warm-up; a warm-up that 403s costs the whole session. 0 restores "
             "the old no-gap behaviour."),
+    _s("QUEST_STEP_BACKOFF", L.TEMPLATE, float, 1.5, _WRK, "login_resilience", min_value=0.0,
+       note="base seconds to wait before RETRYING a questionnaire step that failed (raised or came "
+            "back non-200). Grows exponentially per attempt (base, base*2, base*4 ...) capped at "
+            "~8s, +-30%% jitter. Added 2026-10-01: the retry loop used a flat 1.5s, which burned all "
+            "three attempts inside the same second against a 503/WAF storm (step 5 attempts 1-2 both "
+            "at 18:41:53 in one live log) -- worse than not retrying. A 503 is portal overload (high "
+            "traffic / slow render), so backing off between attempts is the reliable recovery; it is "
+            "NOT a dead-exit signal and does not roll the exit. Default 1.5 preserves the first "
+            "attempt's wait; 0 restores the old no-backoff behaviour."),
     _s("WARMUP_MAX_ATTEMPTS", L.TEMPLATE, int, 6, _WRK, "login_resilience",
        note=
        "Attempts at the warm-up chain before giving up on it. A warm-up failure means the server- "

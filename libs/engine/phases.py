@@ -317,6 +317,20 @@ class PhaseMachine:
                     return PhaseResult("stopped", self._sub, "stopped while re-holding after "
                                        "slot-open inactivation", self.visited)
                 continue
+            # PROVE the session healthy BEFORE discovering (finding #2, 2026-10-01). The keepalive
+            # between rounds only logs an inconclusive/dead probe and re-probes -- it does not stop
+            # this discover. So a degraded scout went into do_discover and gettime died with
+            # "Execution context was destroyed", wasting the whole ~68s round before the reactive
+            # all-failed ladder below noticed. session_probe_ok() is a cheap positive check (authed +
+            # on a live portal origin); if it fails, rebuild the session FIRST, then discover on it.
+            # getattr-guarded so a test double without the method keeps its old behaviour.
+            _probe = getattr(self.ops, "session_probe_ok", None)
+            if callable(_probe) and not _probe():
+                _relogin = getattr(self.ops, "discovery_needs_relogin", None)
+                _skip = bool(callable(_relogin) and _relogin())
+                if not self._rebuild_session("session not proven healthy before discover",
+                                             skip_rewarm=_skip):
+                    return self._fail("scout session unrecoverable")
             self._to(WorkerSubstate.DISCOVERING)
             results = self.ops.do_discover(dates)
             found = _flatten_found(results)

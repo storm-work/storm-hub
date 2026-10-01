@@ -1035,6 +1035,48 @@ class LiveEngineOps(EngineOps):
             return False
         return "cmbPeriodo" in html or "getPeriodosOcupados" in html
 
+    def session_probe_ok(self) -> bool:
+        """POSITIVE liveness gate the scout runs BEFORE discovery (finding #2, 2026-10-01).
+
+        A scout must not discover from a session that has not just proven itself live. The keepalive
+        between rounds classifies an off-origin / dead-tunnel / UNKNOWN page as 'inconclusive, will
+        re-probe' and RETURNS -- it does not stop the next discover command from running. So a
+        degraded scout went straight into do_discover, gettime raised 'Execution context was
+        destroyed' (the page was on chrome-error / mid-nav), and a whole ~68s round was wasted before
+        the REACTIVE all-failed ladder noticed. This makes the check PROACTIVE: prove the session is
+        authenticated and on a live portal origin first, and let the phase machine rebuild it if not.
+
+        Auth-level, not form-level: KEEPING is auth-only, so this asks the same question the keepalive
+        asks (classify_session_state warmed=False) on the same home page, inventing no new opinion.
+        do_discover re-establishes the Schedule.jsp context it needs on its own.
+        """
+        if self.session is None:
+            return False
+        probe = self.cfg.keepalive.probe or "home"
+        url = HOME_URL if probe == "home" else probe
+        try:
+            final_url = self.session.browser_nav(url, timeout=30)
+        except Exception as e:
+            self._log(f"session_probe_ok: nav failed ({str(e)[:100]}) -- not healthy")
+            return False
+        if probe != "home":
+            # Custom KEEPALIVE_PROBE URL: a successful nav is the whole check, exactly as _do_keepalive
+            # treats it (no content evidence is known for an arbitrary operator-chosen page).
+            return True
+        try:
+            page = self._keepalive_read_page()
+        except Exception as e:
+            self._log(f"session_probe_ok: read failed ({str(e)[:100]}) -- not healthy")
+            return False
+        if self._is_dead_exit_response(page, final_url):
+            self._log("session_probe_ok: dead exit / chrome-error -- not healthy")
+            return False
+        state = classify_session_state(page, final_url, warmed=False)
+        if state is not SessionState.AUTHENTICATED:
+            self._log(f"session_probe_ok: not authenticated ({state}, {len(page)}B) -- not healthy")
+            return False
+        return True
+
     def _probe_swapped_session(self) -> bool:
         """Is the session still AUTHENTICATED after moving it to the hold proxy?
 
@@ -1653,13 +1695,27 @@ class LiveEngineOps(EngineOps):
             if not self._ensure_portal_origin("the warm-up chain"):
                 raise RuntimeError(
                     "portal origin could not be restored -- the in-page fetch chain cannot run")
+            # Retry budget + backoff, now operator-tunable (QUEST_STEP_RETRIES / QUEST_STEP_BACKOFF,
+            # wired 2026-10-01). _QUEST_STEP_RETRIES stays as the fallback default so a config that
+            # omits the key is byte-identical to the old behaviour. The backoff GROWS per attempt
+            # (base, 2x, 4x ... capped 8s, +-30% jitter): a 503/WAF storm is portal overload, and
+            # the flat 1.5s used before burned all three attempts inside the same second (step 5
+            # attempts 1-2 both at 18:41:53 in one live log) -- worse than not retrying.
+            _retries = max(1, int(self.cfg.raw.get("QUEST_STEP_RETRIES", _QUEST_STEP_RETRIES)))
+            _bk_base = max(0.0, float(self.cfg.raw.get("QUEST_STEP_BACKOFF", 1.5)))
+
+            def _quest_backoff(att: int) -> float:
+                if _bk_base <= 0:
+                    return 0.0
+                return min(_bk_base * (2 ** (att - 1)), 8.0) * random.uniform(0.7, 1.3)
+
             # Retried like every other in-page fetch in this chain. When the labelling went in I
             # made this one raise on the FIRST failure while giving the quest steps below three
             # attempts -- and it is by far the most common failure point: 377 aborted warmups in one
             # live run, 370 of them from just two workers stuck in a hot retry loop, none of which
             # ever reached ScheduleController. "TypeError: Failed to fetch" is a transient network
             # failure inside the page (dead proxy, dropped tunnel), exactly what a retry is for.
-            for attempt in range(1, _QUEST_STEP_RETRIES + 1):
+            for attempt in range(1, _retries + 1):
                 try:
                     self.session.browser_eval(
                         "(async()=>{const r=await fetch('%s',{method:'POST',credentials:'include',"
@@ -1668,10 +1724,10 @@ class LiveEngineOps(EngineOps):
                     )
                     break
                 except Exception as e:
-                    self._log(f"home-lang POST attempt {attempt}/{_QUEST_STEP_RETRIES} failed: {e}")
-                    if attempt == _QUEST_STEP_RETRIES:
+                    self._log(f"home-lang POST attempt {attempt}/{_retries} failed: {e}")
+                    if attempt == _retries:
                         raise RuntimeError(f"home-lang POST failed: {e}") from e
-                    time.sleep(1.5)
+                    time.sleep(_quest_backoff(attempt))
             # Same pacing before the Questionario nav: storm-auto paces the whole early burst
             # (HOME -> lang POST -> Questionario), not just the steps.
             _gap0 = max(0.0, float(self.cfg.raw.get("QUEST_STEP_GAP", 1.0)))
@@ -1718,7 +1774,7 @@ class LiveEngineOps(EngineOps):
                 # non-200 and carried on regardless, so one flaky step silently poisoned the whole
                 # chain and surfaced later as the much vaguer quest_state_stale.
                 res = None
-                for attempt in range(1, _QUEST_STEP_RETRIES + 1):
+                for attempt in range(1, _retries + 1):
                     try:
                         res = self.session.browser_eval(js)
                     except Exception as e:
@@ -1727,22 +1783,36 @@ class LiveEngineOps(EngineOps):
                         # to the outer handler and killed the whole warmup on the first blip --
                         # 306 aborted warmups in one live run.
                         self._log(f"quest step {i+1}/{len(steps)} attempt {attempt}/"
-                                  f"{_QUEST_STEP_RETRIES} raised: {e}")
-                        if attempt == _QUEST_STEP_RETRIES:
+                                  f"{_retries} raised: {e}")
+                        if attempt == _retries:
                             raise RuntimeError(f"quest step {i+1} failed: {e}") from e
-                        time.sleep(1.5)
+                        time.sleep(_quest_backoff(attempt))
                         continue
                     if isinstance(res, dict) and res.get("status") == 200:
                         break
                     self._log(f"quest step {i+1}/{len(steps)} attempt {attempt}/"
-                              f"{_QUEST_STEP_RETRIES} non-200: {res}")
-                    # storm-auto sleeps 1.5s here ("retrying -- like a manual page refresh"). We
-                    # slept only on the EXCEPTION path, so a non-200 burned all three attempts in
-                    # the same second -- visible in the live log: step 5 attempts 1 and 2 both at
-                    # 18:41:53, step 6 attempts 1-3 across 18:41:54-56. Against a rate limiter or a
-                    # WAF that is worse than not retrying at all: three hits where one would do.
-                    if attempt < _QUEST_STEP_RETRIES:
-                        time.sleep(1.5)
+                              f"{_retries} non-200: {res}")
+                    # ABORT THE CHAIN on retry-exhaustion (2026-10-01). The questionnaire is a
+                    # STATEFUL server-side sequence: every step builds on the one before, so a step
+                    # that never returns 200 means the remaining steps and the Formulario/
+                    # ScheduleController POST are already doomed. Before, this logged the non-200 and
+                    # FELL THROUGH to the next step; the chain then plowed on and failed later with
+                    # the vaguer `quest_state_stale` / `csrf_missing after Formulario POST` (the
+                    # exact 0925 log: step 3/7 exhausted 3x503 -> step 4 -> ... -> csrf_missing).
+                    # Raise here instead so the failure is named at its real cause and the recovery
+                    # ladder re-runs the WHOLE chain from step 1 (you cannot resume mid-questionnaire).
+                    # Raised like the exception path so _warmup_last_error records it; a 503 message
+                    # does NOT match _is_transient_login_failure, so do_apply will NOT roll the exit
+                    # for portal overload -- it backs off and re-warms, which is the right cure.
+                    if attempt == _retries:
+                        raise RuntimeError(
+                            f"quest step {i+1} never returned 200 after {_retries} attempts "
+                            f"(last={res}) -- aborting the warm-up chain")
+                    # storm-auto sleeps here ("retrying -- like a manual page refresh"). We slept
+                    # only on the EXCEPTION path before, so a non-200 burned all attempts in the same
+                    # second (step 5 attempts 1-2 both at 18:41:53 in one live log). Backoff grows
+                    # per attempt so a 503/WAF storm gets real recovery time, not three hits at once.
+                    time.sleep(_quest_backoff(attempt))
                 if is_last and isinstance(res, dict):
                     last_fields = res.get("fields") or {}
                     if not last_fields:
@@ -3074,11 +3144,39 @@ class LiveEngineOps(EngineOps):
         self._pending_special_days = None
         fetched_fresh = special_days is None
         if fetched_fresh:
-            try:
-                self.session.browser_nav(f"{GETTIME_URL}?id_posto={self.posto_id}", timeout=30)
-                gettime_body = self.session.browser_eval("document.documentElement.outerHTML") or ""
-            except Exception as e:
-                self._log(f"do_discover: gettime nav failed ({e}) -- all requested dates FAILED, not empty")
+            # Ensure a LIVE portal origin before gettime (finding #1/#C, 2026-10-01). A gettime that
+            # fires from a chrome-error / off-origin page raises "Execution context was destroyed"
+            # (the nav raced, or the exit is dead): the old code failed the whole round AND left the
+            # page off-origin, so the NEXT warm-up logged "not on a live portal origin -- re-anchoring
+            # to Schedule.jsp" (exactly ss#1 from the 0925 logs). Anchor first; and treat a context-
+            # destroyed / dead-exit failure as transient -- re-anchor + retry ONCE before giving up.
+            self._ensure_portal_origin("discovery gettime")
+            gettime_body = ""
+            _gt_ok = False
+            for _gt_attempt in (1, 2):
+                try:
+                    self.session.browser_nav(f"{GETTIME_URL}?id_posto={self.posto_id}", timeout=30)
+                    gettime_body = self.session.browser_eval("document.documentElement.outerHTML") or ""
+                    _gt_ok = True
+                    break
+                except Exception as e:
+                    _msg = str(e)
+                    _raced = "execution context was destroyed" in _msg.lower()
+                    _dead = self._is_transient_login_failure(_msg)
+                    if _gt_attempt == 1 and (_raced or _dead):
+                        self._log(f"do_discover: gettime raced/dead-exit ({_msg[:100]}) -- "
+                                  f"re-anchoring and retrying once")
+                        self._ensure_portal_origin("discovery gettime retry")
+                        time.sleep(1.0)
+                        continue
+                    self._log(f"do_discover: gettime nav failed ({e}) -- all requested dates FAILED, not empty")
+                    # A CONFIRMED dead exit (chrome-error/tunnel) will fail identically every round;
+                    # roll it now so the scout loop's rebuild re-logs in on a fresh exit, instead of
+                    # re-probing the dead tunnel forever ([[dead_exit_page_not_rolled]]).
+                    if _dead:
+                        self._roll_exit("discovery: dead tunnel at gettime")
+                    break
+            if not _gt_ok:
                 return [{"date": d, "outcome": "failed"} for d in dates]
 
             gt_status = classify_gettime_body(gettime_body)
@@ -3359,6 +3457,17 @@ class LiveEngineOps(EngineOps):
             # 0923-3018 (copy)' as 20/46 applies entering APPLYING with no warm-up. The chain is the
             # only thing that establishes the cursor, so run it every round; ~40s is the price of a
             # valid submit, and a skipped warm is a guaranteed form_stale (zero bookings).
+            #
+            # SHOW the re-warm (2026-10-01). phases.py sets substate=APPLYING BEFORE calling do_apply,
+            # and this mandatory ~40s re-warm emits no substate of its own, so the dashboard shows
+            # KEEPING->APPLYING with a silent warm-up and it LOOKS like warm-up was skipped on a
+            # slot-found (recurring operator report). It is not skipped -- it always runs here. Emit
+            # the warming_up substate so the apply round's warm-up is visible, then applying for the
+            # submit. Observability only; no control-flow change. Uses the same status_change emit
+            # _mark_keep_bookable already uses.
+            if self._emit is not None:
+                self._emit("status_change", substate="warming_up",
+                           detail="apply: round-start re-warm (mandatory)")
             if not self._run_warmup_steps():
                 # NOT "bounced". This is OUR session failing before we ever spoke to the portal
                 # about this slot, and calling it a bounce blames the slot for our dead proxy:
@@ -3386,6 +3495,11 @@ class LiveEngineOps(EngineOps):
                     self._roll_exit("apply: dead exit at round-start re-warm")
                 self._log("do_apply: re-warm at round start failed -- session problem, not the slot")
                 return "session"
+
+            # Warm-up succeeded -- back to APPLYING for the submit (pairs with the warming_up emit
+            # above so the dashboard shows warm-up THEN submit, not a silent gap inside "applying").
+            if self._emit is not None:
+                self._emit("status_change", substate="applying", detail="apply: warmed, submitting")
 
             # THE /slots PRIMER IS GONE. It destroyed the server-side booking cursor every round.
             #

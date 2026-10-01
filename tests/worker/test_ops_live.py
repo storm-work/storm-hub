@@ -4406,3 +4406,148 @@ def test_do_discover_prefers_the_hub_pushed_source_over_frozen_cfg(monkeypatch):
         {"date": d, "outcome": "empty"} for d in dates]
     ops.do_discover(["2026-09-14"])
     assert called["slots"] == 1 and called["cal"] == 0, "must honour the pushed 'slots', not frozen 'calendar'"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2026-10-01 session-health batch: warm-up fails fast on a broken quest step,
+# discovery survives an origin/context loss, do_apply's mandatory re-warm is visible.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _QuestStorm(_WarmupSession):
+    """Warm-up chain where one quest step keeps returning non-200 (a 503 storm). Records the step
+    marker of every quest-step eval so a test can prove the chain does NOT advance past the failure."""
+    def __init__(self, sched_html, *, fail_mark, status=503):
+        super().__init__(sched_html)
+        self._fail_mark = fail_mark
+        self._status = status
+        self.steps_seen: list[str] = []
+
+    def browser_eval(self, js, timeout=30):
+        if "location.origin" in (js or ""):
+            return _origin_reply(js)
+        if "outerHTML" in js:
+            return self._sched_html
+        if "method:'GET'" in js:                      # a questionnaire step fetch
+            for mark in ("STEP1", "STEP2", "STEP3"):
+                if mark in js:
+                    self.steps_seen.append(mark)
+                    if mark == self._fail_mark:
+                        return {"status": self._status}
+                    return {"status": 200, "fields": {"a": "1"}}
+        return "200"                                   # home-lang POST
+
+
+def _quest_storm_ops(fail_mark, **template):
+    ops = _make_ops(
+        cfg=_cfg(QUEST_STEP_GAP=0, QUEST_STEP_BACKOFF=0, **template),
+        quest_steps={"IRL": [{"q": "STEP1"}, {"q": "STEP2"}, {"q": "STEP3"}]},
+    )
+    ops.session = _QuestStorm(_SCHED_OK, fail_mark=fail_mark)
+    return ops
+
+
+def test_warmup_aborts_the_chain_when_a_quest_step_never_succeeds():
+    """0925 root cause: a 503 step exhausted its retries, the loop logged it and FELL THROUGH to the
+    next step, and the correlated chain died later with the vaguer csrf_missing. The questionnaire is
+    a stateful server-side sequence, so a failed step must ABORT the whole chain, not advance."""
+    ops = _quest_storm_ops("STEP2")
+    assert ops._run_warmup_steps() is False
+    assert "STEP3" not in ops.session.steps_seen, "the chain must NOT advance past the failed step"
+    assert ops.session.steps_seen.count("STEP2") == 3   # QUEST_STEP_RETRIES default = retried in place
+
+
+def test_warmup_abort_on_503_is_not_a_dead_exit_so_do_apply_would_not_roll():
+    """A 503 is portal overload, not a dead tunnel -- the recorded failure must NOT classify as
+    transient/infra, or do_apply's dead-exit guard would roll a perfectly good exit."""
+    ops = _quest_storm_ops("STEP1")
+    assert ops._run_warmup_steps() is False
+    assert "quest step 1" in ops._warmup_last_error
+    assert ops._is_transient_login_failure(ops._warmup_last_error) is False
+
+
+def test_warmup_quest_step_backoff_grows_per_attempt(monkeypatch):
+    """The old flat 1.5s burned all three attempts inside the same second against a WAF/503 storm.
+    Backoff now grows (base, 2x) so each retry gets real recovery time."""
+    sleeps: list[float] = []
+    monkeypatch.setattr("apps.worker.ops_live.time.sleep", lambda s: sleeps.append(s))
+    monkeypatch.setattr("apps.worker.ops_live.random.uniform", lambda a, b: 1.0)   # kill jitter
+    ops = _make_ops(
+        cfg=_cfg(QUEST_STEP_GAP=0, QUEST_STEP_BACKOFF=1.5),
+        quest_steps={"IRL": [{"q": "STEP1"}, {"q": "STEP2"}, {"q": "STEP3"}]},
+    )
+    ops.session = _QuestStorm(_SCHED_OK, fail_mark="STEP1")
+    ops._run_warmup_steps()
+    # STEP1 fails 3x: backoff after attempts 1 and 2, none after the final (it aborts).
+    assert sleeps[:2] == [1.5, 3.0]
+
+
+class _ContextLostSession(_RecordingSession):
+    """gettime read raises 'Execution context was destroyed' the first `fail_times` times, then
+    succeeds -- models the page-context race / dead-exit that failed the whole 0925 discovery round."""
+    def __init__(self, fail_times=1):
+        super().__init__()
+        self._fail = fail_times
+        self.gettime_reads = 0
+
+    def browser_eval(self, js):
+        if "location.origin" in (js or ""):
+            return _origin_reply(js)
+        if "gettime" in self._last_url:
+            self.gettime_reads += 1
+            if self.gettime_reads <= self._fail:
+                raise RuntimeError("Page.evaluate: Execution context was destroyed")
+            return self.GETTIME_BODY
+        return self.PERIODOS_BODY
+
+
+def test_do_discover_recovers_when_gettime_context_is_destroyed(monkeypatch):
+    """ss#1 root cause: a context-destroyed gettime failed the round AND left the page off-origin, so
+    the next warm-up logged 're-anchoring to Schedule.jsp'. do_discover now re-anchors and retries
+    once instead of surrendering the whole round."""
+    monkeypatch.setattr("apps.worker.ops_live.time.sleep", lambda _s: None)
+    ops = _make_ops()
+    ops.session = _ContextLostSession(fail_times=1)
+    out = ops.do_discover(["2026-08-16"])
+    assert ops.session.gettime_reads == 2    # failed once, re-anchored + retried, then OK
+    assert {o["date"]: o["outcome"] for o in out}["2026-08-16"] == "found"
+
+
+def test_do_discover_gives_up_after_the_single_context_retry(monkeypatch):
+    """One re-anchor+retry, not an unbounded loop: a page that never recovers reports the round
+    failed (and the scout loop's rebuild + the pre-discover probe gate take it from there)."""
+    monkeypatch.setattr("apps.worker.ops_live.time.sleep", lambda _s: None)
+    ops = _make_ops()
+    ops.session = _ContextLostSession(fail_times=99)
+    out = ops.do_discover(["2026-08-16"])
+    assert ops.session.gettime_reads == 2    # initial + exactly one retry
+    assert out == [{"date": "2026-08-16", "outcome": "failed"}]
+
+
+def test_session_probe_ok_true_for_an_authenticated_home_page():
+    ops = _make_ops()
+    ops.session = _FakeSession(alive=True)
+    assert ops.session_probe_ok() is True
+
+
+def test_session_probe_ok_false_when_the_session_is_expired():
+    ops = _make_ops()
+    ops.session = _FakeSession(alive=False)
+    assert ops.session_probe_ok() is False
+
+
+def test_session_probe_ok_false_when_there_is_no_session():
+    ops = _make_ops()
+    ops.session = None
+    assert ops.session_probe_ok() is False
+
+
+def test_do_apply_makes_its_mandatory_rewarm_visible():
+    """'applying without warmup' was an observability lie: do_apply DOES re-warm unconditionally, but
+    phases.py sets APPLYING before calling it and the ~40s re-warm emitted no substate. It now emits
+    warming_up then applying so the dashboard shows the warm-up it was always running."""
+    events = []
+    ops = _apply_ops(b"%PDF-1.4\nreal confirmation", events)
+    assert ops.do_apply({"date": "2026-09-01", "period": 4}) == "booked"
+    substates = [p.get("substate") for t, p in events if t == "status_change"]
+    assert "warming_up" in substates and "applying" in substates
+    assert substates.index("warming_up") < substates.index("applying")

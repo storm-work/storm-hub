@@ -792,3 +792,47 @@ def test_an_already_booked_warmup_terminates_and_does_not_respawn():
     ops = _AlreadyBookedOps(discover_tasks=[["d1"]], discover_outcomes={})
     res = PhaseMachine(_cfg(ROLE="scout"), ops).run()
     assert res.outcome == "already_booked", f"expected terminal already_booked, got {res.outcome!r}"
+
+
+# ── a scout proves its session healthy BEFORE discovering (finding #2, 2026-10-01) ──
+class _ProbeGateOps(SimEngineOps):
+    """SimEngineOps that answers session_probe_ok() from a scripted list -- lets a test force the
+    pre-discover health gate to fail on a given round and assert the scout rebuilds first."""
+    def __init__(self, probe_results, **kw):
+        super().__init__(**kw)
+        self._probe_results = list(probe_results)
+        self.probe_calls = 0
+
+    def session_probe_ok(self) -> bool:
+        self.probe_calls += 1
+        return self._probe_results.pop(0) if self._probe_results else True
+
+
+def test_scout_rebuilds_before_discovering_when_the_session_probe_fails():
+    """The keepalive between rounds only logs an inconclusive/dead probe and re-probes -- it never
+    stopped the next do_discover, so a degraded scout discovered into a dying session and gettime
+    died with 'Execution context was destroyed', wasting the whole round. Now a failed pre-discover
+    probe forces a RE-WARM first. Outcomes are 'empty' here so the all-failed ladder can't be the
+    cause of the rebuild -- it is purely the probe gate."""
+    ops = _ProbeGateOps(
+        probe_results=[False, True],
+        discover_tasks=[["d1"], ["d2"]],
+        discover_outcomes={"d1": {"outcome": "empty"}, "d2": {"outcome": "empty"}},
+    )
+    res = PhaseMachine(_cfg(ROLE="scout"), ops).run()
+    assert ops.probe_calls == 2
+    assert ops.warmups == 2    # initial slot-open warm-up + the pre-discover rebuild's re-warm
+    assert ops.logins == 1     # a RE-WARM, not a re-login
+    assert res.outcome in ("discovered", "stopped")
+
+
+def test_scout_does_not_rebuild_when_the_probe_passes():
+    """A healthy probe must add no cost -- no extra warm-up, no re-login."""
+    ops = _ProbeGateOps(
+        probe_results=[True, True],
+        discover_tasks=[["d1"], ["d2"]],
+        discover_outcomes={"d1": {"outcome": "empty"}, "d2": {"outcome": "empty"}},
+    )
+    PhaseMachine(_cfg(ROLE="scout"), ops).run()
+    assert ops.warmups == 1    # just the initial slot-open warm-up
+    assert ops.logins == 1
