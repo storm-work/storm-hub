@@ -1443,29 +1443,73 @@ def _csv(passport, user="u1", ident="ID1", first="Ana", last="Silva", kind="real
     return _CSV_HEAD + f"{ident},{first},{last},{passport},CPV,{kind},1985-01-01,F,{user},pw1,{user}@x.com\n"
 
 
-def test_a_re_imported_passport_supersedes_the_row_it_duplicates(client):
-    """It used to `continue` with "skip duplicate passport", so re-importing a corrected identity
-    silently did nothing and the stale row stayed the only one. Operator decision: prefer the new
-    row (HIGH) and sink the one it supersedes (LOW) -- deleting nothing, since the old row keeps its
-    sub-accounts, history and bookings."""
+def test_a_re_imported_passport_is_deduped_not_duplicated(client):
+    """Dedup (2026-10-02, replaces the old supersede+create-new): re-importing a passport REUSES the
+    existing row -- promoted to HIGH, gaining only genuinely-new sub-accounts -- rather than adding a
+    second row. The old behaviour multiplied rows on every re-import and buried the verified one."""
     from libs.domain import priority
     h = _operate_headers(client)
     r1 = client.post("/identities/import", json={"csv": _csv("PP-1", user="old1"),
                                                  "default_type": "real"}, headers=h)
     assert r1.status_code == 200, r1.text
     first = r1.json()["identity_ids"][0]
+    client.patch(f"/identities/{first}", json={"priority": priority.NORMAL}, headers=h)  # so promote shows
 
     r2 = client.post("/identities/import", json={"csv": _csv("PP-1", user="new1"),
                                                  "default_type": "real"}, headers=h)
     assert r2.status_code == 200, r2.text
     body = r2.json()
-    assert body["created"] == 1, "the duplicate was skipped instead of superseding"
-    assert body["superseded"] == [first], f"the prior row was not reported as superseded: {body}"
-    second = body["identity_ids"][0]
+    assert body["created"] == 0, f"a duplicate passport must NOT create a new row: {body}"
+    assert body["promoted"] == [first], f"the existing row was not reused/promoted: {body}"
+    assert body["identity_ids"] == []
 
-    rows = {i["id"]: i for i in client.get("/identities", headers=h).json()}
-    assert rows[second]["priority"] == priority.HIGH
-    assert rows[first]["priority"] == priority.LOW
+    same = [i for i in client.get("/identities", headers=h).json() if i["passport_no"] == "PP-1"]
+    assert len(same) == 1, f"dedup must leave exactly one row per passport: {same}"
+    assert same[0]["id"] == first and same[0]["priority"] == priority.HIGH
+    subs = [s for s in client.get("/sub-accounts", headers=h).json() if s["identity_id"] == first]
+    assert {s["username"] for s in subs} == {"old1", "new1"}, "the new sub was not merged onto it"
+
+
+def test_a_re_imported_HIGH_verified_passport_is_ignored(client):
+    """The protected case: an existing row already HIGH AND holding a verified sub-account is KEPT
+    and the incoming identical copy IGNORED -- never wiped, nothing added."""
+    import apps.hub.main as hub_main
+    from libs.db import models as M
+    from libs.domain.enums import SubAccountStatus
+    from sqlalchemy import select as _select
+    h = _operate_headers(client)
+    first = client.post("/identities/import", json={"csv": _csv("PP-2", user="v1"),
+                                                    "default_type": "real"},
+                        headers=h).json()["identity_ids"][0]
+    db = hub_main.SessionLocal()
+    try:
+        sa = db.scalars(_select(M.SubAccount).where(M.SubAccount.identity_id == first)).first()
+        sa.status = SubAccountStatus.VERIFIED
+        db.commit()
+    finally:
+        db.close()
+
+    r = client.post("/identities/import", json={"csv": _csv("PP-2", user="v2"),
+                                                "default_type": "real"}, headers=h).json()
+    assert r["created"] == 0 and r["ignored"] == [first], f"identical HIGH+verified not ignored: {r}"
+    subs = [s for s in client.get("/sub-accounts", headers=h).json() if s["identity_id"] == first]
+    assert {s["username"] for s in subs} == {"v1"}, "an ignored import must add NOTHING"
+
+
+def test_add_identity_dedups_on_passport(client):
+    """The manual-add path obeys the same rule: adding an existing passport reuses + promotes."""
+    from libs.domain import priority
+    h = _operate_headers(client)
+    first = client.post("/identities/import", json={"csv": _csv("PP-D", user="d1"),
+                                                    "default_type": "real"},
+                        headers=h).json()["identity_ids"][0]
+    client.patch(f"/identities/{first}", json={"priority": priority.NORMAL}, headers=h)
+    dup = client.post("/identities", json={"full_name": "Dup", "type": "real",
+                                           "passport_no": "PP-D"}, headers=h).json()
+    assert dup["id"] == first, "manual add of an existing passport must reuse the row, not duplicate"
+    assert dup["priority"] == priority.HIGH
+    assert len([i for i in client.get("/identities", headers=h).json()
+                if i["passport_no"] == "PP-D"]) == 1
 
 
 def test_priority_orders_the_list_the_attach_panel_renders(client):
@@ -1476,16 +1520,15 @@ def test_priority_orders_the_list_the_attach_panel_renders(client):
     client.post("/identities/import", json={"csv": _csv("PP-A", user="a1"), "default_type": "real"}, headers=h)
     plain = client.post("/identities", json={"full_name": "Z", "type": "real",
                                              "passport_no": "PP-Z"}, headers=h).json()
-    assert plain["priority"] == priority.NORMAL, "a hand-created identity should sit at NORMAL"
+    assert plain["priority"] == priority.HIGH, "a freshly added identity is in-demand -> HIGH"
 
+    # demote the import to LOW; the hand-added HIGH one must then sort above it.
+    a_id = [i["id"] for i in client.get("/identities", headers=h).json()
+            if i["passport_no"] == "PP-A"][0]
+    client.patch(f"/identities/{a_id}", json={"priority": priority.LOW}, headers=h)
     listed = client.get("/identities", headers=h).json()
-    assert listed[0]["passport_no"] == "PP-A", \
-        f"the freshly imported HIGH identity is not first: {[i['passport_no'] for i in listed]}"
-
-    # demote it and it must sink below the NORMAL one
-    client.patch(f"/identities/{listed[0]['id']}", json={"priority": priority.LOW}, headers=h)
-    listed2 = client.get("/identities", headers=h).json()
-    assert listed2[0]["passport_no"] == "PP-Z", "priority is stored but not read"
+    assert listed[0]["passport_no"] == "PP-Z", \
+        f"priority is stored but not read: {[i['passport_no'] for i in listed]}"
 
 
 def test_force_delete_removes_a_burned_out_identity_and_its_sub_accounts(client):

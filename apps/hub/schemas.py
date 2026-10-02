@@ -332,9 +332,14 @@ class ImportResult(BaseModel):
     created: int
     sub_accounts: int = 0
     skipped: int = 0
-    # Pre-existing identities this import superseded: same passport arrived again, so the fresh row
-    # takes HIGH priority and these were demoted to LOW rather than silently skipped.
+    # DEPRECATED (2026-10-02): the old "supersede" path demoted duplicates to LOW and created a new
+    # row. Dedup replaced it, so this stays only for response back-compat and is now always empty.
     superseded: list[str] = Field(default_factory=list)
+    # Dedup outcomes (2026-10-02): `promoted` = existing passport rows REUSED and bumped to HIGH
+    # (no new row created); `ignored` = existing rows already HIGH + verified, so the incoming copy
+    # was dropped untouched. `created` still counts only genuinely-new identity rows.
+    promoted: list[str] = Field(default_factory=list)
+    ignored: list[str] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
     # Populated by identity-related imports/generators (empty/unused for proxy imports) so the
     # dashboard can chain follow-up actions (gen-subaccounts, then registration/run) onto exactly

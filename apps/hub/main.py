@@ -81,6 +81,7 @@ from .config_store import get_config, seed_defaults, seed_templates, set_config
 from .db import SessionLocal, engine, get_db
 from .events import EventHub
 from .genaccounts import gen_fake_identities, gen_subaccounts
+from . import dedup
 from .importers import parse_geo, parse_identities, parse_proxies
 from .settings_store import get_global, set_layer
 from .scheduler import (LAUNCH_FAILED_PREFIX, _LAUNCH_BLOCKED_BOOKING_STATUSES, _aware,
@@ -1144,6 +1145,19 @@ def deny_extra_view_session(req_id: str, db: Session = Depends(get_db),
 def create_identity(
     body: IdentityCreate, db: Session = Depends(get_db), _op: Principal = Depends(require_operator)
 ) -> M.Identity:
+    # DEDUP ON THE PASSPORT KEY (2026-10-02) -- same rule as import: a manual add of a passport that
+    # already exists reuses that row (promoted to HIGH) or, if it is already HIGH and verified, is
+    # returned untouched, rather than creating a duplicate. A passport-less add always creates.
+    key = dedup.norm_passport(body.passport_no)
+    if key:
+        ready = dedup.ready_counts(db)
+        action, best = dedup.decide(dedup.index_by_passport(db).get(key, []), ready)
+        if action != dedup.CREATE:
+            if action == dedup.PROMOTE and best.priority < priority.HIGH:
+                best.priority = priority.HIGH
+                db.commit()
+                db.refresh(best)
+            return best
     ident = M.Identity(
         full_name=body.full_name,
         type=body.type,
@@ -1152,6 +1166,7 @@ def create_identity(
         gender=body.gender,
         nationality=body.nationality,
         comment=body.comment,
+        priority=priority.HIGH,          # a freshly added identity is in-demand, like a fresh import
         target_posto=body.target_posto if body.type == "real" else None,
     )
     db.add(ident)
@@ -1460,54 +1475,69 @@ def import_identities(body: IdentityImport, db: Session = Depends(get_db),
     created = subs = 0
     identity_ids: list[str] = []
     sub_account_ids: list[str] = []
+    promoted: list[str] = []
+    ignored: list[str] = []
     existing = {u for (u,) in db.execute(select(M.SubAccount.username)).all()}
-    # Passport -> the identity rows already carrying it. A list, not a flag: the same passport can
-    # legitimately have been imported more than once before this rule existed.
-    by_passport: dict[str, list[M.Identity]] = {}
-    for row in db.scalars(select(M.Identity).where(M.Identity.passport_no.isnot(None))).all():
-        by_passport.setdefault(row.passport_no, []).append(row)
-    superseded: list[str] = []
+    # DEDUP ON THE PASSPORT KEY (2026-10-02, apps/hub/dedup.py). A re-imported passport is NOT a new
+    # row: it reuses the existing one, promoted to HIGH, or -- when that row is already HIGH and
+    # verified -- is dropped untouched. Only a never-seen passport creates a row. `ready` and
+    # `by_passport` are read ONCE and kept current as we go, so a passport repeated within this same
+    # file dedups against the row an earlier line just created.
+    ready = dedup.ready_counts(db)
+    by_passport = dedup.index_by_passport(db)
+
+    def _merge_subs(target: M.Identity) -> None:
+        nonlocal subs
+        for sa in pi.sub_accounts:
+            if sa.username in existing:
+                errors.append(f"skip duplicate username {sa.username}")
+                continue
+            new_sa = M.SubAccount(identity_id=target.id, username=sa.username, password=sa.password,
+                                  email=sa.email, email_pass=sa.email_pass, status=sa.status)
+            db.add(new_sa)
+            db.flush()
+            existing.add(sa.username)
+            if sa.status in READY_SUB_ACCOUNT_STATUSES:
+                ready[target.id] = ready.get(target.id, 0) + 1
+            subs += 1
+            sub_account_ids.append(new_sa.id)
+        if target.status == "empty" and target.sub_accounts:
+            target.status = "active"
+
     for pi in parsed:
-        # A RE-IMPORTED PASSPORT SUPERSEDES, IT DOES NOT BOUNCE.
-        #
-        # This used to `continue` with "skip duplicate passport", so re-importing a corrected or
-        # refreshed identity silently did nothing and the stale row stayed the only one. Operator
-        # decision 2026-09-02: the newly imported row is the one to prefer, so it is created at HIGH
-        # and every row it supersedes drops to LOW. Nothing is deleted -- the old rows keep their
-        # sub-accounts, their history, and their bookings; they just sink to the bottom of the list
-        # the attach panel offers.
-        prior = by_passport.get(pi.passport_no or "", [])
-        for old in prior:
-            if old.priority > priority.LOW:
-                old.priority = priority.LOW
-                superseded.append(old.id)
+        key = dedup.norm_passport(pi.passport_no)
+        action, best = dedup.decide(by_passport.get(key, []) if key else [], ready)
+        if action == dedup.IGNORE:
+            # Already HIGH and verified -- keep it, add nothing, never wipe it.
+            ignored.append(best.id)
+            continue
+        if action == dedup.PROMOTE:
+            # Reuse the existing row: promote to HIGH and merge only new sub-accounts. No new row.
+            if best.priority < priority.HIGH:
+                best.priority = priority.HIGH
+            promoted.append(best.id)
+            _merge_subs(best)
+            continue
+        # CREATE: a passport never seen before -> a fresh HIGH row.
         ident = M.Identity(full_name=pi.full_name, type=pi.type, birthdate=pi.birthdate,
                            passport_no=pi.passport_no, gender=pi.gender, nationality=pi.nationality,
                            status="active" if pi.sub_accounts else "empty",
                            priority=priority.HIGH,
                            target_posto=body.default_target_posto if pi.type == "real" else None)
-        if pi.passport_no:
-            by_passport.setdefault(pi.passport_no, []).append(ident)
         db.add(ident)
         db.flush()
+        if key:
+            by_passport.setdefault(key, []).append(ident)   # later lines dedup against it
+        ready.setdefault(ident.id, 0)
         created += 1
         identity_ids.append(ident.id)
-        for sa in pi.sub_accounts:
-            if sa.username in existing:
-                errors.append(f"skip duplicate username {sa.username}")
-                continue
-            new_sa = M.SubAccount(identity_id=ident.id, username=sa.username, password=sa.password,
-                                  email=sa.email, email_pass=sa.email_pass, status=sa.status)
-            db.add(new_sa)
-            db.flush()
-            existing.add(sa.username)
-            subs += 1
-            sub_account_ids.append(new_sa.id)
+        _merge_subs(ident)
     db.commit()
-    if superseded:
-        logger.warning("import superseded %d existing identity row(s) with a re-imported passport",
-                       len(superseded))
-    return ImportResult(created=created, sub_accounts=subs, errors=errors, superseded=superseded,
+    if promoted or ignored:
+        logger.info("import dedup: created=%d promoted=%d ignored=%d",
+                    created, len(promoted), len(ignored))
+    return ImportResult(created=created, sub_accounts=subs, errors=errors,
+                        promoted=promoted, ignored=ignored,
                         identity_ids=identity_ids, sub_account_ids=sub_account_ids)
 
 
