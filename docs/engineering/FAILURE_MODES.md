@@ -730,3 +730,41 @@ a silent truncated code. The importer (labeled + CSV) surfaces it against the pe
 `scripts/repair_nationalities.py` re-mapped the 10 already-broken rows in place (GUINEENS→GNB×7,
 GUINÉENN→GIN×2, GHANAIAN→GHA×1). ISO-3 is the confirmed contract because SEN/CPV -- the only codes
 that ever registered -- are exactly ISO-3.
+
+---
+
+## F38 — An unlocked dict iteration crashed the whole scheduler tick
+- **Class:** APP
+- **Cause:** `Supervisor.running_ids()` iterated the `_pids` dict while another thread mutated it
+  (spawn/reap), raising `RuntimeError: dictionary changed size during iteration`. The exception
+  propagated out of `_tick_once`, so the ENTIRE tick aborted — booking drive, signal latch, slot
+  assignment, respawn — not just the supervisor read.
+- **Detection:** signals firing late or not at all; the tick traceback in the Hub log (~1234×/day
+  at peak). The symptom "signals didn't fire at the scheduled time" was this, not the schedule.
+- **Current behaviour:** `threading.RLock` guards every `_pids`/`_procs` access; `running_ids()`
+  snapshots under the lock then liveness-checks outside it. The tick additionally isolates faults
+  **per-booking** (`_drive_booking`) and **per-maintenance-phase**, each wrapped in try/except +
+  rollback, so one booking's error can no longer abort the others.
+- **Recovery:** none needed at runtime; a crashed tick simply ran again next interval, but late.
+- **Related OPS trap:** `systemd` must set `KillMode=process`, or a Hub restart cgroup-kills every
+  worker in the control group. See `ARCHITECTURE.md` §12.
+
+## F39 — An in-page fetch slips off-origin DURING a long CAPTCHA solve
+- **Class:** INFRA
+- **Cause:** a stage that navigates (establishing the portal origin), then solves a CAPTCHA for
+  ~15-25 s, then issues an in-page `fetch`/token-inject, can have the browser's proxy tunnel drop
+  the PAGE off-origin (to `chrome-error`/opaque) *during* the idle solve **while the exit itself
+  stays alive** (MEASURED on the registrar: a raw client survives nav+28 s+POST 5/5; only the
+  in-page world slips). The in-page call then throws `TypeError: Failed to fetch` /
+  `onCaptchaSuccess not defined`. This is the `opaque_origin` class specialised to a long gap.
+- **Detection:** registrar — every register POST failing `Failed to fetch`, cursor frozen (0/11
+  registered). Slots discovery — `onCaptchaSuccess not defined` after a page that WAS ready
+  pre-solve, every paid token thrown away → discovery goes blind on bad proxy weather.
+- **Current behaviour:** both re-anchor on that specific failure. Registrar re-navs
+  `Authentication.jsp` before the POST (2026-10-01). Slots re-navs the slots page once and
+  re-delivers the SAME still-valid token (~110 s TTL) before giving up (2026-10-02). If the
+  re-anchor cannot restore the origin/callback, the page is genuinely gone → the existing
+  failed/roll path runs.
+- **Recovery:** re-anchor (one navigation) on a live exit; roll the exit only if that fails.
+- **Not exposed:** login (submits via a DOM `form.submit()` navigation — immune), warmup/apply
+  (no long gap before their in-page fetch), calendar discovery and keepalive (navigation-based).

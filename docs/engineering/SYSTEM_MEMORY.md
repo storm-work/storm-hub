@@ -22,6 +22,8 @@ and update this directory. Never silently pick one.
 | `DECISIONS.md` | Deliberate engineering choices, with the reasoning and what would reverse them |
 | `FAILURE_MODES.md` | Known and suspected failure modes in a fixed schema |
 | `OPEN_QUESTIONS.md` | What we do not know, and what evidence would settle it |
+| `REPORT_<date>_*.md` | Point-in-time analyses, preserved as written — NOT living docs |
+| `SYSTEM_MEMORY.md` | This file — purpose, discipline, and the snapshot status |
 
 ## Epistemic discipline
 
@@ -50,7 +52,13 @@ risk remains.
 
 ## Status of this snapshot
 
-Written 2026-08-25 from a full read of the repository at branch `apply-revert-proven`,
-commit `dc133fb`. Test suite: 883 passing. This is a reconstruction of current
-understanding, not a design document — several sections record that the system does *not*
-do what its own comments claim.
+Originally written 2026-08-25 from a full read of the repository at branch `apply-revert-proven`,
+commit `dc133fb` (883 tests). **Last reconciled 2026-10-02** against branch `request-manual-review`
+(base `pt-version`, commit `81d67a2`): **1306 tests across 70 files**. The living line has since
+diverged onto `pt-version` — the confirmed apply path is now the PT in-page **XHR submit** (a real
+`%PDF` captured), the consecutive-portal-down booking breaker was **removed** (2026-09-23, replaced
+by a record-only portal-liveness badge), and discovery, proxy-geo, login-token-pool and
+cross-booking-feed subsystems were added. `ARCHITECTURE.md` §12 is the roll-up; `CONFIRMED_FACTS.md`,
+`DECISIONS.md` and `FAILURE_MODES.md` carry the dated entries. This directory remains a
+reconstruction of current understanding, not a design document — several sections still record that
+the system does *not* do what its own comments claim.

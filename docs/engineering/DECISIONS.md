@@ -734,3 +734,52 @@ slots unless forced, because seeding phantoms on top of real finds only dilutes 
 
 **Reverse if:** the portal starts answering a bad-slot submit in a way the bounce classifier reads as
 a session fault. Then rule 1 stops being safe and blind apply needs its own verdict, not a reuse.
+
+---
+
+### D44. The confirmed apply path is the PT in-page XHR submit
+Submit `SubmeterVistoCriaPDF` as an in-page **XHR** with `lang=PT`, reproduced from a real booking
+HAR; the flow skips `Formulario`/`ScheduleController`. The round re-warms (a navigation) immediately
+before the submit so the page is on-origin, then submits. Success ≈ 1.5 KB, `form_stale` ≈ 66 KB
+(the slot was taken — a SERVER verdict, not a cursor fault); the `%PDF` is a separate, failable step.
+**Why:** it is the path with a captured `%PDF` behind it (`CONFIRMED_FACTS.md`); the ENG nav+nav
+round stays proven on the `apply-revert-proven` line but did not reproduce under the hot window.
+**Reverse if:** the portal stops honouring the XHR submit, or a HAR capture shows the real client
+moved back to a navigation form POST.
+
+### D45. The consecutive-portal-down booking breaker is removed; portal liveness is record-only
+Deleted 2026-09-23. A fleet-wide breaker that trips on portal-down froze the fleet, oscillated and
+starved discovery. Replaced by a **record-only** `portal_liveness` badge shown to the operator plus
+a per-worker maintenance backoff; nothing gates the fleet on it.
+**Why:** a shared breaker couples every worker to the worst recent observation and turns a transient
+portal blip into a self-inflicted outage. The *event-rate* breaker (F16) is unrelated and stays — it
+kills ONE runaway worker, not the fleet.
+**Reverse if:** a measured incident shows uncoordinated workers hammering a down portal does real
+harm that a per-worker backoff cannot contain.
+
+### D46. Discovery is a round-robin, one-scout, full-range rotation
+One scout sweeps the full date range per turn, rotating round-robin across scouts, paced by
+`DISCOVERY_MIN_INTERVAL` (2026-09-21). It replaced the split/single-range model; six older settings
+were retired. `DISCOVERY_SOURCE ∈ {calendar, slots, both}` is pushed on each `discover` command.
+**Why:** split ranges manufactured phantom coverage and raced each other; `/slots` is the operator's
+ground truth and one scout on the full range is simpler to reason about and rate-limit.
+**Reverse if:** a posto's range grows large enough that one scout cannot cover it inside the slot's
+open window.
+
+### D47. Login throughput lever is a shared pre-solved token pool, OFF by default
+A Hub factory thread solves `LOGIN_EVISA` reCAPTCHA tokens continuously (ProxyLess → not IP-bound)
+into a perishable Redis list; the worker login loop pops one and passes `pre_token` to the vendored
+`browser_login` (which already accepts it). Enabled only when `LOGIN_TOKEN_POOL_TARGET > 0`.
+**Why:** login throttle is a ~1% global lottery on byte-identical requests, so the lever is
+SHOTS/minute; the ~15-25 s solve is the removable cost and a token is reusable by any worker.
+Browser reuse was investigated and **deferred** — it lives inside the locked vendored flow and its
+reward shrank once the solve was poolable. **Reverse if:** CapSolver cost at the needed depth
+outweighs the shot-rate gain, or the sitekey/action becomes session-bound.
+
+### D48. A booking may feed its discovered slots to another booking
+`discovery_feeder_booking_ids` (migration `cp000`) lets a disposable *detector* booking's finds be
+mirrored into a precious *main* booking's pool, firing the main's slot-open, with no main restart
+(`scheduler._mirror_feeder_slots`). Guarded by posto-match and CLOSED-slot dedupe.
+**Why:** it decouples the risk of discovery (burning identities/exits on scanning) from the booking
+that must stay pristine for the submit. **Reverse if:** the mirror ever injects a slot the main
+booking's posto cannot book — the posto-match guard is what prevents that and must stay.

@@ -912,3 +912,39 @@ by anyone"* (`_maybe_revert_false_slot_found` docstring).
 Also observed: 3 x `This applicant already has an application registered with a future schedule`
 (identities that can never book and will retry until stopped), and 88 `no scheduling markers`
 warm-up failures against 101 ScheduleController calls.
+
+---
+
+## 37. The PT in-page XHR submit books a real appointment — NEW, pt-version
+
+**CONFIRMED.** Reproduced from a real booking HAR (`data/new_booking.har`): the portal client
+submits `SubmeterVistoCriaPDF` as an in-page **XHR** with `lang=PT`, and the flow skips
+`Formulario`/`ScheduleController`. Driven this way, the run **booked a real appointment with a
+~240 KB `%PDF`** (run `0925-3059`: webshare rotating + `DISCOVERY_SOURCE=slots` + the PT XHR submit —
+the reference winning config). An earlier confirmation booked two appointments on the same path.
+
+**Response signatures (MEASURED):** a booked submit ≈ **1.5 KB**; a `form_stale` bounce ≈ **66 KB**.
+The 66 KB case is the slot having been taken by someone else — a SERVER verdict, **not** a lost
+cursor or a session fault — so it must not be charged to the session-health budget. Reaching
+`MostrarPdf` is **not** proof of a booking; only `%PDF` bytes are (`success_detection_false_negative`).
+The PDF is a separate, failable step after the submit.
+
+**Relationship to the ENG path:** the ENG nav+nav apply round remains proven on the
+`apply-revert-proven` line (113 storm-auto bookings behind its lineage) but did not reproduce under
+the hot window; `pt-version` is the live line. See `DECISIONS.md` D44, `ARCHITECTURE.md` §6/§12.
+
+## 38. "Signals fired late" was a scheduler-tick crash, not the schedule — NEW, 2026-09
+
+**CONFIRMED.** The operator reported slot-open/start signals firing well after their scheduled time.
+Root cause was **not** the schedule computation: `Supervisor.running_ids()` iterated the `_pids` dict
+unlocked while another thread spawned/reaped workers, raising
+`RuntimeError: dictionary changed size during iteration`. That exception escaped `_tick_once`, so the
+**entire tick** aborted every time it hit the race — observed ~1234×/day at peak — and every timed
+transition in that tick (signal latch, assignment, respawn) was skipped until a tick happened to run
+clean.
+
+**Fix (verified by test + the race disappearing from logs):** a `threading.RLock` around all
+`_pids`/`_procs` access with a snapshot-then-check read, plus per-booking (`_drive_booking`) and
+per-maintenance-phase fault isolation so no single error can abort the whole tick. See
+`FAILURE_MODES.md` F38. OPS corollary: `systemd` `KillMode=process`, or a Hub restart cgroup-kills
+every worker.

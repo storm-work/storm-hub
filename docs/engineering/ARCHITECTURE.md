@@ -1,7 +1,11 @@
-# Architecture — as implemented, 2026-08-25
+# Architecture — as implemented
 
-Reconstructed by reading the code at `dc133fb`. Where the implementation differs from what
-a docstring or plan claims, the difference is called out rather than smoothed over.
+Originally reconstructed 2026-08-25 from the code at `dc133fb` (branch `apply-revert-proven`).
+**Reconciled 2026-10-02** against branch `request-manual-review` (base `pt-version`, commit
+`81d67a2`): line counts, the removed booking breaker, the PT in-page XHR apply path, and the
+subsystems added since August are corrected below, with a dated roll-up in §12. Where the
+implementation differs from what a docstring or plan claims, the difference is called out rather
+than smoothed over.
 
 ## 1. What the system does
 
@@ -18,15 +22,15 @@ that keeps storm-auto's browser engine vendored verbatim and rebuilds the contro
 ## 2. Components
 
 ```
-apps/hub/        FastAPI control plane (73 routes) — owns ALL database access
-  main.py        REST + SPA host + WebSocket    2773 lines
-  scheduler.py   background tick thread          1055 lines
-  events.py      Redis evt consumer + WS fanout   696 lines
-  supervisor.py  process spawn/reap by PID        215 lines
+apps/hub/        FastAPI control plane (94 routes) — owns ALL database access
+  main.py        REST + SPA host + WebSocket    4111 lines
+  scheduler.py   background tick thread          1352 lines
+  events.py      Redis evt consumer + WS fanout   847 lines
+  supervisor.py  process spawn/reap by PID        284 lines
   auth.py        JWT, roles, single-operator seat
 apps/worker/     one process per identity — NO database access at all
   __main__.py    entrypoint; engine selection sim|live from the launch payload
-  ops_live.py    LiveEngineOps — the portal implementation   2269 lines
+  ops_live.py    LiveEngineOps — the portal implementation   4136 lines
   ops_sim.py     SimEngineOps — same Protocol, no browser
   runtime.py     emits started/status_change/terminal; triggers checkpoints
   bus_signals.py worker side of the command stream
@@ -35,8 +39,9 @@ apps/dashboard/  React + Vite SPA, single 2856-line App.jsx
 libs/domain/     PURE: enums, state machines, settings catalog + resolver, rules
 libs/engine/     phases.py (PhaseMachine + EngineOps Protocol), payload, discovery,
                  pool_manager, checkpoint, orchestration, portal_health
-libs/engine/vendor/  storm-auto's Playwright engine, vendored, ~2742 lines — NOT modified
-libs/bus/        Redis streams (cmd/evt), pub/sub signals, semaphore, breaker
+libs/engine/vendor/  storm-auto's Playwright engine, vendored, ~2911 lines — NOT modified
+libs/bus/        Redis streams (cmd/evt), pub/sub signals, semaphore, portal_liveness,
+                 token_pool (pre-solved login tokens)  [booking breaker removed 2026-09-23, D-portal-liveness]
 libs/proxies/    lease.py (pool selection + leasing), health, exit_ip, credentials (Phase 3)
 libs/db/         SQLAlchemy models (24) + Alembic migrations
 ```
@@ -180,9 +185,23 @@ The critical structural rule, learned the hard way (CONFIRMED):
 An in-page fetch inherits the current page's origin. If a navigation failed and left the page
 on `chrome-error://chromewebdata/` (an *opaque* origin), **every** subsequent in-page fetch
 throws `TypeError: Failed to fetch` — forever, for the life of that page. Login, warmup and
-discovery self-heal because each *begins* with a navigation. Apply did not, which is why apply
-failed in isolation while everything else worked. The proven apply round is navigation +
-navigation.
+discovery self-heal because each *begins* with a navigation.
+
+**Updated 2026-10-02 (pt-version).** The confirmed apply path is now the PT in-page **XHR submit**
+to `SubmeterVistoCriaPDF` (`lang=PT`, matching a real booking HAR), not the old ENG nav+nav round —
+and it books (a 240 KB `%PDF` captured, `CONFIRMED_FACTS.md`; the ENG nav+nav round remains proven
+on the `apply-revert-proven` line). Because the submit is an in-page fetch, it is origin-dependent,
+so do_apply re-warms (a navigation) immediately before it — a short gap, no CAPTCHA solve — and an
+off-origin submit throws → "bounced" → the next round re-warms. That is the correct recovery: apply
+needs the full Schedule.jsp **cursor**, not merely the origin, so a cheap re-anchor would be wrong.
+
+Two stages that DO pair an in-page fetch with a long (~15-25 s) CAPTCHA-solve gap — where the page
+can slip off-origin *during* the solve while the exit stays alive — now **re-anchor** on that
+specific failure: the **registrar** register POST re-navs `Authentication.jsp` before POSTing
+(fixed 2026-10-01), and **slots discovery** re-navs the slots page once and re-delivers the same
+still-valid token rather than discarding a paid solve (fixed 2026-10-02). Login is immune: it
+submits via a real DOM `form.submit()` — a navigation — so its own solve→submit gap cannot strand
+it. See §12 and `FAILURE_MODES.md`.
 
 Stealth/anti-detection is env-driven (`STEALTH_HARDEN`, `DETERMINISTIC_FP`, `HUMAN_BEHAVIOR`,
 `WEBRTC_BLOCK`), read into module constants **at import time** — so `vendor_env.apply()` must
@@ -208,7 +227,7 @@ storm-auto.
 | One lease per worker | DB | inline check in `_assign_slots` (see debt below) |
 | Login concurrency | Redis | `RedisSemaphore`, atomic Lua prune+check+add |
 | Apply concurrency | Redis | same |
-| Portal-down | Redis | `RedisBreaker`, consecutive portal-down only |
+| ~~Portal-down booking breaker~~ | — | **Removed 2026-09-23** — it froze the fleet, oscillated and starved discovery. Replaced by a **record-only** `portal_liveness` badge (shown to the operator) + per-worker maintenance backoff; it never gates the fleet. |
 | Operator seat | DB | partial unique index `uq_single_active_operate` |
 | Identity exclusivity | DB | partial unique index `uq_identity_active_allocation` |
 
@@ -362,3 +381,59 @@ per the D29/Q22 finding, not a duration budget — consistent, not a gap.
 second signal; building the cheaper roll-then-retry ladder for `PROXY_TRANSPORT_FAILURE`; extending
 the same classifier/`UNKNOWN` discipline to `events.py`'s `_TERMINAL_STATUS.get()` (F26's other
 half).
+
+## 12. Reconciliation — what changed since the 2026-08-25 snapshot (added 2026-10-02)
+
+Everything above §12 was written at `dc133fb` on `apply-revert-proven`. The live line is now
+`pt-version` (`request-manual-review` @ `81d67a2`). The structural model (one DB-less worker process
+per identity, the phase machine, nav-vs-in-page-fetch, the DB-recomputed tick) is unchanged; these
+are the deltas worth knowing before reading the code.
+
+- **PT apply path (the big one).** The confirmed submit is an in-page **XHR** to
+  `SubmeterVistoCriaPDF` with `lang=PT`, reproduced from a real booking HAR and verified by a
+  captured `%PDF`. The flow skips `Formulario`/`ScheduleController` relative to the ENG round.
+  Success ≈ 1.5 KB, `form_stale` ≈ 66 KB (slot taken, **not** a cursor fault), PDF is a separate
+  failable step. See §6 and `CONFIRMED_FACTS.md`.
+
+- **Booking breaker removed (2026-09-23).** The consecutive-portal-down breaker was deleted
+  outright — it froze the fleet and starved discovery. It is replaced by a **record-only**
+  `libs/bus/portal_liveness.py` badge plus per-worker maintenance backoff. The *event-rate* circuit
+  breaker (F16, `scheduler.py`/`events.py`) is a DIFFERENT mechanism and stays — it auto-kills a
+  single worker emitting an anomalous event rate.
+
+- **Discovery source + rotation.** `DISCOVERY_SOURCE ∈ {calendar, slots, both}` is pushed on each
+  `discover` command (Hub-live value, read in `do_discover`). `/slots` is the operator-preferred
+  ground truth (`getTables` WAF handshake installed as an init script before the nav). Discovery
+  orchestration is a **round-robin, one-scout, full-range rotation** (2026-09-21) — it replaced the
+  split/single-range model; `DISCOVERY_MIN_INTERVAL` paces it and six older settings were retired.
+
+- **Cross-booking slot feed.** A booking may list `discovery_feeder_booking_ids` (JSON column,
+  migration `cp000`); the scheduler's `_mirror_feeder_slots` copies a disposable *detector*
+  booking's finds into a precious *main* booking's pool and fires the main's slot-open — no main
+  restart. Guarded by posto-match and CLOSED-slot dedupe.
+
+- **Login token pool (throughput lever, OFF by default).** `libs/bus/token_pool.py` + a Hub factory
+  thread solve `LOGIN_EVISA` reCAPTCHA tokens continuously (ProxyLess, so not IP-bound) into a
+  perishable Redis list; the worker login loop pops one and passes `pre_token` to the vendored
+  `browser_login`, which already accepts it. Enabled only when `LOGIN_TOKEN_POOL_TARGET > 0`.
+  Rationale: login throttle is a ~1% global lottery on byte-identical requests, so the lever is
+  SHOTS/minute, and the solve (~15-25 s) is the removable cost.
+
+- **Per-roll geo.** An unpinned worker carries the whole `PROXY_GEOS` set and varies its exit
+  country on each roll via `reseat_geo` (soax `-country-cc`), instead of freezing one geo for the
+  run (the login-throttle worst case). An operator pin still forces a single geo.
+
+- **Scheduler tick made crash-proof.** `supervisor.running_ids()` iterated the `_pids` dict
+  unlocked while another thread mutated it → `RuntimeError: dictionary changed size during
+  iteration` crashed the WHOLE tick (~1234×/day), which is why signals fired late. Fixed with a
+  `threading.RLock` + snapshot, and the tick now isolates faults per-booking (`_drive_booking`) and
+  per-maintenance-phase so one booking's error cannot abort the others. `systemd` needs
+  `KillMode=process` so a Hub restart does not cgroup-kill every worker.
+
+- **Origin recovery for the two long-solve-gap in-page fetches.** Registrar register POST and slots
+  discovery now re-anchor when the page slips off-origin during the solve (§6). This is the
+  `opaque_origin` failure class applied to the two paths that were still exposed; login/warmup/
+  calendar-discovery/keepalive were already safe (navigation-based or no long gap).
+
+**Current counts (2026-10-02):** 94 Hub routes · 24 DB models · migration head `cp000` · 1306 tests
+across 70 files. Line counts in §2 are current as of this commit.
