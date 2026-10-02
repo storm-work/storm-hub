@@ -41,11 +41,11 @@ class KeepaliveConfig:
     dead_trip: int = 3
     probe: str = "home"
     jitter: float = 30.0
-    # KEEPALIVE_MODE: "auth_only" (default, proven -- probes HOME, never keeps the form cursor) |
-    # "schedule" (ACTIVE cursor-keeping, 2026-10-02 -- probes Schedule.jsp and RE-WARMS the booking
-    # cursor before FORM_STATE_TTL so KEEPING holds a warm, bookable session; paces under the TTL).
-    # NOTE: do_apply still re-warms unconditionally, so schedule mode does not by itself make apply
-    # instant. See ops_live._do_keepalive / _keepalive_window and the catalog note.
+    # KEEPALIVE_MODE: "auth_only" (default, proven -- defer warmup; probe HOME; do_apply re-warms
+    # every round) | "schedule" (EAGER model, 2026-10-02 -- warm BEFORE keeping; keepalive probes
+    # Schedule.jsp and re-warms the cursor before FORM_STATE_TTL, paced under the TTL; the worker
+    # applies/discovers DIRECTLY on the signal, do_apply skips its round-start re-warm when warmed).
+    # See phases._warmup/_keepalive_mode, ops_live._do_keepalive/_keepalive_window/do_apply.
     mode: str = "auth_only"
 
 

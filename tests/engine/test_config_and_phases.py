@@ -41,6 +41,44 @@ def _cfg(booking=None, **template):
     return EngineConfig.from_settings(resolve({L.BOOKING: booking or {}, L.TEMPLATE: template}))
 
 
+# ── KEEPALIVE_MODE fork: schedule warms BEFORE keeping (eager model); auth_only defers it ───────
+def test_schedule_mode_warms_before_keeping_apply():
+    ops = SimEngineOps(assignment=None, scouts_invalid=False, stop_after_polls=1)
+    res = PhaseMachine(_cfg(booking={"KEEPALIVE_MODE": "schedule"}, ROLE="apply"), ops).run()
+    assert ops.warmups >= 1, "schedule apply must warm eagerly in setup"
+    assert WorkerSubstate.WARMED in res.visited
+    assert res.visited.index(WorkerSubstate.WARMED) < res.visited.index(WorkerSubstate.KEEPING)
+
+
+def test_auth_only_mode_does_not_warm_before_keeping_apply():
+    ops = SimEngineOps(assignment=None, scouts_invalid=False, stop_after_polls=1)
+    res = PhaseMachine(_cfg(ROLE="apply"), ops).run()          # default = auth_only
+    assert ops.warmups == 0, "auth_only defers warmup -- KEEPING is authed-only"
+    assert WorkerSubstate.WARMED not in res.visited
+
+
+def test_schedule_mode_warms_before_keeping_scout():
+    ops = SimEngineOps(discover_tasks=[])                       # stop at the first discover wait
+    res = PhaseMachine(_cfg(booking={"KEEPALIVE_MODE": "schedule"}, ROLE="scout"), ops).run()
+    assert ops.warmups >= 1
+    assert WorkerSubstate.WARMED in res.visited
+    assert res.visited.index(WorkerSubstate.WARMED) < res.visited.index(WorkerSubstate.KEEPING)
+
+
+def test_schedule_scout_does_not_double_warm_on_slot_open():
+    ops = SimEngineOps(discover_tasks=[])
+    PhaseMachine(_cfg(booking={"KEEPALIVE_MODE": "schedule"}, ROLE="scout"), ops).run()
+    assert ops.warmups == 1, "eager warm once; slot-open's _warm_if_needed must skip (is_warmed)"
+
+
+def test_auth_only_scout_warms_on_slot_open_not_before_keeping():
+    ops = SimEngineOps(discover_tasks=[])
+    res = PhaseMachine(_cfg(ROLE="scout"), ops).run()           # default = auth_only
+    assert ops.warmups == 1, "auth_only scout warms on slot-open (deferred), once"
+    assert res.visited.index(WorkerSubstate.KEEPING) < res.visited.index(WorkerSubstate.WARMED), \
+        "auth_only: KEEPING comes first, WARMED only after slot-open"
+
+
 def test_apply_books_assigned_slot():
     ops = SimEngineOps(assignment={"date": "2026-08-18", "period": 3})
     res = PhaseMachine(_cfg(ROLE="apply"), ops).run()

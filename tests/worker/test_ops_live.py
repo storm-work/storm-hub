@@ -4723,6 +4723,53 @@ def test_session_probe_ok_false_when_there_is_no_session():
     assert ops.session_probe_ok() is False
 
 
+def _apply_ops_counting(pdf_bytes, events, *, mode="auth_only", warmed=False):
+    cfg = _cfg() if mode == "auth_only" else _cfg_schedule()
+    ops = _make_ops(cfg=cfg, emit=lambda t, **p: events.append((t, p)))
+    ops.session = _SubmitSession(pdf_bytes)
+    ops._warm_calls = []
+    def _w():
+        ops._warm_calls.append(1)
+        ops.posto_pdf = "3059"; ops._set_anchor("chain")   # a successful warm establishes the cursor
+        return True
+    ops._run_warmup_steps = _w
+    ops._save_pdf = lambda b: "/tmp/x.pdf"
+    if warmed:
+        ops.posto_pdf = "3059"; ops._set_anchor("chain")   # pretend KEEPING kept it warm
+    return ops
+
+
+def test_do_apply_schedule_fresh_cursor_applies_without_a_round_start_rewarm():
+    events = []
+    ops = _apply_ops_counting(b"%PDF-1.4 ok", events, mode="schedule", warmed=True)
+    assert ops.do_apply({"date": "2026-09-01", "period": 4}) == "booked"
+    assert ops._warm_calls == [], "schedule + fresh kept cursor must apply directly, no re-warm"
+    substates = [p.get("substate") for t, p in events if t == "status_change"]
+    assert "applying" in substates and "warming_up" not in substates, substates
+
+
+def test_do_apply_schedule_stale_cursor_rewarms_first():
+    events = []
+    ops = _apply_ops_counting(b"%PDF-1.4 ok", events, mode="schedule", warmed=False)
+    assert ops.do_apply({"date": "2026-09-01", "period": 4}) == "booked"
+    assert ops._warm_calls == [1], "schedule + stale/absent cursor must re-warm before applying"
+
+
+def test_do_apply_auth_only_always_rewarms_even_when_warmed():
+    events = []
+    ops = _apply_ops_counting(b"%PDF-1.4 ok", events, mode="auth_only", warmed=True)
+    assert ops.do_apply({"date": "2026-09-01", "period": 4}) == "booked"
+    assert ops._warm_calls == [1], "auth_only re-warms every round regardless of is_warmed()"
+
+
+def test_do_apply_non_booked_clears_anchor_so_the_retry_rewarms():
+    events = []
+    ops = _apply_ops_counting(b"", events, mode="schedule", warmed=True)   # MostrarPdf, no PDF -> bounce
+    out = ops.do_apply({"date": "2026-09-01", "period": 4})
+    assert out != "booked", out
+    assert not ops.is_warmed(), "a non-booked submit consumed the cursor -> anchor cleared -> retry re-warms"
+
+
 def test_do_apply_makes_its_mandatory_rewarm_visible():
     """'applying without warmup' was an observability lie: do_apply DOES re-warm unconditionally, but
     phases.py sets APPLYING before calling it and the ~40s re-warm emitted no substate. It now emits

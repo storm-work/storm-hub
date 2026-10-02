@@ -224,13 +224,32 @@ class PhaseMachine:
                 return self._fail("warmup")
             self._to(WorkerSubstate.WARMED)
             return PhaseResult("warmed", self._sub, "warmup_only", self.visited)
-        # HOLD_SWAP_AFTER_LOGIN (renamed 2026-09-09 from HOLD_SWAP_AFTER_LOGIN): swap now
-        # genuinely happens right after login, since warmup no longer runs at this point in the
-        # lifecycle on the main path.
+        # KEEPALIVE_MODE='schedule' (operator eager-warmup model, 2026-10-02): warm NOW so the
+        # worker enters KEEPING already WARMED/bookable, and its keepalive keeps that Schedule.jsp
+        # cursor fresh (ops_live._do_keepalive schedule branch). auth_only is unchanged: it DEFERS
+        # warmup to the signal that needs it (slot-open for scouts via _warm_if_needed, assignment
+        # for apply via do_apply's unconditional re-warm) and holds an authed-only session here.
+        # _warm_if_needed handles already_booked (terminal) and the re-warm recovery ladder, same as
+        # the scout/apply call sites, so a failed initial warm does not throw away the authed login.
+        if self._keepalive_mode() == "schedule":
+            warm = self._warm_if_needed("initial warm-up (schedule mode)")
+            if warm is not None:
+                return warm
+        # HOLD_SWAP_AFTER_LOGIN: swap happens right after login (auth_only) or right after the
+        # eager warm-up (schedule); either way before KEEPING.
         if self.ops.do_swap():
             self._to(WorkerSubstate.SWAPPED)
         self._to(WorkerSubstate.KEEPING)
         return None
+
+    def _keepalive_mode(self) -> str:
+        """The frozen KEEPALIVE_MODE for this worker ('auth_only' default | 'schedule'). Defensive
+        for the many partial EngineConfig/test doubles that phases.py runs against."""
+        try:
+            return str(getattr(getattr(self.cfg, "keepalive", None), "mode", "auth_only")
+                       or "auth_only").strip().lower()
+        except Exception:
+            return "auth_only"
 
     def _warm_if_needed(self, why: str) -> PhaseResult | None:
         """Warm up now, only if not already warmed (covers both: PREWARM_BEFORE_SLOT_OPEN or a

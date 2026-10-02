@@ -3727,9 +3727,15 @@ class LiveEngineOps(EngineOps):
             # (The booking breaker's is_tripped gate here was removed 2026-09-23 -- do_apply no
             # longer refuses fleet-wide; a down portal is shown on the dashboard, not gated.)
 
-            # RE-WARM UNCONDITIONALLY, right before the submit (operator model, 2026-09-23). The
-            # portal's Schedule-page form cursor is NAVIGATION-bound, not time-bound: KEEPING is an
-            # authed HOME session (the keepalive nav'd there), and any nav away from Schedule.jsp
+            # ROUND-START RE-WARM. KEEPALIVE_MODE forks here (2026-10-02):
+            #   auth_only (default): RE-WARM UNCONDITIONALLY right before the submit. KEEPING is an
+            #     authed HOME session and the cursor is NAVIGATION-bound, so it is dead by submit time
+            #     -- see the else branch and the measured history below.
+            #   schedule: KEEPING already holds a fresh Schedule.jsp cursor (kept warm there), so
+            #     apply DIRECTLY when is_warmed() -- see the if branch.
+            # The unconditional-re-warm rationale (operator model, 2026-09-23), which still governs
+            # auth_only: the portal's Schedule-page form cursor is NAVIGATION-bound, not time-bound:
+            # KEEPING is an authed HOME session (the keepalive nav'd there), and any nav away from
             # destroys the cursor -- so a "chain anchor within FORM_STATE_TTL" is NOT a live cursor.
             # Gating the re-warm on is_warmed()/FORM_STATE_TTL let a worker submit with a lapsed
             # cursor and get the questionnaire back -- form_stale -> re-login loop, measured on 'Prev
@@ -3744,16 +3750,33 @@ class LiveEngineOps(EngineOps):
             # the warming_up substate so the apply round's warm-up is visible, then applying for the
             # submit. Observability only; no control-flow change. Uses the same status_change emit
             # _mark_keep_bookable already uses.
-            if self._emit is not None:
-                self._emit("status_change", substate="warming_up",
-                           detail="apply: round-start re-warm (mandatory)")
-            self._slog("warmup_start", phase="apply_round", slot=slot)
-            _t_warm = time.time()
-            _warm_ok = self._run_warmup_steps()
-            self._slog("warmup_end", phase="apply_round",
-                       result=("ok" if _warm_ok else "fail"),
-                       duration_ms=int((time.time() - _t_warm) * 1000),
-                       kind=self._warmup_kind(_warm_ok))
+            _mode = (getattr(self.cfg.keepalive, "mode", "auth_only")
+                     or "auth_only").strip().lower()
+            if _mode == "schedule" and self.is_warmed():
+                # SCHEDULE (eager-warmup model): KEEPING already holds a VERIFIED-fresh Schedule.jsp
+                # cursor -- the keepalive keeps the browser on Schedule.jsp and re-warms before
+                # FORM_STATE_TTL -- so apply DIRECTLY, no round-start re-warm. This deliberately forks
+                # around rewarm_every_round_is_mandatory, which is an auth_only truth: there the
+                # keepalive navs to HOME and the nav-bound cursor is dead by submit time. Here it is
+                # not. A form_stale/bounce clears the anchor (below) so the retry re-warms.
+                self._slog("apply_round_warm_skipped", reason="schedule_cursor_fresh", slot=slot)
+                if self._emit is not None:
+                    self._emit("status_change", substate="applying",
+                               detail="apply: kept-warm cursor (schedule) -- submitting")
+                _warm_ok = True
+                _t_warm = time.time()
+            else:
+                # auth_only (always), OR schedule with a stale/absent cursor: re-warm first.
+                if self._emit is not None:
+                    self._emit("status_change", substate="warming_up",
+                               detail="apply: round-start re-warm (mandatory)")
+                self._slog("warmup_start", phase="apply_round", slot=slot)
+                _t_warm = time.time()
+                _warm_ok = self._run_warmup_steps()
+                self._slog("warmup_end", phase="apply_round",
+                           result=("ok" if _warm_ok else "fail"),
+                           duration_ms=int((time.time() - _t_warm) * 1000),
+                           kind=self._warmup_kind(_warm_ok))
             if not _warm_ok:
                 # NOT "bounced". This is OUR session failing before we ever spoke to the portal
                 # about this slot, and calling it a bounce blames the slot for our dead proxy:
@@ -3939,6 +3962,12 @@ class LiveEngineOps(EngineOps):
                     outcome = "bounced"
             if outcome != "booked":
                 self._last_apply_outcome = outcome
+                # SCHEDULE mode: the submit consumed/lost the Schedule.jsp cursor (a non-booked
+                # outcome means the cursor is gone -- form_stale is exactly "our form-state expired").
+                # Clear the anchor so is_warmed() is false and the NEXT do_apply re-warms, matching
+                # the "re-warm on bounce" model. Harmless in auth_only (it re-warms every round
+                # regardless, overwriting the anchor). phases._run_apply drives the retry.
+                self._clear_anchor()
                 # Confirmed live 2026-08-14: this returned silently. A holding applier went
                 # `-> applying` then `-> holding` 43s later with terminal "apply bounced" and NOT ONE
                 # log line in between, so there was no way to tell a rejected slot from a bounced
