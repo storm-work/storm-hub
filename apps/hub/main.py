@@ -106,6 +106,7 @@ from .schemas import (
     IdentityBulkDelete,
     IdentityBulkDeleteResult,
     IdentityBulkPriority,
+    IdentityDuplicate,
     IdentityImport,
     IdentityOut,
     IdentityUpdate,
@@ -1554,6 +1555,56 @@ def import_identities(body: IdentityImport, db: Session = Depends(get_db),
     return ImportResult(created=created, sub_accounts=subs, errors=errors,
                         promoted=promoted, ignored=ignored,
                         identity_ids=identity_ids, sub_account_ids=sub_account_ids)
+
+
+@app.post("/identities/duplicate", response_model=ImportResult)
+def duplicate_identities(body: IdentityDuplicate, db: Session = Depends(get_db),
+                         _op: Principal = Depends(require_operator)) -> ImportResult:
+    """Clone selected identities with a passport SUFFIX (e.g. PA123 -> PA123+), so an operator can
+    stand up near-identical identities without preparing another import file. The clone copies the
+    person's details but NOT their sub-accounts -- a duplicate starts with zero, ready for its own
+    registration run. The suffixed passport is a DIFFERENT passport, so it does not collide with the
+    source under the dedup rule; an already-existing suffixed passport is skipped (never a second
+    duplicate). group_name defaults to the source's own group when left blank."""
+    suffix = (body.passport_suffix or "").strip()
+    if not suffix:
+        raise HTTPException(400, "passport_suffix is required and must be non-empty (e.g. '+')")
+    grp = (body.group_name or "").strip() or None
+    created = 0
+    errors: list[str] = []
+    identity_ids: list[str] = []
+    # Current passports (incl. ones created in THIS call) so a batch cannot mint the same suffixed
+    # passport twice, and a re-run is a no-op rather than a duplicator.
+    by_passport = dedup.index_by_passport(db)
+    for iid in body.identity_ids:
+        src = db.get(M.Identity, iid)
+        if src is None:
+            errors.append(f"{iid}: identity not found")
+            continue
+        base = (src.passport_no or "").strip()
+        if not base:
+            errors.append(f"{src.full_name}: no passport number to suffix")
+            continue
+        new_pp = base + suffix
+        key = dedup.norm_passport(new_pp)
+        if by_passport.get(key):
+            errors.append(f"skip {new_pp}: that passport already exists")
+            continue
+        dup = M.Identity(
+            full_name=src.full_name, type=src.type, birthdate=src.birthdate, gender=src.gender,
+            nationality=src.nationality, passport_no=new_pp, comment=src.comment,
+            target_posto=src.target_posto,
+            group_name=grp if grp is not None else src.group_name,
+            priority=priority.HIGH,          # a freshly minted duplicate is in-demand, like an import
+            status="empty",                  # NO sub-accounts copied -- it starts empty
+        )
+        db.add(dup)
+        db.flush()
+        by_passport.setdefault(key, []).append(dup)
+        created += 1
+        identity_ids.append(dup.id)
+    db.commit()
+    return ImportResult(created=created, errors=errors, identity_ids=identity_ids)
 
 
 # ── Sub-account generation ────────────────────────────────────────────────────

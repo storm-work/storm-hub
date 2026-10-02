@@ -322,6 +322,15 @@ class BlindApplyRequest(BaseModel):
     force: bool = False
 
 
+class IdentityDuplicate(BaseModel):
+    identity_ids: list[str]
+    # Appended to each source passport_no to make the duplicate's (a different passport, so it does
+    # not collide with the original under the dedup rule). e.g. "+", "++". Required + non-empty.
+    passport_suffix: str
+    # Group for the new duplicates. Blank/absent inherits each source identity's own group_name.
+    group_name: str | None = None
+
+
 class IdentityImport(BaseModel):
     csv: str
     default_type: IdentityType = IdentityType.TEST

@@ -1496,6 +1496,65 @@ def test_a_re_imported_HIGH_verified_passport_is_ignored(client):
     assert {s["username"] for s in subs} == {"v1"}, "an ignored import must add NOTHING"
 
 
+def test_duplicate_identities_suffixes_passport_no_subs_own_group(client):
+    """Duplicate = clone with a passport suffix, NO sub-accounts, operator-chosen group; the
+    suffixed passport is distinct so it does not collide with the source under dedup."""
+    import apps.hub.main as hub_main
+    from libs.db import models as M
+    from sqlalchemy import select as _select
+    h = _operate_headers(client)
+    src = client.post("/identities/import", json={"csv": _csv("PA900", user="s1"),
+                                                  "default_type": "real", "group_name": "orig"},
+                      headers=h).json()["identity_ids"][0]
+    r = client.post("/identities/duplicate",
+                    json={"identity_ids": [src], "passport_suffix": "+", "group_name": "dup-grp"},
+                    headers=h)
+    assert r.status_code == 200, r.text
+    assert r.json()["created"] == 1
+    dup_id = r.json()["identity_ids"][0]
+    rows = {i["id"]: i for i in client.get("/identities", headers=h).json()}
+    assert rows[dup_id]["passport_no"] == "PA900+"
+    assert rows[dup_id]["group_name"] == "dup-grp"
+    assert rows[dup_id]["priority"] == 200
+    # the duplicate has ZERO sub-accounts
+    db = hub_main.SessionLocal()
+    try:
+        n = len(db.scalars(_select(M.SubAccount).where(M.SubAccount.identity_id == dup_id)).all())
+    finally:
+        db.close()
+    assert n == 0, "a duplicate must not copy sub-accounts"
+    # both source and duplicate exist (distinct passports, no dedup collision)
+    pps = {i["passport_no"] for i in rows.values()}
+    assert {"PA900", "PA900+"} <= pps
+
+
+def test_duplicate_blank_group_inherits_source_group_and_skips_existing(client):
+    h = _operate_headers(client)
+    src = client.post("/identities/import", json={"csv": _csv("PA901", user="s2"),
+                                                  "default_type": "real", "group_name": "cohortX"},
+                      headers=h).json()["identity_ids"][0]
+    # blank group -> inherit source's group
+    r1 = client.post("/identities/duplicate",
+                     json={"identity_ids": [src], "passport_suffix": "++"}, headers=h).json()
+    dup = r1["identity_ids"][0]
+    got = {i["id"]: i for i in client.get("/identities", headers=h).json()}
+    assert got[dup]["group_name"] == "cohortX"
+    # re-duplicating the SAME suffix is a no-op (passport already exists), reported in errors
+    r2 = client.post("/identities/duplicate",
+                     json={"identity_ids": [src], "passport_suffix": "++"}, headers=h).json()
+    assert r2["created"] == 0 and any("already exists" in e for e in r2["errors"]), r2
+
+
+def test_duplicate_requires_a_suffix(client):
+    h = _operate_headers(client)
+    src = client.post("/identities/import", json={"csv": _csv("PA902", user="s3"),
+                                                  "default_type": "real"},
+                      headers=h).json()["identity_ids"][0]
+    r = client.post("/identities/duplicate",
+                    json={"identity_ids": [src], "passport_suffix": "  "}, headers=h)
+    assert r.status_code == 400, r.text
+
+
 def test_import_group_name_tags_the_whole_file(client):
     """Batch group: the group_name on the import body is applied to every identity the file touches
     -- created now, and (on a later re-import under a new group) promoted/ignored rows too."""

@@ -2396,11 +2396,20 @@ function Identities({ me, setLeftPanel, setRightPanel }) {
 
   const selectedIds = Object.keys(sel).filter((k) => sel[k]);
   const [bulkPriority, setBulkPriority] = useState("200");
+  const [dupSuffix, setDupSuffix] = useState("+");
+  const [dupGroup, setDupGroup] = useState("");
   async function act(fn) { setMsg(""); try { await fn(); setSel({}); reload(); reloadSubs(); } catch (e) { setMsg(e.message); } }
   const genSubs = () => act(() => api("/identities/gen-subaccounts",
     { method: "POST", body: { identity_ids: selectedIds, count: Number(subCount) } }));
   const setPriority = () => act(() => api("/identities/bulk-priority",
     { method: "POST", body: { identity_ids: selectedIds, priority: Number(bulkPriority) } }));
+  // Duplicate = clone each selected identity with a passport SUFFIX, no sub-accounts, into an
+  // optional group. Reports per-id skips (e.g. passport already exists) rather than failing silently.
+  const duplicateSelected = () => act(async () => {
+    const r = await api("/identities/duplicate", { method: "POST",
+      body: { identity_ids: selectedIds, passport_suffix: dupSuffix, group_name: dupGroup.trim() || null } });
+    setMsg(`Duplicated ${r.created}.` + (r.errors?.length ? ` ${r.errors.length} skipped: ${r.errors.slice(0, 3).join("; ")}` : ""));
+  });
 
   // Two-step, mirroring the single-identity Delete in the details panel. A plain delete refuses
   // while an identity still owns rows WE generated (sub-accounts, allocations, event history) --
@@ -2516,6 +2525,15 @@ function Identities({ me, setLeftPanel, setRightPanel }) {
             <option value="0">low</option>
           </select>
           <button className="btn" disabled={!op} onClick={setPriority}>Set priority</button>
+          <span className="grow" />
+          <label style={{ margin: 0 }} title="appended to each selected identity's passport number, e.g. + or ++">Suffix</label>
+          <input value={dupSuffix} onChange={(e) => setDupSuffix(e.target.value)} placeholder="+" style={{ width: 50 }} />
+          <label style={{ margin: 0 }}>Group</label>
+          <input value={dupGroup} onChange={(e) => setDupGroup(e.target.value)} placeholder="(keep source's)" style={{ width: 120 }} />
+          <button className="btn" disabled={!op || !dupSuffix.trim()} onClick={duplicateSelected}
+                  title="Clone each selected identity with the passport suffix. No sub-accounts are copied — the duplicates start empty.">
+            Duplicate
+          </button>
           <button className="btn ghost" disabled={!op} onClick={deleteSelectedIdentities}
                   title="Delete the selected identities. Anything attached to a booking, or holding a real booked appointment, is refused.">
             🗑 Delete selected
