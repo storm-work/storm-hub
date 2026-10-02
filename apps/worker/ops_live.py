@@ -3947,6 +3947,15 @@ class LiveEngineOps(EngineOps):
                     self._log(f"do_apply: PDF verification fetch failed: {e}")
                 if pdf_body[:4] == b"%PDF":
                     self._log(f"do_apply: BOOKED -- verified PDF ({len(pdf_body)}B) at {_final_url}")
+                    # Capture the confirmation RESPONSE too (2026-10-02): `html` is the
+                    # SubmeterVistoCriaPDF submit body that carries the portal's appointment
+                    # reference in TEXT (BookedAppointment.appointment_ref, never populated to date).
+                    # The PDF has it as well but only as a rendered document; this HTML is the
+                    # parseable source. Additive, no control-flow change.
+                    try:
+                        self._save_submit_body(html, "booked")
+                    except Exception:
+                        pass
                     if self._emit is not None:
                         self._emit("booked", slot=slot)
                         self._emit("booked_pdf", pdf_path=self._save_pdf(pdf_body), slot=slot)
@@ -3980,6 +3989,16 @@ class LiveEngineOps(EngineOps):
                 return outcome
 
             self._log(f"do_apply: BOOKED slot={slot} | final_url={_final_url}")
+            # CAPTURE THE CONFIRMATION RESPONSE (2026-10-02). Every NON-booked submit body is saved
+            # above, but the one that matters most -- the booked confirmation HTML -- was discarded.
+            # It carries the portal's appointment reference, which BookedAppointment.appointment_ref
+            # is meant to hold and nothing ever populated (all bookings show ref=None). Saving it is
+            # additive (same mechanism, a string already in hand, no control-flow change) and is the
+            # evidence needed to wire appointment_ref from a confirmed booking.
+            try:
+                self._save_submit_body(html, "booked")
+            except Exception:
+                pass
             # Announce the booking BEFORE going after the PDF. The appointment is real the moment
             # the portal confirms it; the PDF is an artifact that may or may not come back, and
             # making the Hub's record depend on it lost real bookings.

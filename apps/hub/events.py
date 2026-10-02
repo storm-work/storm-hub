@@ -488,24 +488,33 @@ class EventHub:
                 # against it here, and past BLIND_MAX_BOUNCES it is CLOSED. form_stale/session
                 # releases do not count: those are about our session, not the combination.
                 if getattr(s, "source", "scout") == "blind" and reason not in ("form_stale", "session"):
-                    # A BOOKING IS PROOF THE COMBINATION IS REAL, so a bounce after one must never
-                    # retire it. Measured on Test 0919 (2026-09-19): 10-12 p3 booked at 23:23:46,
-                    # then three racing workers hit its remaining capacity, bounced, and drove
-                    # miss_count to 3 -- CLOSING a genuinely bookable slot mid-run. It cost nothing
-                    # there (capacity ~3, the booking already landed), but on a higher-capacity
-                    # posto with a fleet larger than the capacity it would retire real inventory
-                    # while units are still open. The miss count is meant to catch PHANTOM combos;
-                    # a slot that has produced a real appointment is by definition not one.
+                    s.miss_count = (s.miss_count or 0) + 1
+                    # A BOOKING PROVES THE COMBINATION IS REAL and that its real capacity is at least
+                    # `already_booked`. Measured on Test 0919 (2026-09-19): three workers racing a
+                    # genuinely-open unit bounced and drove miss_count to 3, which CLOSED a real slot
+                    # mid-run -- so a booked slot must get HEADROOM for racing multi-capacity.
+                    #
+                    # But "never retire a booked slot" (the old `if already_booked: continue`) is the
+                    # OPPOSITE failure, CONFIRMED live 2026-10-02 (Test 1002): worker 8fac5d27 bounced
+                    # ONE booked slot (2026-11-02 p3) EIGHTEEN times in 25 minutes while other workers
+                    # starved -- the default cap of 5 left 4 phantom units behind a single real
+                    # booking, and nothing could ever close them. A bounce AFTER the real inventory is
+                    # taken is not racing; it is an endless loop. So a booked slot DOES retire, as
+                    # TAKEN (the appointment(s) exist) rather than CLOSED (phantom), once its bounces
+                    # exceed BLIND_MAX_BOUNCES + already_booked -- i.e. the phantom budget plus one
+                    # racing-bounce of headroom per real booking.
                     already_booked = db.scalar(select(func.count()).select_from(M.BookedAppointment)
                                                .where(M.BookedAppointment.slot_id == s.id)) or 0
-                    if already_booked:
-                        continue
-                    s.miss_count = (s.miss_count or 0) + 1
                     limit = self._blind_max_bounces(db, s.booking_id)
-                    if limit > 0 and s.miss_count >= limit and s.status != SlotStatus.CLOSED:
-                        s.status = SlotStatus.CLOSED
-                        logger.info("blind slot %s %s/p%s CLOSED after %d bounce(s)",
-                                    s.id, s.date, s.period, s.miss_count)
+                    if limit > 0:
+                        threshold = limit + already_booked
+                        if s.miss_count >= threshold and s.status not in (SlotStatus.CLOSED,
+                                                                          SlotStatus.TAKEN):
+                            s.status = SlotStatus.TAKEN if already_booked else SlotStatus.CLOSED
+                            logger.info("blind slot %s %s/p%s %s after %d bounce(s) (booked=%d)",
+                                        s.id, s.date, s.period,
+                                        "TAKEN" if already_booked else "CLOSED",
+                                        s.miss_count, already_booked)
             db.commit()
         finally:
             db.close()

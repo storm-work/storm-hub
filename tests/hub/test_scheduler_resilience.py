@@ -901,6 +901,36 @@ def test_assign_slots_multi_capacity_fills_one_slot_before_the_next(db):
     assert unassigned is not None   # w3 simply wasn't paired this tick, nothing broke
 
 
+def test_assign_slots_sends_a_recently_bounced_slot_to_the_back(db):
+    """A just-BOUNCED blind slot must yield to a fresh one, so a single bouncing slot cannot
+    monopolize assignment while other workers starve. CONFIRMED live Test 1002 (2026-10-02): worker
+    8fac5d27 took one booked-but-exhausted slot 18 times in a row (it stayed at the FRONT, being the
+    earliest date) while another worker got ZERO leases. Mirrors the long-standing form_stale
+    reorder, now extended to BOUNCED."""
+    bus = _FakeBus()
+    sched = _scheduler(bus=bus)
+    bk = _make_booking(db)
+    ident = _make_identity(db)
+    w = _make_worker(db, bk, ident, role=WorkerRole.APPLY, substate=WorkerSubstate.KEEPING)
+    # `a` is the EARLIER date (normally assigned first) but was just bounced; `b` is fresh.
+    a = M.Slot(booking_id=bk.id, posto_id="5084", date="2026-08-18", period=4,
+               status=SlotStatus.AVAILABLE, source="blind")
+    b = M.Slot(booking_id=bk.id, posto_id="5084", date="2026-08-19", period=4,
+               status=SlotStatus.AVAILABLE, source="blind")
+    db.add_all([a, b]); db.commit()
+    other = _make_worker(db, bk, ident, role=WorkerRole.APPLY, substate=WorkerSubstate.APPLYING)
+    db.add(M.SlotLease(slot_id=a.id, worker_id=other.id, outcome=SlotLeaseOutcome.BOUNCED,
+                       released_at=datetime.now(timezone.utc)))
+    db.commit()
+
+    sched._assign_slots(db, bk)
+
+    leases = db.scalars(select(M.SlotLease).where(
+        M.SlotLease.worker_id == w.id, M.SlotLease.released_at.is_(None))).all()
+    assert len(leases) == 1
+    assert leases[0].slot_id == b.id, "the fresh slot is assigned before the just-bounced earlier one"
+
+
 def test_assign_slots_respects_already_active_leases_when_computing_remaining_capacity(db):
     """A slot with 1 active lease out of a cap of 2 has exactly 1 unit of room left -- confirms
     remaining capacity is computed from CURRENT active SlotLease rows, not just the cap alone."""

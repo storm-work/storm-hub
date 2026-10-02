@@ -256,12 +256,14 @@ def test_slot_released_frees_the_lease_and_reopens_the_slot(slots_db):
     db.close()
 
 
-def test_a_booked_blind_slot_is_never_retired_by_later_bounces(slots_db):
-    """CONFIRMED LIVE Test 0919 (2026-09-19): blind slot 10-12 p3 booked at 23:23:46, then three
-    racing workers hit its remaining capacity, bounced, and drove miss_count to BLIND_MAX_BOUNCES --
-    CLOSING a genuinely bookable slot. A booking is proof the combination is real, so a bounce after
-    one must not count. Harmless there (the booking already landed), but on a higher-capacity posto
-    it would retire real inventory while units are still open."""
+def test_a_booked_blind_slot_retires_as_taken_after_its_capacity_headroom(slots_db):
+    """A booking PROVES the combination is real and its capacity is >= already_booked, so racing
+    workers on a genuinely-open unit get HEADROOM (Test 0919, 2026-09-19: three racers must not
+    CLOSE a real slot). But "never retire a booked slot" was the OPPOSITE failure, CONFIRMED live
+    Test 1002 (2026-10-02): worker 8fac5d27 bounced ONE booked slot 18 times in 25 min while other
+    workers got zero leases -- the default cap of 5 left 4 phantom units nothing could ever close.
+    So a booked slot DOES retire -- as TAKEN (the appointment exists), never CLOSED -- once its
+    bounces exceed BLIND_MAX_BOUNCES + already_booked."""
     from sqlalchemy import select
 
     import apps.hub.events as ev
@@ -274,24 +276,27 @@ def test_a_booked_blind_slot_is_never_retired_by_later_bounces(slots_db):
     slot = M.Slot(booking_id=bid, posto_id="2032", date="2026-10-12", period=3,
                   status=SlotStatus.LEASED, source="blind")
     db.add(slot); db.commit(); sid = slot.id
-    # A real appointment already landed on this slot.
     sa = M.SubAccount(identity_id=iid, username="u", password="p", status="verified")
     db.add(sa); db.flush()
     db.add(M.BookedAppointment(booking_id=bid, identity_id=iid, sub_account_id=sa.id, slot_id=sid))
     db.commit(); db.close()
 
     hub = ev.EventHub.__new__(ev.EventHub)
-    for _ in range(5):                        # far past BLIND_MAX_BOUNCES
+    # threshold = BLIND_MAX_BOUNCES(3) + already_booked(1) = 4: the first 3 bounces keep headroom,
+    # the 4th retires it -- NOT an endless loop (the live bug was 18 bounces with no escape).
+    for i in range(4):
         db = slots_db()
         db.get(M.Slot, sid).status = SlotStatus.LEASED
         db.add(M.SlotLease(slot_id=sid, worker_id=wid)); db.commit(); db.close()
         hub._release_slot_lease(wid, {"date": "2026-10-12", "period": 3}, reason="bounce")
-
-    db = slots_db()
-    s = db.get(M.Slot, sid)
-    assert s.status != SlotStatus.CLOSED, "a slot that has booked must never be retired by bounces"
-    assert s.miss_count == 0, "bounces after a booking must not even be counted"
-    db.close()
+        db = slots_db()
+        s = db.get(M.Slot, sid)
+        if i < 3:
+            assert s.status == SlotStatus.AVAILABLE, f"bounce {i}: headroom for racing multi-capacity"
+        else:
+            assert s.status == SlotStatus.TAKEN, "an exhausted booked slot retires as TAKEN"
+            assert s.status != SlotStatus.CLOSED, "booked -> TAKEN (real), never CLOSED (phantom)"
+        db.close()
 
 
 def test_a_blind_slot_retires_after_blind_max_bounces(slots_db):

@@ -658,6 +658,10 @@ class Scheduler:
     # ── D4: apply-as-scout fallback (proactive half; the reactive half is
     #        PhaseMachine._run_apply's scouts_invalid() check) ────────────────
     def _maybe_self_scout(self, db, bk: M.Booking, now: datetime) -> None:
+        # GATE 0: the operator can forbid the self-scout fallback for this booking entirely. When
+        # off, an apply worker only ever books slots a scout found, and holds when there are none.
+        if not self._effective_booking_setting(db, bk, "SELF_SCOUT_FALLBACK", True):
+            return
         # GATE 1: suppress the fallback while the pool still holds LIVE INVENTORY -- not because a
         # slot was once found.
         #
@@ -1270,26 +1274,30 @@ class Scheduler:
             .order_by(M.Slot.date.asc(), M.Slot.period.asc())).all()
         if not avail:
             return
-        # A slot that just answered form_stale goes to the BACK of the queue.
+        # A slot that just had a SETBACK (form_stale OR bounced) goes to the BACK of the queue.
         #
         # This ordering was strictly `date.asc(), period.asc()`, and form_stale releases WITHOUT a
         # penalty by design (miss_count untouched, status straight back to AVAILABLE) -- so the
         # first candidate came back to the same worker on the very next tick, forever. Measured
         # live 2026-08-27 on booking "E2E VALIDATION 0827": 14 leases over ONE slot
-        # (2026-08-28/period 3) while 31 others sat AVAILABLE and freshly seen. `bounced` retires a
-        # slot after N misses and `session` parks the worker after N; form_stale had NEITHER escape,
-        # so the worker re-warmed and re-logged in four times without ever trying a different slot.
-        # storm-auto's own reading of that response (quoted at ops_live.py's _BOUNCE_KEYWORDS) is
-        # "the slot was taken", which makes retrying the same one exactly wrong.
+        # (2026-08-28/period 3) while 31 others sat AVAILABLE and freshly seen.
         #
-        # Deliberately ORDER ONLY: no miss_count, no status change, no retirement. A slot we could
-        # not use is not a slot that is gone -- charging it would reintroduce the false-slot revert
-        # that condemned a real pool over 5082 "bounces". It simply goes last until something else
-        # has had a turn.
+        # BOUNCED is now reordered the same way (2026-10-02). It retires a slot after N misses, but
+        # a BOOKED blind slot is retirement-protected until its phantom-capacity budget is spent
+        # (events._release_slot_lease) -- so between a bounce and that retirement the slot stays
+        # AVAILABLE and, being the earliest date, sat at the FRONT and was re-handed to the same
+        # worker every tick. CONFIRMED live (Test 1002): worker 8fac5d27 took one booked slot
+        # 18 times in a row while others got ZERO leases. Pushing a just-bounced slot to the back
+        # lets every other worker have a turn before it comes round again.
+        #
+        # Deliberately ORDER ONLY: no miss_count, no status change, no retirement here. A slot we
+        # could not use is not a slot that is gone -- charging it would reintroduce the false-slot
+        # revert that condemned a real pool over 5082 "bounces". It simply goes last until something
+        # else has had a turn.
         recent_stale = dict(db.execute(
             select(M.SlotLease.slot_id, func.max(M.SlotLease.released_at)).where(
                 M.SlotLease.slot_id.in_([s.id for s in avail]),
-                M.SlotLease.outcome == SlotLeaseOutcome.FORM_STALE,
+                M.SlotLease.outcome.in_([SlotLeaseOutcome.FORM_STALE, SlotLeaseOutcome.BOUNCED]),
                 M.SlotLease.released_at.isnot(None),
             ).group_by(M.SlotLease.slot_id)
         ).all())

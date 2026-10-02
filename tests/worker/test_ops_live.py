@@ -2861,8 +2861,11 @@ def test_saving_the_submit_body_never_breaks_the_round(tmp_path, monkeypatch):
     assert any("could not save the submit body" in m for m in logs)
 
 
-def test_a_booked_submit_does_not_write_a_rejection_body(tmp_path):
-    """Only rejections are captured; a real booking already persists its PDF artifact."""
+def test_a_booked_submit_captures_a_booked_body_never_a_rejection(tmp_path):
+    """A booking now ALSO captures its confirmation HTML -- it carries the portal's appointment
+    reference (BookedAppointment.appointment_ref, previously never populated) as parseable text.
+    It must be labeled 'booked', NEVER as a rejection/bounce/stale body (the original invariant:
+    a success must not be mis-recorded as a rejection)."""
     events = []
     ops = _apply_ops(b"%PDF-1.4 real booking", events)
     calls = []
@@ -2870,7 +2873,8 @@ def test_a_booked_submit_does_not_write_a_rejection_body(tmp_path):
     ops._save_pdf = lambda b: "/tmp/x.pdf"
 
     assert ops.do_apply({"date": "2026-09-01", "period": 4}) == "booked"
-    assert calls == [], "a successful booking wrote a rejection body"
+    assert calls == ["booked"], "a booking captures its confirmation body, labeled 'booked'"
+    assert all(c not in ("bounced", "no_slot", "session") and "stale" not in c for c in calls)
 
 
 # ── the apply round must not POST /slots before the submit (2026-08-27) ──────────────────────
