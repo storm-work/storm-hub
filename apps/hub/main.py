@@ -107,6 +107,7 @@ from .schemas import (
     IdentityBulkDeleteResult,
     IdentityBulkPriority,
     IdentityDuplicate,
+    IdentityBulkTargetPosto,
     IdentityImport,
     IdentityOut,
     IdentityUpdate,
@@ -1529,6 +1530,28 @@ def bulk_set_priority(body: IdentityBulkPriority, db: Session = Depends(get_db),
         updated.append(iid)
     db.commit()
     return {"updated": updated}
+
+
+@app.post("/identities/bulk-target-posto")
+def bulk_set_target_posto(body: IdentityBulkTargetPosto, db: Session = Depends(get_db),
+                          _op: Principal = Depends(require_operator)) -> dict:
+    """Set the same target_posto on many identities at once. REAL identities only (app-enforced,
+    like the per-identity PATCH): a TEST identity in the selection is skipped and reported, never
+    silently given a posto it can't use. Blank clears it to NULL. Unknown ids are skipped."""
+    posto = (body.target_posto or "").strip() or None
+    updated: list[str] = []
+    skipped_non_real: list[str] = []
+    for iid in body.identity_ids:
+        ident = db.get(M.Identity, iid)
+        if not ident:
+            continue
+        if ident.type != "real":
+            skipped_non_real.append(iid)
+            continue
+        ident.target_posto = posto
+        updated.append(iid)
+    db.commit()
+    return {"updated": updated, "skipped_non_real": skipped_non_real}
 
 
 @app.post("/identities/import", response_model=ImportResult)

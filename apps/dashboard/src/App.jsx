@@ -2403,6 +2403,13 @@ function Identities({ me, setLeftPanel, setRightPanel }) {
     { method: "POST", body: { identity_ids: selectedIds, count: Number(subCount) } }));
   const setPriority = () => act(() => api("/identities/bulk-priority",
     { method: "POST", body: { identity_ids: selectedIds, priority: Number(bulkPriority) } }));
+  const [bulkPosto, setBulkPosto] = useState("");
+  const setTargetPosto = () => act(async () => {
+    const r = await api("/identities/bulk-target-posto",
+      { method: "POST", body: { identity_ids: selectedIds, target_posto: bulkPosto.trim() || null } });
+    const n = r.skipped_non_real?.length || 0;
+    setMsg(`Set target posto on ${r.updated.length}.` + (n ? ` Skipped ${n} test identit${n === 1 ? "y" : "ies"} (real only).` : ""));
+  });
   // Duplicate = clone each selected identity with a passport SUFFIX, no sub-accounts, into an
   // optional group. Reports per-id skips (e.g. passport already exists) rather than failing silently.
   const duplicateSelected = () => act(async () => {
@@ -2545,6 +2552,9 @@ function Identities({ me, setLeftPanel, setRightPanel }) {
             <option value="0">low</option>
           </select>
           <button className="btn" disabled={!op} onClick={setPriority}>Set priority</button>
+          <label style={{ margin: 0 }} title="set target posto on the selected REAL identities; blank clears it">Posto</label>
+          <input value={bulkPosto} onChange={(e) => setBulkPosto(e.target.value)} placeholder="5084" style={{ width: 70 }} />
+          <button className="btn" disabled={!op} onClick={setTargetPosto}>Set posto</button>
           <span className="grow" />
           <label style={{ margin: 0 }} title="appended to each selected identity's passport number, e.g. + or ++">Suffix</label>
           <input value={dupSuffix} onChange={(e) => setDupSuffix(e.target.value)} placeholder="+" style={{ width: 50 }} />

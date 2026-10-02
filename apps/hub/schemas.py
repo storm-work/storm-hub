@@ -509,6 +509,14 @@ class IdentityBulkDeleteResult(BaseModel):
     refused: dict[str, str] = Field(default_factory=dict)   # identity_id -> why
 
 
+class IdentityBulkTargetPosto(BaseModel):
+    """Bulk set target_posto on many identities at once. Applies to REAL identities only (same
+    app-enforced rule as the per-identity PATCH); test identities in the selection are skipped.
+    Blank/empty clears it (NULL)."""
+    identity_ids: list[str]
+    target_posto: str | None = None
+
+
 class IdentityBulkPriority(BaseModel):
     """Bulk override of the attach-panel selection preference. See libs/domain/priority.py for the
     named levels (HIGH=200, NORMAL=100, LOW=0) -- any int is accepted, matching the single-identity

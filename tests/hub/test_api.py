@@ -1612,6 +1612,26 @@ def test_duplicate_requires_a_suffix(client):
     assert r.status_code == 400, r.text
 
 
+def test_bulk_set_target_posto_real_only(client):
+    h = _operate_headers(client)
+    real = client.post("/identities/import", json={"csv": _csv("PA-TP1", user="tp1"),
+                                                   "default_type": "real"},
+                       headers=h).json()["identity_ids"][0]
+    test_id = client.post("/identities", json={"full_name": "T", "type": "test"},
+                          headers=h).json()["id"]
+    r = client.post("/identities/bulk-target-posto",
+                    json={"identity_ids": [real, test_id], "target_posto": "9999"}, headers=h).json()
+    assert r["updated"] == [real] and r["skipped_non_real"] == [test_id], r
+    got = {i["id"]: i for i in client.get("/identities", headers=h).json()}
+    assert got[real]["target_posto"] == "9999"
+    assert got[test_id]["target_posto"] is None    # test identity never gets a posto
+    # blank clears it
+    client.post("/identities/bulk-target-posto",
+                json={"identity_ids": [real], "target_posto": "  "}, headers=h)
+    got = {i["id"]: i for i in client.get("/identities", headers=h).json()}
+    assert got[real]["target_posto"] is None
+
+
 def test_import_labeled_block_with_no_subaccounts(client):
     """REGRESSION (live 500 'Identity has no attribute sub_accounts'): the paria labeled-block format
     carries NO sub-accounts, so an imported identity stays status=empty and _merge_subs must not touch
