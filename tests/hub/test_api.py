@@ -1612,6 +1612,33 @@ def test_duplicate_requires_a_suffix(client):
     assert r.status_code == 400, r.text
 
 
+def test_import_labeled_block_with_no_subaccounts(client):
+    """REGRESSION (live 500 'Identity has no attribute sub_accounts'): the paria labeled-block format
+    carries NO sub-accounts, so an imported identity stays status=empty and _merge_subs must not touch
+    a non-existent ORM relationship. Covers the dedup PROMOTE path landing on an empty row too."""
+    h = _operate_headers(client)
+    block = ("=== (1).jpeg ===\n"
+             "First Name     : ESTER NICOLE\n"
+             "Last Name      : ALMEIDA MONIZ\n"
+             "Date of Birth  : 08-10-1997\n"
+             "Gender         : F\n"
+             "Nationality    : CABO-VERDIANA\n"
+             "Passport Number: PA581394\n")
+    r = client.post("/identities/import",
+                    json={"csv": block, "default_type": "real", "default_target_posto": "5084++",
+                          "group_name": "roming"}, headers=h)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["created"] == 1 and body["sub_accounts"] == 0, body
+    got = [i for i in client.get("/identities", headers=h).json() if i["passport_no"] == "PA581394"]
+    assert len(got) == 1 and got[0]["status"] == "empty" and got[0]["group_name"] == "roming"
+    # re-import the SAME passport (promote path onto an empty row) must also not 500
+    r2 = client.post("/identities/import",
+                     json={"csv": block, "default_type": "real"}, headers=h)
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["created"] == 0
+
+
 def test_import_group_name_tags_the_whole_file(client):
     """Batch group: the group_name on the import body is applied to every identity the file touches
     -- created now, and (on a later re-import under a new group) promoted/ignored rows too."""

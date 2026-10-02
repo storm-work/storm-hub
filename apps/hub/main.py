@@ -1556,6 +1556,7 @@ def import_identities(body: IdentityImport, db: Session = Depends(get_db),
 
     def _merge_subs(target: M.Identity) -> None:
         nonlocal subs
+        added = 0
         for sa in pi.sub_accounts:
             if sa.username in existing:
                 errors.append(f"skip duplicate username {sa.username}")
@@ -1567,9 +1568,11 @@ def import_identities(body: IdentityImport, db: Session = Depends(get_db),
             existing.add(sa.username)
             if sa.status in READY_SUB_ACCOUNT_STATUSES:
                 ready[target.id] = ready.get(target.id, 0) + 1
+            added += 1
             subs += 1
             sub_account_ids.append(new_sa.id)
-        if target.status == "empty" and target.sub_accounts:
+        # Identity has no `sub_accounts` ORM relationship -- key off what this call actually added.
+        if added and target.status == "empty":
             target.status = "active"
 
     for pi in parsed:
