@@ -1949,6 +1949,34 @@ def test_keepalive_probes_home_never_schedule_jsp_even_when_previously_warmed():
     assert ops.session.navs and "Schedule.jsp" not in ops.session.navs[0], ops.session.navs
 
 
+def test_keepalive_restore_rewarms_the_form_only_in_schedule_mode():
+    """A dead-exit keepalive restore re-AUTHENTICATES either way, but it must re-warm the booking
+    FORM only in schedule mode. auth_only defers warmup to the signal, so re-warming in the restore
+    put a worker in WARMING_UP before slot_found/slot_open (CONFIRMED live 2026-10-02 'Booking w
+    Auth': full warmup chain ~10 min before slot_found)."""
+    # auth_only (default): re-auth only, NEVER re-warm the form
+    ops = _make_ops(emit=lambda t, **p: None)
+    ops._log = lambda *a, **k: None
+    ops._try_restore_from_checkpoint = lambda: True
+    ops._anchor_src = None                      # re-auth did not establish a verified chain anchor
+    warm = []
+    ops._run_warmup_steps = lambda: (warm.append(1), True)[1]
+    ops._mark_keep_bookable = lambda *a, **k: None
+    assert ops._attempt_keepalive_restore("test") is True
+    assert warm == [], "auth_only restore must re-authenticate only, never re-warm the form"
+
+    # schedule: re-warm so KEEPING holds a bookable cursor
+    ops2 = _make_ops(cfg=_cfg_schedule(), emit=lambda t, **p: None)
+    ops2._log = lambda *a, **k: None
+    ops2._try_restore_from_checkpoint = lambda: True
+    ops2._anchor_src = None
+    warm2 = []
+    ops2._run_warmup_steps = lambda: (warm2.append(1), True)[1]
+    ops2._mark_keep_bookable = lambda *a, **k: None
+    assert ops2._attempt_keepalive_restore("test") is True
+    assert warm2 == [1], "schedule restore must re-warm the cursor to stay bookable"
+
+
 def test_keepalive_still_detects_session_expired_and_restores():
     """Session-death detection is independent of form-state verification -- it never depended on
     it, and must keep working now that there is no form-state check at all."""

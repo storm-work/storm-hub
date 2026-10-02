@@ -2737,12 +2737,18 @@ class LiveEngineOps(EngineOps):
             pass
         self.session = None
         ok = self._try_restore_from_checkpoint() or self._fresh_login()
-        # `posto_pdf is None` was the wrong test. A checkpoint restore SETS posto_pdf from the file
-        # without rebuilding anything, so an unverified anchor silently suppressed this re-warm and
-        # the restore reported success on form state nothing had checked. Re-warm unless the chain
-        # itself established the anchor on THIS session.
-        if ok and self._anchor_src != "chain":
-            ok = self._run_warmup_steps()   # restore only re-authenticates; form-state needs re-warming
+        # RE-WARM THE FORM ONLY IN SCHEDULE MODE. A checkpoint restore re-AUTHENTICATES only (it SETS
+        # posto_pdf from the file without rebuilding anything, so `_anchor_src != "chain"` means the
+        # form-state anchor is not verified on THIS session). In schedule mode KEEPING must hold a
+        # warm, bookable cursor, so the restore re-warms it. In auth_only, warmup is DEFERRED to the
+        # signal (do_apply/do_discover warm on demand) -- re-warming the form here put the worker in
+        # WARMING_UP before slot_found/slot_open, violating the deferred model. CONFIRMED live
+        # 2026-10-02 ("Booking w Auth"): a dead-exit keepalive restore ran the full warmup chain
+        # ~10 min before slot_found. So auth_only restore stops at re-auth; the session is bookable
+        # (authenticated) and the next do_apply/do_discover establishes the form-state when needed.
+        _mode = (getattr(self.cfg.keepalive, "mode", "auth_only") or "auth_only").strip().lower()
+        if ok and _mode == "schedule" and self._anchor_src != "chain":
+            ok = self._run_warmup_steps()
         if ok:
             self._keepalive_restore_attempts = 0
             self._mark_keep_bookable(True)
