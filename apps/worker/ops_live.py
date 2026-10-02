@@ -3895,11 +3895,16 @@ class LiveEngineOps(EngineOps):
             # in the live Schedule.jsp context (Referer set automatically), so the origin must be the
             # live schedule page -- which the round-start warmup establishes.
             try:
+                # STRESS MODE: a submit into a down-window hangs the full timeout, spanning up-
+                # windows. APPLY_SUBMIT_TIMEOUT (default 100, the proven value) lets the operator
+                # fast-fail (~15-20s) so the worker re-fires several times per up-window.
+                _submit_timeout = max(5.0, float(self.cfg.raw.get("APPLY_SUBMIT_TIMEOUT", 100.0)
+                                                 or 100.0))
                 _res = self.session.browser_fetch(
                     submit_url, body, method="POST",
                     headers={"X-Requested-With": "XMLHttpRequest",
                              "Referer": SCHED_JSP + "?posto_id=" + str(self.posto_pdf)},
-                    encode="form", timeout=100)
+                    encode="form", timeout=_submit_timeout)
                 html = str(_res.get("body") or "") if isinstance(_res, dict) else str(_res or "")
                 _status = _res.get("status") if isinstance(_res, dict) else None
                 _final_url = submit_url        # XHR: no navigation, still on Schedule.jsp

@@ -1528,6 +1528,27 @@ def _apply_ops(pdf_bytes: bytes, events: list):
     return ops
 
 
+def test_apply_submit_timeout_is_tunable_for_stress_mode():
+    """APPLY_SUBMIT_TIMEOUT (default 100) controls the submit XHR timeout so stress mode can fast-fail
+    a down-portal submit instead of hanging ~100s across the up-window."""
+    events = []
+    captured = {}
+    ops = _make_ops(cfg=_cfg_schedule(booking={"APPLY_SUBMIT_TIMEOUT": 15.0}),
+                    emit=lambda t, **p: events.append((t, p)))
+
+    class _TimeoutRec(_SubmitSession):
+        def browser_fetch(self, url, data, method="POST", headers=None, timeout=30, **k):
+            captured["timeout"] = timeout
+            return {"status": 200, "body": _PDF_SHELL}
+
+    ops.session = _TimeoutRec(b"%PDF-1.4 ok")
+    ops._run_warmup_steps = lambda: True
+    ops._save_pdf = lambda b: "/tmp/x.pdf"
+    ops.posto_pdf = "3059"; ops._set_anchor("chain")
+    assert ops.do_apply({"date": "2026-09-01", "period": 4}) == "booked"
+    assert captured.get("timeout") == 15.0, f"submit used timeout={captured.get('timeout')}"
+
+
 def test_overshoot_promotes_to_booked_only_with_real_pdf_bytes():
     events = []
     ops = _apply_ops(b"%PDF-1.4\nreal confirmation document", events)

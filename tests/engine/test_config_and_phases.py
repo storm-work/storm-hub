@@ -79,6 +79,27 @@ def test_auth_only_scout_warms_on_slot_open_not_before_keeping():
         "auth_only: KEEPING comes first, WARMED only after slot-open"
 
 
+def test_stress_retry_gap_keeps_the_slot_on_portal_unreachable():
+    """STRESS MODE: a portal_unreachable means a down-window, not a taken slot -- so with
+    STRESS_RETRY_GAP>0 the worker KEEPS its slot and retries fast, rather than releasing it and
+    paying a Hub re-assignment round-trip. 'Ride the window'."""
+    ops = SimEngineOps(assignment={"date": "d", "period": 3},
+                       apply_outcome=["portal_unreachable", "booked"])
+    res = PhaseMachine(_cfg(booking={"STRESS_RETRY_GAP": 0.01}, ROLE="apply"), ops).run()
+    assert res.outcome == "booked"
+    assert ops.released == 0, "stress retry must KEEP the slot across a portal_unreachable"
+    assert ops.applied == 2, "it retries the SAME slot (unreachable then booked)"
+
+
+def test_without_stress_retry_portal_unreachable_releases_the_slot():
+    """Default (STRESS_RETRY_GAP=0): unchanged -- release the slot and re-poll."""
+    ops = SimEngineOps(assignment={"date": "d", "period": 3},
+                       apply_outcome=["portal_unreachable", "booked"])
+    res = PhaseMachine(_cfg(ROLE="apply"), ops).run()
+    assert res.outcome == "booked"
+    assert ops.released >= 1, "default path releases the slot on portal_unreachable"
+
+
 def test_apply_books_assigned_slot():
     ops = SimEngineOps(assignment={"date": "2026-08-18", "period": 3})
     res = PhaseMachine(_cfg(ROLE="apply"), ops).run()

@@ -30,6 +30,8 @@ them in tests, so the whole control flow is unit-tested with no browser.
 """
 from __future__ import annotations
 
+import time
+
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Protocol, runtime_checkable
@@ -694,9 +696,23 @@ class PhaseMachine:
                 # _park is the right brake rather than a rebuild or a failure: the session really
                 # is fine, so this keeps it and simply stops consuming pooled slots for a few poll
                 # gaps -- the same session-preserving back-off the bounce storm already uses.
+                unreachable_streak += 1
+                # STRESS MODE (STRESS_RETRY_GAP > 0): the submit never reached the portal -- it is a
+                # down-window -- so the SLOT is not taken and the cursor is intact. KEEP both and
+                # retry fast after a short gap, rather than releasing the slot and paying a Hub
+                # re-assignment round-trip + a full poll_gap -- so we fire the instant the portal is
+                # back up ("ride the window"). Still bounded by the park brake below so a portal that
+                # stays down does not spin forever.
+                stress_gap = max(0.0, float(self.cfg.raw.get("STRESS_RETRY_GAP", 0.0) or 0.0))
+                if stress_gap > 0 and unreachable_streak < max_unreachable:
+                    self._to(WorkerSubstate.KEEPING,
+                             detail=f"portal unreachable x{unreachable_streak}; stress retry")
+                    _end = time.time() + stress_gap
+                    while time.time() < _end and not self.ops.is_stopped():
+                        time.sleep(min(0.5, max(0.0, _end - time.time())))
+                    continue          # slot KEPT -- retry the same slot, no Hub round-trip
                 self.ops.release_slot(slot, "session")
                 slot = None
-                unreachable_streak += 1
                 if unreachable_streak >= max_unreachable:
                     self._park(f"portal unreachable x{unreachable_streak}")
                     unreachable_streak = 0

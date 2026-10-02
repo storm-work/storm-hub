@@ -553,6 +553,23 @@ _BOOKING = [
        "A bounce must never end the run -- the authed session is the expensive thing. Note the park "
        "is only 3 poll gaps (~15-20s), which measurement showed is too short to brake a repeating "
        "failure."),
+    _s("APPLY_SUBMIT_TIMEOUT", L.BOOKING, float, 100.0, group="guards", min_value=5.0,
+       note=
+       "STRESS MODE lever. Timeout (s) for the SubmeterVistoCriaPDF submit XHR. Default 100 (the "
+       "proven value). When the portal is in stress mode (up 30-90s then down), a submit into a "
+       "down-window HANGS the full timeout -- spanning entire up-windows -- so the worker gets ~1 "
+       "attempt per 100s. Lower it to ~15-20 so a down-portal submit FAILS FAST (portal_unreachable) "
+       "and the worker can re-fire several times per up-window ('ride the window'). Too low risks "
+       "aborting a slow-but-live submit; 15-20 is the stress sweet spot, 100 for a healthy portal."),
+    _s("STRESS_RETRY_GAP", L.BOOKING, float, 0.0, group="guards", min_value=0.0,
+       note=
+       "STRESS MODE lever. 0 (default) = OFF: on portal_unreachable the worker releases the slot and "
+       "waits a full HOLD_POLL_GAP, re-leasing via the Hub next tick. When > 0, the worker instead "
+       "KEEPS its assigned slot and retries the submit after this short gap (s) -- no slot release, "
+       "no Hub re-assignment round-trip -- so it fires the instant the portal is back up. The cursor "
+       "survives a portal_unreachable (the submit never reached the portal), so in schedule mode the "
+       "retry is a ~3s direct-apply. Bounded by APPLY_MAX_ATTEMPTS (the park brake still applies). "
+       "Pair with a low APPLY_SUBMIT_TIMEOUT and schedule keepalive mode."),
     # Consecutive apply bounces across the fleet after which the Hub stops believing its own slot
     # pool. Operator's call 2026-08-14: "even when there are some slots found - they may be false
     # positive. if applying keeps being failed then regard the slots as false, and revert to hold."
