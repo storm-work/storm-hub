@@ -1173,10 +1173,19 @@ function WorkerGeoCell({ worker, op, onChanged }) {
   }
 
   if (!editing) {
+    // "auto" = UNPINNED, which is not "no geo": the worker draws from the booking's PROXY_GEOS set
+    // and rolls a fresh country on every exit rotation. The bare chip read as "geos not applied"
+    // (operator, 2026-10-02), so the tooltip now always says what unpinned actually does, and an
+    // unpinned chip carries a small rotation glyph to distinguish it from a hard pin.
+    const tip = cur
+      ? (`pinned to ${cur}` + (op ? " — click to change" : ""))
+      : ("unpinned — exit rolls across the booking's PROXY_GEOS set each rotation"
+         + (op ? " — click to pin a single country" : ""));
     return (
-      <span className="pill" title={op ? "click to set this worker's exit country" : cur || "auto"}
-        style={{ cursor: op ? "pointer" : "default", fontFamily: "monospace" }}
-        onClick={open}>{cur || "auto"}</span>
+      <span className="pill" title={tip}
+        style={{ cursor: op ? "pointer" : "default", fontFamily: "monospace",
+                 opacity: cur ? 1 : 0.8 }}
+        onClick={open}>{cur || "auto ⟳"}</span>
     );
   }
   return (
