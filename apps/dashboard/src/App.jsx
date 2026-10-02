@@ -2788,10 +2788,10 @@ function IdentityDetailPanel({ i, op, subs, onChanged, onClose }) {
       )}
       <div className="field"><label>Priority</label>
         <select value={String(prio)} onChange={(e) => setPrio(Number(e.target.value))}
-                title="selection preference — the identity list is ordered by this, highest first. Import sets fresh identities High and drops any duplicate they supersede to Low.">
-          <option value="200">High (freshly imported)</option>
+                title="selection preference — the identity list is ordered by this, highest first. Import/add dedup on passport: a fresh identity is set High, and re-importing an existing one reuses that row and promotes it to High rather than creating a duplicate.">
+          <option value="200">High (fresh / in-demand)</option>
           <option value="100">Normal</option>
-          <option value="0">Low (superseded)</option>
+          <option value="0">Low (deprioritised)</option>
         </select></div>
       <div className="field"><label>Comment</label>
         <input value={comment} onChange={(e) => setComment(e.target.value)} style={{ width: "100%" }} /></div>
