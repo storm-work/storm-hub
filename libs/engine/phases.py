@@ -169,12 +169,25 @@ class PhaseMachine:
         only if re-warming is genuinely not rebuilding the anchor escalate to a fresh login. Leaves
         substate at WARMING_UP on success so the caller owns what happens next.
         """
+        # ALREADY-BOOKED IS TERMINAL -- never re-warm or re-login a dead identity. do_warmup (which
+        # the caller ran once before calling this) sets identity_unavailable when the portal says
+        # "applicant already has a request". CONFIRMED live 2026-10-02 ("Booking w Schedule"): an
+        # already-booked identity re-warmed REWARM_MAX_ATTEMPTS times AND re-logged in, burning ~24
+        # min and scarce login shots per dead identity during a throttled window, before the caller
+        # finally terminated it. Bail immediately so _warm_if_needed returns the already_booked
+        # terminal. (do_apply handles its own already_booked; this is the eager/slot-open/self-scout
+        # warm path.)
+        _unavail = getattr(self.ops, "identity_unavailable", lambda: False)
+        if _unavail():
+            return False
         max_rewarms = max(1, int(self.cfg.raw.get("REWARM_MAX_ATTEMPTS", 1)))
         for attempt in range(max_rewarms):
             self._to(WorkerSubstate.WARMING_UP,
                      detail=f"re-warm {attempt + 1}/{max_rewarms}: {why}")
             if self.ops.do_warmup():
                 return True
+            if _unavail():
+                return False          # became already-booked mid-ladder -- terminal, stop retrying
         # A SLOW portal is not a broken session, and a re-login cannot make the portal faster --
         # it just spends a CAPTCHA solve and a slice of the sub-account rate limit, which is already
         # the binding constraint, to arrive back at the same slow portal. Keep re-warming instead;
@@ -188,7 +201,10 @@ class PhaseMachine:
             return False
 
         # Re-warm alone has stopped rebuilding the anchor -- only a fresh login will (storm-auto
-        # abc5). Still in-process: same worker, same proxy, same sub-account.
+        # abc5). Still in-process: same worker, same proxy, same sub-account. NEVER for an
+        # already-booked identity (a re-login cannot un-book it; it only spends a login shot).
+        if _unavail():
+            return False
         self._to(WorkerSubstate.KEEPING, detail=f"re-warm exhausted; re-login in place: {why}")
         self._to(WorkerSubstate.LOGGING_IN)
         if not self.ops.do_login():

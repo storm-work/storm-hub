@@ -823,13 +823,36 @@ def test_an_already_booked_warmup_terminates_and_does_not_respawn():
             super().__init__(*a, **kw)
             self._unavail = False
         def do_warmup(self) -> bool:
+            self.warmups += 1             # count calls so the "no grinding" assertion is meaningful
             self._unavail = True          # the portal said "already has a request"
             return False
         def identity_unavailable(self) -> bool:
             return self._unavail
     ops = _AlreadyBookedOps(discover_tasks=[["d1"]], discover_outcomes={})
-    res = PhaseMachine(_cfg(ROLE="scout"), ops).run()
+    res = PhaseMachine(_cfg(ROLE="scout", REWARM_MAX_ATTEMPTS=3), ops).run()
     assert res.outcome == "already_booked", f"expected terminal already_booked, got {res.outcome!r}"
+    # It must NOT grind the dead identity: one warm-up detects already-booked and terminates; no
+    # re-warm ladder (would be up to REWARM_MAX_ATTEMPTS=3) and no re-login (CONFIRMED live
+    # 2026-10-02: ~24 min + login shots wasted per already-booked identity during a throttle).
+    assert ops.warmups == 1, f"already-booked must not re-warm; saw {ops.warmups} warm-ups"
+    assert ops.logins == 1, f"already-booked must not re-login; saw {ops.logins} logins"
+
+
+def test_already_booked_at_the_eager_schedule_warm_terminates_without_grinding():
+    """The schedule-mode eager warm (phases._warmup, before KEEPING) must also terminate instantly on
+    already-booked -- this is exactly where 'Booking w Schedule' looped re-warm+re-login on 2026-10-02."""
+    class _AlreadyBookedOps(SimEngineOps):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw); self._unavail = False
+        def do_warmup(self) -> bool:
+            self.warmups += 1; self._unavail = True; return False
+        def identity_unavailable(self) -> bool:
+            return self._unavail
+    ops = _AlreadyBookedOps()
+    res = PhaseMachine(_cfg(booking={"KEEPALIVE_MODE": "schedule"}, ROLE="apply",
+                            REWARM_MAX_ATTEMPTS=3), ops).run()
+    assert res.outcome == "already_booked", f"got {res.outcome!r}"
+    assert ops.warmups == 1 and ops.logins == 1, f"warmups={ops.warmups} logins={ops.logins}"
 
 
 # ── a scout proves its session healthy BEFORE discovering (finding #2, 2026-10-01) ──
