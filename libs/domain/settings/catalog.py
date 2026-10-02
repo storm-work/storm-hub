@@ -256,6 +256,13 @@ _BOOKING = [
             "getPeriodosOcupados rounds keeps the server-side booking anchor alive, which a bare "
             "keepalive nav does not (147 lapses vs 42 restores, measured 2026-08-21). Scouts are "
             "unnecessary in this mode but not forbidden."),
+    _s("SELF_SCOUT_FALLBACK", L.BOOKING, bool, True, group="mode",
+       note="When True (default), an apply worker falls back to discovering its OWN slots if the "
+            "booking's pool is empty AND no scout is actually scouting (scheduler._maybe_self_scout "
+            "sends it a scouts_invalid assignment). Set False to FORBID that fallback: an apply "
+            "worker then only ever books slots a scout found, and simply keeps holding when there "
+            "are none. Independent of MONO_BOOKING, which is the deliberate always-self-scout mode "
+            "and is not gated by this."),
     _s("no_book", L.BOOKING, bool, False, group="mode", note="test dry-run: apply workers never submit"),
     # NOT IMPLEMENTED -- audited 2026-08-21, zero read sites anywhere in the codebase (the only
     # references are this line and a resolver test asserting the default). Kept rather than deleted

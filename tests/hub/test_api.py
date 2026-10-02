@@ -1496,6 +1496,63 @@ def test_a_re_imported_HIGH_verified_passport_is_ignored(client):
     assert {s["username"] for s in subs} == {"v1"}, "an ignored import must add NOTHING"
 
 
+def test_cleanup_booked_by_others_removes_flagged_keeps_real_bookings(client):
+    """The cleanup button: removes identities the portal flagged BY OTHERS (durable IdentityEvent
+    step), but KEEPS any that hold a real BookedAppointment we made."""
+    import apps.hub.main as hub_main
+    from libs.db import models as M
+    from libs.domain.enums import IdentityEvent as IEnum
+    from datetime import datetime, timezone
+    h = _operate_headers(client)
+    flagged = client.post("/identities/import", json={"csv": _csv("PA-BO1", user="bo1"),
+                                                      "default_type": "real"},
+                          headers=h).json()["identity_ids"][0]
+    keep = client.post("/identities/import", json={"csv": _csv("PA-BO2", user="bo2"),
+                                                   "default_type": "real"},
+                       headers=h).json()["identity_ids"][0]
+    bk_id = client.post("/bookings", json={"name": "bo-bk", "type": "real", "posto_id": "5084"},
+                        headers=h).json()["id"]
+    db = hub_main.SessionLocal()
+    try:
+        from sqlalchemy import select as _sel
+        # both flagged by-others
+        for iid in (flagged, keep):
+            db.add(M.IdentityEvent(identity_id=iid, event=IEnum.BOOKED,
+                                   step="already_booked_at_portal", ts=datetime.now(timezone.utc)))
+        # but `keep` also holds a REAL appointment we made
+        sa = db.scalars(_sel(M.SubAccount).where(M.SubAccount.identity_id == keep)).first()
+        db.add(M.BookedAppointment(identity_id=keep, sub_account_id=sa.id, booking_id=bk_id,
+                                   booked_at=datetime.now(timezone.utc)))
+        db.commit()
+    finally:
+        db.close()
+
+    r = client.post("/identities/cleanup-booked-by-others", headers=h)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert flagged in body["deleted"], body
+    assert keep not in body["deleted"] and keep in body["refused"], body
+    ids = {i["id"] for i in client.get("/identities", headers=h).json()}
+    assert flagged not in ids                 # gone
+    # `keep` is excluded from the attach list because it has a BookedAppointment, but still exists:
+    import apps.hub.main as hm
+    db = hm.SessionLocal()
+    try:
+        assert db.get(M.Identity, keep) is not None, "a real-appointment identity must be kept"
+    finally:
+        db.close()
+
+
+def test_self_scout_fallback_setting_defaults_true_and_is_booking_layer():
+    from libs.domain.settings import resolve, validate_layer
+    from libs.domain.enums import SettingsLayer as L
+    assert resolve({}).get("SELF_SCOUT_FALLBACK") is True
+    validate_layer(L.BOOKING, {"SELF_SCOUT_FALLBACK": False})       # allowed at booking layer
+    import pytest as _pytest
+    with _pytest.raises(Exception):
+        validate_layer(L.TEMPLATE, {"SELF_SCOUT_FALLBACK": False})  # not a template setting
+
+
 def test_duplicate_identities_suffixes_passport_no_subs_own_group(client):
     """Duplicate = clone with a passport suffix, NO sub-accounts, operator-chosen group; the
     suffixed passport is distinct so it does not collide with the source under dedup."""

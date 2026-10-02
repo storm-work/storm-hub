@@ -532,6 +532,10 @@ class PhaseMachine:
         max_bounces = max(1, int(self.cfg.raw.get("APPLY_MAX_ATTEMPTS", 5)))
         rewarm_after_bounces = max(1, int(self.cfg.raw.get("APPLY_REWARM_AFTER_BOUNCES", 2)))
         mono = bool(self.cfg.raw.get("MONO_BOOKING", False))
+        # The scouts-invalid fallback (self-scout when scouts are dead) can be forbidden per booking.
+        # MONO_BOOKING is independent -- it is the deliberate always-self-scout mode. Primary gate is
+        # the Hub (it stops sending scouts_invalid); this guards a stale command already in flight.
+        self_scout_fallback = bool(self.cfg.raw.get("SELF_SCOUT_FALLBACK", True))
         # Consecutive `session` outcomes. The bounce cap above deliberately does NOT cover these --
         # treating a session failure as a bounce is what let one dead proxy manufacture 5082
         # "bounced" leases and park every applier (2026-08-15). But uncapping it entirely left the
@@ -573,7 +577,7 @@ class PhaseMachine:
             if slot is None and self.ops.is_stopped():
                 return PhaseResult("stopped", self._sub, "stopped while awaiting assignment",
                                    self.visited)
-            if slot is None and (mono or self.ops.scouts_invalid()):
+            if slot is None and (mono or (self_scout_fallback and self.ops.scouts_invalid())):
                 # MONO_BOOKING: the worker discovers its OWN slots and books them, instead of idling
                 # until a scout hands it one. This is storm-auto's confirmed architecture -- there is
                 # no separate scout fleet there, every warmed worker scans a slice of the date window

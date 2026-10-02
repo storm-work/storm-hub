@@ -1456,6 +1456,62 @@ def bulk_delete_identities(body: IdentityBulkDelete, db: Session = Depends(get_d
     return IdentityBulkDeleteResult(deleted=deleted, refused=refused)
 
 
+# The durable marker events._mark_already_booked sets when the portal reports a worker's applicant
+# already holds an appointment made by someone else (status RETIRED + this IdentityEvent step).
+_BY_OTHERS_STEP = "already_booked_at_portal"
+
+
+@app.post("/identities/cleanup-booked-by-others", response_model=IdentityBulkDeleteResult)
+def cleanup_booked_by_others(db: Session = Depends(get_db),
+                             _op: Principal = Depends(require_operator)) -> IdentityBulkDeleteResult:
+    """Remove every identity the portal flagged as already booked BY OTHERS -- they can never book
+    again (the portal blocks a second appointment), so they are dead weight in the pool.
+
+    Detected by the durable IdentityEvent step (not the editable comment). Safe by construction:
+    an identity that turns out to hold a REAL BookedAppointment (one WE made) is KEPT, never
+    deleted -- that record is sacred. A terminal (COMPLETED) worker row left over from the detection
+    run is cleared first (same cascade as detach); a still-RUNNING worker refuses the identity so a
+    live run is never disturbed. Reuses delete_identity(force=True) for the actual removal so the
+    deletion rules live in exactly one place."""
+    flagged = [i for (i,) in db.execute(
+        select(M.IdentityEvent.identity_id).where(M.IdentityEvent.step == _BY_OTHERS_STEP)
+        .distinct()).all()]
+    deleted: list[str] = []
+    refused: dict[str, str] = {}
+    for iid in flagged:
+        ident = db.get(M.Identity, iid)
+        if ident is None:
+            continue
+        if db.scalar(select(func.count()).select_from(M.BookedAppointment)
+                     .where(M.BookedAppointment.identity_id == iid)):
+            refused[iid] = "has a real booked appointment WE made -- kept, not deleted"
+            continue
+        workers = db.scalars(select(M.Worker).where(M.Worker.identity_id == iid)).all()
+        if any(w.status == WorkerStatus.RUNNING for w in workers):
+            refused[iid] = "has a running worker -- stop it first"
+            continue
+        try:
+            # Clear the terminal worker rows that would otherwise block delete_identity's
+            # "detach first" guard -- same lease/run cascade detach_identity uses.
+            for w in workers:
+                db.execute(delete(M.ProxyLease).where(M.ProxyLease.worker_id == w.id))
+                db.execute(delete(M.SlotLease).where(M.SlotLease.worker_id == w.id))
+                db.execute(delete(M.WorkerRun).where(M.WorkerRun.worker_id == w.id))
+                db.execute(update(M.Artifact).where(M.Artifact.worker_id == w.id).values(worker_id=None))
+                _reset_worker_bus_state(w.booking_id, w.id)
+                db.delete(w)
+            db.flush()
+            delete_identity(iid, force=True, db=db, _op=_op)   # cascades subs/allocs/events + commits
+            deleted.append(iid)
+        except HTTPException as e:
+            db.rollback()
+            refused[iid] = str(e.detail)
+        except SQLAlchemyError as e:
+            db.rollback()
+            refused[iid] = f"{e.__class__.__name__}: {str(getattr(e, 'orig', e))}"[:200]
+    return IdentityBulkDeleteResult(deleted=deleted, refused=refused)
+
+
 @app.post("/identities/bulk-priority")
 def bulk_set_priority(body: IdentityBulkPriority, db: Session = Depends(get_db),
                       _op: Principal = Depends(require_operator)) -> dict:

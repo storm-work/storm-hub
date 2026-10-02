@@ -2410,6 +2410,22 @@ function Identities({ me, setLeftPanel, setRightPanel }) {
       body: { identity_ids: selectedIds, passport_suffix: dupSuffix, group_name: dupGroup.trim() || null } });
     setMsg(`Duplicated ${r.created}.` + (r.errors?.length ? ` ${r.errors.length} skipped: ${r.errors.slice(0, 3).join("; ")}` : ""));
   });
+  // Remove every identity the portal flagged as already booked BY OTHERS (dead weight -- they can
+  // never book again). Server-side detection; a real booked appointment we made is always kept.
+  async function cleanupByOthers() {
+    if (!window.confirm(
+      "Remove all identities flagged 'By Others' (portal says they already hold an appointment)?\n\n"
+      + "Their sub-accounts and history go with them. Any identity that holds a REAL appointment we "
+      + "booked is kept. This cannot be undone.")) return;
+    setMsg("");
+    try {
+      const r = await api("/identities/cleanup-booked-by-others", { method: "POST" });
+      const kept = Object.keys(r.refused || {}).length;
+      setMsg(`Removed ${r.deleted.length} By-Others identit${r.deleted.length === 1 ? "y" : "ies"}.`
+        + (kept ? ` Kept ${kept} (real appointment / running worker).` : ""));
+      setSel({}); reload(); reloadSubs();
+    } catch (e) { setMsg(e.message); }
+  }
 
   // Two-step, mirroring the single-identity Delete in the details panel. A plain delete refuses
   // while an identity still owns rows WE generated (sub-accounts, allocations, event history) --
@@ -2469,6 +2485,10 @@ function Identities({ me, setLeftPanel, setRightPanel }) {
   const identityControls = (
     <>
         <button className="btn ghost" onClick={openCreatePanel}>+ Add / import</button>
+        <button className="btn ghost" disabled={!op} onClick={cleanupByOthers}
+                title="Remove all identities the portal flagged as already booked by others. Real appointments we made are kept.">
+          🧹 Cleanup By Others
+        </button>
         <SearchBox q={q} setQ={setQ} placeholder="search identities…" />
         <div className="field" style={{ margin: 0 }}><label>Filter</label>
           <select value={filter} onChange={(e) => setFilter(e.target.value)}>
