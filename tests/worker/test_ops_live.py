@@ -2996,6 +2996,84 @@ def test_a_non_array_payload_is_failed_not_empty(monkeypatch):
     assert all(r["outcome"] == "failed" for r in out), out
 
 
+class _SlotsSlipSession(_SlotsPageSession):
+    """Models the registrar failure mode in the slots path: the callback IS present at ready-check
+    time, then the browser page slips off-origin DURING the ~solve gap, so the FIRST token delivery
+    finds `onCaptchaSuccess` gone. A single re-anchor (browser_nav back to the slots page) brings the
+    widget back and the SAME token is re-delivered successfully."""
+    def __init__(self, payload):
+        super().__init__(payload)
+        self.injects = 0
+        self.navs = 0
+
+    def browser_nav(self, url, timeout=30, **kw):
+        self.navs += 1
+        return url
+
+    def browser_eval(self, js, timeout=30):
+        self.evals.append(js)
+        if "onCaptchaSuccess === 'function'" in js and "window.data" not in js:
+            return True                       # the widget is (re)registered
+        if "onCaptchaSuccess" in js and "window.data" in js:
+            self.injects += 1
+            if self.injects == 1:
+                return {"err": "onCaptchaSuccess not defined"}   # slipped mid-solve
+            return self.payload               # re-anchored -> token re-delivered
+        if "location.origin" in (js or ""):
+            return _origin_reply(js)
+        return ""
+
+
+def test_slots_reanchors_and_redelivers_when_callback_slips_mid_solve(monkeypatch):
+    monkeypatch.setattr("libs.engine.vendor.race_all", lambda *a, **k: "T" * 2617)
+    ops = _make_ops(emit=lambda t, **p: None)
+    ops.session = _SlotsSlipSession(
+        {"ok": True, "data": [{"date": "2026-09-14", "periods": [3, 5]}]})
+    ops._log = lambda *a, **k: None
+    ops.posto_pdf = "3059"
+    ops.cfg.raw["DISCOVERY_SOURCE"] = "slots"
+    object.__setattr__(ops.cfg.discovery, "source", "slots")
+    out = {r["date"]: r for r in ops.do_discover(["2026-09-14"])}
+    assert out["2026-09-14"]["outcome"] == "found", "the paid solve must survive one page slip"
+    assert out["2026-09-14"]["periods"] == [3, 5]
+    assert ops.session.injects == 2, "the SAME token is re-delivered after the re-anchor"
+    assert ops.session.navs >= 2, "a re-anchor nav back to the slots page must have happened"
+
+
+def test_slots_reports_failed_when_reanchor_cannot_restore_the_callback(monkeypatch):
+    """If the callback never comes back after the re-anchor, the exit page is gone (not just the
+    origin) -- do not loop; report failed and let the existing roll ladder escalate."""
+    monkeypatch.setattr("libs.engine.vendor.race_all", lambda *a, **k: "T" * 2617)
+    ops = _make_ops(emit=lambda t, **p: None)
+
+    class _NeverRecovers(_SlotsPageSession):
+        def __init__(self, payload):
+            super().__init__(payload)
+            self.ready_calls = 0
+
+        def browser_nav(self, url, timeout=30, **kw):
+            return url
+
+        def browser_eval(self, js, timeout=30):
+            self.evals.append(js)
+            if "onCaptchaSuccess === 'function'" in js and "window.data" not in js:
+                self.ready_calls += 1
+                return self.ready_calls == 1   # ready first time, gone after the re-anchor
+            if "onCaptchaSuccess" in js and "window.data" in js:
+                return {"err": "onCaptchaSuccess not defined"}
+            if "location.origin" in (js or ""):
+                return _origin_reply(js)
+            return ""
+
+    ops.session = _NeverRecovers({"ok": True, "data": []})
+    ops._log = lambda *a, **k: None
+    ops.posto_pdf = "3059"
+    ops.cfg.raw["DISCOVERY_SOURCE"] = "slots"
+    object.__setattr__(ops.cfg.discovery, "source", "slots")
+    out = ops.do_discover(["2026-09-14"])
+    assert all(r["outcome"] == "failed" for r in out), out
+
+
 def test_calendar_remains_the_default(monkeypatch):
     """The proven path must stay the default until a measurement justifies flipping it."""
     ops = _slots_ops({"ok": True, "data": []}, "calendar", monkeypatch)

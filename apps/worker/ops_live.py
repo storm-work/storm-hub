@@ -3137,6 +3137,43 @@ class LiveEngineOps(EngineOps):
             try: res = json.loads(res)
             except Exception: res = {"err": f"unparseable: {str(res)[:120]}"}
         res = res or {}
+        # RE-ANCHOR IF THE PAGE SLIPPED DURING THE SOLVE (registrar-confirmed failure mode,
+        # [[registrar_opaque_origin]]). `onCaptchaSuccess not defined` AFTER the callback WAS present
+        # at ready-check time means the browser's proxy tunnel dropped the page off-origin during the
+        # ~15-25s solve while the exit itself stayed alive (MEASURED on the registrar: a raw client
+        # survives nav+28s+POST 5/5; only the in-page world slips). The reCAPTCHA token is still
+        # valid (~110s), so re-nav the slots page ONCE to re-register the widget and re-deliver the
+        # SAME token rather than discarding a paid solve and waiting out the roll-after-2 streak --
+        # the slip is near-100% on bad proxy weather, which is precisely what makes discovery go
+        # blind. If the re-anchor cannot bring the callback back, the page (not just the origin) is
+        # gone; fall through to the existing failed/roll path untouched.
+        if res.get("err") == "onCaptchaSuccess not defined":
+            self._log("do_discover[slots]: callback vanished after the solve (page slipped "
+                      "off-origin during the solve gap) -- re-anchoring the slots page once and "
+                      "re-delivering the same token")
+            try:
+                self._ensure_gettables_hook()
+                self.session.browser_nav(
+                    SCHED_JSP + "?posto_id=" + str(self.posto_pdf or self.posto_id), timeout=30)
+                self._await_gettables()
+                _re_ready = self.session.browser_eval(ready_js, timeout=45)
+            except Exception as e:
+                self._log(f"do_discover[slots]: re-anchor nav failed ({str(e)[:80]})")
+                _re_ready = False
+            if _re_ready is True or str(_re_ready).lower() == "true":
+                try:
+                    res = self.session.browser_eval(js, timeout=45)
+                    if isinstance(res, str):
+                        try: res = json.loads(res)
+                        except Exception: res = {"err": f"unparseable: {str(res)[:120]}"}
+                    res = res or {}
+                    self._log("do_discover[slots]: re-anchor restored the callback; "
+                              "token re-delivered")
+                except Exception as e:
+                    self._log(f"do_discover[slots]: re-delivery eval failed ({str(e)[:80]})")
+            else:
+                self._log("do_discover[slots]: re-anchor did not restore the callback -- the exit "
+                          "page is gone, not just off-origin")
         self._log(f"do_discover[slots]: endpoint said {_fmt_slots_probe(res.get('probe'))}")
         kind = _classify_slots_response(res)
         if kind == SLOTS_RATE_LIMITED:
