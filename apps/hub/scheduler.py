@@ -1001,7 +1001,14 @@ class Scheduler:
             return 0
         feeder_rows = db.scalars(select(M.Slot).where(
             M.Slot.booking_id.in_(feeders),
-            M.Slot.status == SlotStatus.AVAILABLE)).all()
+            M.Slot.status == SlotStatus.AVAILABLE,
+            # Only REAL discovered slots feed the main pool -- never operator-seeded BLIND phantoms.
+            # A blind grid is deliberately mostly-phantom (the operator books it by hand on the
+            # detector); mirroring it into the precious main booking would hand its apply workers a
+            # wall of slots that bounce. Discovered slots are source='scout'; a slot mirrored from
+            # another feeder is source='feeder' and still real, so exclude ONLY 'blind'. NULL-safe
+            # (or_ keeps a source-less row) so a future discovered source can't silently be dropped.
+            or_(M.Slot.source.is_(None), M.Slot.source != "blind"))).all()
         injected = 0
         for s in feeder_rows:
             if s.posto_id and bk.posto_id and s.posto_id != bk.posto_id:

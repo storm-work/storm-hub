@@ -2416,6 +2416,22 @@ def test_mirror_feeder_only_mirrors_available_detector_slots(db):
     assert [(r.date, r.period) for r in rows] == [("2026-10-20", 3)]
 
 
+def test_mirror_feeder_excludes_blind_seeded_slots(db):
+    """The feed carries REAL discovered slots only. A detector's operator-seeded BLIND grid is
+    deliberately mostly-phantom; mirroring it into the precious main booking would hand its apply
+    workers a wall of bouncing slots. Discovered (source='scout') feeds; source='blind' does not."""
+    detector, main = _detector_and_main(db)
+    _add_slot(db, detector, "2026-10-20", 3, source="scout")   # real find -> feeds
+    _add_slot(db, detector, "2026-10-21", 4, source="blind")   # phantom seed -> excluded
+    _add_slot(db, detector, "2026-10-22", 5, source="blind")
+
+    n = _scheduler()._mirror_feeder_slots(db, main, _utcnow())
+
+    assert n == 1, "only the real discovered slot should feed"
+    rows = db.scalars(select(M.Slot).where(M.Slot.booking_id == main.id)).all()
+    assert [(r.date, r.period) for r in rows] == [("2026-10-20", 3)]
+
+
 def test_mirror_feeder_is_a_noop_without_feeders_or_when_inactive(db):
     detector = _mk_booking(db, status=BookingStatus.RUNNING)
     _add_slot(db, detector, "2026-10-20", 3)
