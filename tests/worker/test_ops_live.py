@@ -1993,6 +1993,110 @@ def test_keepalive_recovers_bookable_after_a_prior_not_bookable_marking():
     assert bookable_calls == [True]
 
 
+# ── KEEPALIVE_MODE='schedule' = ACTIVE cursor-keeping (operator 2026-10-02) ─────────────────────
+# The worker holds a WARM, bookable Schedule.jsp session through KEEPING instead of auth-only: it
+# probes Schedule.jsp and RE-WARMS the cursor before FORM_STATE_TTL. auth_only stays the default and
+# must be completely unaffected (the tests above already pin its behaviour; the two below re-pin it
+# against this change specifically).
+
+def _cfg_schedule(template=None, booking=None):
+    layers = {L.TEMPLATE: {"ROLE": "apply", **(template or {})},
+              L.BOOKING: {"KEEPALIVE_MODE": "schedule", **(booking or {})}}
+    return EngineConfig.from_settings(resolve(layers))
+
+
+def _sched_keep_ops(page, *, warmed_fresh=False):
+    ops = _make_ops(cfg=_cfg_schedule(), emit=lambda t, **p: None)
+    ops.session = _KeepaliveSession(page)
+    ops._log = lambda *a, **k: None
+    ops.posto_pdf = "3018"
+    if warmed_fresh:
+        ops._set_anchor("chain")          # fresh chain anchor -> is_warmed() True
+    return ops
+
+
+def test_schedule_keepalive_probes_schedule_jsp_and_does_not_rewarm_a_fresh_cursor():
+    ops = _sched_keep_ops("<html>cmbPeriodo getSlots</html>", warmed_fresh=True)
+    ops._run_warmup_steps = lambda: pytest.fail("a live, fresh cursor must not be re-warmed")
+    ops._do_keepalive("test")
+    assert ops.session.navs and "Schedule.jsp" in ops.session.navs[0], ops.session.navs
+
+
+def test_schedule_keepalive_rewarms_when_cursor_absent():
+    ops = _sched_keep_ops("<html><title>E-VISA</title>no scheduling markers</html>")
+    warm = []
+    ops._run_warmup_steps = lambda: (warm.append(1), True)[1]
+    bookable = []
+    ops._mark_keep_bookable = lambda ok, why="": bookable.append(ok)
+    ops._do_keepalive("test")
+    assert warm == [1], "cursor absent -> must re-warm to keep a bookable session"
+    assert bookable == [True]
+
+
+def test_schedule_keepalive_rewarms_when_anchor_is_stale_even_if_markers_present():
+    # markers present but no FRESH chain anchor -> is_warmed() False -> re-warm anyway
+    ops = _sched_keep_ops("<html>cmbPeriodo</html>", warmed_fresh=False)
+    warm = []
+    ops._run_warmup_steps = lambda: (warm.append(1), True)[1]
+    ops._do_keepalive("test")
+    assert warm == [1]
+
+
+def test_schedule_keepalive_rewarm_failure_marks_not_bookable_without_dropping_auth():
+    ops = _sched_keep_ops("<html>no markers</html>")
+    ops._run_warmup_steps = lambda: False
+    restore = []
+    ops._attempt_keepalive_restore = lambda context="": restore.append(context)
+    bookable = []
+    ops._mark_keep_bookable = lambda ok, why="": bookable.append(ok)
+    ops._do_keepalive("test")
+    assert bookable == [False], "a failed re-warm marks not-bookable (shows WARMING_UP)"
+    assert restore == [], "a re-warm failure must NOT throw away the authenticated session"
+
+
+def test_auth_only_mode_is_unaffected_by_the_schedule_change():
+    ops = _keepalive_ops("<html>consultar pedidos terminar sessão</html>", warmed=True)
+    ops._set_anchor("chain")
+    ops._run_warmup_steps = lambda: pytest.fail("auth_only keepalive must never re-warm")
+    ops._do_keepalive("test")
+    assert "Schedule.jsp" not in ops.session.navs[0], ops.session.navs
+
+
+def test_schedule_keepalive_window_paces_under_form_state_ttl():
+    ops = _make_ops(cfg=_cfg_schedule(template={"KEEPALIVE_INTERVAL": 900.0,
+                             "KEEPALIVE_JITTER": 30.0, "FORM_STATE_TTL": 240.0}))
+    for _ in range(20):
+        assert ops._keepalive_window() <= 180.0 + 1e-9   # cap = 0.75 * 240
+
+
+def test_auth_only_keepalive_window_is_the_full_interval():
+    ops = _make_ops(cfg=_cfg(KEEPALIVE_INTERVAL=900.0, KEEPALIVE_JITTER=0.0))
+    assert ops._keepalive_window() >= 900.0
+
+
+def test_initial_schedule_warm_fires_once_when_not_warmed():
+    ops = _make_ops(cfg=_cfg_schedule())
+    ops.posto_pdf = None                      # not warmed
+    calls = []
+    ops._do_keepalive = lambda ctx: calls.append(ctx)
+    ops._initial_schedule_warm("await_slot_open")
+    assert calls == ["await_slot_open/initial"]
+
+
+def test_initial_schedule_warm_is_a_noop_in_auth_only():
+    ops = _make_ops(cfg=_cfg())
+    ops._do_keepalive = lambda ctx: pytest.fail("auth_only must not warm on KEEPING entry")
+    ops._initial_schedule_warm("await_slot_open")
+
+
+def test_initial_schedule_warm_skips_when_already_warmed():
+    ops = _make_ops(cfg=_cfg_schedule())
+    ops.posto_pdf = "3018"
+    ops._set_anchor("chain")                  # fresh -> is_warmed() True
+    ops._do_keepalive = lambda ctx: pytest.fail("already warmed -> no initial warm")
+    ops._initial_schedule_warm("await_slot_open")
+
+
 # ── explicit session-state classifier (F21-F26) ────────────────────────────────────────────────
 # The keepalive loop used to discard the very evidence it fetched: a logged-out home page returned
 # HTTP 200 and was read as healthy (F23), a lapsed Schedule.jsp was always treated as a lapsed FORM
@@ -4631,7 +4735,7 @@ def test_do_apply_makes_its_mandatory_rewarm_visible():
     assert substates.index("warming_up") < substates.index("applying")
 
 
-# ── KEEPALIVE_MODE='schedule': non-destructive cursor-survival measurement (cp000-adjacent, 2026-10-01) ──
+# ── KEEPALIVE_MODE='schedule': ACTIVE cursor-keeping (operator 2026-10-02; was measurement-only 2026-10-01) ──
 def _schedule_keepalive_ops(page, events, session=None):
     # KEEPALIVE_MODE is a BOOKING-layer setting (so a template can't silently override the operator's
     # per-booking choice), so it must be set at L.BOOKING, not via _cfg's TEMPLATE-only helper.
@@ -4643,29 +4747,34 @@ def _schedule_keepalive_ops(page, events, session=None):
     return ops
 
 
-def test_keepalive_schedule_mode_probes_schedule_jsp_and_never_rewarms():
+def test_keepalive_schedule_mode_probes_schedule_jsp_and_rewarms_a_stale_cursor():
     events = []
-    ops = _schedule_keepalive_ops(_SCHED_OK, events)
-    ops._run_warmup_steps = lambda: pytest.fail("schedule keepalive must MEASURE, never re-warm")
+    ops = _schedule_keepalive_ops(_SCHED_OK, events)   # posto set but NO fresh chain anchor -> stale
+    warm = []
+    ops._run_warmup_steps = lambda: (warm.append(1), True)[1]
     ops._do_keepalive("test")
     assert ops.session.navs and "Schedule.jsp" in ops.session.navs[0], ops.session.navs
+    assert warm == [1], "active keeping re-warms a cursor that is not verified-fresh"
 
 
-def test_keepalive_schedule_mode_records_cursor_present():
+def test_keepalive_schedule_mode_leaves_a_fresh_cursor_alone():
     events = []
-    ops = _schedule_keepalive_ops(_SCHED_OK, events)   # _SCHED_OK carries cmbPeriodo + SubmeterVistoCriaPDF
+    ops = _schedule_keepalive_ops(_SCHED_OK, events)   # cmbPeriodo + SubmeterVistoCriaPDF present
+    ops._set_anchor("chain")                           # verified-fresh -> must NOT re-warm
+    ops._run_warmup_steps = lambda: pytest.fail("a live, fresh cursor must not be re-warmed")
     ops._do_keepalive("test")
     lines = [p["text"] for t, p in events if t == "log_line"]
-    assert any("keepalive[schedule]" in x and "cursor=present" in x for x in lines), lines
+    assert any("keepalive[schedule]" in x and "live & fresh" in x for x in lines), lines
 
 
-def test_keepalive_schedule_mode_records_cursor_absent():
+def test_keepalive_schedule_mode_rewarms_an_absent_cursor():
     events = []
     ops = _schedule_keepalive_ops(
         "<html><title>E-VISA</title>authenticated_index -- no scheduling markers</html>", events)
+    warm = []
+    ops._run_warmup_steps = lambda: (warm.append(1), True)[1]
     ops._do_keepalive("test")
-    lines = [p["text"] for t, p in events if t == "log_line"]
-    assert any("keepalive[schedule]" in x and "cursor=ABSENT" in x for x in lines), lines
+    assert warm == [1], "cursor absent -> active keeping re-warms to keep a bookable session"
 
 
 def test_keepalive_schedule_mode_still_detects_auth_loss_and_restores():

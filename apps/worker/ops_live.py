@@ -2219,6 +2219,7 @@ class LiveEngineOps(EngineOps):
     def await_slot_open(self) -> str:
         if self._signals is None:
             return "slot_open"
+        self._initial_schedule_warm("await_slot_open")
         while True:
             # Was slot_open ALREADY known before this wait? If so the delivery that returns below is
             # a redelivery (the Hub's _latch_signals re-sends to a worker not yet confirmed notified),
@@ -2293,6 +2294,17 @@ class LiveEngineOps(EngineOps):
         # exists to catch a resolved 0 (F14's incident shape), not to bless a 1s portal-ping cadence.
         interval = max(float(self.cfg.keepalive.interval), 30.0)
         jitter = max(0.0, float(self.cfg.keepalive.jitter))
+        mode = (getattr(self.cfg.keepalive, "mode", "auth_only") or "auth_only").strip().lower()
+        if mode == "schedule":
+            # ACTIVE cursor-keeping: a warmed Schedule.jsp cursor lapses after FORM_STATE_TTL, so the
+            # ping cadence MUST stay under it or the "kept" cursor is already stale by the next cycle.
+            # Cap the window (and its jitter) to ~75% of the TTL so a re-warm always lands before the
+            # anchor ages out. This is the deliberately HOTTER cadence the operator accepted when
+            # choosing active keeping over auth-only (more portal traffic, higher detection cost).
+            ttl = max(1.0, float(self.cfg.raw.get("FORM_STATE_TTL", 240.0)))
+            cap = max(30.0, ttl * 0.75)
+            interval = min(interval, cap)
+            jitter = min(jitter, max(0.0, cap - interval))
         return interval + random.uniform(0, jitter)
 
     def _slot_open_seen(self) -> bool:
@@ -2450,6 +2462,22 @@ class LiveEngineOps(EngineOps):
             time.sleep(1.0)
             return self.session.browser_eval("document.documentElement.outerHTML") or ""
 
+    def _initial_schedule_warm(self, context: str) -> None:
+        """KEEPALIVE_MODE='schedule' only: establish the bookable cursor IMMEDIATELY on entering a
+        KEEPING wait, instead of waiting out the first keepalive window. No-op in auth_only mode,
+        when keepalive is off, or when already warmed. A slot-open/assignment fired during the warm
+        is NOT lost -- the Hub's signal latch re-sends to a not-yet-notified worker -- so warming
+        before the first listen is safe."""
+        mode = (getattr(self.cfg.keepalive, "mode", "auth_only") or "auth_only").strip().lower()
+        if mode != "schedule" or self.cfg.keepalive.off:
+            return
+        try:
+            if self.is_warmed():
+                return
+        except Exception:
+            pass
+        self._do_keepalive(context + "/initial")
+
     def _do_keepalive(self, context: str) -> None:
         if self.cfg.keepalive.off:
             return
@@ -2480,19 +2508,27 @@ class LiveEngineOps(EngineOps):
         mode = (getattr(self.cfg.keepalive, "mode", "auth_only") or "auth_only").strip().lower()
         probe = self.cfg.keepalive.probe or "home"
         if mode == "schedule" and probe == "home":
-            # KEEPALIVE_MODE='schedule' (2026-10-01): probe Schedule.jsp instead of home and RECORD
-            # whether the booking form cursor survived. NON-DESTRUCTIVE measurement of the 147-vs-42
-            # "the nav verifies but does not renew the cursor" finding on live infra. It does NOT
-            # re-warm and do_apply still re-warms unconditionally, so this cannot make an apply worker
-            # pre-bookable -- it only measures. See docs REPORT_2026-10-01_hot_period_reliability.md.
+            # KEEPALIVE_MODE='schedule' -- ACTIVE cursor-keeping (operator 2026-10-02; replaces the
+            # 2026-10-01 measurement-only probe). The worker holds a WARM, bookable Schedule.jsp
+            # session through KEEPING instead of an auth-only one: each cycle re-establishes the
+            # booking form cursor BEFORE it lapses (FORM_STATE_TTL -- _keepalive_window paces this
+            # branch under the TTL). auth_only mode is unchanged and remains the default.
+            #
+            # CAVEAT, recorded verbatim so it is not re-litigated: the cursor is NAVIGATION-bound and
+            # do_apply STILL re-warms unconditionally before the submit, so this does NOT by itself
+            # make slot-found -> apply "instant" -- gating do_apply's re-warm on is_warmed() was
+            # measured to submit a stale questionnaire ([[rewarm_every_round_is_mandatory]]). What
+            # active keeping delivers is the thing the operator asked for: KEEPING is a genuinely
+            # warm/bookable session, not auth-only. Opting do_apply into trusting the kept cursor is
+            # a SEPARATE, measured-risky change, deliberately not bundled here.
             probe = SCHED_JSP + "?posto_id=" + str(self.posto_pdf or self.posto_id)
         url = HOME_URL if probe == "home" else probe
         try:
             final_url = self.session.browser_nav(url, timeout=30)
             if mode == "schedule" and probe != "home":
                 # Schedule.jsp carries DIFFERENT markers than home, so classify it on its own terms:
-                # auth loss = Authentication.jsp redirect; dead exit = chrome-error; otherwise record
-                # cursor present/absent. Reuses the auth-only path's dead/expired handling verbatim.
+                # auth loss = Authentication.jsp redirect; dead exit = chrome-error. Both reuse the
+                # auth-only path's handling verbatim.
                 if "Authentication.jsp" in (final_url or ""):
                     self._log(f"keepalive[schedule]: session expired (auth redirect, {context}) -- "
                               f"re-authenticating")
@@ -2505,17 +2541,34 @@ class LiveEngineOps(EngineOps):
                     self._roll_exit("keepalive: dead exit (schedule probe)")
                     self._attempt_keepalive_restore(context)
                     return
-                cursor_present = any(m in page for m in _SCHED_PAGE_MARKERS)
                 self._keepalive_dead_streak = 0
-                if getattr(self, "_keep_unbookable", False):
+                cursor_present = any(m in page for m in _SCHED_PAGE_MARKERS)
+                if cursor_present and self.is_warmed():
+                    # Live, VERIFIED-fresh cursor (chain anchor within FORM_STATE_TTL). Nothing to do
+                    # but keep the worker marked bookable -- no re-warm, no wasted chain.
+                    if getattr(self, "_keep_unbookable", False):
+                        self._mark_keep_bookable(True)
+                    if self._emit is not None:
+                        self._emit("log_line", text=(
+                            f"keepalive[schedule]: cursor live & fresh ({len(page)}B, {context})"))
+                    self._slog("keepalive", result="ok", mode="schedule", cursor="fresh",
+                               bytes=len(page), ctx=context)
+                    return
+                # Cursor ABSENT (never warmed, or a bare nav verified auth but not the form) or the
+                # anchor has aged past FORM_STATE_TTL -- RE-WARM to re-establish a bookable cursor,
+                # which is the whole point of active keeping. A failed re-warm must NOT discard the
+                # authenticated session: mark the worker not-bookable (it then shows WARMING_UP, per
+                # _mark_keep_bookable / "holding is a lie") and let the next cycle try again.
+                self._log(f"keepalive[schedule]: cursor "
+                          f"{'ABSENT' if not cursor_present else 'stale'} -- re-warming to keep it live "
+                          f"({context})")
+                if self._run_warmup_steps():
                     self._mark_keep_bookable(True)
-                if self._emit is not None:
-                    self._emit("log_line", text=(
-                        f"keepalive[schedule]: probe OK cursor="
-                        f"{'present' if cursor_present else 'ABSENT'} ({len(page)}B, {context})"))
-                self._slog("keepalive", result="ok", mode="schedule",
-                           cursor=("present" if cursor_present else "absent"), bytes=len(page),
-                           ctx=context)
+                    self._slog("keepalive", result="ok", mode="schedule", cursor="rewarmed",
+                               ctx=context)
+                else:
+                    self._mark_keep_bookable(False, why="schedule keepalive re-warm failed")
+                    self._slog("keepalive", result="rewarm_failed", mode="schedule", ctx=context)
                 return
             if probe != "home":
                 # A custom KEEPALIVE_PROBE URL: no positive/negative content evidence is known for
@@ -3591,6 +3644,7 @@ class LiveEngineOps(EngineOps):
     def await_assignment(self) -> dict | None:
         if self._signals is None:
             return None
+        self._initial_schedule_warm("await_assignment")
         while True:
             result = self._signals.wait_assignment(timeout=self._keepalive_window())
             if result is not TIMEOUT:

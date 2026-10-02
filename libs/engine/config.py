@@ -41,9 +41,11 @@ class KeepaliveConfig:
     dead_trip: int = 3
     probe: str = "home"
     jitter: float = 30.0
-    # KEEPALIVE_MODE (2026-10-01): "auth_only" (default, proven) | "schedule" (non-destructive
-    # cursor-survival measurement -- probes Schedule.jsp and records whether the booking cursor
-    # survived, never re-warms). See ops_live._do_keepalive and the hot-period report.
+    # KEEPALIVE_MODE: "auth_only" (default, proven -- probes HOME, never keeps the form cursor) |
+    # "schedule" (ACTIVE cursor-keeping, 2026-10-02 -- probes Schedule.jsp and RE-WARMS the booking
+    # cursor before FORM_STATE_TTL so KEEPING holds a warm, bookable session; paces under the TTL).
+    # NOTE: do_apply still re-warms unconditionally, so schedule mode does not by itself make apply
+    # instant. See ops_live._do_keepalive / _keepalive_window and the catalog note.
     mode: str = "auth_only"
 
 
