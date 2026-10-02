@@ -2298,11 +2298,17 @@ class LiveEngineOps(EngineOps):
         if mode == "schedule":
             # ACTIVE cursor-keeping: a warmed Schedule.jsp cursor lapses after FORM_STATE_TTL, so the
             # ping cadence MUST stay under it or the "kept" cursor is already stale by the next cycle.
-            # Cap the window (and its jitter) to ~75% of the TTL so a re-warm always lands before the
-            # anchor ages out. This is the deliberately HOTTER cadence the operator accepted when
-            # choosing active keeping over auth-only (more portal traffic, higher detection cost).
+            # Cap the window (and its jitter) to SCHEDULE_KEEPALIVE_TTL_FRACTION x TTL so a re-warm
+            # lands before the anchor ages out. LOWER fraction = fresher cursor (more slot-opens hit
+            # an instant direct-apply) at the cost of MORE re-warm traffic -- the operator tunes this
+            # per booking against portal conditions (default 0.75; 0.5 near-eliminates the lapse).
             ttl = max(1.0, float(self.cfg.raw.get("FORM_STATE_TTL", 240.0)))
-            cap = max(30.0, ttl * 0.75)
+            try:
+                frac = float(self.cfg.raw.get("SCHEDULE_KEEPALIVE_TTL_FRACTION", 0.75) or 0.75)
+            except (TypeError, ValueError):
+                frac = 0.75
+            frac = min(0.95, max(0.2, frac))   # stay strictly under the TTL, never a hot 1s ping
+            cap = max(30.0, ttl * frac)
             interval = min(interval, cap)
             jitter = min(jitter, max(0.0, cap - interval))
         return interval + random.uniform(0, jitter)

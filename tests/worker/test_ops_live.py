@@ -2069,6 +2069,33 @@ def test_schedule_keepalive_window_paces_under_form_state_ttl():
         assert ops._keepalive_window() <= 180.0 + 1e-9   # cap = 0.75 * 240
 
 
+def test_schedule_keepalive_ttl_fraction_tightens_the_cap():
+    """SCHEDULE_KEEPALIVE_TTL_FRACTION (L.BOOKING) tunes the cadence: 0.5 caps the window at half the
+    TTL (fresher cursor, more re-warms) vs the 0.75 default."""
+    ops = _make_ops(cfg=_cfg_schedule(
+        template={"KEEPALIVE_INTERVAL": 900.0, "KEEPALIVE_JITTER": 30.0, "FORM_STATE_TTL": 240.0},
+        booking={"SCHEDULE_KEEPALIVE_TTL_FRACTION": 0.5}))
+    for _ in range(20):
+        assert ops._keepalive_window() <= 120.0 + 1e-9   # cap = 0.5 * 240
+
+
+def test_schedule_keepalive_ttl_fraction_upper_clamp_keeps_it_under_the_ttl():
+    """The catalog enforces the 0.2 floor on resolve (BelowMinimum); there is no max, so the code
+    clamps an over-1 fraction to 0.95 -- the cadence must stay strictly UNDER the TTL or the cursor
+    would lapse every cycle."""
+    hi = _make_ops(cfg=_cfg_schedule(
+        template={"KEEPALIVE_INTERVAL": 900.0, "KEEPALIVE_JITTER": 0.0, "FORM_STATE_TTL": 240.0},
+        booking={"SCHEDULE_KEEPALIVE_TTL_FRACTION": 5.0}))
+    assert hi._keepalive_window() <= 0.95 * 240.0 + 1e-9   # clamped to 0.95, still under the TTL
+
+
+def test_schedule_keepalive_ttl_fraction_floor_is_enforced_by_the_resolver():
+    from libs.domain.settings.resolver import BelowMinimum
+    with pytest.raises(BelowMinimum):
+        _cfg_schedule(template={"FORM_STATE_TTL": 240.0},
+                      booking={"SCHEDULE_KEEPALIVE_TTL_FRACTION": 0.01})
+
+
 def test_auth_only_keepalive_window_is_the_full_interval():
     ops = _make_ops(cfg=_cfg(KEEPALIVE_INTERVAL=900.0, KEEPALIVE_JITTER=0.0))
     assert ops._keepalive_window() >= 900.0

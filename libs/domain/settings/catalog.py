@@ -790,6 +790,17 @@ _TEMPLATE = [
        "MEASUREMENT only (the 147-vs-42 nav-verifies-but-does-not-renew finding). Deliberately at the "
        "BOOKING layer (not TEMPLATE) so a template cannot silently override the operator's per-booking "
        "choice. See docs/engineering/REPORT_2026-10-01_hot_period_reliability.md."),
+    _s("SCHEDULE_KEEPALIVE_TTL_FRACTION", L.BOOKING, float, 0.75, _WRK, "keepalive",
+       min_value=0.2,
+       note=
+       "schedule mode ONLY: the keepalive probe/re-warm cadence as a fraction of FORM_STATE_TTL. The "
+       "window is capped at fraction x TTL so a re-warm lands before the cursor ages out. LOWER = "
+       "fresher cursor (a slot-open is more likely to find the cursor live and apply INSTANTLY, no "
+       "round-start re-warm) at the cost of MORE re-warm traffic -- riskier on a throttled portal. "
+       "0.5 near-eliminates the ~one-TTL-window lapse per cycle; 0.75 (default) keeps traffic lower "
+       "and accepts that a slot-open landing in the lapse window pays a ~50s re-warm (it still books). "
+       "Ignored in auth_only mode. CONFIRMED live 2026-10-02 that schedule direct-apply books (~3s "
+       "submit); see docs."),
     _s("KEEPALIVE_OFF", L.TEMPLATE, bool, False, _WRK, "keepalive",
        note=
        "Disable keepalive entirely. Diagnostic only: a holding worker then has NO portal traffic and "
