@@ -90,6 +90,10 @@ class Identity(Base, PKMixin, TimestampMixin):
     archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     comment: Mapped[str | None] = mapped_column(String(512))
     target_posto: Mapped[str | None] = mapped_column(String(16))  # real identities only (app-enforced)
+    # Operator-assigned batch/cohort label, set in bulk at import (one group per imported file) or
+    # per-identity. Pure organisation: the identities and attach pages filter and sort by it. NULL =
+    # ungrouped. Indexed because both of those lists filter on it.
+    group_name: Mapped[str | None] = mapped_column(String(64), index=True)
     # Selection preference, higher first. Read by GET /identities' ordering, which is what the
     # attach panel lists -- so it decides what the operator reaches for first, not just what is
     # stored. Import sets fresh identities HIGH and demotes any duplicate they supersede to LOW,

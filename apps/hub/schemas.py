@@ -66,11 +66,13 @@ class IdentityCreate(BaseModel):
     nationality: str | None = None
     comment: str | None = None
     target_posto: str | None = None
+    group_name: str | None = None
 
 
 class IdentityUpdate(BaseModel):
     comment: str | None = None
     target_posto: str | None = None
+    group_name: str | None = None
     # Selection preference, higher first. See libs/domain/priority.py for the named levels.
     priority: int | None = None
 
@@ -86,6 +88,7 @@ class IdentityOut(BaseModel):
     nationality: str | None = None
     comment: str | None = None
     target_posto: str | None = None
+    group_name: str | None = None
     priority: int = 100
     created_at: datetime | None = None
     # C2 exclusivity, surfaced so the UI can filter instead of letting an operator pick an identity
@@ -326,6 +329,9 @@ class IdentityImport(BaseModel):
     # format itself has no target_posto column -- app-enforced real-identities-only, same as
     # IdentityCreate's own target_posto). None/absent leaves it unset, matching pre-existing behavior.
     default_target_posto: str | None = None
+    # Batch group label applied to EVERY identity this import touches (created, promoted, or an
+    # existing one that was otherwise ignored) -- one group per imported file. None leaves it unset.
+    group_name: str | None = None
 
 
 class ImportResult(BaseModel):

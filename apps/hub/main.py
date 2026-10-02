@@ -1148,6 +1148,7 @@ def create_identity(
     # DEDUP ON THE PASSPORT KEY (2026-10-02) -- same rule as import: a manual add of a passport that
     # already exists reuses that row (promoted to HIGH) or, if it is already HIGH and verified, is
     # returned untouched, rather than creating a duplicate. A passport-less add always creates.
+    grp = (body.group_name or "").strip() or None
     key = dedup.norm_passport(body.passport_no)
     if key:
         ready = dedup.ready_counts(db)
@@ -1155,8 +1156,10 @@ def create_identity(
         if action != dedup.CREATE:
             if action == dedup.PROMOTE and best.priority < priority.HIGH:
                 best.priority = priority.HIGH
-                db.commit()
-                db.refresh(best)
+            if grp is not None:
+                best.group_name = grp     # reused row still joins the group it was added under
+            db.commit()
+            db.refresh(best)
             return best
     ident = M.Identity(
         full_name=body.full_name,
@@ -1166,6 +1169,7 @@ def create_identity(
         gender=body.gender,
         nationality=body.nationality,
         comment=body.comment,
+        group_name=grp,
         priority=priority.HIGH,          # a freshly added identity is in-demand, like a fresh import
         target_posto=body.target_posto if body.type == "real" else None,
     )
@@ -1332,6 +1336,8 @@ def update_identity(identity_id: str, body: IdentityUpdate, db: Session = Depend
         if ident.type != "real":
             raise HTTPException(400, "target_posto only applies to real identities")
         ident.target_posto = body.target_posto
+    if body.group_name is not None:
+        ident.group_name = body.group_name.strip() or None
     if body.priority is not None:
         ident.priority = int(body.priority)
     db.commit()
@@ -1485,6 +1491,11 @@ def import_identities(body: IdentityImport, db: Session = Depends(get_db),
     # file dedups against the row an earlier line just created.
     ready = dedup.ready_counts(db)
     by_passport = dedup.index_by_passport(db)
+    # Batch group label for the whole file: applied to EVERY identity this import touches -- created,
+    # promoted, OR otherwise-ignored -- so the imported cohort ends up in one group regardless of
+    # dedup. Setting a group on an ignored row is the one thing an ignore does: it is metadata, it
+    # does not add a sub-account or change priority, so it does not violate "keep it, add nothing".
+    grp = (body.group_name or "").strip() or None
 
     def _merge_subs(target: M.Identity) -> None:
         nonlocal subs
@@ -1508,13 +1519,17 @@ def import_identities(body: IdentityImport, db: Session = Depends(get_db),
         key = dedup.norm_passport(pi.passport_no)
         action, best = dedup.decide(by_passport.get(key, []) if key else [], ready)
         if action == dedup.IGNORE:
-            # Already HIGH and verified -- keep it, add nothing, never wipe it.
+            # Already HIGH and verified -- keep it, add nothing (except the batch group tag).
+            if grp is not None:
+                best.group_name = grp
             ignored.append(best.id)
             continue
         if action == dedup.PROMOTE:
             # Reuse the existing row: promote to HIGH and merge only new sub-accounts. No new row.
             if best.priority < priority.HIGH:
                 best.priority = priority.HIGH
+            if grp is not None:
+                best.group_name = grp
             promoted.append(best.id)
             _merge_subs(best)
             continue
@@ -1522,7 +1537,7 @@ def import_identities(body: IdentityImport, db: Session = Depends(get_db),
         ident = M.Identity(full_name=pi.full_name, type=pi.type, birthdate=pi.birthdate,
                            passport_no=pi.passport_no, gender=pi.gender, nationality=pi.nationality,
                            status="active" if pi.sub_accounts else "empty",
-                           priority=priority.HIGH,
+                           priority=priority.HIGH, group_name=grp,
                            target_posto=body.default_target_posto if pi.type == "real" else None)
         db.add(ident)
         db.flush()

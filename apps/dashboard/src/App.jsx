@@ -75,6 +75,24 @@ function matchesTargetPosto(identity, filter) {
   return String(identity.target_posto || "") === filter;
 }
 
+// Distinct group names for a filter dropdown, same shape as target postos. Ungrouped identities
+// (group_name null/empty) fall under an explicit "(none)" option so "which aren't grouped yet?"
+// is answerable.
+function groupOptions(identities) {
+  const set = new Set();
+  let hasNone = false;
+  for (const i of identities || []) {
+    if (i.group_name) set.add(String(i.group_name)); else hasNone = true;
+  }
+  return { groups: [...set].sort(), hasNone };
+}
+
+function matchesGroup(identity, filter) {
+  if (filter === "all") return true;
+  if (filter === "none") return !identity.group_name;
+  return String(identity.group_name || "") === filter;
+}
+
 // Comments are freeform (in practice "++" or empty), so a case-insensitive CONTAINS match beats a
 // dropdown -- it filters the "++" batch today and any future note without a code change. A blank
 // query matches everything.
@@ -1949,6 +1967,7 @@ function AttachPanel({ me, booking, identities, templates, attached, onAttached 
   // MUST be declared in THIS component -- an earlier edit's anchor matched the Identities page
   // instead, leaving AttachPanel referencing an undefined `postoFilter` and crashing on open.
   const [postoFilter, setPostoFilter] = useState("all");        // all | none | <posto id>
+  const [groupFilter, setGroupFilter] = useState("all");        // all | none | <group name>
   const [commentFilter, setCommentFilter] = useState("");       // contains-match; "" = all
   const [msg, setMsg] = useState("");
   // `attached`/`identities` are plain props captured on the JSX element the instant openAttachPanel()
@@ -2006,8 +2025,10 @@ function AttachPanel({ me, booking, identities, templates, attached, onAttached 
            && (booking.type === "test" || showRole === "all" || roleFor(i) === showRole)
            && (priorityFilter === "all" || (i.priority ?? 100) === Number(priorityFilter))
            && matchesTargetPosto(i, postoFilter)
+           && matchesGroup(i, groupFilter)
            && matchesComment(i, commentFilter));
   const postoOpts = targetPostoOptions(forThisBooking);
+  const groupOpts = groupOptions(forThisBooking);
 
   // An identity attached ANYWHERE is not mentioned at all (operator, 2026-08-21). It was already
   // excluded from the selectable list -- `attached` covers this booking, `allocated_booking_id`
@@ -2094,6 +2115,13 @@ function AttachPanel({ me, booking, identities, templates, attached, onAttached 
               <option key={p} value={p}>{p}{String(p) === String(booking.posto_id) ? " (this booking)" : ""}</option>))}
             {postoOpts.hasNone && <option value="none">(none)</option>}
           </select></div>
+        <div className="field"><label>Group</label>
+          <select value={groupFilter} onChange={(e) => { setGroupFilter(e.target.value); setSel({}); }}
+                  style={{ width: "100%" }}>
+            <option value="all">all</option>
+            {groupOpts.groups.map((g) => <option key={g} value={g}>{g}</option>)}
+            {groupOpts.hasNone && <option value="none">(none)</option>}
+          </select></div>
         <div className="field"><label>Comment</label>
           <input value={commentFilter} onChange={(e) => { setCommentFilter(e.target.value); setSel({}); }}
                  placeholder="e.g. ++" style={{ width: "100%" }} /></div>
@@ -2119,6 +2147,7 @@ function AttachPanel({ me, booking, identities, templates, attached, onAttached 
           <th>Passport</th>
           <th>Name</th>
           <Sortable label="Type" k="type" sort={sort} setSort={setSort} w={70} />
+          <Sortable label="Group" k="group_name" sort={sort} setSort={setSort} w={90} />
           <Sortable label="Priority" k="priority" sort={sort} setSort={setSort} w={80} />
           {/* Verified sub-accounts = how many login attempts do_login() has to rotate through
               before this worker is out of accounts. Always >=1 here (that is the eligibility
@@ -2135,6 +2164,7 @@ function AttachPanel({ me, booking, identities, templates, attached, onAttached 
             <td>{i.passport_no || <span className="muted">— none —</span>}</td>
             <td>{i.full_name}</td>
             <td><span className="pill">{i.type}</span></td>
+            <td className="muted">{i.group_name ? <span className="pill">{i.group_name}</span> : "—"}</td>
             <td className="muted">{priorityLabel(i.priority)}</td>
             <td className="muted">{i.ready_sub_accounts}</td>
             <td><span className="pill">{roleFor(i)}</span></td>
@@ -2336,6 +2366,7 @@ function Identities({ me, setLeftPanel, setRightPanel }) {
   // PATCH any int in between, so "all" is the escape hatch for anything off the three named points.
   const [priorityFilter, setPriorityFilter] = useState("all");  // all | 200 | 100 | 0
   const [postoFilter, setPostoFilter] = useState("all");        // all | none | <posto id>
+  const [groupFilter, setGroupFilter] = useState("all");        // all | none | <group name>
   const [commentFilter, setCommentFilter] = useState("");       // contains-match; "" = all
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
@@ -2347,8 +2378,10 @@ function Identities({ me, setLeftPanel, setRightPanel }) {
   const priorityFiltered = typeAndStatus.filter((i) =>
     priorityFilter === "all" ? true : (i.priority ?? 100) === Number(priorityFilter));
   const postoFiltered = priorityFiltered.filter((i) => matchesTargetPosto(i, postoFilter));
-  const commentFiltered = postoFiltered.filter((i) => matchesComment(i, commentFilter));
+  const groupFiltered = postoFiltered.filter((i) => matchesGroup(i, groupFilter));
+  const commentFiltered = groupFiltered.filter((i) => matchesComment(i, commentFilter));
   const postoOpts = targetPostoOptions(rows);
+  const groupOpts = groupOptions(rows);
   const dateFiltered = commentFiltered.filter((i) => {
     if (!i.created_at) return true;
     const d = i.created_at.slice(0, 10);
@@ -2446,6 +2479,12 @@ function Identities({ me, setLeftPanel, setRightPanel }) {
             {postoOpts.postos.map((p) => <option key={p} value={p}>{p}</option>)}
             {postoOpts.hasNone && <option value="none">(none)</option>}
           </select></div>
+        <div className="field" style={{ margin: 0 }}><label>Group</label>
+          <select value={groupFilter} onChange={(e) => setGroupFilter(e.target.value)}>
+            <option value="all">all</option>
+            {groupOpts.groups.map((g) => <option key={g} value={g}>{g}</option>)}
+            {groupOpts.hasNone && <option value="none">(none)</option>}
+          </select></div>
         <div className="field" style={{ margin: 0 }}><label>Comment</label>
           <input value={commentFilter} onChange={(e) => setCommentFilter(e.target.value)}
                  placeholder="e.g. ++" style={{ width: 90 }} /></div>
@@ -2488,14 +2527,15 @@ function Identities({ me, setLeftPanel, setRightPanel }) {
           <th style={{ width: 36, whiteSpace: "nowrap" }}>#</th>
           <th style={{ width: 36 }}><input type="checkbox" checked={shown.length > 0 && shown.every((i) => sel[i.id])}
             onChange={(e) => { const s = {}; if (e.target.checked) shown.forEach((i) => (s[i.id] = true)); setSel(s); }} /></th>
-          <Sortable label="Name" k="full_name" sort={sort} setSort={setSort} w="17%" />
-          <Sortable label="Type" k="type" sort={sort} setSort={setSort} w="6%" />
-          <Sortable label="Priority" k="priority" sort={sort} setSort={setSort} w="8%" />
-          <th style={{ width: "16%" }}>Sub-accounts</th>
+          <Sortable label="Name" k="full_name" sort={sort} setSort={setSort} w="16%" />
+          <Sortable label="Type" k="type" sort={sort} setSort={setSort} w="5%" />
+          <Sortable label="Group" k="group_name" sort={sort} setSort={setSort} w="9%" />
+          <Sortable label="Priority" k="priority" sort={sort} setSort={setSort} w="7%" />
+          <th style={{ width: "15%" }}>Sub-accounts</th>
           <Sortable label="Passport" k="passport_no" sort={sort} setSort={setSort} w="10%" />
-          <Sortable label="Nat." k="nationality" sort={sort} setSort={setSort} w="6%" />
-          <th style={{ width: "6%" }}>Posto</th><th style={{ width: "11%" }}>Comment</th>
-          <Sortable label="Created" k="created_at" sort={sort} setSort={setSort} w="10%" />
+          <Sortable label="Nat." k="nationality" sort={sort} setSort={setSort} w="5%" />
+          <th style={{ width: "6%" }}>Posto</th><th style={{ width: "10%" }}>Comment</th>
+          <Sortable label="Created" k="created_at" sort={sort} setSort={setSort} w="9%" />
         </tr></thead>
         <tbody>{shown.map((i, idx) => (
           <tr key={i.id} className={`row-clickable${i.id === selectedId ? " row-selected" : ""}`}
@@ -2505,6 +2545,7 @@ function Identities({ me, setLeftPanel, setRightPanel }) {
               <input type="checkbox" checked={!!sel[i.id]} onChange={(e) => setSel({ ...sel, [i.id]: e.target.checked })} />
             </td>
             <td>{i.full_name}</td><td><span className="pill">{i.type}</span></td>
+            <td className="muted">{i.group_name ? <span className="pill">{i.group_name}</span> : "—"}</td>
             <td className="muted">{priorityLabel(i.priority)}</td>
             <td className="muted" style={{ fontSize: 13 }} title={i.status}>{summarizeSubAccounts(subsByIdentity[i.id])}</td>
             <td className="muted">{i.passport_no || "—"}</td><td className="muted">{i.nationality || "—"}</td>
@@ -2526,7 +2567,8 @@ function Identities({ me, setLeftPanel, setRightPanel }) {
 function IdentityCreatePanel({ me, onDone }) {
   const op = me.is_operating;
   const [f, setF] = useState({ full_name: "", type: "test", birthdate: "", gender: "M",
-                               passport_no: "", nationality: "CPV", comment: "", target_posto: "5084" });
+                               passport_no: "", nationality: "CPV", comment: "", target_posto: "5084",
+                               group_name: "" });
   const [msg, setMsg] = useState("");
   const [gt, setGt] = useState({ count: 10, accounts_per_identity: 3, nationality: "CPV" });
 
@@ -2562,6 +2604,7 @@ function IdentityCreatePanel({ me, onDone }) {
       {f.type === "real" && (
         <div className="field"><label>Target posto (default 5084)</label><input value={f.target_posto} onChange={(e) => setF({ ...f, target_posto: e.target.value })} style={{ width: "100%" }} /></div>
       )}
+      <div className="field"><label>Group</label><input value={f.group_name} onChange={(e) => setF({ ...f, group_name: e.target.value })} placeholder="optional batch/cohort label" style={{ width: "100%" }} /></div>
       <div className="field"><label>Comment</label><input value={f.comment} onChange={(e) => setF({ ...f, comment: e.target.value })} style={{ width: "100%" }} /></div>
       <button className="btn" disabled={!op || !f.full_name} onClick={create} style={{ width: "100%", marginBottom: 18 }}>Create identity</button>
 
@@ -2587,6 +2630,7 @@ function IdentityImportPipeline({ me, onDone }) {
   const [text, setText] = useState("");
   const [defaultType, setDefaultType] = useState("real");
   const [targetPosto, setTargetPosto] = useState("5084");
+  const [groupName, setGroupName] = useState("");
   const [autoGen, setAutoGen] = useState(true);
   const [subCount, setSubCount] = useState(3);
   const [autoRegister, setAutoRegister] = useState(true);
@@ -2612,8 +2656,11 @@ function IdentityImportPipeline({ me, onDone }) {
     const log = [];
     try {
       const imp = await api("/identities/import", { method: "POST",
-        body: { csv: text, default_type: defaultType, default_target_posto: targetPosto || null } });
-      log.push({ label: "Import", detail: `${imp.created} identities created, ${imp.sub_accounts} sub-accounts from file, ${imp.errors.length} skipped/errors` });
+        body: { csv: text, default_type: defaultType, default_target_posto: targetPosto || null,
+                group_name: groupName.trim() || null } });
+      const dd = (imp.promoted?.length || imp.ignored?.length)
+        ? `, ${imp.promoted?.length || 0} promoted + ${imp.ignored?.length || 0} ignored (dedup)` : "";
+      log.push({ label: "Import", detail: `${imp.created} identities created, ${imp.sub_accounts} sub-accounts from file, ${imp.errors.length} skipped/errors${dd}` });
       setSteps([...log]);
 
       let subAccountIds = imp.sub_account_ids || [];
@@ -2670,6 +2717,11 @@ function IdentityImportPipeline({ me, onDone }) {
           <label>Target posto (real identities)</label>
           <input value={targetPosto} onChange={(e) => setTargetPosto(e.target.value)} disabled={!op}
             placeholder="5084" style={{ width: "100%" }} />
+        </div>
+        <div className="field" style={{ margin: 0, minWidth: 140 }}>
+          <label>Group (applied to every identity in this file)</label>
+          <input value={groupName} onChange={(e) => setGroupName(e.target.value)} disabled={!op}
+            placeholder="e.g. Oct-batch-1" style={{ width: "100%" }} />
         </div>
       </div>
 
@@ -2733,12 +2785,13 @@ function IdentityImportPipeline({ me, onDone }) {
 function IdentityDetailPanel({ i, op, subs, onChanged, onClose }) {
   const [comment, setComment] = useState(i.comment || "");
   const [posto, setPosto] = useState(i.target_posto || "");
+  const [group, setGroup] = useState(i.group_name || "");
   const [prio, setPrio] = useState(i.priority ?? 100);
   const [msg, setMsg] = useState("");
   // Re-sync when a DIFFERENT identity is selected -- without this the panel kept showing (and would
   // have saved) the previously-selected identity's comment/posto.
   useEffect(() => {
-    setComment(i.comment || ""); setPosto(i.target_posto || "");
+    setComment(i.comment || ""); setPosto(i.target_posto || ""); setGroup(i.group_name || "");
     setPrio(i.priority ?? 100); setMsg("");
   }, [i.id]);
 
@@ -2746,7 +2799,8 @@ function IdentityDetailPanel({ i, op, subs, onChanged, onClose }) {
     setMsg("");
     try {
       await api(`/identities/${i.id}`, { method: "PATCH",
-        body: { comment, priority: prio, target_posto: i.type === "real" ? posto : undefined } });
+        body: { comment, priority: prio, group_name: group,
+                target_posto: i.type === "real" ? posto : undefined } });
       onChanged();
     } catch (e) { setMsg(e.message); }
   }
@@ -2782,6 +2836,8 @@ function IdentityDetailPanel({ i, op, subs, onChanged, onClose }) {
       <div className="field"><label>Passport</label>{i.passport_no || "—"}</div>
       <div className="field"><label>Nationality</label>{i.nationality || "—"}</div>
       <div className="field"><label>Created</label>{i.created_at ? i.created_at.slice(0, 10) : "—"}</div>
+      <div className="field"><label>Group</label>
+        <input value={group} onChange={(e) => setGroup(e.target.value)} placeholder="batch/cohort label" style={{ width: "100%" }} /></div>
       {i.type === "real" && (
         <div className="field"><label>Target posto</label>
           <input value={posto} onChange={(e) => setPosto(e.target.value)} style={{ width: "100%" }} /></div>

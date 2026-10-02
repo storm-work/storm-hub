@@ -1496,6 +1496,40 @@ def test_a_re_imported_HIGH_verified_passport_is_ignored(client):
     assert {s["username"] for s in subs} == {"v1"}, "an ignored import must add NOTHING"
 
 
+def test_import_group_name_tags_the_whole_file(client):
+    """Batch group: the group_name on the import body is applied to every identity the file touches
+    -- created now, and (on a later re-import under a new group) promoted/ignored rows too."""
+    h = _operate_headers(client)
+    r = client.post("/identities/import",
+                    json={"csv": _csv("PP-G1", user="g1") + _csv("PP-G2", user="g2", ident="ID2"),
+                          "default_type": "real", "group_name": "Oct-batch"}, headers=h)
+    assert r.status_code == 200, r.text
+    rows = {i["passport_no"]: i for i in client.get("/identities", headers=h).json()}
+    assert rows["PP-G1"]["group_name"] == "Oct-batch"
+    assert rows["PP-G2"]["group_name"] == "Oct-batch"
+
+    # re-import the SAME passports under a different group -> deduped (no new rows) but re-tagged
+    r2 = client.post("/identities/import",
+                     json={"csv": _csv("PP-G1", user="g1b"), "default_type": "real",
+                           "group_name": "Nov-batch"}, headers=h).json()
+    assert r2["created"] == 0, r2
+    same = [i for i in client.get("/identities", headers=h).json() if i["passport_no"] == "PP-G1"]
+    assert len(same) == 1 and same[0]["group_name"] == "Nov-batch", same
+
+
+def test_group_name_is_editable_and_blank_clears_it(client):
+    h = _operate_headers(client)
+    iid = client.post("/identities/import", json={"csv": _csv("PP-G3", user="g3"),
+                                                  "default_type": "real"},
+                      headers=h).json()["identity_ids"][0]
+    client.patch(f"/identities/{iid}", json={"group_name": "Cohort-A"}, headers=h)
+    got = {i["id"]: i for i in client.get("/identities", headers=h).json()}
+    assert got[iid]["group_name"] == "Cohort-A"
+    client.patch(f"/identities/{iid}", json={"group_name": "  "}, headers=h)  # blank -> NULL
+    got = {i["id"]: i for i in client.get("/identities", headers=h).json()}
+    assert got[iid]["group_name"] is None
+
+
 def test_add_identity_dedups_on_passport(client):
     """The manual-add path obeys the same rule: adding an existing passport reuses + promotes."""
     from libs.domain import priority
