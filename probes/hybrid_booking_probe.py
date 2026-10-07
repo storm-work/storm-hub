@@ -95,6 +95,12 @@ def _warm(pool, geo, posto, nat, res, log, headless=True, tries=8, exit_tries=4)
     cfg = EngineConfig.from_settings(resolve({L.GLOBAL: g, L.BOOKING: {
         "DISCOVERY_SOURCE": "slots", "KEEPALIVE_MODE": "schedule"}}))
     vendor_env.apply(resolve({L.GLOBAL: g}))
+    # Faster login for the experiment: HUMAN_BEHAVIOR pacing lengthens the login, widening the window
+    # in which a rotating exit can move mid-solve ('confirma o reCAPTCHA'). The warmup/submit do not
+    # depend on it. Set --human to keep the production pacing. (Must precede the ops_live import --
+    # the vendor session reads this at import time.)
+    if "--human" not in sys.argv:
+        os.environ["HUMAN_BEHAVIOR"] = "0"
     from apps.worker.ops_live import LiveEngineOps
 
     tried = 0

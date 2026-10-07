@@ -152,35 +152,40 @@ def _seeded_rng(seed: str | None):
 
 # -- Fingerprint pool ----------------------------------------------------------
 # (user_agent, sec_ch_ua, viewport_w, viewport_h, platform)
+# Claimed versions track the bundled Chromium (Chrome/149 at pin playwright==1.61.0). _fp_version_align
+# below still corrects any residual drift at launch (future-proof), but keeping the pool current means
+# that guard is a no-op on the happy path and the "fp version aligned" line stays quiet. Variety is in
+# the OS/viewport/brand-mix + the deliberately-arbitrary "Not_A Brand" versions, not the Chrome major
+# (real browsers auto-update, so a fleet almost all on one major is itself realistic).
 _FP_POOL = [
     (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
-        '"Microsoft Edge";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36 Edg/149.0.0.0",
+        '"Microsoft Edge";v="149", "Chromium";v="149", "Not_A Brand";v="24"',
         1280, 800, "Windows",
     ),
     (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+        '"Google Chrome";v="149", "Chromium";v="149", "Not_A Brand";v="24"',
         1920, 1080, "Windows",
     ),
     (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-        '"Google Chrome";v="130", "Chromium";v="130", "Not_A Brand";v="99"',
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+        '"Google Chrome";v="149", "Chromium";v="149", "Not_A Brand";v="99"',
         1366, 768, "Windows",
     ),
     (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+        '"Google Chrome";v="149", "Chromium";v="149", "Not_A Brand";v="24"',
         1440, 900, "macOS",
     ),
     (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
-        '"Google Chrome";v="129", "Chromium";v="129", "Not_A Brand";v="8"',
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+        '"Google Chrome";v="149", "Chromium";v="149", "Not_A Brand";v="8"',
         1600, 900, "Windows",
     ),
     (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-        '"Google Chrome";v="130", "Chromium";v="130", "Not_A Brand";v="99"',
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+        '"Google Chrome";v="149", "Chromium";v="149", "Not_A Brand";v="99"',
         1440, 900, "macOS",
     ),
 ]
