@@ -2548,6 +2548,7 @@ class LiveEngineOps(EngineOps):
                     self._attempt_keepalive_restore(context)
                     return
                 self._keepalive_dead_streak = 0
+                self._portal_down_streak = 0
                 cursor_present = any(m in page for m in _SCHED_PAGE_MARKERS)
                 if cursor_present and self.is_warmed():
                     # Live, VERIFIED-fresh cursor (chain anchor within FORM_STATE_TTL). Nothing to do
@@ -2583,6 +2584,7 @@ class LiveEngineOps(EngineOps):
                 # get classified below, so this is the one path where a bare successful nav IS the
                 # whole check and resetting the streak here is correct.
                 self._keepalive_dead_streak = 0
+                self._portal_down_streak = 0
                 if self._emit is not None:
                     self._emit("log_line", text=f"keepalive: probe OK ({context})")
                 return
@@ -2599,6 +2601,7 @@ class LiveEngineOps(EngineOps):
             # fires once the FULL cycle -- nav AND eval -- has completed without raising, so a
             # nav-succeeds-then-eval-throws cycle correctly counts as one failure toward dead_trip.
             self._keepalive_dead_streak = 0
+            self._portal_down_streak = 0
             state = classify_session_state(page, final_url, warmed=False)
             if state == SessionState.AUTHENTICATED:
                 # Only fires on a RECOVERY transition (was marked not-bookable, e.g. by the
@@ -2655,6 +2658,37 @@ class LiveEngineOps(EngineOps):
                       f"inconclusive, will re-probe")
             self._slog("keepalive", result="inconclusive", bytes=len(page), ctx=context)
         except Exception as e:
+            # STRESS MODE (KEEPALIVE_STRESS_HOLD): a HELD warm session is gold when re-login is the
+            # hardest thing in stress, so do NOT roll + re-authenticate it merely because the PORTAL
+            # is in a down-window. A probe exception that is a portal-reachability error (timeout /
+            # connection closed/reset/refused / empty response) and NOT a proxy/tunnel/chrome-error
+            # means the exit is reaching the net but the portal did not answer -- a down-window, not
+            # a dead session. Record the portal DOWN and HOLD, re-probing next cycle. Bounded by
+            # ~4x dead_trip so a "portal down" that is really a slowly-dying exit still escalates.
+            _low = str(e).lower()
+            _proxy_dead = any(m in _low for m in ("err_tunnel", "err_proxy", "err_socks",
+                              "chromewebdata", "chrome-error", "err_name_not_resolved", "err_address"))
+            _portal_down = any(m in _low for m in ("err_timed_out", "timed out", "timeout",
+                              "err_connection_closed", "err_connection_reset",
+                              "err_connection_refused", "err_empty_response"))
+            if (bool(self.cfg.raw.get("KEEPALIVE_STRESS_HOLD", False))
+                    and _portal_down and not _proxy_dead):
+                self._portal_down_streak = getattr(self, "_portal_down_streak", 0) + 1
+                _patience = max(1, int(self.cfg.keepalive.dead_trip)) * 4
+                if self._portal_down_streak < _patience:
+                    if self._liveness is not None:
+                        self._liveness.record_down(self.sub_account_id)
+                    if self._emit is not None:
+                        self._emit("log_line", text=f"keepalive: portal down-window, exit reachable "
+                                   f"-- HOLDING the warm session (stress {self._portal_down_streak}/"
+                                   f"{_patience}) ({context})")
+                    self._slog("keepalive", result="portal_down_hold", error_type=type(e).__name__,
+                               streak=f"{self._portal_down_streak}/{_patience}", ctx=context)
+                    return          # ride the window: no roll, no re-login
+                # persisted far too long -- the exit may genuinely be dead; fall through to the
+                # dead-trip ladder WITHOUT resetting the streak (so it stays past patience and keeps
+                # escalating each cycle, instead of oscillating hold<->fall-through forever). It
+                # resets only on a clean probe or after a restore.
             self._keepalive_dead_streak = getattr(self, "_keepalive_dead_streak", 0) + 1
             dead_trip = max(1, int(self.cfg.keepalive.dead_trip))
             if self._emit is not None:
@@ -2664,6 +2698,7 @@ class LiveEngineOps(EngineOps):
                        streak=f"{self._keepalive_dead_streak}/{dead_trip}", ctx=context)
             if self._keepalive_dead_streak >= dead_trip:
                 self._keepalive_dead_streak = 0
+                self._portal_down_streak = 0
                 # NOT BOOKABLE, for the same reason the re-warm branch above already says so: at
                 # this point the code has concluded the session is dead, but the substate stays a
                 # bare KEEPING and _assign_slots counts it as ready capacity. The fix was applied to

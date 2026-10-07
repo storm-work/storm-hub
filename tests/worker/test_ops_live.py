@@ -2011,6 +2011,59 @@ def test_keepalive_still_detects_session_expired_and_restores():
     assert restore_calls == ["test"]
 
 
+class _NavRaises(_FakeSession):
+    def __init__(self, err):
+        super().__init__(); self._err = err
+    def browser_nav(self, url, timeout=30, **k):
+        raise RuntimeError(self._err)
+
+
+def test_keepalive_stress_hold_holds_through_a_portal_down_window():
+    """KEEPALIVE_STRESS_HOLD: a portal-reachability error (timeout) with the exit reachable is a
+    down-window, not a dead session -- HOLD the warm session, never roll or re-login."""
+    ops = _make_ops(cfg=_cfg_schedule(booking={"KEEPALIVE_STRESS_HOLD": True},
+                                      template={"KEEPALIVE_DEAD_TRIP": 2}), emit=lambda t, **p: None)
+    ops._log = lambda *a, **k: None
+    ops._note_exit_ip = lambda when="": False
+    ops.session = _NavRaises("net::ERR_TIMED_OUT at https://pedidodevistos.mne.gov.pt/")
+    restores, rolls = [], []
+    ops._attempt_keepalive_restore = lambda context="": restores.append(context)
+    ops._roll_exit = lambda why: rolls.append(why)
+    for _ in range(6):            # well past dead_trip(2) but under patience(4*2=8)
+        ops._do_keepalive("test")
+    assert restores == [], "stress-hold must not re-login during a portal-down window"
+    assert rolls == [], "stress-hold must not roll the exit on a portal-down window"
+
+
+def test_stress_hold_escalates_once_a_portal_down_persists_past_patience():
+    """Bounded: a 'portal down' that persists ~4x dead_trip may really be a dying exit -> escalate."""
+    ops = _make_ops(cfg=_cfg_schedule(booking={"KEEPALIVE_STRESS_HOLD": True},
+                                      template={"KEEPALIVE_DEAD_TRIP": 2}), emit=lambda t, **p: None)
+    ops._log = lambda *a, **k: None
+    ops._note_exit_ip = lambda when="": False
+    ops.session = _NavRaises("net::ERR_TIMED_OUT")
+    restores = []
+    ops._attempt_keepalive_restore = lambda context="": restores.append(context)
+    for _ in range(12):           # patience = 8 holds, then the dead-trip ladder (another 2) restores
+        ops._do_keepalive("test")
+    assert restores, "a portal-down that never recovers must eventually escalate to restore"
+
+
+def test_stress_hold_still_rolls_a_genuinely_dead_exit():
+    """A proxy/tunnel/chrome-error is the EXIT dying, not the portal -- always escalates even with
+    stress-hold on (it reaches dead_trip and restores)."""
+    ops = _make_ops(cfg=_cfg_schedule(booking={"KEEPALIVE_STRESS_HOLD": True},
+                                      template={"KEEPALIVE_DEAD_TRIP": 2}), emit=lambda t, **p: None)
+    ops._log = lambda *a, **k: None
+    ops._note_exit_ip = lambda when="": False
+    ops.session = _NavRaises("net::ERR_TUNNEL_CONNECTION_FAILED")
+    restores = []
+    ops._attempt_keepalive_restore = lambda context="": restores.append(context)
+    for _ in range(3):
+        ops._do_keepalive("test")
+    assert restores, "a dead-exit (tunnel) must still escalate under stress-hold"
+
+
 def test_keepalive_still_reaches_dead_trip_on_transport_failure():
     """The transport-failure/dead-trip branch never read `warmed` and is unaffected by the
     form-state check being removed entirely."""

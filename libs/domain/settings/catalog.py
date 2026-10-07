@@ -818,6 +818,19 @@ _TEMPLATE = [
        "and accepts that a slot-open landing in the lapse window pays a ~50s re-warm (it still books). "
        "Ignored in auth_only mode. CONFIRMED live 2026-10-02 that schedule direct-apply books (~3s "
        "submit); see docs."),
+    _s("KEEPALIVE_STRESS_HOLD", L.BOOKING, bool, False, _WRK, "keepalive",
+       note=
+       "STRESS MODE lever. When the portal is up 30-90s then down, a held warm session is gold -- "
+       "re-login is the hardest thing in stress. By default a keepalive probe failure counts toward "
+       "KEEPALIVE_DEAD_TRIP and, past it, ROLLS the exit + re-authenticates -- which during a "
+       "portal-DOWN window destroys a perfectly good session. With this ON, a probe that fails with "
+       "a PORTAL-reachability error (timeout / connection closed/reset/refused / empty response) "
+       "while the error is NOT a proxy/tunnel/chrome-error (= the exit is reaching the net, the "
+       "PORTAL is down) is treated as a down-window: record the portal DOWN and HOLD the session, "
+       "re-probing next cycle -- no roll, no re-login. Bounded: after ~4x KEEPALIVE_DEAD_TRIP "
+       "consecutive portal-down cycles it falls through to the normal restore (the exit may really "
+       "be dead). A genuine dead-exit (tunnel/proxy/chrome-error) still rolls immediately. OFF by "
+       "default (unchanged behaviour). Pair with schedule mode for the hot period."),
     _s("KEEPALIVE_OFF", L.TEMPLATE, bool, False, _WRK, "keepalive",
        note=
        "Disable keepalive entirely. Diagnostic only: a holding worker then has NO portal traffic and "
