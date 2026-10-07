@@ -561,6 +561,17 @@ _BOOKING = [
        "A bounce must never end the run -- the authed session is the expensive thing. Note the park "
        "is only 3 poll gaps (~15-20s), which measurement showed is too short to brake a repeating "
        "failure."),
+    _s("HYBRID_SUBMIT", L.BOOKING, bool, False, group="guards",
+       note=
+       "HYBRID mode (CONFIRMED 2026-10-07): send the SubmeterVistoCriaPDF submit via a DETACHED primp "
+       "client on the worker's SAME exit with the browser's cookies, instead of the in-page browser "
+       "XHR. The portal's only post-login gate is reCAPTCHA (server-side token); the submit carries no "
+       "token, so a detached client books (status 200, ~1.5KB). Benefits: the submit no longer depends "
+       "on a live in-page origin (opaque-origin/down-window slips can't strand it) and is lighter/"
+       "faster -- the 'ride the window' lever. The %PDF artifact 403s a detached client, so it is "
+       "POSTPONED and fetched via the browser after the booking is confirmed (the browser is already "
+       "open for login+warmup). Login + warmup still use the browser (reCAPTCHA). Default OFF; validate "
+       "live before fleet-wide. Pairs with schedule mode + APPLY_SUBMIT_TIMEOUT."),
     _s("APPLY_SUBMIT_TIMEOUT", L.BOOKING, float, 100.0, group="guards", min_value=5.0,
        note=
        "STRESS MODE lever. Timeout (s) for the SubmeterVistoCriaPDF submit XHR. Default 100 (the "

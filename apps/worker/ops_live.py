@@ -3744,6 +3744,38 @@ class LiveEngineOps(EngineOps):
     # The bug-fix comments below are ad1c570's own and refer to ITS history, not to anything from
     # this week. Do not "improve" this method again without a booking to prove the change.
     # ─────────────────────────────────────────────────────────────────────────────────────────
+    def _submit_via_primp(self, submit_url: str, body_dict: dict, timeout: float):
+        """HYBRID submit (HYBRID_SUBMIT): SubmeterVistoCriaPDF via a DETACHED primp client on the
+        SAME exit with the browser's cookies -- CONFIRMED 2026-10-07 that this BOOKS (status 200,
+        ~1.5KB, the same signature as the browser XHR). Fast, light, and origin-independent (no live
+        in-page origin to slip off, so opaque-origin/down-window slips can't strand it). Returns
+        (status, html). The %PDF artifact 403s a detached client, so it is fetched via the BROWSER
+        afterward (see the PDF block) -- by then the booking is already made."""
+        import primp
+        from urllib.parse import urlencode
+        cookies = {c["name"]: c["value"] for c in (self.session.get_all_cookies() or [])
+                   if isinstance(c, dict) and c.get("name") in ("Vistos_sid", "cookiesession1")}
+        try:
+            ua = (self.session.browser_eval("navigator.userAgent") or "").strip()
+        except Exception:
+            ua = ""
+        pc = primp.Client(proxy=self.warm_proxy, verify=False,
+                          timeout=int(max(5.0, timeout)), follow_redirects=True)
+        try:
+            pc.set_cookies(_PORTAL_ORIGIN + "/", cookies)
+        except Exception:
+            pass
+        headers = {
+            "User-Agent": ua or "Mozilla/5.0",
+            "X-Requested-With": "XMLHttpRequest",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "Referer": SCHED_JSP + "?posto_id=" + str(self.posto_pdf),
+            "Origin": _PORTAL_ORIGIN,
+            "Cookie": "; ".join(f"{k}={v}" for k, v in cookies.items()),
+        }
+        r = pc.post(submit_url, data=urlencode(body_dict), headers=headers)
+        return (getattr(r, "status_code", None), (getattr(r, "text", "") or ""))
+
     def do_apply(self, slot: dict) -> str:
         """Bug fix #3: re-warm at the START of every round (ScheduleController form-state TTL is
         ~90-120s and lapses during a long hold -- submitting on stale context bounces -> false
@@ -3935,13 +3967,19 @@ class LiveEngineOps(EngineOps):
                 # fast-fail (~15-20s) so the worker re-fires several times per up-window.
                 _submit_timeout = max(5.0, float(self.cfg.raw.get("APPLY_SUBMIT_TIMEOUT", 100.0)
                                                  or 100.0))
-                _res = self.session.browser_fetch(
-                    submit_url, body, method="POST",
-                    headers={"X-Requested-With": "XMLHttpRequest",
-                             "Referer": SCHED_JSP + "?posto_id=" + str(self.posto_pdf)},
-                    encode="form", timeout=_submit_timeout)
-                html = str(_res.get("body") or "") if isinstance(_res, dict) else str(_res or "")
-                _status = _res.get("status") if isinstance(_res, dict) else None
+                if bool(self.cfg.raw.get("HYBRID_SUBMIT", False)):
+                    # HYBRID: submit via a detached primp client (confirmed to book). The %PDF is
+                    # fetched via the browser below -- POSTPONED, because the artifact endpoint 403s
+                    # a detached client and the booking is already made by submit time.
+                    _status, html = self._submit_via_primp(submit_url, body, _submit_timeout)
+                else:
+                    _res = self.session.browser_fetch(
+                        submit_url, body, method="POST",
+                        headers={"X-Requested-With": "XMLHttpRequest",
+                                 "Referer": SCHED_JSP + "?posto_id=" + str(self.posto_pdf)},
+                        encode="form", timeout=_submit_timeout)
+                    html = str(_res.get("body") or "") if isinstance(_res, dict) else str(_res or "")
+                    _status = _res.get("status") if isinstance(_res, dict) else None
                 _final_url = submit_url        # XHR: no navigation, still on Schedule.jsp
                 _round_ms = int((time.time() - _t_apply) * 1000)
                 self._log(f"do_apply: SubmeterVistoCriaPDF XHR -> status={_status} len={len(html)} "

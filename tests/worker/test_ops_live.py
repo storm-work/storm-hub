@@ -1528,6 +1528,37 @@ def _apply_ops(pdf_bytes: bytes, events: list):
     return ops
 
 
+def test_do_apply_hybrid_submit_goes_via_primp_not_the_browser():
+    """HYBRID_SUBMIT: the SubmeterVistoCriaPDF submit is sent by the detached primp client, not the
+    in-page browser XHR; the %PDF is still fetched via the browser (postponed)."""
+    events = []
+    ops = _make_ops(cfg=_cfg_schedule(booking={"HYBRID_SUBMIT": True}),
+                    emit=lambda t, **p: events.append((t, p)))
+    primp_calls = []
+
+    class _NoXHR(_SubmitSession):
+        def browser_fetch(self, *a, **k):
+            raise AssertionError("HYBRID must NOT submit via the browser XHR")
+
+    ops.session = _NoXHR(b"%PDF-1.4 ok")
+    ops._run_warmup_steps = lambda: True
+    ops._save_pdf = lambda b: "/tmp/x.pdf"
+    ops.posto_pdf = "3059"; ops._set_anchor("chain")
+    ops._submit_via_primp = lambda url, body, to: (primp_calls.append((url, body)), (200, _PDF_SHELL))[1]
+    assert ops.do_apply({"date": "2026-09-01", "period": 4}) == "booked"
+    assert primp_calls and "SubmeterVistoCriaPDF" in primp_calls[0][0], "submit must go via primp"
+
+
+def test_do_apply_default_still_submits_via_the_browser_xhr():
+    """Default (HYBRID_SUBMIT off): unchanged -- the in-page browser XHR path."""
+    events = []
+    ops = _apply_ops(b"%PDF-1.4 ok", events)   # default cfg, HYBRID_SUBMIT off
+    ops._submit_via_primp = lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("default must NOT use primp"))
+    ops.posto_pdf = "3059"
+    assert ops.do_apply({"date": "2026-09-01", "period": 4}) == "booked"
+
+
 def test_apply_submit_timeout_is_tunable_for_stress_mode():
     """APPLY_SUBMIT_TIMEOUT (default 100) controls the submit XHR timeout so stress mode can fast-fail
     a down-portal submit instead of hanging ~100s across the up-window."""
