@@ -91,6 +91,15 @@ def _warm(pool, geo, posto, nat, res, log, headless=True, tries=8, exit_tries=4)
     running = {r[0] for r in db.execute(select(M.Worker.identity_id).where(M.Worker.status == "RUNNING")).all()}
     cands = db.scalars(select(M.Identity).where(M.Identity.status == "ACTIVE").limit(400)).all()
     random.shuffle(cands)
+    # SESSION CACHE: prefer the last identity we warmed, so do_login restores ITS fresh checkpoint
+    # (skip the whole login lottery) when re-run within the Vistos_sid TTL. First run fights login
+    # once; re-runs ride the banked session.
+    _cache = _ROOT / "var" / "probe_session_identity.txt"
+    _pref = _cache.read_text().strip() if _cache.exists() else ""
+    if _pref:
+        cands.sort(key=lambda i: 0 if i.id == _pref else 1)
+        if cands and cands[0].id == _pref:
+            log(f"session cache: trying banked identity {_pref[:8]} first (checkpoint restore)")
 
     cfg = EngineConfig.from_settings(resolve({L.GLOBAL: g, L.BOOKING: {
         "DISCOVERY_SOURCE": "slots", "KEEPALIVE_MODE": "schedule"}}))
@@ -130,6 +139,13 @@ def _warm(pool, geo, posto, nat, res, log, headless=True, tries=8, exit_tries=4)
                     log("  warmup failed"); ops._close_session_quietly()
                     proxy = roll_rotating_url(proxy); continue
                 db.close()
+                try:
+                    ops.save_checkpoint_now()
+                    _cache.parent.mkdir(parents=True, exist_ok=True)
+                    _cache.write_text(ident.id)
+                    log("session cache: checkpoint banked -- re-run to restore (skips login)")
+                except Exception as _ce:
+                    log(f"session cache: save failed ({str(_ce)[:60]})")
                 log(f"WARMED ✓ posto_pdf={ops.posto_pdf} ({ident.full_name[:22]!r})")
                 return ops, quest_steps, res
             except Exception as e:
