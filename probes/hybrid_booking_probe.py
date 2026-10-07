@@ -183,28 +183,33 @@ def _detached_submit(ops, slot, quest_steps, res, log):
     r = pc.post(SUBMIT + "?posto_id=" + posto, data=body, headers=headers)
     html = r.text or ""
     log(f"[hybrid] submit -> status={r.status_code} len={len(html)} body[:160]={html[:160]!r}")
-    # verify: parse MostrarPdf out of the response, fetch the PDF detached
+    # VERDICT via the production classifier -- the submit RESPONSE is the confirmation (~1.5KB
+    # booked / ~66KB form_stale). CONFIRMED live: a detached primp submit of 1566B is the booked
+    # signature. The %PDF is the proof (success_detection_false_negative), fetched via the BROWSER:
+    # the MostrarPdf artifact endpoint 403s a detached client even though the SUBMIT books, so the
+    # hybrid is DETACHED-SUBMIT + BROWSER-PDF -- and the booking is already made by the time we fetch
+    # the artifact.
+    verdict = ops._classify_submit_response(html, "")
     pdf = b""
-    m = re.search(r'["\']([^"\']*MostrarPdf[^"\']*)["\']', html, re.I)
-    if m:
-        action = m.group(1)
-        url = action if action.startswith("http") else (ORIGIN + action if action.startswith("/")
-                                                         else BASE + "/" + action.lstrip("/"))
-        inner = re.search(r'<form[^>]*MostrarPdf[^>]*>(.*?)</form>', html, re.I | re.S)
-        params = dict(re.findall(r'name\s*=\s*["\']([^"\']+)["\'][^>]*value\s*=\s*["\']([^"\']*)["\']',
-                                 inner.group(1) if inner else "", re.I))
-        if params:
-            url += ("&" if "?" in url else "?") + urlencode(params)
-        try:
+    try:
+        pdf = ops._fetch_pdf_from_submit_body(html)      # in-page browser fetch (credentials:include)
+        log(f"[hybrid] BROWSER PDF fetch -> bytes={len(pdf)} %PDF={pdf[:4]==b'%PDF'}")
+    except Exception as e:
+        log(f"[hybrid] browser PDF fetch error: {type(e).__name__}: {str(e)[:100]}")
+    # for the record, also try the detached PDF fetch (expected to 403 -- artifact endpoint is stricter)
+    try:
+        m = re.search(r'["\']([^"\']*MostrarPdf[^"\']*)["\']', html, re.I)
+        if m:
+            action = m.group(1)
+            url = action if action.startswith("http") else (ORIGIN + action if action.startswith("/")
+                                                             else BASE + "/" + action.lstrip("/"))
             rp = pc.get(url)
-            pdf = rp.content if hasattr(rp, "content") else (rp.text or "").encode("latin-1", "replace")
-            log(f"[hybrid] primp GET MostrarPdf -> status={rp.status_code} bytes={len(pdf)} "
-                f"%PDF={pdf[:4]==b'%PDF'}")
-        except Exception as e:
-            log(f"[hybrid] MostrarPdf fetch error: {type(e).__name__}: {str(e)[:100]}")
+            log(f"[hybrid] (primp GET MostrarPdf -> status={rp.status_code} -- artifact endpoint)")
+    except Exception:
+        pass
     booked = pdf[:4] == b"%PDF"
-    return {"status": r.status_code, "resp_len": len(html), "pdf_bytes": len(pdf), "booked": booked,
-            "pdf": pdf}
+    return {"status": r.status_code, "resp_len": len(html), "verdict": verdict,
+            "pdf_bytes": len(pdf), "booked": booked, "pdf": pdf}
 
 
 def main() -> int:
@@ -267,15 +272,22 @@ def main() -> int:
                   "verify the %PDF (this BOOKS a real appointment).")
             return 0
         out = _detached_submit(ops, slot, quest_steps, res, log)
+        print(f"\n[probe] detached submit: status={out['status']} resp_len={out['resp_len']} "
+              f"classifier={out['verdict']!r}  (resp_len~1.5KB & verify_pdf/booked = the DETACHED submit booked)")
         if out["booked"]:
             p = _ROOT / "var" / "artifacts" / f"hybrid_{ops.identity_id}_{int(__import__('time').time())}.pdf"
             p.parent.mkdir(parents=True, exist_ok=True); p.write_bytes(out["pdf"])
-            print(f"\n[probe] ✅ HYBRID BOOKED -- DETACHED primp submit produced a %PDF "
-                  f"({out['pdf_bytes']}B) -> {p}\n           The post-login submit does NOT need the browser.")
+            print(f"[probe] ✅ HYBRID CONFIRMED -- detached primp submit BOOKED, %PDF verified via "
+                  f"browser ({out['pdf_bytes']}B) -> {p}\n           Post-login SUBMIT does NOT need the "
+                  f"browser; the browser is only needed for login+warmup (and the PDF artifact).")
+        elif out["verdict"] in ("booked", "verify_pdf"):
+            print(f"[probe] ⚠ LIKELY BOOKED -- the detached submit returned the booked signature "
+                  f"(classifier={out['verdict']!r}, resp_len={out['resp_len']}), but the %PDF proof "
+                  f"could not be fetched ({out['pdf_bytes']}B). VERIFY ON THE PORTAL. The booking is "
+                  f"made the moment the submit confirms; the %PDF is a separate, failable step.")
         else:
-            print(f"\n[probe] ❌ detached submit did NOT confirm (status={out['status']} "
-                  f"resp_len={out['resp_len']} pdf_bytes={out['pdf_bytes']}). "
-                  f"resp_len~1.5KB=booked / ~66KB=form_stale(slot taken) / redirect=session not accepted.")
+            print(f"[probe] ❌ detached submit did NOT book (classifier={out['verdict']!r} "
+                  f"resp_len={out['resp_len']}). ~66KB=form_stale(slot taken) / redirect=session not accepted.")
         return 0
     finally:
         try: ops._close_session_quietly()
