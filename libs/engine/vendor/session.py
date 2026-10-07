@@ -883,13 +883,19 @@ class PlaywrightSession:
             # Apply playwright-stealth for comprehensive bot-detection evasion.
             # Patches 20+ signals: canvas getImageData noise, audio fingerprint,
             # getBoundingClientRect, Function.toString, webdriver, chrome runtime, etc.
-            try:
-                from playwright_stealth import Stealth
-                Stealth().apply_stealth_sync(page)
-            except ImportError:
-                print("[session] playwright-stealth not installed - using fallback script only")
-            except Exception as _se:
-                print(f"[session] playwright-stealth warning: {_se}")
+            # OPT-IN (PLAYWRIGHT_STEALTH=1). Default OFF: the deterministic per-account fingerprint
+            # script above is the proven path, and playwright-stealth can OVERRIDE its canvas/WebGL
+            # noise (breaking determinism) -- so it is gated for A/B rather than silently always-on
+            # the moment the package is installed. Validate LIVE before making it default.
+            if os.environ.get("PLAYWRIGHT_STEALTH", "0").strip() == "1":
+                try:
+                    from playwright_stealth import Stealth
+                    Stealth().apply_stealth_sync(page)
+                    print("[session] playwright-stealth applied (on top of the fallback fp script)")
+                except ImportError:
+                    print("[session] PLAYWRIGHT_STEALTH=1 but the package is not installed -- fallback only")
+                except Exception as _se:
+                    print(f"[session] playwright-stealth warning: {_se}")
 
             # Bootstrap HOME -> AUTH with a Referer, on domcontentloaded + the username field — NEVER
             # networkidle (this portal's WAF telemetry means the page never goes idle, so a networkidle

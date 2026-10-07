@@ -207,6 +207,14 @@ _GLOBAL = [
        note=
        "Pace interactions like a human rather than firing them back-to-back. Slower per worker; the "
        "questionnaire burst is exactly the pattern that draws challenges."),
+    _s("PLAYWRIGHT_STEALTH", L.GLOBAL, bool, False, _TPL, "browser",
+       note=
+       "Apply the playwright-stealth library's patches ON TOP of the built-in deterministic "
+       "fingerprint script. Default OFF (the built-in script is the proven path). ON is for A/B "
+       "testing whether the extra patches lower the reCAPTCHA-flag rate -- it can OVERRIDE the "
+       "deterministic canvas/WebGL noise, so it may help or HURT; validate login rates live before "
+       "leaving it on. Does NOT affect the global 'try again later' throttle (that is a portal "
+       "load-shed, not a detection signal). Requires `uv pip install playwright-stealth`."),
     # Solver defaults (override-ok at template for A/B)
     _s("LOGIN_CAPSOLVER_ONLY", L.GLOBAL, bool, False, _TPL, "solver",
        note=
