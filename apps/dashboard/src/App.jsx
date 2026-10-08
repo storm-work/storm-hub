@@ -1047,8 +1047,17 @@ const ROTATING_POOLS = [
   { provider: "webshare", kind: "rotating", label: "webshare / rotating (self-minted)" },
 ];
 
-function derivePoolOptions(poolRows) {
+function derivePoolOptions(poolRows, rotatingPools = []) {
   const out = [...ROTATING_POOLS];
+  // NAMED rotating pools (DB credential entries, operator direction 2026-10-08). Each is selected
+  // as PROXY_PROVIDER="pool:<name>" with an empty kind (the pool row carries its own provider+kind);
+  // the Hub's _resolve_rotating_pool turns that back into the real provider/kind + creds at launch.
+  for (const rp of rotatingPools) {
+    if (rp && rp.active !== false) {
+      out.push({ provider: `pool:${rp.name}`, kind: "",
+                 label: `★ ${rp.name} — ${rp.provider}/${rp.kind} (named rotating)` });
+    }
+  }
   // Only static rows contribute; a rotating row here is pre-migration residue and is already
   // represented above, so including it would duplicate the option.
   const staticRows = poolRows.filter((p) => p.resource_type === "static");
@@ -1201,11 +1210,12 @@ function WorkerGeoCell({ worker, op, onChanged }) {
 
 function BookingShortcutSettings({ me, booking, onSaved }) {
   const proxies = useList("/proxies/pools");
+  const rotatingPools = useList("/rotating-pools");
   const { settings, setSettings } = useServerSyncedSettings(booking);
   const [msg, setMsg] = useState("");
   const op = me.is_operating;
 
-  const pools = derivePoolOptions(proxies.rows);
+  const pools = derivePoolOptions(proxies.rows, rotatingPools.rows);
   const poolValue = (provider, kind) => `${provider}|${kind}`;
   const warmupValue = poolValue(settings.PROXY_PROVIDER ?? "soax", settings.PROXY_KIND ?? "");
   const holdValue = poolValue(settings.HOLD_PROXY_PROVIDER ?? "soax", settings.HOLD_PROXY_KIND ?? "");
@@ -3449,14 +3459,13 @@ function Proxies({ me, setLeftPanel }) {
             onDone={() => { reload(); setModal(null); }} />
         </Modal>
       )}
-      {/* This page is the STATIC/ISP inventory now (2026-09-15, DECISIONS.md D39). Without this
-          note an empty table reads as "our proxies are gone" -- which is exactly what it would have
-          looked like the morning after the migration, during a booking. Rotating pools are still
-          fully configured and in use; they simply are not rows any more. */}
+      {/* Named rotating pools (DB credential entries, 2026-10-08) are managed here; the table below
+          is still the STATIC/ISP inventory (2026-09-15, DECISIONS.md D39). */}
+      <RotatingPoolsPanel me={me} />
       <div className="banner" style={{ marginBottom: 12 }}>
-        <b>Static / ISP proxies only.</b> Rotating pools (soax, webshare) are self-minted per worker
-        from <b>.env</b> credentials — nothing to store, probe or lease, so they are not listed here.
-        An empty table means no ISP inventory has been imported, not that proxies are missing.
+        <b>The table below is Static / ISP proxies only.</b> Rotating capacity is either a named pool
+        above or the built-in <b>.env</b> soax/webshare pools (self-minted per worker). An empty table
+        means no ISP inventory has been imported, not that proxies are missing.
       </div>
       <div className="card">
         <div className="row" style={{ marginBottom: 10 }}>
@@ -3666,6 +3675,115 @@ function ProxyPoolTree({ tree, selected, onSelect, onAdd, onImport, op }) {
         </div>
       ))}
     </>
+  );
+}
+
+// ── Named rotating pools (operator direction 2026-10-08) ─────────────────────────────────────────
+// A rotating pool is ONE credential a worker mints unlimited sessions from. Several let one Hub hold
+// multiple soax packages / webshare accounts, which the fixed .env-prefix model could not. A booking
+// selects one in its proxy picker as "★ <name> (named rotating)". The PASSWORD is write-only: the
+// API never returns it, so an edit that leaves it blank keeps the stored one.
+function RotatingPoolForm({ me, existing, onDone }) {
+  const editing = !!existing;
+  const [provider, setProvider] = useState(existing?.provider || "soax");
+  const [name, setName] = useState(existing?.name || "");
+  const [kind, setKind] = useState(existing?.kind || "rotating");
+  const [fields, setFields] = useState({});
+  const [msg, setMsg] = useState("");
+  const secretFields = provider === "webshare" ? ["PREFIX", "PASSWORD"] : ["PACKAGE", "PASSWORD"];
+  const kindOptions = provider === "webshare" ? ["rotating"] : ["rotating", "mobile"];
+  async function save() {
+    setMsg("");
+    const creds = {};
+    for (const k of secretFields) if (fields[k] != null && fields[k] !== "") creds[k] = fields[k];
+    try {
+      if (editing) {
+        await api(`/rotating-pools/${existing.id}`, { method: "PATCH", body: { name, kind, credentials: creds } });
+      } else {
+        await api("/rotating-pools", { method: "POST", body: { name, provider, kind, credentials: creds } });
+      }
+      onDone();
+    } catch (e) { setMsg(e.message); }
+  }
+  return (
+    <>
+      {msg && <div className="banner err">{msg}</div>}
+      <div className="field"><label>Pool name</label>
+        <input value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. webshare-acct2" style={{ width: "100%" }} /></div>
+      <div className="field"><label>Provider</label>
+        <select value={provider} disabled={editing} onChange={(e) => { setProvider(e.target.value); setKind("rotating"); }} style={{ width: "100%" }}>
+          <option value="soax">soax</option><option value="webshare">webshare</option>
+        </select>{editing && <div className="muted" style={{ fontSize: 12 }}>provider is fixed after creation</div>}</div>
+      <div className="field"><label>Kind</label>
+        <select value={kind} onChange={(e) => setKind(e.target.value)} style={{ width: "100%" }}>
+          {kindOptions.map((k) => <option key={k} value={k}>{k}</option>)}
+        </select></div>
+      {secretFields.map((fld) => (
+        <div className="field" key={fld}><label>{fld}{fld === "PASSWORD" ? " (secret)" : ""}</label>
+          <input type={fld === "PASSWORD" ? "password" : "text"} value={fields[fld] || ""}
+            onChange={(e) => setFields({ ...fields, [fld]: e.target.value })}
+            placeholder={editing ? "leave blank to keep" : (fld === "PACKAGE" ? "e.g. 352438" : "")}
+            style={{ width: "100%" }} /></div>
+      ))}
+      <button className="btn" disabled={!me.is_operating || !name} onClick={save} style={{ width: "100%" }}>
+        {editing ? "Save pool" : "Add rotating pool"}</button>
+    </>
+  );
+}
+
+function RotatingPoolsPanel({ me }) {
+  const { rows, reload } = useList("/rotating-pools");
+  const [modal, setModal] = useState(null);   // null | "add" | <pool row for edit>
+  const [msg, setMsg] = useState("");
+  const op = me.is_operating;
+  async function del(pool) {
+    if (!window.confirm(`Delete rotating pool "${pool.name}"?\n\nBookings using PROXY_PROVIDER="pool:${pool.name}" will fail to launch until repointed.`)) return;
+    setMsg("");
+    try { await api(`/rotating-pools/${pool.id}`, { method: "DELETE" }); reload(); }
+    catch (e) { setMsg(e.message); }
+  }
+  async function toggle(pool) {
+    setMsg("");
+    try { await api(`/rotating-pools/${pool.id}`, { method: "PATCH", body: { active: !pool.active } }); reload(); }
+    catch (e) { setMsg(e.message); }
+  }
+  const fieldSummary = (creds) => Object.keys(creds || {}).sort().map((k) =>
+    `${k}=${creds[k] === "********" ? "••••" : creds[k]}`).join("  ");
+  return (
+    <div className="card" style={{ marginBottom: 12 }}>
+      <div className="row" style={{ marginBottom: 10 }}>
+        <h2 style={{ margin: 0 }}>Rotating pools ({rows.length})</h2>
+        <span className="grow" />
+        <button className="btn" disabled={!op} onClick={() => setModal("add")}>Add rotating pool</button>
+      </div>
+      {msg && <div className="banner err">{msg}</div>}
+      <div className="muted" style={{ fontSize: 12, marginBottom: 8 }}>
+        A pool is one credential; workers mint unlimited sessions from it. Select a pool in a booking's
+        proxy picker. The built-in <b>.env</b> soax/webshare pools still work and remain the default.
+      </div>
+      {rows.length === 0
+        ? <div className="muted">No named rotating pools. The built-in .env pools are still available.</div>
+        : <table className="tbl"><thead><tr><th>Name</th><th>Provider</th><th>Kind</th><th>Credentials</th><th>Active</th><th></th></tr></thead>
+            <tbody>{rows.map((p) => (
+              <tr key={p.id} style={{ opacity: p.active ? 1 : 0.5 }}>
+                <td><code>pool:{p.name}</code></td><td>{p.provider}</td><td>{p.kind}</td>
+                <td className="muted" style={{ fontSize: 12 }}>{fieldSummary(p.credentials)}</td>
+                <td>{p.active ? "yes" : "no"}</td>
+                <td style={{ whiteSpace: "nowrap" }}>
+                  <button className="btn ghost sm" disabled={!op} onClick={() => setModal(p)}>Edit</button>{" "}
+                  <button className="btn ghost sm" disabled={!op} onClick={() => toggle(p)}>{p.active ? "Disable" : "Enable"}</button>{" "}
+                  <button className="btn ghost sm" disabled={!op} onClick={() => del(p)}>Delete</button>
+                </td>
+              </tr>))}</tbody></table>}
+      {modal === "add" && (
+        <Modal title="Add rotating pool" onClose={() => setModal(null)}>
+          <RotatingPoolForm me={me} onDone={() => { reload(); setModal(null); }} />
+        </Modal>)}
+      {modal && modal !== "add" && (
+        <Modal title={`Edit pool: ${modal.name}`} onClose={() => setModal(null)}>
+          <RotatingPoolForm me={me} existing={modal} onDone={() => { reload(); setModal(null); }} />
+        </Modal>)}
+    </div>
   );
 }
 
@@ -3912,6 +4030,7 @@ function ConfigJsonEditor({ me, ck }) {
 function Templates({ me }) {
   const { rows, err, reload } = useList("/templates");
   const { rows: proxyRows } = useList("/proxies/pools");
+  const { rows: rotatingPoolRows } = useList("/rotating-pools");
   const [f, setF] = useState({ name: "", role: "scout", settings: "{}" });
   const [editId, setEditId] = useState(null);
   const [msg, setMsg] = useState("");
@@ -3929,7 +4048,7 @@ function Templates({ me }) {
   // keeps sending exactly what it already sends today.
   let parsedSettings = {};
   try { parsedSettings = JSON.parse(f.settings || "{}"); } catch { /* left to save()'s own error banner */ }
-  const pools = derivePoolOptions(proxyRows);
+  const pools = derivePoolOptions(proxyRows, rotatingPoolRows);
   const poolValue = (provider, kind) => `${provider}|${kind}`;
   const warmupPoolValue = poolValue(parsedSettings.PROXY_PROVIDER ?? "soax", parsedSettings.PROXY_KIND ?? "");
   const holdPoolValue = poolValue(parsedSettings.HOLD_PROXY_PROVIDER ?? "soax", parsedSettings.HOLD_PROXY_KIND ?? "");

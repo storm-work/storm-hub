@@ -282,6 +282,37 @@ class ProxyImport(BaseModel):
     text: str                    # newline-separated proxy lines
 
 
+class RotatingPoolOut(BaseModel):
+    id: str
+    name: str
+    provider: str
+    kind: str
+    active: bool
+    created_at: datetime
+    # The credential fields this pool has set. Any field whose NAME contains PASSWORD is shown only
+    # as "********"/"" (set/unset) -- its value is NEVER returned. Non-secret identifiers (soax
+    # PACKAGE, webshare PREFIX) are echoed so the operator can tell pools apart.
+    credentials: dict = {}
+
+
+class RotatingPoolCreate(BaseModel):
+    name: str
+    provider: Literal["soax", "webshare"] = "soax"
+    kind: str = "rotating"
+    # Secret account fields for this provider/kind's Pool: soax -> {PACKAGE, PASSWORD},
+    # webshare -> {PREFIX, PASSWORD}. Validated against the provider Pool at the endpoint.
+    credentials: dict
+
+
+class RotatingPoolUpdate(BaseModel):
+    name: str | None = None
+    kind: str | None = None
+    active: bool | None = None
+    # Partial. A credential field omitted (or blank) is KEPT -- so a password the operator is not
+    # changing never has to be re-sent (write-only rotate).
+    credentials: dict | None = None
+
+
 class ProxyHealthCheck(BaseModel):
     ids: list[str]
     # Run tier 2 (browser -> portal) as well as tier 1 (raw -> neutral url). Off by default: tier 2

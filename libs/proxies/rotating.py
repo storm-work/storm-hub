@@ -65,7 +65,7 @@ def reseat_geo(url: str, geo: str | None, *, provider: str = "") -> str:
 
 def mint_rotating_url(provider: str, kind: str | None = None, *, settings: dict | None = None,
                       geo: str | None = None, scheme: str = "http",
-                      env: dict | None = None) -> str:
+                      env: dict | None = None, creds: dict | None = None) -> str:
     """One fresh rotating connection URL: http://user:pass@host:port.
 
     No DB, no network, no shared state -- which is exactly what makes it safe to call from any
@@ -81,7 +81,9 @@ def mint_rotating_url(provider: str, kind: str | None = None, *, settings: dict 
     environment regardless of what is in it. `env` overrides the environment, for tests only.
     """
     prov = providers.get(provider)
-    creds = providers.resolve_credentials(provider, kind, settings=settings, env=env)
+    # `creds` (optional): a named rotating pool's DB-stored account secrets, passed by the Hub.
+    # None keeps the proven behaviour -- secrets from the environment.
+    creds = providers.resolve_credentials(provider, kind, settings=settings, env=env, creds=creds)
     # The session id's SHAPE is a provider fact (soax accepts 16-alphanumeric, webshare only digits),
     # so the provider mints its own -- not the shared alphanumeric one, which webshare rejects.
     return prov.mint(creds, session_id=prov.new_session_id(), geo=geo or None, scheme=scheme)

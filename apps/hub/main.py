@@ -117,6 +117,8 @@ from .schemas import (
     ProxyCreate,
     ProxyImport,
     ProxyOut,
+    RotatingPoolCreate,
+    RotatingPoolUpdate,
     RegistrationJobOut,
     RegistrationRunRequest,
     SlotOut,
@@ -1841,6 +1843,118 @@ def create_proxy(body: ProxyCreate, db: Session = Depends(get_db),
     return p
 
 
+# ── Named rotating pools (DB-stored credential entries; operator direction 2026-10-08) ──
+# A rotating pool is ONE credential a worker mints unlimited sessions from -- one row per account,
+# never per session (the ci000droprot principle holds). A booking selects one with
+# PROXY_PROVIDER="pool:<name>". This API NEVER returns a password value and the Hub never logs one;
+# the secret is read only at mint time (Hub-side) and the minted URL carries it to the DB-free
+# worker. See libs/db/models.py::RotatingPool and _resolve_rotating_pool.
+_SECRET_FIELD = "PASSWORD"   # substring match on the field NAME -> redacted in every read response
+
+
+def _rotating_pool_out(p: M.RotatingPool) -> dict:
+    creds = p.credentials or {}
+    shown = {}
+    for k, v in creds.items():
+        if _SECRET_FIELD in str(k).upper():
+            shown[k] = "********" if (v is not None and str(v) != "") else ""
+        else:
+            shown[k] = v
+    return {"id": p.id, "name": p.name, "provider": p.provider, "kind": p.kind,
+            "active": p.active, "created_at": p.created_at, "credentials": shown}
+
+
+def _validate_pool_creds(provider: str, kind: str | None, creds: dict) -> None:
+    """Reject creds that do not match the provider Pool's required secret fields BEFORE the row can
+    produce a half-built credential that authenticates as nobody at launch. Validates the FULL
+    (merged, for an update) cred set: all required present, nothing unexpected."""
+    from libs.proxies import providers as _providers
+    try:
+        pool = _providers.get(provider).pool(kind)
+    except Exception as e:
+        raise HTTPException(422, f"unknown rotating provider/kind: {e}")
+    required = set(pool.secrets)
+    present = {k for k, v in (creds or {}).items() if v is not None and str(v).strip() != ""}
+    missing = required - present
+    if missing:
+        raise HTTPException(422, f"{provider}/{pool.name} pool needs {sorted(required)}; "
+                                 f"missing {sorted(missing)}")
+    extra = present - required
+    if extra:
+        raise HTTPException(422, f"{provider}/{pool.name} pool takes only {sorted(required)}; "
+                                 f"unexpected {sorted(extra)}")
+
+
+@app.get("/rotating-pools")
+def list_rotating_pools(db: Session = Depends(get_db),
+                        _v: Principal = Depends(require_viewer)) -> list[dict]:
+    rows = db.scalars(select(M.RotatingPool).order_by(M.RotatingPool.name)).all()
+    return [_rotating_pool_out(p) for p in rows]
+
+
+@app.post("/rotating-pools", status_code=201)
+def create_rotating_pool(body: RotatingPoolCreate, db: Session = Depends(get_db),
+                         _op: Principal = Depends(require_operator)) -> dict:
+    name = (body.name or "").strip()
+    if not name:
+        raise HTTPException(422, "name is required")
+    if db.scalar(select(M.RotatingPool).where(M.RotatingPool.name == name)):
+        raise HTTPException(409, f"rotating pool {name!r} already exists")
+    kind = (body.kind or "rotating").strip() or "rotating"
+    cleaned = {k: str(v).strip() for k, v in (body.credentials or {}).items()
+               if v is not None and str(v).strip() != ""}
+    _validate_pool_creds(body.provider, kind, cleaned)
+    p = M.RotatingPool(name=name, provider=body.provider, kind=kind,
+                       credentials=cleaned, active=True)
+    db.add(p)
+    db.commit()
+    db.refresh(p)
+    return _rotating_pool_out(p)
+
+
+@app.patch("/rotating-pools/{pool_id}")
+def update_rotating_pool(pool_id: str, body: RotatingPoolUpdate, db: Session = Depends(get_db),
+                         _op: Principal = Depends(require_operator)) -> dict:
+    p = db.get(M.RotatingPool, pool_id)
+    if not p:
+        raise HTTPException(404, "rotating pool not found")
+    if body.name is not None:
+        nm = body.name.strip()
+        if nm and nm != p.name and db.scalar(
+                select(M.RotatingPool).where(M.RotatingPool.name == nm)):
+            raise HTTPException(409, f"rotating pool {nm!r} already exists")
+        p.name = nm or p.name
+    if body.kind is not None:
+        p.kind = body.kind.strip() or p.kind
+    if body.active is not None:
+        p.active = bool(body.active)
+    if body.credentials is not None:
+        # Merge: a field omitted or blank is KEPT (write-only rotate -- a password the operator is
+        # not changing need not be re-sent). Validate the MERGED result so an edit can't leave a
+        # half-built credential behind.
+        merged = dict(p.credentials or {})
+        for k, v in body.credentials.items():
+            if v is None or str(v).strip() == "":
+                continue
+            merged[k] = str(v).strip()
+        _validate_pool_creds(p.provider, p.kind, merged)
+        p.credentials = merged
+    db.commit()
+    db.refresh(p)
+    return _rotating_pool_out(p)
+
+
+@app.delete("/rotating-pools/{pool_id}")
+def delete_rotating_pool(pool_id: str, db: Session = Depends(get_db),
+                         _op: Principal = Depends(require_operator)) -> dict:
+    p = db.get(M.RotatingPool, pool_id)
+    if not p:
+        raise HTTPException(404, "rotating pool not found")
+    db.delete(p)
+    db.commit()
+    return {"deleted": pool_id}
+
+
 @app.post("/proxies/import", response_model=ImportResult)
 def import_proxies(body: ProxyImport, db: Session = Depends(get_db),
                    _op: Principal = Depends(require_operator)) -> ImportResult:
@@ -2265,7 +2379,10 @@ def run_registration(body: RegistrationRunRequest, db: Session = Depends(get_db)
     # false-condemnation incident was fixed, but registration kept the old filter and so kept
     # shrinking its own pool permanently, one transient failure at a time.
     geos = _geos(body.geos)
-    if not _static_pool(body.kind):
+    # 'pool:<name>' selects a NAMED rotating pool (DB creds); resolve to the real provider/kind +
+    # creds before the branch so the static/rotating decision reads the real kind.
+    _rprov, _rkind, _rcreds = _resolve_rotating_pool(db, body.provider, body.kind)
+    if not _static_pool(_rkind):
         # ROTATING: mint, don't query (D39/D40). This path was the last one still selecting rotating
         # proxies from DB rows, and ci000droprot deleted those rows -- so registration failed with
         # "409: no active healthy soax proxies available (kind=rotating)" against a perfectly
@@ -2283,9 +2400,9 @@ def run_registration(body: RegistrationRunRequest, db: Session = Depends(get_db)
         try:
             n = max(1, int(body.concurrency or 1), len(subs))
             proxies = [{"id": None,
-                        "url": mint_rotating_url(body.provider, body.kind,
+                        "url": mint_rotating_url(_rprov, _rkind,
                                                  settings=get_global(db),
-                                                 geo=_pick_geo(geos))}
+                                                 geo=_pick_geo(geos), creds=_rcreds)}
                        for _ in range(n)]
         except RotatingPoolError as e:
             raise HTTPException(409, str(e))
@@ -3112,6 +3229,29 @@ def _rank_live_sub_accounts(db: Session, identity_id: str) -> list[M.SubAccount]
     return candidates
 
 
+def _resolve_rotating_pool(db: Session, provider: str, kind: str | None):
+    """Resolve a PROXY_PROVIDER of the form ``pool:<name>`` to a NAMED rotating pool's real
+    provider, kind and DB-stored account creds (operator direction 2026-10-08). Any other provider
+    is returned unchanged with ``creds=None`` -- the built-in env pools, untouched. 409s (same shape
+    a mint failure uses) name a missing/inactive pool so the operator's next action is clear.
+
+    SECRETS STAY SERVER-SIDE: the returned creds are consumed only by ``mint_rotating_url`` here in
+    the Hub; the worker receives the already-minted URL and never the creds.
+    """
+    prov = str(provider or "").strip()
+    if not prov.lower().startswith("pool:"):
+        return provider, kind, None
+    name = prov[len("pool:"):].strip()
+    if not name:
+        raise HTTPException(409, "PROXY_PROVIDER 'pool:' is missing a pool name")
+    row = db.scalar(select(M.RotatingPool).where(M.RotatingPool.name == name))
+    if row is None:
+        raise HTTPException(409, f"rotating pool {name!r} not found (Proxies page -> Rotating pools)")
+    if not row.active:
+        raise HTTPException(409, f"rotating pool {name!r} is inactive")
+    return row.provider, (row.kind or kind), dict(row.credentials or {})
+
+
 def _static_pool(kind: str | None) -> bool:
     """Does this request want a FIXED exit, where a per-row health flag has a real subject?
 
@@ -3276,6 +3416,10 @@ def _do_launch_worker(db: Session, w: M.Worker) -> None:
         w.sub_account_id = sub_account.id
         _prov = str(eff.get("PROXY_PROVIDER", "soax"))
         _kind = eff.get("PROXY_KIND") or None
+        # 'pool:<name>' selects a NAMED rotating pool (DB-stored account creds). Resolve it to the
+        # real provider/kind + creds BEFORE the static/rotating branch and the gateway probe, so
+        # they all see the real provider. Non-pool providers pass through unchanged (creds=None).
+        _prov, _kind, _rcreds = _resolve_rotating_pool(db, _prov, _kind)
         # Bind this worker's exit country for the whole run. If it already has one (operator pick or
         # a previously-frozen random draw), keep it -- consistency across relaunches is the point.
         # Otherwise draw one uniformly from the booking's PROXY_GEOS set and FREEZE it on the row, so
@@ -3328,7 +3472,7 @@ def _do_launch_worker(db: Session, w: M.Worker) -> None:
             try:
                 warm_proxy = mint_rotating_url(
                     _prov, _kind, settings=get_global(db),
-                    geo=_init_geo,
+                    geo=_init_geo, creds=_rcreds,
                 )
             except RotatingPoolError as e:
                 # 409, same shape a lease failure used: the operator has to go and configure the

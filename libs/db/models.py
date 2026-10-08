@@ -191,6 +191,29 @@ class Proxy(Base, PKMixin, TimestampMixin):
     checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class RotatingPool(Base, PKMixin, TimestampMixin):
+    """A NAMED rotating-proxy credential entry (operator direction 2026-10-08).
+
+    Deliberately reverses the 2026-09-16 env-only rule FOR THE MULTI-ACCOUNT CASE: the fixed
+    `{env_prefix}_{FIELD}` model (providers/soax.py, webshare.py) holds exactly one account per
+    pool kind, so a second webshare account or soax package was impossible. A rotating pool is NOT
+    inventory -- it is ONE credential from which workers mint unlimited session ids, so there is one
+    row per account, not per session (the ci000droprot principle is intact).
+
+    `credentials` holds the provider Pool's secret fields: soax -> {PACKAGE, PASSWORD},
+    webshare -> {PREFIX, PASSWORD}. It is NEVER returned by the read API and NEVER logged. The Hub
+    resolves it at mint time (mint is Hub-only) and the minted URL carries the embedded creds to the
+    DB-free worker, so no secret ever reaches a worker process or the event stream. A booking selects
+    a pool by name via PROXY_PROVIDER="pool:<name>"; the built-in env pools stay the default.
+    """
+    __tablename__ = "rotating_pools"
+    name: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    provider: Mapped[str] = mapped_column(String(16), nullable=False)        # soax | webshare
+    kind: Mapped[str] = mapped_column(String(24), nullable=False, default="rotating")  # rotating|mobile
+    credentials: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+
 class ProxyLease(Base, PKMixin, TimestampMixin):
     """Central proxy-lease authority — removes the cross-process proxy-cursor collision."""
     __tablename__ = "proxy_leases"

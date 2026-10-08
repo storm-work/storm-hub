@@ -63,7 +63,8 @@ def for_url(url: str) -> RotatingProvider | None:
 
 
 def resolve_credentials(provider: str, kind: str | None = None, *,
-                        settings: dict | None = None, env: dict | None = None) -> dict:
+                        settings: dict | None = None, env: dict | None = None,
+                        creds: dict | None = None) -> dict:
     """Everything `mint()` needs for one pool: secrets from the environment, options from settings.
 
     The two namespaces resolve from DIFFERENT sources ON PURPOSE (see Pool's docstring):
@@ -89,9 +90,19 @@ def resolve_credentials(provider: str, kind: str | None = None, *,
     out: dict = {}
     missing: list[str] = []
 
+    # SECRETS. Normally from the environment ONLY (`{env_prefix}_{FIELD}`). When `creds` is given
+    # -- a NAMED rotating pool whose account creds live in the DB (operator direction 2026-10-08) --
+    # the secret comes from there instead, and the Hub (the only caller with DB access) is what
+    # loads and passes it. The worker never sees this path: it receives an already-minted URL. The
+    # missing-field error names the DB field when creds was supplied, the env var otherwise, so the
+    # operator is told where to go set it.
     for fieldname in pool.secrets:
-        key = f"{pool.env_prefix}_{fieldname}"
-        val = environ.get(key)
+        if creds is not None:
+            val = creds.get(fieldname)
+            key = f"{pool.name} pool field {fieldname!r}"
+        else:
+            key = f"{pool.env_prefix}_{fieldname}"
+            val = environ.get(key)
         if val is None or str(val).strip() == "":
             missing.append(key)
             continue
