@@ -312,6 +312,8 @@ _BOOKING = [
     # setting -- this just opens the same door to booking-home settings via override, not home.
     _s("PROXY_PROVIDER", L.BOOKING, str, "soax", _TPL, group="mode",
        note="phase-1 (login/warmup) leased-proxy provider: 'soax' | 'webshare' (self-minted rotating), "
+            "'pool:<name>' for a NAMED rotating pool (a stored soax package / webshare account, managed "
+            "on the Proxies page -- carries its own provider+kind+creds, so PROXY_KIND is ignored), "
             "a static/ISP provider name (leased, e.g. 'capsolver' | 'thordata'), or 'all-isp' to LEASE "
             "ACROSS EVERY ISP POOL AT ONCE (capacity = union of all ISP pools; the provider filter is "
             "dropped and resource_type='static' bounds it to ISP). 'all-isp' also forces the lease "
