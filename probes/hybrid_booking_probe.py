@@ -39,6 +39,11 @@ Discovery flags (find the real open slots instead of an arbitrary window):
   --start YYYY-MM-DD / --end YYYY-MM-DD      scan window (default today+1 .. today+120)
   --max-dates N (default 90)                 cap on dates scanned
   --weekends                                 include Sat/Sun (default weekdays only)
+  --discovery-via {browser|primp}            EXPERIMENT #4: 'primp' runs the CALENDAR discovery
+                                             (gettime+getPeriodosOcupados) as detached primp GETs --
+                                             they carry NO reCAPTCHA token, only the session cookie, so
+                                             primp should return the same bodies the browser nav does.
+                                             Default 'browser' keeps the proven do_discover path.
 
 EXPERIMENT #2 -- keeping endurance (--keep-min N [--keep-interval S]): after warm-up, HOLD the session
 N minutes by re-warming every S seconds (default 180) on the warm-up transport (primp for
@@ -372,6 +377,76 @@ def _warmup_via_primp(ops, quest_steps, res, log):
     return True, markers
 
 
+def _discover_calendar_via_primp(ops, dates, log):
+    """EXPERIMENT #4 -- calendar discovery (gettime + getPeriodosOcupados) on a DETACHED primp client.
+
+    These are plain session-cookie GETs with NO reCAPTCHA token (ops_live._discover_via_calendar uses
+    browser_nav only by convention, not necessity), so primp should get the SAME bodies the browser
+    does -- and the SAME parsers (classify_gettime_body / parse_special_days / parse_periodos_ocupados)
+    read them, transport-independent. If this matches the browser calendar, discovery leaves the
+    browser. Returns the do_discover-shaped list [{date, outcome, periods?}] so it slots in unchanged."""
+    import primp
+    from datetime import date as _date
+    from apps.worker.ops_live import GETTIME_URL, GETPERIODOS_URL, _PORTAL_ORIGIN
+    from libs.engine.discovery.gettime import (
+        GettimeStatus, classify_gettime_body, parse_special_days)
+    from libs.engine.discovery.periodos import parse_periodos_ocupados
+    import re as _re
+
+    cookies = {c["name"]: c["value"] for c in (ops.session.get_all_cookies() or [])
+               if isinstance(c, dict) and c.get("name") in ("Vistos_sid", "cookiesession1")}
+    try:
+        ua = (ops.session.browser_eval("navigator.userAgent") or "").strip() or "Mozilla/5.0"
+    except Exception:
+        ua = "Mozilla/5.0"
+    H = {"User-Agent": ua, "Cookie": "; ".join(f"{k}={v}" for k, v in cookies.items())}
+    pc = primp.Client(proxy=ops.warm_proxy, verify=False, timeout=30, follow_redirects=True)
+    try: pc.set_cookies(_PORTAL_ORIGIN + "/", cookies)
+    except Exception: pass
+
+    # 1. gettime (special/closed days) -- one GET for the whole posto
+    r = pc.get(f"{GETTIME_URL}?id_posto={ops.posto_id}", headers=H)
+    body = r.text or ""
+    status = classify_gettime_body(body)
+    log(f"[primp-cal] gettime -> {r.status_code} len={len(body)} status={status}")
+    if status != GettimeStatus.OK:
+        log(f"[primp-cal] gettime BLOCKED/not-OK via primp -- all {len(dates)} dates FAILED")
+        return [{"date": d, "outcome": "failed"} for d in dates]
+    special_days = parse_special_days(body)
+
+    # 2. getPeriodosOcupados per date (plain GET; marker periodos_ocupados='...')
+    out = []
+    for d in dates:
+        try:
+            iso = _date.fromisoformat(d)
+        except ValueError:
+            out.append({"date": d, "outcome": "failed"}); continue
+        if iso.day in special_days.get(iso.year, {}).get(iso.month, set()):
+            out.append({"date": d, "outcome": "empty"}); continue
+        url = f"{GETPERIODOS_URL}?id_posto={ops.posto_id}&data_agendamento={iso.strftime('%Y/%m/%d')}"
+        try:
+            rp = pc.get(url, headers=H)
+            html = rp.text or ""
+        except Exception as e:
+            log(f"[primp-cal] {d} GET error {type(e).__name__}: {str(e)[:60]} -- FAILED")
+            out.append({"date": d, "outcome": "failed"}); continue
+        m = _re.search(r"periodos_ocupados='([0-9]*)", html)
+        if not m:
+            out.append({"date": d, "outcome": "failed"}); continue
+        free, _occ = parse_periodos_ocupados(m.group(1), max_period=ops.cfg.discovery.max_period)
+        if free is None:
+            out.append({"date": d, "outcome": "failed"})
+        elif free:
+            out.append({"date": d, "outcome": "found", "periods": free, "raw": m.group(1)})
+        else:
+            out.append({"date": d, "outcome": "empty"})
+    _f = sum(1 for r in out if r["outcome"] == "found")
+    _e = sum(1 for r in out if r["outcome"] == "empty")
+    _x = sum(1 for r in out if r["outcome"] == "failed")
+    log(f"[primp-cal] calendar via primp: {_f} found, {_e} empty, {_x} failed")
+    return out
+
+
 def _keep_loop(ops, quest_steps, res, log, minutes: float, interval: float, via: str):
     """EXPERIMENT #2 -- hold a BOOKABLE session for `minutes` by RE-WARMING every `interval`s, on the
     chosen transport (primp or browser), with the browser otherwise PARKED (idle, never navigated).
@@ -597,7 +672,16 @@ def main() -> int:
               f"cap {max_dates}) -> {len(dates)} dates; source={ops.cfg.discovery.source!r} "
               f"(slots-first then CALENDAR fallback if 'both')")
         print(f"[probe]   dates: {dates[0]} ... {dates[-1]}" if dates else "[probe]   (no dates!)")
-        results = ops.do_discover(dates)
+        # EXPERIMENT #4 -- calendar discovery on primp. --discovery-via primp runs gettime +
+        # getPeriodosOcupados as detached primp GETs (browser otherwise untouched); default 'browser'
+        # keeps the proven do_discover path. If a prior cursor exists we re-warm via primp first so
+        # gettime answers on a live session.
+        discovery_via = (_arg("--discovery-via", "browser")).lower()
+        if discovery_via == "primp":
+            print("[probe] === EXPERIMENT #4: CALENDAR discovery via DETACHED primp (no browser) ===")
+            results = _discover_calendar_via_primp(ops, dates, log)
+        else:
+            results = ops.do_discover(dates)
         found = [r for r in results if r.get("outcome") == "found" and r.get("periods")]
         print(f"[probe] discovery: {sum(1 for r in results if r.get('outcome')=='found')} found, "
               f"{sum(1 for r in results if r.get('outcome')=='empty')} empty, "
