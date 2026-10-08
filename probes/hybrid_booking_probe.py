@@ -39,6 +39,11 @@ Discovery flags (find the real open slots instead of an arbitrary window):
   --start YYYY-MM-DD / --end YYYY-MM-DD      scan window (default today+1 .. today+120)
   --max-dates N (default 90)                 cap on dates scanned
   --weekends                                 include Sat/Sun (default weekdays only)
+  --close-browser                            EXPERIMENT #5 (Phase C): after login, CLOSE the browser
+                                             and run the ENTIRE hot path browserless on primp (implies
+                                             --discovery-via primp); reopen a cookie-injected browser
+                                             only for the PDF. Proves the portal session survives the
+                                             browser closing. Requires --warmup-via primp.
   --discovery-via {browser|primp}            EXPERIMENT #4: 'primp' runs the CALENDAR discovery
                                              (gettime+getPeriodosOcupados) as detached primp GETs --
                                              they carry NO reCAPTCHA token, only the session cookie, so
@@ -243,6 +248,26 @@ def _warm(pool, geo, posto, nat, res, log, headless=True, tries=8, exit_tries=4,
     return None, quest_steps, res
 
 
+# EXPERIMENT #5 state: once the browser is CLOSED after login, primp can no longer read cookies/UA
+# off the browser (those are browser commands). We cache them here while the browser is still alive,
+# and _primp_creds() serves the cache after close. Empty = browser still open (normal Phase B).
+_CLOSED_CREDS: dict = {}
+
+
+def _primp_creds(ops):
+    """(cookies_dict, ua) for a detached primp request. Uses the pre-close cache when the browser has
+    been closed (Exp #5), else reads live from the browser (Phase B -- browser parked but open)."""
+    if _CLOSED_CREDS:
+        return dict(_CLOSED_CREDS["cookies"]), _CLOSED_CREDS["ua"]
+    cookies = {c["name"]: c["value"] for c in (ops.session.get_all_cookies() or [])
+               if isinstance(c, dict) and c.get("name") in ("Vistos_sid", "cookiesession1")}
+    try:
+        ua = (ops.session.browser_eval("navigator.userAgent") or "").strip()
+    except Exception:
+        ua = ""
+    return cookies, ua or "Mozilla/5.0"
+
+
 def _parse_inputs(html: str) -> dict:
     """Mirror the browser's `querySelectorAll('input')` field harvest with two regexes (name-then-
     value AND value-then-name), so a detached warmup gathers the same Formulario fields the in-page
@@ -275,9 +300,7 @@ def _warmup_via_primp(ops, quest_steps, res, log):
     )
     from libs.engine.payload import schedule_controller_payload
 
-    cookies = {c["name"]: c["value"] for c in ops.session.get_all_cookies()
-               if c.get("name") in ("Vistos_sid", "cookiesession1")}
-    ua = (ops.session.browser_eval("navigator.userAgent") or "").strip() or "Mozilla/5.0"
+    cookies, ua = _primp_creds(ops)
     ck = "; ".join(f"{k}={v}" for k, v in cookies.items())
     H = {"User-Agent": ua, "Cookie": ck}
     pc = primp.Client(proxy=ops.warm_proxy, verify=False, timeout=100, follow_redirects=True)
@@ -393,12 +416,7 @@ def _discover_calendar_via_primp(ops, dates, log):
     from libs.engine.discovery.periodos import parse_periodos_ocupados
     import re as _re
 
-    cookies = {c["name"]: c["value"] for c in (ops.session.get_all_cookies() or [])
-               if isinstance(c, dict) and c.get("name") in ("Vistos_sid", "cookiesession1")}
-    try:
-        ua = (ops.session.browser_eval("navigator.userAgent") or "").strip() or "Mozilla/5.0"
-    except Exception:
-        ua = "Mozilla/5.0"
+    cookies, ua = _primp_creds(ops)
     H = {"User-Agent": ua, "Cookie": "; ".join(f"{k}={v}" for k, v in cookies.items())}
     pc = primp.Client(proxy=ops.warm_proxy, verify=False, timeout=30, follow_redirects=True)
     try: pc.set_cookies(_PORTAL_ORIGIN + "/", cookies)
@@ -491,14 +509,32 @@ def _keep_loop(ops, quest_steps, res, log, minutes: float, interval: float, via:
     return ok, fail
 
 
+def _reopen_pdf(ops, submit_html, log) -> bytes:
+    """EXPERIMENT #5 PDF step: the browser was closed for the hot path, so reopen a FRESH browser on
+    the same exit with the saved cookie jar injected (get_session(inject_cookies_full=...), the engine's
+    own close-then-reopen-with-cookies path), fetch the %PDF, then close it. Returns the PDF bytes."""
+    from libs.engine.vendor import get_session
+    full_jar = (_CLOSED_CREDS or {}).get("full_jar") or []
+    log(f"[reopen] launching a fresh browser on the warm exit with {len(full_jar)} injected cookies "
+        f"for the PDF ...")
+    pdf_sess = get_session(proxy=ops.warm_proxy, inject_cookies_full=full_jar, headless=True)
+    saved = ops.session
+    try:
+        ops.session = pdf_sess
+        pdf = ops._fetch_pdf_from_submit_body(submit_html)
+        log(f"[reopen] PDF via reopened browser -> {len(pdf)}B %PDF={pdf[:4]==b'%PDF'}")
+        return pdf
+    finally:
+        ops.session = saved
+        try: pdf_sess.close()
+        except Exception: pass
+
+
 def _detached_submit(ops, slot, quest_steps, res, log):
     """The HYBRID: SubmeterVistoCriaPDF via primp from the same exit + synced cookies. Returns dict."""
     import primp
     from libs.engine.payload import booking_payload
-    cookies = {c["name"]: c["value"]
-               for c in ops.session.get_all_cookies()
-               if c.get("name") in ("Vistos_sid", "cookiesession1")}
-    ua = (ops.session.browser_eval("navigator.userAgent") or "").strip()
+    cookies, ua = _primp_creds(ops)
     posto = str(ops.posto_pdf)
     body = urlencode(booking_payload(quest_steps, slot, residence=res))
     headers = {
@@ -526,7 +562,12 @@ def _detached_submit(ops, slot, quest_steps, res, log):
     verdict = ops._classify_submit_response(html, "")
     pdf = b""
     try:
-        pdf = ops._fetch_pdf_from_submit_body(html)      # in-page browser fetch (credentials:include)
+        if _CLOSED_CREDS:
+            # EXPERIMENT #5: the browser was CLOSED for the hot path. REOPEN one with the saved cookie
+            # jar injected (the engine's own "reopen after close" mechanism), fetch the %PDF, close it.
+            pdf = _reopen_pdf(ops, html, log)
+        else:
+            pdf = ops._fetch_pdf_from_submit_body(html)  # in-page browser fetch (credentials:include)
         log(f"[hybrid] BROWSER PDF fetch -> bytes={len(pdf)} %PDF={pdf[:4]==b'%PDF'}")
     except Exception as e:
         log(f"[hybrid] browser PDF fetch error: {type(e).__name__}: {str(e)[:100]}")
@@ -582,13 +623,32 @@ def main() -> int:
                                       login_only=True)
         if ops is None:
             print("[probe] could not LOG IN any identity -- re-run (login is a lottery)."); return 1
+        if "--close-browser" in sys.argv:
+            # EXPERIMENT #5: prove the portal session SURVIVES the browser closing. Cache the cookies
+            # + UA while the browser is alive, then CLOSE it -- the whole hot path (warm-up, keep,
+            # discover, re-warm, submit) then runs on primp with zero browser; the PDF reopens one.
+            full_jar = ops.session.get_all_cookies() or []
+            cookies = {c["name"]: c["value"] for c in full_jar
+                       if isinstance(c, dict) and c.get("name") in ("Vistos_sid", "cookiesession1")}
+            try:
+                ua = (ops.session.browser_eval("navigator.userAgent") or "").strip() or "Mozilla/5.0"
+            except Exception:
+                ua = "Mozilla/5.0"
+            _CLOSED_CREDS.update(cookies=cookies, ua=ua, full_jar=full_jar)
+            print(f"[probe] === EXPERIMENT #5: CLOSING the browser after login "
+                  f"({len(cookies)} session cookies cached) -- hot path runs browserless on primp ===")
+            try:
+                ops.session.close_browser()
+            except Exception as e:
+                print(f"[probe] close_browser raised: {type(e).__name__}: {str(e)[:100]}")
         print("[probe] === EXPERIMENT #1: warm-up via DETACHED primp (browser did login only) ===")
         chain_ok, markers = _warmup_via_primp(ops, quest_steps, res, log)
         if not (chain_ok and markers):
-            if not chain_ok:
-                print(f"[probe] ❌ primp WARM-UP broke mid-chain (see the step log). Not yet a verdict "
-                      f"on primp-warm capability -- re-run; if it recurs at the same step, that step "
-                      f"needs the browser.")
+            if not chain_ok or _CLOSED_CREDS:
+                # Broke mid-chain, OR the browser is closed (Exp #5) so the browser-control can't run.
+                print(f"[probe] ❌ primp WARM-UP did not establish a cursor (chain_ok={chain_ok} "
+                      f"markers={markers}){' [browser closed -- no control possible]' if _CLOSED_CREDS else ''}. "
+                      f"Re-run; if it recurs at the same step, that step needs the browser.")
                 try: ops._close_session_quietly()
                 except Exception: pass
                 return 1
@@ -677,6 +737,9 @@ def main() -> int:
         # keeps the proven do_discover path. If a prior cursor exists we re-warm via primp first so
         # gettime answers on a live session.
         discovery_via = (_arg("--discovery-via", "browser")).lower()
+        if _CLOSED_CREDS and discovery_via != "primp":
+            print("[probe] --close-browser: forcing --discovery-via primp (no browser to nav)")
+            discovery_via = "primp"
         if discovery_via == "primp":
             print("[probe] === EXPERIMENT #4: CALENDAR discovery via DETACHED primp (no browser) ===")
             results = _discover_calendar_via_primp(ops, dates, log)
