@@ -29,7 +29,12 @@ def _origin_reply(js, otherwise=""):
 
 
 def _cfg(**template):
-    return EngineConfig.from_settings(resolve({L.TEMPLATE: {"ROLE": "apply", **template}}))
+    # HYBRID_MODE defaults ON in production (full-primp workflow), but these unit tests pin the
+    # BROWSER transport they assert against; a test exercising the hybrid/primp path builds a cfg
+    # with HYBRID_MODE on explicitly (e.g. via _cfg_schedule(booking=...)). HYBRID_MODE is a BOOKING
+    # setting, so it goes in the BOOKING layer, not TEMPLATE.
+    return EngineConfig.from_settings(
+        resolve({L.TEMPLATE: {"ROLE": "apply", **template}, L.BOOKING: {"HYBRID_MODE": False}}))
 
 
 _REAL_SAVE_SUBMIT_BODY = LiveEngineOps._save_submit_body
@@ -1532,7 +1537,7 @@ def test_do_apply_hybrid_submit_goes_via_primp_not_the_browser():
     """HYBRID_SUBMIT: the SubmeterVistoCriaPDF submit is sent by the detached primp client, not the
     in-page browser XHR; the %PDF is still fetched via the browser (postponed)."""
     events = []
-    ops = _make_ops(cfg=_cfg_schedule(booking={"HYBRID_SUBMIT": True}),
+    ops = _make_ops(cfg=_cfg_schedule(booking={"HYBRID_MODE": True, "HYBRID_SUBMIT": True}),
                     emit=lambda t, **p: events.append((t, p)))
     primp_calls = []
 
@@ -1550,13 +1555,91 @@ def test_do_apply_hybrid_submit_goes_via_primp_not_the_browser():
 
 
 def test_do_apply_default_still_submits_via_the_browser_xhr():
-    """Default (HYBRID_SUBMIT off): unchanged -- the in-page browser XHR path."""
+    """HYBRID_MODE off: the fallback in-page browser XHR submit path still works end to end."""
     events = []
-    ops = _apply_ops(b"%PDF-1.4 ok", events)   # default cfg, HYBRID_SUBMIT off
+    ops = _apply_ops(b"%PDF-1.4 ok", events)   # _cfg() pins HYBRID_MODE off -> browser XHR
     ops._submit_via_primp = lambda *a, **k: (_ for _ in ()).throw(
         AssertionError("default must NOT use primp"))
     ops.posto_pdf = "3059"
     assert ops.do_apply({"date": "2026-09-01", "period": 4}) == "booked"
+
+
+# ── FULL HYBRID (HYBRID_MODE): warm-up / discovery / keepalive on detached primp ──────────────
+class _FakeResp:
+    def __init__(self, text="", status=200, url=""):
+        self.text, self.status_code, self.url = text, status, url
+
+
+class _FakePrimp:
+    """Records requests and replays scripted responses keyed by a URL substring."""
+    def __init__(self, routes):
+        self.routes = routes          # list of (substr, _FakeResp)
+        self.gets, self.posts = [], []
+
+    def _match(self, url):
+        for sub, resp in self.routes:
+            if sub in url:
+                return resp
+        return _FakeResp("", 200, url)
+
+    def get(self, url, headers=None):
+        self.gets.append(url); return self._match(url)
+
+    def post(self, url, data=None, content=None, headers=None):
+        self.posts.append(url); return self._match(url)
+
+
+def _hybrid_cfg(**booking):
+    return EngineConfig.from_settings(resolve(
+        {L.TEMPLATE: {"ROLE": "apply"}, L.BOOKING: {"HYBRID_MODE": True, **booking}}))
+
+
+def test_hybrid_gating_is_master_AND_leg():
+    """_hybrid(leg) = HYBRID_MODE AND HYBRID_<leg>; a browserless session forces it off."""
+    ops = _make_ops(cfg=_hybrid_cfg()); ops.session = _FakeSession()   # master on, legs default on
+    assert ops._hybrid("SUBMIT") and ops._hybrid("WARMUP") and ops._hybrid("DISCOVERY")
+    off_leg = _make_ops(cfg=_hybrid_cfg(HYBRID_KEEPALIVE=False)); off_leg.session = _FakeSession()
+    assert off_leg._hybrid("WARMUP") and not off_leg._hybrid("KEEPALIVE")
+    master_off = _make_ops(cfg=_hybrid_cfg(HYBRID_MODE=False, HYBRID_SUBMIT=True)); master_off.session = _FakeSession()
+    assert not master_off._hybrid("SUBMIT"), "master off disables every leg"
+    ops.session = None
+    assert not ops._hybrid("WARMUP"), "no browser session -> hybrid forced off"
+
+
+def test_run_warmup_steps_hybrid_routes_to_primp_chain():
+    """With HYBRID_WARMUP on, _run_warmup_steps delegates to the primp chain, not the browser."""
+    ops = _make_ops(cfg=_hybrid_cfg()); ops.session = _FakeSession()
+    called = []
+    ops._primp_warmup_chain = lambda: (called.append(1), True)[1]
+    ops.session.browser_eval = lambda *a, **k: pytest.fail("hybrid warm-up must not touch the browser")
+    assert ops._run_warmup_steps() is True and called == [1]
+
+
+def test_discover_via_calendar_hybrid_uses_primp_and_parses():
+    """HYBRID_DISCOVERY: calendar discovery runs on primp (gettime + getPeriodosOcupados GETs) and
+    feeds the real parsers -- a '136' occupied string decodes to free periods [2,4,5]."""
+    ops = _make_ops(cfg=_hybrid_cfg(DISCOVERY_SOURCE="calendar")); ops.session = _FakeSession()
+    ops.posto_id = "3018"
+    fake = _FakePrimp([
+        ("gettime", _FakeResp("SPECIAL_DAYS=[];", 200, "gettime")),
+        ("getPeriodosOcupados", _FakeResp("x periodos_ocupados='136' y", 200, "gp")),
+    ])
+    ops._primp_client = lambda: (fake, {})
+    ops._reject_phantom_round = lambda out: out      # isolate transport+parse from the phantom guard
+    res = ops._discover_via_calendar(["2026-11-03"])
+    assert res == [{"date": "2026-11-03", "outcome": "found", "periods": [2, 4, 5], "raw": "136"}], res
+    assert any("gettime" in u for u in fake.gets) and any("getPeriodosOcupados" in u for u in fake.gets)
+
+
+def test_do_keepalive_hybrid_routes_to_primp():
+    """HYBRID_KEEPALIVE: _do_keepalive delegates to the primp keepalive and never navigates."""
+    ops = _make_ops(cfg=_hybrid_cfg()); ops.session = _FakeSession()
+    seen = []
+    ops._do_keepalive_primp = lambda ctx: (seen.append(ctx), True)[1]
+    ops.session.browser_nav = lambda *a, **k: pytest.fail("hybrid keepalive must not nav the browser")
+    ops._note_exit_ip = lambda when: False
+    ops._do_keepalive("hold")
+    assert seen == ["hold"]
 
 
 def test_apply_submit_timeout_is_tunable_for_stress_mode():
@@ -2133,8 +2216,10 @@ def test_keepalive_recovers_bookable_after_a_prior_not_bookable_marking():
 # against this change specifically).
 
 def _cfg_schedule(template=None, booking=None):
+    # Browser transport by default (see _cfg); a hybrid test passes HYBRID_MODE / HYBRID_<leg> in
+    # `booking` to opt the relevant leg onto primp.
     layers = {L.TEMPLATE: {"ROLE": "apply", **(template or {})},
-              L.BOOKING: {"KEEPALIVE_MODE": "schedule", **(booking or {})}}
+              L.BOOKING: {"KEEPALIVE_MODE": "schedule", "HYBRID_MODE": False, **(booking or {})}}
     return EngineConfig.from_settings(resolve(layers))
 
 
@@ -4950,8 +5035,11 @@ def test_do_apply_makes_its_mandatory_rewarm_visible():
 def _schedule_keepalive_ops(page, events, session=None):
     # KEEPALIVE_MODE is a BOOKING-layer setting (so a template can't silently override the operator's
     # per-booking choice), so it must be set at L.BOOKING, not via _cfg's TEMPLATE-only helper.
+    # HYBRID_MODE off: these assert the BROWSER keepalive path (nav + _KeepaliveSession); the primp
+    # keepalive is covered by its own tests below.
     cfg = EngineConfig.from_settings(
-        resolve({L.TEMPLATE: {"ROLE": "apply"}, L.BOOKING: {"KEEPALIVE_MODE": "schedule"}}))
+        resolve({L.TEMPLATE: {"ROLE": "apply"},
+                 L.BOOKING: {"KEEPALIVE_MODE": "schedule", "HYBRID_MODE": False}}))
     ops = _make_ops(cfg=cfg, emit=lambda t, **p: events.append((t, p)))
     ops.session = session or _KeepaliveSession(page)
     ops.posto_pdf = "3018"

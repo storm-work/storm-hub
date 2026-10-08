@@ -474,6 +474,20 @@ def _extract_csrf(html: str) -> str | None:
     return m.group(1) if m else None
 
 
+def _primp_parse_inputs(html: str) -> dict:
+    """Harvest <input name=.. value=..> fields from the last quest step's HTML for the hybrid
+    (browserless) Formulario POST -- mirrors the browser chain's in-page querySelectorAll('input'),
+    with two regexes (name-then-value AND value-then-name) so attribute order doesn't matter."""
+    fields: dict = {}
+    for m in re.finditer(r'<input\b[^>]*\bname=["\']([^"\']+)["\'][^>]*\bvalue=["\']([^"\']*)["\']',
+                         html or "", re.I):
+        fields.setdefault(m.group(1), m.group(2))
+    for m in re.finditer(r'<input\b[^>]*\bvalue=["\']([^"\']*)["\'][^>]*\bname=["\']([^"\']+)["\']',
+                         html or "", re.I):
+        fields.setdefault(m.group(2), m.group(1))
+    return fields
+
+
 # Portuguese validation vocabulary the portal uses when it re-renders a rejected form.
 _ERR_WORDS = ("obrigat", "inválid", "invalid", "erro", "preencha", "não é válid",
               "deve ser", "incorrect", "incorret")
@@ -1760,9 +1774,255 @@ class LiveEngineOps(EngineOps):
             return "unreachable"
         return "unknown"
 
+    # ── HYBRID: detached-primp transport for the post-login steps ──────────────
+    # CONFIRMED end-to-end 2026-10-08 (3 live bookings): the portal's only post-login gate is
+    # reCAPTCHA (a server-side token carried by login + /slots ONLY). Warm-up, keepalive, calendar
+    # discovery, re-warm and the submit are all session-cookie-gated, so a DETACHED primp client on
+    # the SAME sticky exit with the browser's cookies does them -- off the heavy browser and off the
+    # navigation-bound cursor (primp never navigates, so the cursor stays fresh). The browser is kept
+    # only for LOGIN (reCAPTCHA) and the PDF artifact (MostrarPdf 403s a detached client).
+    # The per-leg flag keys, spelled out so each is a real read site (not a dynamic f-string the
+    # catalog-orphan guard can't see) and the set of legs is explicit.
+    _HYBRID_LEG_KEYS = {
+        "SUBMIT": "HYBRID_SUBMIT", "WARMUP": "HYBRID_WARMUP",
+        "DISCOVERY": "HYBRID_DISCOVERY", "KEEPALIVE": "HYBRID_KEEPALIVE",
+    }
+
+    def _hybrid(self, leg: str) -> bool:
+        """True when hybrid is on for this leg: master HYBRID_MODE AND the per-leg HYBRID_<leg>.
+        Both default ON (see catalog). A browserless session (no self.session) can't seed primp
+        cookies, so hybrid is forced off there -- defensive, this path always has a browser."""
+        if self.session is None:
+            return False
+        raw = self.cfg.raw
+        return bool(raw.get("HYBRID_MODE", True)) and bool(raw.get(self._HYBRID_LEG_KEYS[leg], True))
+
+    def _primp_client(self):
+        """A primp.Client on the worker's warm exit, seeded with the browser's portal cookies, plus
+        the (cookie_header, ua) to replay on each request. Cookies are re-read from the live browser
+        every call so a mid-session refresh can't leave primp on a stale Vistos_sid."""
+        import primp
+        cookies = {c["name"]: c["value"] for c in (self.session.get_all_cookies() or [])
+                   if isinstance(c, dict) and c.get("name") in ("Vistos_sid", "cookiesession1")}
+        try:
+            ua = (self.session.browser_eval("navigator.userAgent") or "").strip()
+        except Exception:
+            ua = ""
+        pc = primp.Client(proxy=self.warm_proxy, verify=False, timeout=45, follow_redirects=True)
+        try:
+            pc.set_cookies(_PORTAL_ORIGIN + "/", cookies)
+        except Exception:
+            pass
+        ck = "; ".join(f"{k}={v}" for k, v in cookies.items())
+        return pc, {"User-Agent": ua or "Mozilla/5.0", "Cookie": ck}
+
+    def _primp_warmup_chain(self) -> bool:
+        """HYBRID warm-up: the whole quest chain on a detached primp client (home-lang POST ->
+        Questionario -> quest steps -> Formulario/CSRF -> ScheduleController multipart -> Schedule.jsp
+        markers). Mirrors _run_warmup_steps' CONTRACT exactly: returns True + _set_anchor('chain') on a
+        verified bookable cursor, sets _warmup_last_error with the SAME taxonomy on failure (so
+        do_apply's dead-exit-roll vs portal-reject logic is unchanged -- a 503/non-200/csrf message
+        does NOT match _is_transient_login_failure, a connection error DOES), and sets
+        _identity_unavailable when the portal says this applicant already has a request. Proven live in
+        probes/hybrid_booking_probe.py (_warmup_via_primp)."""
+        self._warmup_last_error = ""
+        try:
+            self.session.clear_last_dialog()
+        except Exception:
+            pass
+        try:
+            pc, H = self._primp_client()
+            # 1. home-lang POST (sets the PT session language)
+            pc.post(HOME_URL, data="lang=PT",
+                    headers={**H, "Content-Type": "application/x-www-form-urlencoded"})
+            # 2. Questionario GET
+            pc.get(QUEST_URL, headers=H)
+            # 3. quest steps (base_qs merged into every step, like the browser chain)
+            quest_key = self.residence if self.residence != self.nationality else self.nationality
+            steps = self.quest_steps.get(quest_key, [])
+            if not steps:
+                self._log(f"hybrid-warm: no quest steps for key {quest_key!r} -- cannot warm")
+                return False
+            base_qs = {"lang": "PT", "nacionalidade": self.nationality}
+            last_html = ""
+            for i, step in enumerate(steps):
+                url = f"{QUEST_NEXT}?{urlencode({**base_qs, **step})}"
+                r = pc.get(url, headers={**H, "Accept": "text/plain, */*; q=0.01",
+                                         "X-Requested-With": "XMLHttpRequest", "Referer": QUEST_URL,
+                                         "Sec-Fetch-Mode": "cors", "Sec-Fetch-Dest": "empty",
+                                         "Sec-Fetch-Site": "same-origin"})
+                if getattr(r, "status_code", None) != 200:
+                    self._log(f"hybrid-warm: quest step {i+1}/{len(steps)} non-200 "
+                              f"({getattr(r, 'status_code', None)}) -- aborting the chain")
+                    return False
+                last_html = r.text or ""
+            last_fields = _primp_parse_inputs(last_html)
+            if not last_fields:
+                self._log(f"hybrid-warm: quest_state_stale (last step yielded no fields, "
+                          f"len={len(last_html)})")
+                return False
+            # 4. Formulario POST -> CSRF
+            r = pc.post(FORMULARIO + "?copy=true", data=urlencode(last_fields),
+                        headers={**H, "Content-Type": "application/x-www-form-urlencoded",
+                                 "Referer": QUEST_URL})
+            form_html = r.text or ""
+            csrf = _extract_csrf(form_html)
+            if not csrf:
+                r = pc.post(FORMULARIO, data=urlencode(last_fields),
+                            headers={**H, "Content-Type": "application/x-www-form-urlencoded",
+                                     "Referer": QUEST_URL})
+                form_html = r.text or ""
+                csrf = _extract_csrf(form_html)
+            if not csrf:
+                self._log("hybrid-warm: csrf_missing after Formulario POST")
+                return False
+            postos = _posto_options(form_html)
+            if postos and self.posto_id not in {v for v, _ in postos}:
+                self._log(f"hybrid-warm: posto_id={self.posto_id} NOT offered for residence "
+                          f"{self.residence!r} -- ScheduleController will reject this")
+            # 5. ScheduleController POST -- MULTIPART, empty file parts, built by hand (primp files=
+            # reads values as paths; send via content= with an explicit boundary).
+            sc_payload = schedule_controller_payload(
+                self.account, self.form_defaults, posto_id=self.posto_id, csrf=csrf,
+                nationality=self.nationality, residence=self.residence)
+            boundary = "----primpWarm" + "".join(random.choice("0123456789abcdef") for _ in range(16))
+            parts = [f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n"
+                     for k, v in sc_payload.items()]
+            parts += [f"--{boundary}\r\nContent-Disposition: form-data; name=\"{f}\"; filename=\"\"\r\n"
+                      f"Content-Type: application/octet-stream\r\n\r\n\r\n"
+                      for f in ("foto", "file1", "file2", "file3", "file4")]
+            multipart = ("".join(parts) + f"--{boundary}--\r\n").encode("utf-8")
+            sc = pc.post(SCHED_CTRL + "?posto_id=" + str(self.posto_id), content=multipart,
+                         headers={**H, "Referer": FORMULARIO,
+                                  "Content-Type": f"multipart/form-data; boundary={boundary}"})
+            sc_body = sc.text or ""
+            if _is_challenge_body(sc_body):
+                self._log(f"hybrid-warm: ScheduleController answered with a bot challenge "
+                          f"({len(sc_body)}B) -- NOT warmed")
+                return False
+            # 6. Schedule.jsp GET -> verify the booking-form markers (the cursor)
+            sr = pc.get(SCHED_JSP + "?posto_id=" + str(self.posto_id), headers={**H, "Referer": FORMULARIO})
+            sched_html = sr.text or ""
+            booked_sig = self._already_booked_signal(sc_body, sched_html)
+            if booked_sig:
+                self._identity_unavailable = True
+                self._log(f"hybrid-warm: portal says this applicant ALREADY HAS a request "
+                          f"({booked_sig[:120]!r}) -- retiring the identity")
+                if self._emit is not None:
+                    self._emit("already_booked", detail=booked_sig)
+                return False
+            if not any(m in sched_html for m in _SCHED_PAGE_MARKERS):
+                errs = _form_error_text(sc_body)
+                self._log(f"hybrid-warm: Schedule.jsp has no scheduling markers (len={len(sched_html)}) "
+                          f"-- ScheduleController rejected (response {len(sc_body)}B); NOT warmed")
+                if errs:
+                    self._log("hybrid-warm: ScheduleController validation errors: "
+                              + " | ".join(e[:120] for e in errs))
+                    if any(m in " | ".join(errs).lower() for m in _ALREADY_BOOKED_MARKERS):
+                        self._identity_unavailable = True
+                        if self._emit is not None:
+                            self._emit("already_booked", detail=" | ".join(e[:200] for e in errs))
+                return False
+            # Verified bookable cursor established detached.
+            self.posto_pdf = self.posto_id
+            self._set_anchor("chain")
+            self._log(f"hybrid-warm: cursor established via primp (posto_pdf={self.posto_pdf}, "
+                      f"Schedule.jsp {len(sched_html)}B)")
+            return True
+        except Exception as e:
+            # Same taxonomy as the browser chain's except path: record the message so do_apply can
+            # tell a dead-exit (chrome-error/tunnel/connection) failure -- which _is_transient_login_
+            # failure matches and do_apply then rolls the exit for -- from a portal rejection.
+            self._warmup_last_error = str(e)
+            self._log(f"hybrid-warm: chain raised {type(e).__name__}: {str(e)[:140]}")
+            return False
+
+    def _discover_via_calendar_primp(self, dates: list[str]) -> list[dict]:
+        """HYBRID calendar discovery: gettime + getPeriodosOcupados on a detached primp client. These
+        are tokenless session-cookie GETs (ops_live uses browser_nav only by convention), so primp
+        returns the same bodies -- fed through the SAME parsers and the SAME phantom-round guard as
+        _discover_via_calendar. Proven live (probes/hybrid_booking_probe.py _discover_calendar_via_primp:
+        21/21 matched the browser calendar). Returns the do_discover 3-way per-date shape."""
+        try:
+            pc, H = self._primp_client()
+        except Exception as e:
+            self._log(f"hybrid-discover: primp client build failed ({str(e)[:90]}) -- all FAILED")
+            return [{"date": d, "outcome": "failed"} for d in dates]
+        # Shared gettime cache: a still-fresh special_days handed down by the Hub skips the gettime
+        # fetch entirely (same as the browser path). A cache hit arrives json-decoded, so undo the
+        # encoding; a miss fetches gettime fresh via primp and emits the result for the fleet cache.
+        special_days = getattr(self, "_pending_special_days", None)
+        self._pending_special_days = None
+        if special_days is not None:
+            special_days = special_days_from_json(special_days)
+        else:
+            try:
+                r = pc.get(f"{GETTIME_URL}?id_posto={self.posto_id}", headers=H)
+                gettime_body = r.text or ""
+            except Exception as e:
+                self._log(f"hybrid-discover: gettime GET failed ({str(e)[:90]}) -- all FAILED")
+                if self._is_transient_login_failure(str(e)):
+                    self._roll_exit("hybrid-discover: dead tunnel at gettime")
+                return [{"date": d, "outcome": "failed"} for d in dates]
+            gt_status = classify_gettime_body(gettime_body)
+            if gt_status != GettimeStatus.OK:
+                why = _classify_gettime_page(gettime_body)
+                self._log(f"hybrid-discover: gettime {gt_status} ({why}, {len(gettime_body)}B) -- "
+                          f"all {len(dates)} FAILED")
+                if self._emit is not None:
+                    self._emit("portal_health", phase="discover", kind=why, seconds=0.0,
+                               **self._health.snapshot())
+                return [{"date": d, "outcome": "failed"} for d in dates]
+            special_days = parse_special_days(gettime_body)
+            if self._emit is not None:
+                self._emit("gettime_result", special_days=special_days_to_json(special_days))
+        out: list[dict] = []
+        for d in dates:
+            try:
+                iso = date.fromisoformat(d)
+            except ValueError:
+                out.append({"date": d, "outcome": "failed"})
+                continue
+            if iso.day in special_days.get(iso.year, {}).get(iso.month, set()):
+                out.append({"date": d, "outcome": "empty"})
+                continue
+            url = (f"{GETPERIODOS_URL}?id_posto={self.posto_id}"
+                   f"&data_agendamento={iso.strftime('%Y/%m/%d')}")
+            html = None
+            for attempt in range(self.cfg.discovery.nav_retries + 1):
+                try:
+                    html = pc.get(url, headers=H).text or ""
+                    break
+                except Exception as e:
+                    if attempt < self.cfg.discovery.nav_retries:
+                        time.sleep(self.cfg.discovery.nav_backoff * (attempt + 1)
+                                   * random.uniform(0.7, 1.3))
+                    else:
+                        self._log(f"hybrid-discover: {d} GET error ({str(e)[:70]}) -- FAILED")
+            if html is None:
+                out.append({"date": d, "outcome": "failed"})
+                continue
+            m = re.search(r"periodos_ocupados='([0-9]*)", html)
+            if not m:
+                out.append({"date": d, "outcome": "failed"})
+                continue
+            free, _occ = parse_periodos_ocupados(m.group(1), max_period=self.cfg.discovery.max_period)
+            if free is None:
+                out.append({"date": d, "outcome": "failed"})
+            elif free:
+                out.append({"date": d, "outcome": "found", "periods": free, "raw": m.group(1)})
+            else:
+                out.append({"date": d, "outcome": "empty"})
+        return self._reject_phantom_round(out)
+
     def _run_warmup_steps(self) -> bool:
         """Questionnaire -> Formulario -> ScheduleController -> Schedule.jsp (confirmed URLs/flow,
         ported from storm-auto batch_apply._run_steps_2_to_6)."""
+        # HYBRID: run the whole chain on the detached primp client (no browser nav). Same contract
+        # (anchor on success, _warmup_last_error taxonomy, already-booked detection), so every caller
+        # -- do_warmup, do_apply's round-start re-warm, _do_keepalive, _rebuild_session -- is unchanged.
+        if self._hybrid("WARMUP"):
+            return self._primp_warmup_chain()
         _t0 = time.time()
         # Records the last EXCEPTION message so a caller can tell a dead-exit warmup failure (roll
         # the exit) from a portal rejection (do not). Cleared each run; only the except path below
@@ -2484,6 +2744,72 @@ class LiveEngineOps(EngineOps):
             pass
         self._do_keepalive(context + "/initial")
 
+    def _do_keepalive_primp(self, context: str) -> bool:
+        """HYBRID keepalive via primp (no browser nav -- the browser is parked). schedule mode holds a
+        fresh Schedule.jsp cursor by re-warming on primp before FORM_STATE_TTL; auth_only confirms the
+        session is authed. Returns True when the cycle was handled (incl. a bounded roll+restore or a
+        re-auth via the browser restore path), False only when it cannot build a primp client (then the
+        caller falls through to the browser keepalive). Mirrors the schedule/auth_only classification of
+        _do_keepalive, including the dead-trip ladder."""
+        mode = (getattr(self.cfg.keepalive, "mode", "auth_only") or "auth_only").strip().lower()
+        try:
+            pc, H = self._primp_client()
+        except Exception:
+            return False
+        sched = mode == "schedule"
+        url = (SCHED_JSP + "?posto_id=" + str(self.posto_pdf or self.posto_id)) if sched else HOME_URL
+        try:
+            r = pc.get(url, headers=H)
+            page = r.text or ""
+            final_url = getattr(r, "url", url) or url
+        except Exception as e:
+            # Connection-level failure = dead exit or portal down. Mirror the browser dead-trip ladder.
+            self._keepalive_dead_streak = getattr(self, "_keepalive_dead_streak", 0) + 1
+            dead_trip = max(1, int(self.cfg.keepalive.dead_trip))
+            self._log(f"keepalive[hybrid]: primp probe error ({str(e)[:90]}) "
+                      f"streak={self._keepalive_dead_streak}/{dead_trip} ({context})")
+            if self._keepalive_dead_streak >= dead_trip:
+                self._keepalive_dead_streak = 0
+                self._roll_exit("keepalive[hybrid]: dead exit")
+                self._attempt_keepalive_restore(context)
+            return True
+        # Auth lost -> re-authenticate (needs the reCAPTCHA browser login; restore owns that).
+        if "Authentication.jsp" in (final_url or "") or "Authentication.jsp" in page[:3000]:
+            self._log(f"keepalive[hybrid]: session expired (auth redirect, {context}) -- re-authenticating")
+            self._attempt_keepalive_restore(context)
+            return True
+        if self._is_dead_exit_response(page, final_url):
+            self._log(f"keepalive[hybrid]: dead exit ({len(page)}B, {context}) -- rolling + restoring")
+            self._roll_exit("keepalive[hybrid]: dead exit")
+            self._attempt_keepalive_restore(context)
+            return True
+        self._keepalive_dead_streak = 0
+        self._portal_down_streak = 0
+        if not sched:
+            if getattr(self, "_keep_unbookable", False):
+                self._mark_keep_bookable(True)
+            self._slog("keepalive", result="ok", mode="auth_only", via="primp", ctx=context)
+            return True
+        cursor_present = any(m in page for m in _SCHED_PAGE_MARKERS)
+        if cursor_present and self.is_warmed():
+            if getattr(self, "_keep_unbookable", False):
+                self._mark_keep_bookable(True)
+            self._slog("keepalive", result="ok", mode="schedule", via="primp", cursor="fresh",
+                       ctx=context)
+            return True
+        # Cursor absent/stale -> re-warm (self._run_warmup_steps is already the primp chain under
+        # hybrid). A failed re-warm keeps the authed session but marks the worker not-bookable.
+        self._log(f"keepalive[hybrid]: cursor {'ABSENT' if not cursor_present else 'stale'} -- "
+                  f"re-warming via primp ({context})")
+        if self._run_warmup_steps():
+            self._mark_keep_bookable(True)
+            self._slog("keepalive", result="ok", mode="schedule", via="primp", cursor="rewarmed",
+                       ctx=context)
+        else:
+            self._mark_keep_bookable(False, why="hybrid keepalive re-warm failed")
+            self._slog("keepalive", result="rewarm_failed", mode="schedule", via="primp", ctx=context)
+        return True
+
     def _do_keepalive(self, context: str) -> None:
         if self.cfg.keepalive.off:
             return
@@ -2500,6 +2826,12 @@ class LiveEngineOps(EngineOps):
             if getattr(self, "_keepalive_restore_attempts", 0) >= _MAX_KEEPALIVE_RESTORE_ATTEMPTS:
                 return
             self._attempt_keepalive_restore(context)
+            return
+        # HYBRID: keep the session alive via primp (no browser nav -- the browser is parked, so its
+        # navs can't stale the cursor). schedule mode re-warms the cursor on primp; auth_only just
+        # confirms the session is still authed. Falls through to the browser path on anything it
+        # cannot resolve detached (e.g. a re-auth, which needs the reCAPTCHA browser login).
+        if self._hybrid("KEEPALIVE") and self._do_keepalive_primp(context):
             return
         # AUTH-ONLY (2026-09-09, consolidated from the HOLD_AUTHED_ONLY A/B -- Test 0907 vs
         # Test 0907-auth matched on outcome, 2/2 booked each, ~same apply latency, while the
@@ -3452,6 +3784,10 @@ class LiveEngineOps(EngineOps):
     def _discover_via_calendar(self, dates: list[str]) -> list[dict]:
         """gettime + getPeriodosOcupados -- the confirmed path, logic untouched. Split out of
         do_discover only so DISCOVERY_SOURCE can dispatch without editing a line of it."""
+        # HYBRID: the calendar GETs are tokenless -- run them detached on primp (browser untouched).
+        # The primp path consumes the Hub's shared gettime cache the same way the browser path does.
+        if self._hybrid("DISCOVERY"):
+            return self._discover_via_calendar_primp(dates)
         out = []
         special_days = getattr(self, "_pending_special_days", None)
         self._pending_special_days = None
@@ -3967,7 +4303,7 @@ class LiveEngineOps(EngineOps):
                 # fast-fail (~15-20s) so the worker re-fires several times per up-window.
                 _submit_timeout = max(5.0, float(self.cfg.raw.get("APPLY_SUBMIT_TIMEOUT", 100.0)
                                                  or 100.0))
-                if bool(self.cfg.raw.get("HYBRID_SUBMIT", False)):
+                if self._hybrid("SUBMIT"):
                     # HYBRID: submit via a detached primp client (confirmed to book). The %PDF is
                     # fetched via the browser below -- POSTPONED, because the artifact endpoint 403s
                     # a detached client and the booking is already made by submit time.

@@ -563,17 +563,45 @@ _BOOKING = [
        "A bounce must never end the run -- the authed session is the expensive thing. Note the park "
        "is only 3 poll gaps (~15-20s), which measurement showed is too short to brake a repeating "
        "failure."),
-    _s("HYBRID_SUBMIT", L.BOOKING, bool, False, group="guards",
+    _s("HYBRID_MODE", L.BOOKING, bool, True, group="guards",
        note=
-       "HYBRID mode (CONFIRMED 2026-10-07): send the SubmeterVistoCriaPDF submit via a DETACHED primp "
-       "client on the worker's SAME exit with the browser's cookies, instead of the in-page browser "
-       "XHR. The portal's only post-login gate is reCAPTCHA (server-side token); the submit carries no "
-       "token, so a detached client books (status 200, ~1.5KB). Benefits: the submit no longer depends "
-       "on a live in-page origin (opaque-origin/down-window slips can't strand it) and is lighter/"
-       "faster -- the 'ride the window' lever. The %PDF artifact 403s a detached client, so it is "
-       "POSTPONED and fetched via the browser after the booking is confirmed (the browser is already "
-       "open for login+warmup). Login + warmup still use the browser (reCAPTCHA). Default OFF; validate "
-       "live before fleet-wide. Pairs with schedule mode + APPLY_SUBMIT_TIMEOUT."),
+       "FULL HYBRID (CONFIRMED end-to-end 2026-10-08, 3 live bookings): run as many steps as possible "
+       "on a DETACHED primp client on the worker's SAME sticky exit with the browser's cookies, keeping "
+       "the browser ONLY for the two steps that genuinely need it -- LOGIN (reCAPTCHA token lifecycle) "
+       "and the PDF artifact (MostrarPdf 403s a detached client). The portal's only post-login gate is "
+       "reCAPTCHA (a server-side token carried only by login + /slots); warm-up, keepalive, CALENDAR "
+       "discovery (gettime+getPeriodosOcupados -- tokenless cookie GETs), the pre-submit re-warm and the "
+       "submit are all cookie-gated and confirmed to work detached. Benefit: the whole hot path leaves "
+       "the heavy browser (host-overload) and the nav-bound cursor behind -- primp doesn't navigate, so "
+       "the cursor stays fresh and keeping survives the unstable hot period. Master switch; it gates the "
+       "four HYBRID_* legs below (effective leg = HYBRID_MODE AND HYBRID_<leg>). Default ON. Set OFF to "
+       "fall back to the all-browser path, or disable a single leg below if it misbehaves."),
+    _s("HYBRID_SUBMIT", L.BOOKING, bool, True, group="guards",
+       note=
+       "HYBRID leg: send the SubmeterVistoCriaPDF submit via the detached primp client instead of the "
+       "in-page browser XHR (confirmed books, status 200 ~1.5KB). Effective only when HYBRID_MODE is on "
+       "(effective = HYBRID_MODE AND HYBRID_SUBMIT). The %PDF is fetched via the browser afterward "
+       "(postponed; the booking is already made). Default ON; set OFF to keep just the submit on the "
+       "browser while other legs stay hybrid."),
+    _s("HYBRID_WARMUP", L.BOOKING, bool, True, group="guards",
+       note=
+       "HYBRID leg: run the warm-up / re-warm quest chain (home-lang -> Questionario -> quest steps -> "
+       "Formulario/CSRF -> ScheduleController -> Schedule.jsp) on the detached primp client (confirmed; "
+       "establishes the bookable cursor without the browser). Effective = HYBRID_MODE AND HYBRID_WARMUP. "
+       "Default ON."),
+    _s("HYBRID_DISCOVERY", L.BOOKING, bool, True, group="guards",
+       note=
+       "HYBRID leg: run CALENDAR discovery (gettime + getPeriodosOcupados -- tokenless session-cookie "
+       "GETs) on the detached primp client (confirmed to return the same availability as the browser "
+       "nav). Effective = HYBRID_MODE AND HYBRID_DISCOVERY, and ONLY the calendar leg -- /slots stays "
+       "browser-mediated (its reCAPTCHA token lives in-page), so pair with DISCOVERY_SOURCE=calendar. "
+       "Default ON."),
+    _s("HYBRID_KEEPALIVE", L.BOOKING, bool, True, group="guards",
+       note=
+       "HYBRID leg: run keepalive (the schedule-mode active-cursor re-warm, or the auth_only liveness "
+       "probe) on the detached primp client, so KEEPING holds a bookable session through the portal's "
+       "down-windows without the browser navigating (which would stale the cursor). Effective = "
+       "HYBRID_MODE AND HYBRID_KEEPALIVE. Default ON."),
     _s("APPLY_SUBMIT_TIMEOUT", L.BOOKING, float, 100.0, group="guards", min_value=5.0,
        note=
        "STRESS MODE lever. Timeout (s) for the SubmeterVistoCriaPDF submit XHR. Default 100 (the "
