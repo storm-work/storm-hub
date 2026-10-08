@@ -596,6 +596,17 @@ _BOOKING = [
        "nav). Effective = HYBRID_MODE AND HYBRID_DISCOVERY, and ONLY the calendar leg -- /slots stays "
        "browser-mediated (its reCAPTCHA token lives in-page), so pair with DISCOVERY_SOURCE=calendar. "
        "Default ON."),
+    _s("HYBRID_CLOSE_BROWSER", L.BOOKING, bool, True, group="guards",
+       note=
+       "HYBRID leg (Phase C, CONFIRMED 2026-10-08): after login + checkpoint, CLOSE the Playwright "
+       "browser and run the entire hot path (warm-up, keepalive, discovery, re-warm, submit) "
+       "browserless on primp, freeing the browser's RAM/handles for the whole hold. The engine's "
+       "close_browser() keeps the primp session alive ('primp carries the session forward'); the %PDF "
+       "reopens a fresh browser on the same exit with the saved cookie jar injected (confirmed: session "
+       "survives the close, real booking + 240KB %PDF). A dead-exit re-login reopens a browser (and the "
+       "next primp step re-closes it). Effective = HYBRID_MODE AND HYBRID_CLOSE_BROWSER. This frees "
+       "browser resources over long holds; it does NOT reduce the acute login-concurrency peak (that is "
+       "WARMUP_START_JITTER / concurrency). Default ON; set OFF to keep the browser parked (Phase B)."),
     _s("HYBRID_KEEPALIVE", L.BOOKING, bool, True, group="guards",
        note=
        "HYBRID leg: run keepalive (the schedule-mode active-cursor re-warm, or the auth_only liveness "

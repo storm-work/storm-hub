@@ -642,6 +642,15 @@ class LiveEngineOps(EngineOps):
         self.booking_id = booking_id
 
         self.session = None
+        # HYBRID Phase C (HYBRID_CLOSE_BROWSER): once the browser is closed after login, the hot path
+        # is browserless -- primp sources cookies/UA from these caches (a browser read would fail /
+        # hang on the dead driver). _browser_closed flips back to False whenever a fresh session is
+        # built (re-login / PDF reopen), and the lazy-close in _primp_client re-closes on the next
+        # primp step.
+        self._browser_closed = False
+        self._hybrid_cookies: dict = {}
+        self._hybrid_full_jar: list = []
+        self._hybrid_ua: str = ""
         self.posto_pdf: str | None = None
         # HOW and WHEN the booking anchor was established. `posto_pdf` alone cannot answer either,
         # and it means two different things depending on which of its two writers set it:
@@ -753,6 +762,10 @@ class LiveEngineOps(EngineOps):
         return False
 
     def do_login(self) -> bool:
+        # A (re-)login builds a fresh browser session (restore or fresh), so the Phase-C closed state
+        # is cleared here; the next primp hot-path step re-closes it via the lazy-close in
+        # _primp_client. This is how a dead-exit recovery gets its browser back for the reCAPTCHA login.
+        self._browser_closed = False
         if self._login_sem is not None:
             if not self._login_sem.acquire(self.identity_id, timeout=300):
                 self._log("do_login: login concurrency gate timed out")
@@ -833,6 +846,7 @@ class LiveEngineOps(EngineOps):
                 headless=self.headless,
                 fp_seed=self.account.get("username"),
             )
+            self._browser_closed = False   # fresh live browser (Phase C invariant)
         except Exception as e:
             # The browser/proxy never came up -- this says nothing about the stored cookies, so the
             # checkpoint is kept for the next attempt.
@@ -1355,6 +1369,7 @@ class LiveEngineOps(EngineOps):
                 self._close_session_quietly()
                 self.session = get_session(proxy=self.warm_proxy, headless=self.headless,
                                            fp_seed=self.account.get("username"))
+                self._browser_closed = False   # fresh live browser (Phase C invariant)
                 # Baseline the exit before the CAPTCHA is solved, so a rejection can be attributed
                 # (or not) to the address moving underneath the solve.
                 self._note_exit_ip("before login attempt")
@@ -1786,6 +1801,7 @@ class LiveEngineOps(EngineOps):
     _HYBRID_LEG_KEYS = {
         "SUBMIT": "HYBRID_SUBMIT", "WARMUP": "HYBRID_WARMUP",
         "DISCOVERY": "HYBRID_DISCOVERY", "KEEPALIVE": "HYBRID_KEEPALIVE",
+        "CLOSE_BROWSER": "HYBRID_CLOSE_BROWSER",
     }
 
     def _hybrid(self, leg: str) -> bool:
@@ -1797,24 +1813,78 @@ class LiveEngineOps(EngineOps):
         raw = self.cfg.raw
         return bool(raw.get("HYBRID_MODE", True)) and bool(raw.get(self._HYBRID_LEG_KEYS[leg], True))
 
-    def _primp_client(self):
-        """A primp.Client on the worker's warm exit, seeded with the browser's portal cookies, plus
-        the (cookie_header, ua) to replay on each request. Cookies are re-read from the live browser
-        every call so a mid-session refresh can't leave primp on a stale Vistos_sid."""
-        import primp
+    def _cache_and_close_browser(self) -> None:
+        """Phase C: cache the cookie jar + UA while the browser is still alive, then close it. The
+        engine's close_browser() keeps the primp session alive, so the hot path continues browserless."""
+        try:
+            self._hybrid_full_jar = self.session.get_all_cookies() or []
+        except Exception:
+            self._hybrid_full_jar = []
+        self._hybrid_cookies = {c["name"]: c["value"] for c in self._hybrid_full_jar
+                                if isinstance(c, dict)
+                                and c.get("name") in ("Vistos_sid", "cookiesession1")}
+        try:
+            self._hybrid_ua = (self.session.browser_eval("navigator.userAgent") or "").strip() \
+                or "Mozilla/5.0"
+        except Exception:
+            self._hybrid_ua = "Mozilla/5.0"
+        try:
+            self.session.close_browser()
+        except Exception as e:
+            self._log(f"hybrid: close_browser raised {type(e).__name__}: {str(e)[:80]}")
+        self._browser_closed = True
+        self._log(f"hybrid: browser CLOSED after login -- hot path is browserless on primp "
+                  f"({len(self._hybrid_cookies)} session cookies cached)")
+
+    def _ensure_browser_for_pdf(self) -> None:
+        """Phase C: the %PDF artifact needs a browser (MostrarPdf 403s a detached client). When the
+        hot-path browser was closed, reopen a fresh one on the SAME exit with the saved jar injected
+        (authed, skips the WAF challenge). Terminal step -- the worker ends after a booking, so this
+        reopened browser is cleaned up on worker exit; the next primp step (none, post-booking) would
+        re-close it via the lazy-close anyway."""
+        if not self._browser_closed:
+            return
+        try:
+            self._close_session_quietly()
+            self.session = get_session(
+                proxy=self.warm_proxy, inject_cookies_full=self._hybrid_full_jar,
+                headless=self.headless, fp_seed=self.account.get("username"))
+            self._browser_closed = False
+            self._log("hybrid: reopened a cookie-injected browser for the PDF")
+        except Exception as e:
+            self._log(f"hybrid: PDF browser reopen failed ({type(e).__name__}: {str(e)[:80]}) "
+                      f"-- booking IS confirmed, PDF missing")
+
+    def _primp_creds(self):
+        """(cookies_dict, ua) for a detached primp request, and the Phase-C lazy-close trigger: when
+        HYBRID_CLOSE_BROWSER is on, the FIRST call here closes the now-unneeded browser and every call
+        thereafter serves cookies/UA from the pre-close cache. While the browser is open, cookies are
+        re-read live so a mid-session refresh can't leave primp on a stale Vistos_sid."""
+        if self._hybrid("CLOSE_BROWSER") and not self._browser_closed and self.session is not None:
+            self._cache_and_close_browser()
+        if self._browser_closed:
+            return dict(self._hybrid_cookies), (self._hybrid_ua or "Mozilla/5.0")
         cookies = {c["name"]: c["value"] for c in (self.session.get_all_cookies() or [])
                    if isinstance(c, dict) and c.get("name") in ("Vistos_sid", "cookiesession1")}
         try:
             ua = (self.session.browser_eval("navigator.userAgent") or "").strip()
         except Exception:
             ua = ""
+        return cookies, (ua or "Mozilla/5.0")
+
+    def _primp_client(self):
+        """A primp.Client on the worker's warm exit, seeded with the portal cookies, plus the
+        (cookie_header, ua) header map to replay on each request. Sources creds via _primp_creds (so
+        it triggers the Phase-C lazy-close and serves the cache when the browser is gone)."""
+        import primp
+        cookies, ua = self._primp_creds()
         pc = primp.Client(proxy=self.warm_proxy, verify=False, timeout=45, follow_redirects=True)
         try:
             pc.set_cookies(_PORTAL_ORIGIN + "/", cookies)
         except Exception:
             pass
         ck = "; ".join(f"{k}={v}" for k, v in cookies.items())
-        return pc, {"User-Agent": ua or "Mozilla/5.0", "Cookie": ck}
+        return pc, {"User-Agent": ua, "Cookie": ck}
 
     def _primp_warmup_chain(self) -> bool:
         """HYBRID warm-up: the whole quest chain on a detached primp client (home-lang POST ->
@@ -2459,6 +2529,7 @@ class LiveEngineOps(EngineOps):
 
         old_session = self.session
         self.session = new_session
+        self._browser_closed = False   # fresh live browser on the swapped exit
         if not self._probe_swapped_session():
             self._log("do_swap: new session failed health check -- reverting to phase-1 proxy")
             self.session = old_session
@@ -2619,8 +2690,9 @@ class LiveEngineOps(EngineOps):
         except Exception:
             return False
         ip = None
-        if self.session is not None:
-            # FETCH, NEVER NAVIGATE.
+        if self.session is not None and not getattr(self, "_browser_closed", False):
+            # FETCH, NEVER NAVIGATE. (Skipped when the Phase-C browser is closed -- a browser_eval on
+            # the dead driver would hang/raise; the primp observe_exit_ip fallback below runs instead.)
             #
             # This used to browser_nav() to the echo, which took the live browser OFF the portal --
             # and _run_warmup_steps calls it at "warmed", i.e. immediately after the chain finishes
@@ -4089,12 +4161,7 @@ class LiveEngineOps(EngineOps):
         afterward (see the PDF block) -- by then the booking is already made."""
         import primp
         from urllib.parse import urlencode
-        cookies = {c["name"]: c["value"] for c in (self.session.get_all_cookies() or [])
-                   if isinstance(c, dict) and c.get("name") in ("Vistos_sid", "cookiesession1")}
-        try:
-            ua = (self.session.browser_eval("navigator.userAgent") or "").strip()
-        except Exception:
-            ua = ""
+        cookies, ua = self._primp_creds()   # cached when the Phase-C browser is closed
         pc = primp.Client(proxy=self.warm_proxy, verify=False,
                           timeout=int(max(5.0, timeout)), follow_redirects=True)
         try:
@@ -4278,15 +4345,21 @@ class LiveEngineOps(EngineOps):
             # round-start warm-up alone (the PRE-SUBMIT read below confirms an intact cursor); form_
             # stale with that intact cursor is a DISCOVERY/slot-taken problem, not an apply one
             # (see [[pt_apply_path_confirmed_live]]).
-            try:
-                _pre = self.session.browser_eval("document.documentElement.outerHTML") or ""
-                _marks = [m for m in _SCHED_PAGE_MARKERS if m in _pre]
-                _t = re.search(r"<title[^>]*>(.*?)</title>", _pre, re.S | re.I)
-                self._log(f"do_apply: PRE-SUBMIT doc {len(_pre)}B markers={_marks or 'NONE'} "
-                          f"title={(_t.group(1).strip()[:50] if _t else '?')!r} "
-                          f"origin_ok={self._on_portal_origin()}")
-            except Exception as e:
-                self._log(f"do_apply: PRE-SUBMIT doc unreadable ({type(e).__name__}: {str(e)[:90]})")
+            # Skip the browser PRE-SUBMIT read when the Phase-C browser is closed -- there is no live
+            # DOM to inspect (the cursor lives server-side, re-established by the primp re-warm), and a
+            # browser_eval on the dead driver would hang. Diagnostic only; nothing downstream needs it.
+            if self._browser_closed:
+                self._log("do_apply: PRE-SUBMIT (hybrid, browser closed) -- cursor re-warmed on primp")
+            else:
+                try:
+                    _pre = self.session.browser_eval("document.documentElement.outerHTML") or ""
+                    _marks = [m for m in _SCHED_PAGE_MARKERS if m in _pre]
+                    _t = re.search(r"<title[^>]*>(.*?)</title>", _pre, re.S | re.I)
+                    self._log(f"do_apply: PRE-SUBMIT doc {len(_pre)}B markers={_marks or 'NONE'} "
+                              f"title={(_t.group(1).strip()[:50] if _t else '?')!r} "
+                              f"origin_ok={self._on_portal_origin()}")
+                except Exception as e:
+                    self._log(f"do_apply: PRE-SUBMIT doc unreadable ({type(e).__name__}: {str(e)[:90]})")
 
             body = booking_payload(self.quest_steps, slot, residence=self.residence)
             submit_url = SUBMIT_URL + "?posto_id=" + str(self.posto_pdf)
@@ -4367,6 +4440,7 @@ class LiveEngineOps(EngineOps):
                 # yields a real document; a rejected one yields an empty/absent render (confirmed
                 # 2026-08-14 -- that exact shell came back for an appointment that does not exist).
                 pdf_body = b""
+                self._ensure_browser_for_pdf()   # Phase C: reopen a browser if the hot path closed it
                 try:
                     pdf_body = self._fetch_pdf_in_page(_final_url)
                 except Exception as e:
@@ -4431,6 +4505,7 @@ class LiveEngineOps(EngineOps):
             if self._emit is not None:
                 self._emit("booked", slot=slot)
             pdf_body = b""
+            self._ensure_browser_for_pdf()   # Phase C: reopen a browser if the hot path closed it
             try:
                 # PT flow: the MostrarPdf form is in the XHR RESPONSE BODY, not the live DOM -- parse
                 # it out and fetch directly (fixes route_never_captured, 2026-09-26).

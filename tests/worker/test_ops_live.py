@@ -1642,6 +1642,57 @@ def test_do_keepalive_hybrid_routes_to_primp():
     assert seen == ["hold"]
 
 
+# ── Phase C (HYBRID_CLOSE_BROWSER): close the browser after login, run browserless ──────────────
+class _CloseSession(_FakeSession):
+    def __init__(self):
+        super().__init__(cookies=[{"name": "Vistos_sid", "value": "abc"},
+                                  {"name": "cookiesession1", "value": "z"}])
+        self.close_calls = 0
+
+    def browser_eval(self, js):
+        if "userAgent" in (js or ""):
+            return "UA/test"
+        return super().browser_eval(js)
+
+    def close_browser(self, timeout=10):
+        self.close_calls += 1
+
+
+def test_hybrid_close_browser_lazy_closes_on_first_primp_and_caches():
+    """HYBRID_CLOSE_BROWSER: the first _primp_creds() caches cookies/UA + closes the browser; later
+    calls serve the cache without touching the (now dead) browser."""
+    ops = _make_ops(cfg=_hybrid_cfg()); s = _CloseSession(); ops.session = s
+    cookies, ua = ops._primp_creds()
+    assert s.close_calls == 1 and ops._browser_closed
+    assert cookies == {"Vistos_sid": "abc", "cookiesession1": "z"} and ua == "UA/test"
+    # second call must NOT re-close and must NOT read the closed browser
+    s.browser_eval = lambda *a, **k: pytest.fail("must not read a closed browser")
+    s.get_all_cookies = lambda: pytest.fail("must not read a closed browser")
+    c2, ua2 = ops._primp_creds()
+    assert s.close_calls == 1 and (c2, ua2) == (cookies, ua)
+
+
+def test_hybrid_close_browser_off_keeps_the_browser_open():
+    """With HYBRID_CLOSE_BROWSER off, _primp_creds reads live and never closes the browser."""
+    ops = _make_ops(cfg=_hybrid_cfg(HYBRID_CLOSE_BROWSER=False)); s = _CloseSession(); ops.session = s
+    ops._primp_creds()
+    assert s.close_calls == 0 and not ops._browser_closed
+
+
+def test_ensure_browser_for_pdf_reopens_a_cookie_injected_browser(monkeypatch):
+    """Phase C PDF: when the hot-path browser was closed, _ensure_browser_for_pdf reopens one with the
+    saved jar injected and clears the closed flag."""
+    import apps.worker.ops_live as o
+    ops = _make_ops(cfg=_hybrid_cfg())
+    ops._browser_closed = True
+    ops._hybrid_full_jar = [{"name": "Vistos_sid", "value": "abc"}]
+    captured = {}
+    monkeypatch.setattr(o, "get_session", lambda **k: captured.update(k) or _FakeSession())
+    ops._ensure_browser_for_pdf()
+    assert not ops._browser_closed
+    assert captured.get("inject_cookies_full") == ops._hybrid_full_jar
+
+
 def test_apply_submit_timeout_is_tunable_for_stress_mode():
     """APPLY_SUBMIT_TIMEOUT (default 100) controls the submit XHR timeout so stress mode can fast-fail
     a down-portal submit instead of hanging ~100s across the up-window."""
