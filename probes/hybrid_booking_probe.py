@@ -19,10 +19,26 @@ WOULD submit + that discovery worked. WITH --book it makes a REAL appointment on
 operator-run only, exactly like a live apply. Retries login+warmup across identities/exits so a login
 failure doesn't rob the test.
 
+EXPERIMENT #1 (--warmup-via primp): the browser does LOGIN ONLY; the ENTIRE warm-up quest chain
+(home-lang -> Questionario -> quest steps -> Formulario -> ScheduleController -> Schedule.jsp) runs
+on a DETACHED primp client on the same exit + cookies. If it establishes the booking-form markers
+AND a following primp submit books, then warm-up does NOT need the browser -- the gate for moving
+KEEPING (which must survive the portal's unstable hot period) off the heavy browser and onto primp.
+Default --warmup-via browser keeps the proven path (browser login+warmup, primp submit only).
+
 Usage:
   cd /srv/projects/storm-hub
   .venv/bin/python probes/hybrid_booking_probe.py --booking "Test2" --pool soax --geo DE [--book]
   .venv/bin/python probes/hybrid_booking_probe.py --posto 3059 --nat CPV --res IRL --pool soax [--book]
+  # Experiment #1 -- warm-up on primp (browser logs in only):
+  .venv/bin/python probes/hybrid_booking_probe.py --booking "Test2" --pool soax --geo DE --warmup-via primp [--book]
+
+Discovery flags (find the real open slots instead of an arbitrary window):
+  --discovery-source {both|calendar|slots}  default both: /slots first, then the CALENDAR
+                                             (gettime+getPeriodosOcupados) fallback -- the proven path.
+  --start YYYY-MM-DD / --end YYYY-MM-DD      scan window (default today+1 .. today+120)
+  --max-dates N (default 90)                 cap on dates scanned
+  --weekends                                 include Sat/Sun (default weekdays only)
 """
 import os
 import random
@@ -53,6 +69,33 @@ def _arg(flag, default=None):
     return sys.argv[sys.argv.index(flag) + 1] if flag in sys.argv else default
 
 
+# Local ledger of appointments THIS probe booked. The probe books on the live portal but never
+# writes a BookedAppointment row (it is not the Hub), so without this the DB-side `booked` filter
+# cannot see the probe's own bookings and the session cache happily re-picks a spent identity (which
+# then hits the portal's "applicant already has a request"). Keyed by identity_id; records posto for
+# visibility. Any identity in here is excluded from the candidate pool AND the session-cache prefer.
+_BOOKED_LEDGER = _ROOT / "var" / "probe_booked_identities.json"
+
+
+def _load_probe_booked() -> dict:
+    import json
+    try:
+        return json.loads(_BOOKED_LEDGER.read_text()) if _BOOKED_LEDGER.exists() else {}
+    except Exception:
+        return {}
+
+
+def _record_probe_booked(identity_id: str, posto, nat, res) -> None:
+    import json, time as _t
+    data = _load_probe_booked()
+    data[identity_id] = {"posto": str(posto), "nat": nat, "res": res, "ts": int(_t.time())}
+    try:
+        _BOOKED_LEDGER.parent.mkdir(parents=True, exist_ok=True)
+        _BOOKED_LEDGER.write_text(json.dumps(data, indent=2))
+    except Exception:
+        pass
+
+
 def _mint_proxy(pool, settings, geo):
     if pool in ("soax", "rotating"):
         from libs.proxies.rotating import mint_rotating_url
@@ -67,8 +110,12 @@ def _mint_proxy(pool, settings, geo):
     return conn_url(random.choice(rows), geo=geo) if rows else None
 
 
-def _warm(pool, geo, posto, nat, res, log, headless=True, tries=8, exit_tries=4):
-    """Login + warmup via the production LiveEngineOps, retrying identities/exits. Returns ops|None."""
+def _warm(pool, geo, posto, nat, res, log, headless=True, tries=8, exit_tries=4, login_only=False):
+    """Login + warmup via the production LiveEngineOps, retrying identities/exits. Returns ops|None.
+
+    login_only=True stops after a successful do_login (NO do_warmup) -- used by the warmup-via-primp
+    experiment so the browser only ever carries the reCAPTCHA login and primp is left to prove the
+    warm-up chain on its own. The session cache is NOT banked in this mode (nothing warmed)."""
     from sqlalchemy import select
     from apps.hub.db import SessionLocal
     from libs.db import models as M
@@ -88,6 +135,13 @@ def _warm(pool, geo, posto, nat, res, log, headless=True, tries=8, exit_tries=4)
     quest_steps = (quest.value if quest else {})
     form_defaults = (formd.value if formd else {})
     booked = {r[0] for r in db.execute(select(M.BookedAppointment.identity_id)).all() if r[0]}
+    # Fold in the probe's OWN bookings (invisible to the DB -- see _BOOKED_LEDGER). An identity the
+    # probe already booked is spent portal-side ("applicant already has a request"), so exclude it
+    # exactly like a real BookedAppointment, whatever posto it was.
+    probe_booked = set(_load_probe_booked().keys())
+    if probe_booked:
+        log(f"excluding {len(probe_booked)} identity(ies) this probe already booked (local ledger)")
+    booked |= probe_booked
     running = {r[0] for r in db.execute(select(M.Worker.identity_id).where(M.Worker.status == "RUNNING")).all()}
     cands = db.scalars(select(M.Identity).where(M.Identity.status == "ACTIVE").limit(400)).all()
     random.shuffle(cands)
@@ -96,13 +150,28 @@ def _warm(pool, geo, posto, nat, res, log, headless=True, tries=8, exit_tries=4)
     # once; re-runs ride the banked session.
     _cache = _ROOT / "var" / "probe_session_identity.txt"
     _pref = _cache.read_text().strip() if _cache.exists() else ""
+    if _pref and _pref in booked:
+        # The banked identity is now spent (booked by the probe or for real) -- never prefer it, or
+        # every re-run restores a checkpoint for an identity the portal will reject as already-having
+        # a request. Drop the stale cache so the next warm banks a fresh one.
+        log(f"session cache: banked identity {_pref[:8]} is spent (booked) -- ignoring + clearing cache")
+        try: _cache.unlink()
+        except Exception: pass
+        _pref = ""
     if _pref:
         cands.sort(key=lambda i: 0 if i.id == _pref else 1)
         if cands and cands[0].id == _pref:
             log(f"session cache: trying banked identity {_pref[:8]} first (checkpoint restore)")
 
+    # DISCOVERY_SOURCE: default 'both' -- /slots FIRST, then the CALENDAR (gettime +
+    # getPeriodosOcupados) fallback for every date /slots did not definitively answer. /slots alone
+    # returns {"data":[]} even when the posto has open slots (it reads the live page's own feed, which
+    # lags / needs its own token), so 'both' is what actually surfaces availability -- the calendar is
+    # this project's PROVEN discovery path ([[confirmed_booking_pipeline]]). Override with
+    # --discovery-source {both|calendar|slots}.
+    disc_source = (_arg("--discovery-source", "both")).lower()
     cfg = EngineConfig.from_settings(resolve({L.GLOBAL: g, L.BOOKING: {
-        "DISCOVERY_SOURCE": "slots", "KEEPALIVE_MODE": "schedule"}}))
+        "DISCOVERY_SOURCE": disc_source, "KEEPALIVE_MODE": "schedule"}}))
     vendor_env.apply(resolve({L.GLOBAL: g}))
     # Faster login for the experiment: HUMAN_BEHAVIOR pacing lengthens the login, widening the window
     # in which a rotating exit can move mid-solve ('confirma o reCAPTCHA'). The warmup/submit do not
@@ -135,6 +204,10 @@ def _warm(pool, geo, posto, nat, res, log, headless=True, tries=8, exit_tries=4)
             try:
                 if not ops.do_login():
                     ops._close_session_quietly(); proxy = roll_rotating_url(proxy); continue
+                if login_only:
+                    db.close()
+                    log(f"LOGGED IN ✓ (login-only, warm-up deferred to primp) ({ident.full_name[:22]!r})")
+                    return ops, quest_steps, res
                 if not ops.do_warmup():
                     log("  warmup failed"); ops._close_session_quietly()
                     proxy = roll_rotating_url(proxy); continue
@@ -155,6 +228,140 @@ def _warm(pool, geo, posto, nat, res, log, headless=True, tries=8, exit_tries=4)
                 proxy = roll_rotating_url(proxy)
     db.close()
     return None, quest_steps, res
+
+
+def _parse_inputs(html: str) -> dict:
+    """Mirror the browser's `querySelectorAll('input')` field harvest with two regexes (name-then-
+    value AND value-then-name), so a detached warmup gathers the same Formulario fields the in-page
+    chain does regardless of attribute order."""
+    fields: dict = {}
+    for m in re.finditer(r'<input\b[^>]*\bname=["\']([^"\']+)["\'][^>]*\bvalue=["\']([^"\']*)["\']', html, re.I):
+        fields.setdefault(m.group(1), m.group(2))
+    for m in re.finditer(r'<input\b[^>]*\bvalue=["\']([^"\']*)["\'][^>]*\bname=["\']([^"\']+)["\']', html, re.I):
+        fields.setdefault(m.group(2), m.group(1))
+    return fields
+
+
+def _warmup_via_primp(ops, quest_steps, res, log):
+    """EXPERIMENT #1 -- run the WHOLE warm-up quest chain on a DETACHED primp client (same exit +
+    cookies as the just-completed BROWSER login), never the browser. Mirrors _run_warmup_steps step
+    for step, reusing the engine's own payload builders so it is faithful, not a re-guess:
+
+        home-lang POST -> Questionario GET -> N quest-step GETs -> Formulario POST (csrf) ->
+        ScheduleController POST (multipart) -> Schedule.jsp GET (markers)
+
+    Returns (chain_ok, markers_present). chain_ok = every step answered as expected and a CSRF came
+    back; markers_present = the final Schedule.jsp carried the booking-form markers (the positive
+    proof the detached chain actually established a bookable cursor). If this returns (True, True)
+    AND a subsequent primp submit books, warm-up does NOT need the browser -- which is the gate for
+    moving KEEPING onto primp (so it survives the hot period without the heavy browser)."""
+    import primp
+    from apps.worker.ops_live import (
+        HOME_URL, QUEST_URL, QUEST_NEXT, FORMULARIO, SCHED_CTRL, SCHED_JSP,
+        _extract_csrf, _SCHED_PAGE_MARKERS,
+    )
+    from libs.engine.payload import schedule_controller_payload
+
+    cookies = {c["name"]: c["value"] for c in ops.session.get_all_cookies()
+               if c.get("name") in ("Vistos_sid", "cookiesession1")}
+    ua = (ops.session.browser_eval("navigator.userAgent") or "").strip() or "Mozilla/5.0"
+    ck = "; ".join(f"{k}={v}" for k, v in cookies.items())
+    H = {"User-Agent": ua, "Cookie": ck}
+    pc = primp.Client(proxy=ops.warm_proxy, verify=False, timeout=100, follow_redirects=True)
+    try: pc.set_cookies(ORIGIN + "/", cookies)
+    except Exception: pass
+
+    # 1. home-lang POST
+    r = pc.post(HOME_URL, data="lang=PT",
+                headers={**H, "Content-Type": "application/x-www-form-urlencoded"})
+    log(f"[primp-warm] home-lang POST -> {r.status_code}")
+
+    # 2. Questionario GET
+    r = pc.get(QUEST_URL, headers=H)
+    log(f"[primp-warm] Questionario GET -> {r.status_code} len={len(r.text or '')}")
+
+    # 3. quest steps (base_qs merged into EVERY step, exactly like _run_warmup_steps)
+    quest_key = ops.residence if ops.residence != ops.nationality else ops.nationality
+    steps = quest_steps.get(quest_key, [])
+    if not steps:
+        log(f"[primp-warm] NO quest steps for key {quest_key!r} -- cannot warm"); return False, False
+    base_qs = {"lang": "PT", "nacionalidade": ops.nationality}
+    last_html = ""
+    for i, step in enumerate(steps):
+        url = f"{QUEST_NEXT}?{urlencode({**base_qs, **step})}"
+        r = pc.get(url, headers={**H, "Accept": "text/plain, */*; q=0.01",
+                                 "X-Requested-With": "XMLHttpRequest", "Referer": QUEST_URL,
+                                 "Sec-Fetch-Mode": "cors", "Sec-Fetch-Dest": "empty",
+                                 "Sec-Fetch-Site": "same-origin"})
+        log(f"[primp-warm] quest step {i+1}/{len(steps)} -> {r.status_code}")
+        if r.status_code != 200:
+            log(f"[primp-warm] quest step {i+1} non-200 -- ABORT (stateful chain is doomed)")
+            return False, False
+        last_html = r.text or ""
+
+    last_fields = _parse_inputs(last_html)
+    if not last_fields:
+        log(f"[primp-warm] quest_state_stale: last step yielded NO input fields (len={len(last_html)})")
+        return False, False
+    log(f"[primp-warm] last quest step yielded {len(last_fields)} fields")
+
+    # 4. Formulario POST (form-encoded) -> CSRF
+    r = pc.post(FORMULARIO + "?copy=true", data=urlencode(last_fields),
+                headers={**H, "Content-Type": "application/x-www-form-urlencoded", "Referer": QUEST_URL})
+    form_html = r.text or ""
+    csrf = _extract_csrf(form_html)
+    if not csrf:
+        r = pc.post(FORMULARIO, data=urlencode(last_fields),
+                    headers={**H, "Content-Type": "application/x-www-form-urlencoded", "Referer": QUEST_URL})
+        form_html = r.text or ""
+        csrf = _extract_csrf(form_html)
+    log(f"[primp-warm] Formulario POST -> {r.status_code} len={len(form_html)} csrf={'yes' if csrf else 'MISSING'}")
+    if not csrf:
+        return False, False
+
+    # 5. ScheduleController POST -- MULTIPART (empty file parts foto/file1-4), like browser_fetch.
+    # primp's `files=` reads each value as a FILE PATH (not content), so it can't make an EMPTY part;
+    # build the multipart body by hand instead -- exact control: empty filename + empty content,
+    # byte-identical to what the unset file inputs send.
+    sc_payload = schedule_controller_payload(
+        ops.account, ops.form_defaults, posto_id=ops.posto_id, csrf=csrf,
+        nationality=ops.nationality, residence=res,
+    )
+    boundary = "----primpWarmup" + "".join(random.choice("0123456789abcdef") for _ in range(16))
+    parts = []
+    for k, v in sc_payload.items():
+        parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n")
+    for f in ("foto", "file1", "file2", "file3", "file4"):
+        parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{f}\"; filename=\"\"\r\n"
+                     f"Content-Type: application/octet-stream\r\n\r\n\r\n")
+    multipart = ("".join(parts) + f"--{boundary}--\r\n").encode("utf-8")
+    r = pc.post(SCHED_CTRL + "?posto_id=" + str(ops.posto_id), content=multipart,
+                headers={**H, "Referer": FORMULARIO,
+                         "Content-Type": f"multipart/form-data; boundary={boundary}"})
+    sc_body = r.text or ""
+    # Signature the body carries: a re-rendered Formulario (len ~1.3MB, has the questionnaire form)
+    # = VALIDATION REJECT; an Authentication.jsp = session lost; a schedule page = accepted.
+    sc_sig = ("formulario_rerender" if ("Formulario" in sc_body and "cmbPeriodo" not in sc_body
+                                        and len(sc_body) > 500000)
+              else "auth_redirect" if "Authentication.jsp" in sc_body or "authentication" in sc_body.lower()[:3000]
+              else "schedule_markers" if any(m in sc_body for m in _SCHED_PAGE_MARKERS)
+              else "other")
+    log(f"[primp-warm] ScheduleController POST -> {r.status_code} len={len(sc_body)} sig={sc_sig}")
+
+    # 6. Schedule.jsp GET -> the positive marker check (same markers the browser warmup verifies)
+    r = pc.get(SCHED_JSP + "?posto_id=" + str(ops.posto_id), headers={**H, "Referer": FORMULARIO})
+    page = r.text or ""
+    markers = any(m in page for m in _SCHED_PAGE_MARKERS)
+    present = [m for m in _SCHED_PAGE_MARKERS if m in page]
+    log(f"[primp-warm] Schedule.jsp GET -> {r.status_code} len={len(page)} markers={markers} {present}")
+    if not markers:
+        log(f"[primp-warm] NO markers. ScheduleController sig={sc_sig} -- "
+            + ("the POST was WAF-passed but the app REJECTED the form (field-level: the detached "
+               "multipart differs from the browser's FormData, OR this posto/residence was declined)."
+               if sc_sig == "formulario_rerender" else
+               "the session was lost mid-chain (auth redirect)." if sc_sig == "auth_redirect" else
+               "unclassified -- inspect the body."))
+    return True, markers
 
 
 def _detached_submit(ops, slot, quest_steps, res, log):
@@ -238,31 +445,106 @@ def main() -> int:
         db.close()
     print(f"[probe] posto={posto} nat={nat} res={res} pool={pool} geo={geo} BOOK={do_book}")
 
+    warmup_via = (_arg("--warmup-via", "browser")).lower()
+
     def log(m): print(m, flush=True)
-    ops, quest_steps, res = _warm(pool, geo, posto, nat, res, log, headless=headless)
-    if ops is None:
-        print("[probe] could not warm any identity -- re-run (login is a lottery)."); return 1
+    if warmup_via == "primp":
+        # EXPERIMENT #1: browser does LOGIN ONLY; the warm-up quest chain runs on DETACHED primp.
+        # _warm_login_only logs in (browser; reCAPTCHA) and skips do_warmup, then we warm via primp.
+        ops, quest_steps, res = _warm(pool, geo, posto, nat, res, log, headless=headless,
+                                      login_only=True)
+        if ops is None:
+            print("[probe] could not LOG IN any identity -- re-run (login is a lottery)."); return 1
+        print("[probe] === EXPERIMENT #1: warm-up via DETACHED primp (browser did login only) ===")
+        chain_ok, markers = _warmup_via_primp(ops, quest_steps, res, log)
+        if not (chain_ok and markers):
+            if not chain_ok:
+                print(f"[probe] ❌ primp WARM-UP broke mid-chain (see the step log). Not yet a verdict "
+                      f"on primp-warm capability -- re-run; if it recurs at the same step, that step "
+                      f"needs the browser.")
+                try: ops._close_session_quietly()
+                except Exception: pass
+                return 1
+            # CONTROL: primp ran the whole chain but got no cursor. Was it a primp FIDELITY gap, or a
+            # portal reject the BROWSER would hit too? Run the browser's own warmup on this SAME
+            # logged-in session (it re-runs the stateful chain from home-lang, so it's independent).
+            print("[probe] primp chain completed but NO cursor -- running the BROWSER warmup on the "
+                  "SAME session as a CONTROL to isolate primp-fidelity vs portal-reject ...")
+            browser_ok = False
+            try:
+                browser_ok = ops.do_warmup()
+            except Exception as e:
+                print(f"[probe] browser control warmup raised: {type(e).__name__}: {str(e)[:120]}")
+            if browser_ok and ops.is_warmed():
+                print("[probe] 🔬 VERDICT: PRIMP FIDELITY GAP. The browser warmed the SAME session/exit "
+                      "where primp could not -- so the detached ScheduleController multipart is not "
+                      "byte-equivalent to the browser's FormData. Warmup-via-primp needs the multipart "
+                      "fixed, NOT a browser. Continuing to discover+submit on the browser-warmed cursor.")
+                # fall through: ops is now browser-warmed, so the existing discover+submit runs.
+            else:
+                print("[probe] 🔬 VERDICT: NOT A PRIMP PROBLEM. The browser ALSO failed to warm this "
+                      "session/exit -- this was a portal/exit reject (or this posto/residence was "
+                      "declined), which the browser hits too. primp is EXONERATED for the chain; "
+                      "re-run on a fresh exit to get a clean read.")
+                try: ops._close_session_quietly()
+                except Exception: pass
+                return 1
+        if markers:
+            # The DETACHED chain established the server-side cursor. Set the anchor so the existing
+            # browser-discover + primp-submit downstream treat this session as warmed.
+            ops.posto_pdf = ops.posto_id
+            ops._set_anchor("chain")
+            print(f"[probe] ✅ primp WARM-UP established the Schedule.jsp cursor (posto_pdf={ops.posto_pdf}) "
+                  f"WITHOUT the browser running the quest chain. Proceeding to discovery + "
+                  f"{'submit' if do_book else 'dry-run'} to confirm the primp-warmed cursor is bookable.")
+        else:
+            # Fell through from the browser CONTROL (primp fidelity gap): ops is browser-warmed now.
+            print(f"[probe] (browser-warmed cursor posto_pdf={ops.posto_pdf}) Proceeding to discovery + "
+                  f"{'submit' if do_book else 'dry-run'} -- this still exercises the primp SUBMIT, "
+                  f"just on a browser-warmed cursor.")
+    else:
+        ops, quest_steps, res = _warm(pool, geo, posto, nat, res, log, headless=headless)
+        if ops is None:
+            print("[probe] could not warm any identity -- re-run (login is a lottery)."); return 1
     try:
         from datetime import date, timedelta
         from libs.engine.config import EngineConfig
+        # DATE RANGE -- was a fixed today+30..today+90 window, weekdays only, capped at a hardcoded 25.
+        # That arbitrary window is a common reason the probe "finds nothing" while the posto DOES have
+        # open slots outside it. Now explicit and overridable:
+        #   --start YYYY-MM-DD   (default: booking's discovery start, else today+1)
+        #   --end   YYYY-MM-DD   (default: booking's discovery end,   else today+120)
+        #   --max-dates N        (default 90 -- cap so a huge range can't fire forever)
+        #   --weekends           (include Sat/Sun; default weekdays only, matching production)
         d = ops.cfg.discovery
-        start = d.start_date or str(date.today() + timedelta(days=30))
-        end = d.end_date or str(date.today() + timedelta(days=90))
+        start = _arg("--start") or d.start_date or str(date.today() + timedelta(days=1))
+        end = _arg("--end") or d.end_date or str(date.today() + timedelta(days=120))
+        max_dates = int(_arg("--max-dates", "90"))
+        weekends = "--weekends" in sys.argv
         dates = []
         cur = date.fromisoformat(start)
-        while cur <= date.fromisoformat(end) and len(dates) < 25:
-            if cur.weekday() < 5:
+        _last = date.fromisoformat(end)
+        while cur <= _last and len(dates) < max_dates:
+            if weekends or cur.weekday() < 5:
                 dates.append(cur.isoformat())
             cur += timedelta(days=1)
-        print(f"[probe] discovering {len(dates)} dates via /slots (browser) ...")
+        print(f"[probe] DATE RANGE {start} .. {end} ({'all days' if weekends else 'weekdays'}, "
+              f"cap {max_dates}) -> {len(dates)} dates; source={ops.cfg.discovery.source!r} "
+              f"(slots-first then CALENDAR fallback if 'both')")
+        print(f"[probe]   dates: {dates[0]} ... {dates[-1]}" if dates else "[probe]   (no dates!)")
         results = ops.do_discover(dates)
         found = [r for r in results if r.get("outcome") == "found" and r.get("periods")]
         print(f"[probe] discovery: {sum(1 for r in results if r.get('outcome')=='found')} found, "
               f"{sum(1 for r in results if r.get('outcome')=='empty')} empty, "
               f"{sum(1 for r in results if r.get('outcome')=='failed')} failed")
+        if found:
+            print("[probe] AVAILABLE dates: " + ", ".join(
+                f"{r['date']}(p{','.join(str(p) for p in r['periods'])})" for r in found[:15]))
         if not found:
-            print("[probe] NO AVAILABLE SLOT right now -- the detached /slots path works (see the "
-                  "quick probe) but there is nothing to submit. Re-run when a slot is open.")
+            print(f"[probe] NO AVAILABLE SLOT in {start}..{end} via source={ops.cfg.discovery.source!r}. "
+                  f"If the posto has open slots you can see on the portal, widen the range "
+                  f"(--start/--end) and/or ensure --discovery-source both so the CALENDAR path runs. "
+                  f"A /slots-only run shows {{\"data\":[]}} even when slots exist.")
             return 0
         slot = {"date": found[0]["date"], "period": found[0]["periods"][0]}
         print(f"[probe] AVAILABLE slot to test: {slot}")
@@ -271,16 +553,40 @@ def main() -> int:
                   "real slot is available. Re-run with --book to make the hybrid DETACHED submit and "
                   "verify the %PDF (this BOOKS a real appointment).")
             return 0
+        # RE-WARM IMMEDIATELY BEFORE THE SUBMIT -- MANDATORY. The booking cursor is NAVIGATION-bound
+        # ([[rewarm_every_round_is_mandatory]] / [[navigation_vs_inpage_fetch]]): the discovery that
+        # just ran NAVIGATED the browser (calendar = one nav per date; even /slots navigates), which
+        # DESTROYS the server-side form cursor the warm-up established. Production's do_apply re-warms
+        # unconditionally at the top of every round for exactly this reason. Without it the submit
+        # bounces to the home page = form_stale (confirmed live 2026-10-08: SANDRA, 85-date calendar
+        # scan between warm and submit -> submit returned the 59KB home page). Re-warm on the SAME
+        # transport we are testing (primp for the primp experiment, else the browser).
+        if warmup_via == "primp":
+            print("[probe] re-warming via primp before the submit (cursor is nav-bound; discovery "
+                  "staled it) ...")
+            _ok2, _markers2 = _warmup_via_primp(ops, quest_steps, res, log)
+            if _markers2:
+                ops.posto_pdf = ops.posto_id; ops._set_anchor("chain")
+            else:
+                print("[probe] ⚠ pre-submit primp re-warm did NOT re-establish the cursor -- the "
+                      "submit will likely form_stale. (Re-run; a transient portal reject here is "
+                      "common.)")
+        else:
+            print("[probe] re-warming via the browser before the submit (cursor is nav-bound) ...")
+            try: ops.do_warmup()
+            except Exception as e: print(f"[probe] pre-submit browser re-warm raised: {str(e)[:100]}")
         out = _detached_submit(ops, slot, quest_steps, res, log)
         print(f"\n[probe] detached submit: status={out['status']} resp_len={out['resp_len']} "
               f"classifier={out['verdict']!r}  (resp_len~1.5KB & verify_pdf/booked = the DETACHED submit booked)")
         if out["booked"]:
+            _record_probe_booked(ops.identity_id, posto, nat, res)  # spend it -- never re-pick
             p = _ROOT / "var" / "artifacts" / f"hybrid_{ops.identity_id}_{int(__import__('time').time())}.pdf"
             p.parent.mkdir(parents=True, exist_ok=True); p.write_bytes(out["pdf"])
             print(f"[probe] ✅ HYBRID CONFIRMED -- detached primp submit BOOKED, %PDF verified via "
                   f"browser ({out['pdf_bytes']}B) -> {p}\n           Post-login SUBMIT does NOT need the "
                   f"browser; the browser is only needed for login+warmup (and the PDF artifact).")
         elif out["verdict"] in ("booked", "verify_pdf"):
+            _record_probe_booked(ops.identity_id, posto, nat, res)  # booked signature -> spent too
             print(f"[probe] ⚠ LIKELY BOOKED -- the detached submit returned the booked signature "
                   f"(classifier={out['verdict']!r}, resp_len={out['resp_len']}), but the %PDF proof "
                   f"could not be fetched ({out['pdf_bytes']}B). VERIFY ON THE PORTAL. The booking is "
