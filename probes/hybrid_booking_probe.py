@@ -39,6 +39,14 @@ Discovery flags (find the real open slots instead of an arbitrary window):
   --start YYYY-MM-DD / --end YYYY-MM-DD      scan window (default today+1 .. today+120)
   --max-dates N (default 90)                 cap on dates scanned
   --weekends                                 include Sat/Sun (default weekdays only)
+
+EXPERIMENT #2 -- keeping endurance (--keep-min N [--keep-interval S]): after warm-up, HOLD the session
+N minutes by re-warming every S seconds (default 180) on the warm-up transport (primp for
+--warmup-via primp), browser otherwise PARKED. Proves a detached hold carries a bookable cursor
+through a long / down window, then discovers + submits. E.g. hold 15min on primp then book:
+  .venv/bin/python probes/hybrid_booking_probe.py --booking "Test 3" --pool soax --geo PT \
+    --warmup-via primp --discovery-source both --start 2026-11-01 --end 2026-11-30 \
+    --keep-min 15 --keep-interval 180 --book
 """
 import os
 import random
@@ -364,6 +372,50 @@ def _warmup_via_primp(ops, quest_steps, res, log):
     return True, markers
 
 
+def _keep_loop(ops, quest_steps, res, log, minutes: float, interval: float, via: str):
+    """EXPERIMENT #2 -- hold a BOOKABLE session for `minutes` by RE-WARMING every `interval`s, on the
+    chosen transport (primp or browser), with the browser otherwise PARKED (idle, never navigated).
+
+    This is the keeping-on-primp feasibility test: can a detached client hold a live Schedule.jsp
+    cursor across a long window (ideally straddling a portal down-window) so that, when a slot opens,
+    the worker applies DIRECTLY instead of paying a cold re-warm during the unstable hot period? Each
+    cycle re-warms and reports whether the cursor came back (markers=True) and how long it took --
+    plus a bare liveness read between cycles. Returns the count of (ok, failed) re-warm cycles."""
+    import time as _t
+    deadline = _t.time() + minutes * 60.0
+    ok = fail = cycle = 0
+    log(f"[keep] EXPERIMENT #2: holding via {via} for {minutes:.0f}min, re-warm every {interval:.0f}s "
+        f"(browser parked)")
+    while _t.time() < deadline:
+        # idle until the next cycle (the browser does NOTHING here -- that is the point: a primp hold
+        # must not depend on the browser touching the portal)
+        nap = min(interval, max(1.0, deadline - _t.time()))
+        _t.sleep(nap)
+        if _t.time() >= deadline:
+            break
+        cycle += 1
+        t0 = _t.time()
+        if via == "primp":
+            _ok, markers = _warmup_via_primp(ops, quest_steps, res, log)
+        else:
+            try:
+                markers = bool(ops.do_warmup() and ops.is_warmed())
+            except Exception as e:
+                markers = False
+                log(f"[keep] cycle {cycle}: browser re-warm raised {type(e).__name__}: {str(e)[:80]}")
+        dt = _t.time() - t0
+        if markers:
+            ok += 1
+            ops.posto_pdf = ops.posto_id; ops._set_anchor("chain")
+            log(f"[keep] cycle {cycle}: cursor HELD (re-warm {dt:.0f}s, {ok} ok / {fail} fail)")
+        else:
+            fail += 1
+            log(f"[keep] cycle {cycle}: cursor LOST this cycle (re-warm {dt:.0f}s, {ok} ok / {fail} fail) "
+                f"-- a transient portal reject; the hold continues")
+    log(f"[keep] done: {ok} held / {fail} lost over {cycle} cycles in {minutes:.0f}min")
+    return ok, fail
+
+
 def _detached_submit(ops, slot, quest_steps, res, log):
     """The HYBRID: SubmeterVistoCriaPDF via primp from the same exit + synced cookies. Returns dict."""
     import primp
@@ -506,6 +558,19 @@ def main() -> int:
         ops, quest_steps, res = _warm(pool, geo, posto, nat, res, log, headless=headless)
         if ops is None:
             print("[probe] could not warm any identity -- re-run (login is a lottery)."); return 1
+    # EXPERIMENT #2: optional keeping-endurance hold between warm-up and discovery/submit. --keep-min
+    # N holds the session N minutes by re-warming every --keep-interval s on the SAME transport as the
+    # warm-up (primp for --warmup-via primp), browser otherwise parked -- proving a detached hold can
+    # carry a bookable cursor through a long (ideally down-) window.
+    _keep_min = float(_arg("--keep-min", "0") or 0)
+    if _keep_min > 0:
+        _keep_int = float(_arg("--keep-interval", "180") or 180)
+        _keep_held, _keep_lost = _keep_loop(
+            ops, quest_steps, res, log, _keep_min, _keep_int,
+            via=("primp" if warmup_via == "primp" else "browser"))
+        if _keep_held == 0:
+            print("[probe] ⚠ EXPERIMENT #2: the session never re-warmed during the hold -- cursor not "
+                  "held. Proceeding to discover+submit anyway (the pre-submit re-warm will try once more).")
     try:
         from datetime import date, timedelta
         from libs.engine.config import EngineConfig
