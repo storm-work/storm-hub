@@ -3001,24 +3001,30 @@ function Registration({ me, events }) {
   // from this page however many proxies it had. Deriving them also lets the count below tell you a
   // selection is empty BEFORE you press Register, instead of a 409 afterwards.
   const { rows: poolRows } = useList("/proxies/pools");
+  const { rows: rotatingPoolRows } = useList("/rotating-pools");
   // Providers/kinds come from the ROTATING pool list PLUS whatever static rows exist -- not from
   // rows alone. Deriving them from rows left this dropdown showing only "thordata" once
   // ci000droprot deleted the rotating rows, so registration could not be pointed at soax at all,
   // even though minting it works fine. Same fix as the booking pool pickers (derivePoolOptions);
   // this page has its own controls and was missed.
   const staticPoolRows = poolRows.filter((p) => p.resource_type === "static");
+  // NAMED rotating pools (2026-10-08): selected as provider "pool:<name>". The pool row carries its
+  // own provider+kind, so the Kind select is ignored for one (the backend's _resolve_rotating_pool
+  // supplies it). This page has its own controls, so it needs the same merge the booking pickers got.
+  const namedPools = (rotatingPoolRows || []).filter((rp) => rp && rp.active !== false);
+  const isPoolSel = String(provider).startsWith("pool:");
   const providers = [...new Set([...ROTATING_POOLS.map((p) => p.provider),
                                  ...staticPoolRows.map((p) => p.provider)])].sort();
-  const rotatingKinds = [...new Set(ROTATING_POOLS.filter((p) => p.provider === provider && p.kind)
+  const rotatingKinds = isPoolSel ? [] : [...new Set(ROTATING_POOLS.filter((p) => p.provider === provider && p.kind)
                                                   .map((p) => p.kind))];
-  const kinds = [...new Set([...rotatingKinds,
+  const kinds = isPoolSel ? [] : [...new Set([...rotatingKinds,
                              ...staticPoolRows.filter((p) => p.provider === provider)
                                               .map((p) => p.kind)])].sort();
   // A minted pool has no rows to carry a geo, so the geo list falls back to the same measured set
   // the booking path uses (PROXY_GEOS' note: DE/IT clear the login wall ~8x better than CZ).
   const staticGeos = [...new Set(staticPoolRows.filter((p) => p.provider === provider && p.geo)
                                                .map((p) => p.geo))];
-  const isRotatingSel = ROTATING_POOLS.some((p) => p.provider === provider
+  const isRotatingSel = isPoolSel || ROTATING_POOLS.some((p) => p.provider === provider
                                                    && (!kind || p.kind === kind));
   const geoOpts = (staticGeos.length ? staticGeos
                                      : (isRotatingSel ? ["DE", "IT", "PT", "NL", "ES", "LU", "CZ"] : []))
@@ -3139,10 +3145,19 @@ function Registration({ me, events }) {
               <select value={provider} onChange={(e) => { setProvider(e.target.value); setKind(""); }}
                       disabled={!op}>
                 {providers.map((p) => <option key={p} value={p}>{p}</option>)}
+                {namedPools.length > 0 && (
+                  <optgroup label="Named rotating pools">
+                    {namedPools.map((rp) => (
+                      <option key={rp.id} value={`pool:${rp.name}`}>
+                        ★ {rp.name} ({rp.provider}/{rp.kind})
+                      </option>
+                    ))}
+                  </optgroup>
+                )}
               </select></div>
             <div className="field" style={{ margin: 0 }}><label>Kind</label>
-              <select value={kind} onChange={(e) => setKind(e.target.value)} disabled={!op}>
-                <option value="">any</option>
+              <select value={kind} onChange={(e) => setKind(e.target.value)} disabled={!op || isPoolSel}>
+                <option value="">{isPoolSel ? "(from pool)" : "any"}</option>
                 {kinds.map((k) => <option key={k} value={k}>{k}</option>)}
               </select></div>
             <div className="field" style={{ margin: 0 }}><label>Geo</label>
