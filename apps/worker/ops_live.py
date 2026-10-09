@@ -474,6 +474,27 @@ def _extract_csrf(html: str) -> str | None:
     return m.group(1) if m else None
 
 
+_APPT_REF_RE = re.compile(
+    r"dia\s*([0-9]{4}/[0-9]{2}/[0-9]{2})\s*&nbsp;?\s*([0-9]{1,2}\s*-\s*[0-9]{1,2})", re.I)
+
+
+def _parse_appointment_ref(html: str) -> str | None:
+    """The portal's booked-confirmation HTML carries NO reference number -- the only portal-confirmed
+    identifier it returns is the appointment DATE + time window ("...dirija-se ao consulado ... no dia
+    2026/11/03  9-10"); the real reference lives only inside the generated PDF. So the best durable
+    identifier we can persist from the submit response is that date+window, e.g. "2026/11/03 9-10".
+    Returns None if the pattern isn't present (nothing to invent)."""
+    m = _APPT_REF_RE.search(html or "")
+    if not m:
+        # Tolerate plain whitespace between the date and the window (not just &nbsp;).
+        m = re.search(r"dia\s*([0-9]{4}/[0-9]{2}/[0-9]{2})\s+([0-9]{1,2}\s*-\s*[0-9]{1,2})",
+                      html or "", re.I)
+    if not m:
+        return None
+    window = re.sub(r"\s*-\s*", "-", m.group(2).strip())
+    return f"{m.group(1)} {window}"
+
+
 def _primp_parse_inputs(html: str) -> dict:
     """Harvest <input name=.. value=..> fields from the last quest step's HTML for the hybrid
     (browserless) Formulario POST -- mirrors the browser chain's in-page querySelectorAll('input'),
@@ -4456,9 +4477,11 @@ class LiveEngineOps(EngineOps):
                         self._save_submit_body(html, "booked")
                     except Exception:
                         pass
+                    _appt_ref = _parse_appointment_ref(html)
                     if self._emit is not None:
-                        self._emit("booked", slot=slot)
-                        self._emit("booked_pdf", pdf_path=self._save_pdf(pdf_body), slot=slot)
+                        self._emit("booked", slot=slot, appointment_ref=_appt_ref)
+                        self._emit("booked_pdf", pdf_path=self._save_pdf(pdf_body), slot=slot,
+                                   appointment_ref=_appt_ref)
                     if self._liveness is not None:
                         self._liveness.record_alive()      # a booking proves the portal is up
                     return "booked"
@@ -4502,8 +4525,11 @@ class LiveEngineOps(EngineOps):
             # Announce the booking BEFORE going after the PDF. The appointment is real the moment
             # the portal confirms it; the PDF is an artifact that may or may not come back, and
             # making the Hub's record depend on it lost real bookings.
+            _appt_ref = _parse_appointment_ref(html)
+            if _appt_ref:
+                self._log(f"do_apply: portal-confirmed appointment {_appt_ref}")
             if self._emit is not None:
-                self._emit("booked", slot=slot)
+                self._emit("booked", slot=slot, appointment_ref=_appt_ref)
             pdf_body = b""
             self._ensure_browser_for_pdf()   # Phase C: reopen a browser if the hot path closed it
             try:
@@ -4524,7 +4550,8 @@ class LiveEngineOps(EngineOps):
                 if pdf_body:
                     self._log(f"do_apply: MostrarPdf PDF captured ({len(pdf_body)}B)")
                     if self._emit is not None:
-                        self._emit("booked_pdf", pdf_path=self._save_pdf(pdf_body), slot=slot)
+                        self._emit("booked_pdf", pdf_path=self._save_pdf(pdf_body), slot=slot,
+                                   appointment_ref=_appt_ref)
                 else:
                     self._log("do_apply: no %PDF from the submit body or the live form -- "
                               "booking IS confirmed, PDF missing")

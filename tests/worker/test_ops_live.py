@@ -1533,6 +1533,37 @@ def _apply_ops(pdf_bytes: bytes, events: list):
     return ops
 
 
+def test_parse_appointment_ref_extracts_portal_date_and_window():
+    """The booked confirmation carries no reference number -- only the appointment date + time window
+    ('...no dia 2026/11/03  9-10'). _parse_appointment_ref returns that as 'YYYY/MM/DD H-H', or None."""
+    from apps.worker.ops_live import _parse_appointment_ref
+    html = ('<td>Imprima o formulário e dirija-se ao consulado escolhido no dia '
+            '2026/11/03  9-10</td>')
+    assert _parse_appointment_ref(html) == "2026/11/03 9-10"
+    assert _parse_appointment_ref("dia 2026/11/09&nbsp;10 - 11") == "2026/11/09 10-11"
+    assert _parse_appointment_ref("<html>no appointment here</html>") is None
+
+
+def test_do_apply_booked_emits_appointment_ref():
+    """A booked submit emits the parsed appointment_ref on the `booked` event so the Hub can persist
+    it to BookedAppointment.appointment_ref (was always None before)."""
+    events = []
+    # a booked confirmation body carrying the portal date+window
+    booked_html = ('<html><body>...no dia 2026/11/03  9-10</body>'
+                   '<form action="MostrarPdf"></form></html>')
+    ops = _make_ops(cfg=_cfg_schedule(booking={"HYBRID_MODE": True, "HYBRID_SUBMIT": True}),
+                    emit=lambda t, **p: events.append((t, p)))
+    ops.session = _SubmitSession(b"%PDF-1.4 ok")
+    ops._run_warmup_steps = lambda: True
+    ops._save_pdf = lambda b: "/tmp/x.pdf"
+    ops._fetch_pdf_from_submit_body = lambda html: b"%PDF-1.4 ok"
+    ops.posto_pdf = "3059"; ops._set_anchor("chain")
+    ops._submit_via_primp = lambda url, body, to: (200, booked_html)
+    assert ops.do_apply({"date": "2026-11-03", "period": 4}) == "booked"
+    refs = [p.get("appointment_ref") for t, p in events if t == "booked"]
+    assert refs and refs[0] == "2026/11/03 9-10", (refs, events)
+
+
 def test_do_apply_hybrid_submit_goes_via_primp_not_the_browser():
     """HYBRID_SUBMIT: the SubmeterVistoCriaPDF submit is sent by the detached primp client, not the
     in-page browser XHR; the %PDF is still fetched via the browser (postponed)."""

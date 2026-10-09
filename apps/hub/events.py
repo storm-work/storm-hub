@@ -528,7 +528,8 @@ class EventHub:
         return int(_resolve_booking_setting(db, bk, "BLIND_MAX_BOUNCES", 3) or 0)
 
     def _persist_booking(self, worker_id: str, slot: dict | None,
-                         pdf_path: str | None = None) -> None:
+                         pdf_path: str | None = None,
+                         appointment_ref: str | None = None) -> None:
         """Record a confirmed booking. The PDF is an ARTIFACT, not the proof.
 
         This used to be reachable only via `booked_pdf`, so a real appointment whose PDF retrieval
@@ -540,7 +541,7 @@ class EventHub:
 
         Idempotent: `booked` and `booked_pdf` both land for a healthy live booking, and the second
         must attach the artifact to the first's row rather than insert a duplicate."""
-        return self._persist_booked_pdf(worker_id, pdf_path, slot)
+        return self._persist_booked_pdf(worker_id, pdf_path, slot, appointment_ref)
 
     def _mark_identity_booked(self, db, w, sub_account_id: str, slot_id: str | None) -> None:
         """Record the result where it SURVIVES: on the identity.
@@ -625,7 +626,8 @@ class EventHub:
         finally:
             db.close()
 
-    def _persist_booked_pdf(self, worker_id: str, pdf_path: str | None, slot: dict | None) -> None:
+    def _persist_booked_pdf(self, worker_id: str, pdf_path: str | None, slot: dict | None,
+                            appointment_ref: str | None = None) -> None:
         """A live apply confirmed a booking and saved its PDF to disk (Phase: dashboard "open pdf"
         feature) -- create the Artifact + BookedAppointment rows the schema already had (models.py's
         Artifact/BookedAppointment) but that nothing wrote to before this."""
@@ -713,11 +715,16 @@ class EventHub:
                         _idn.comment = None
                 if existing.slot_id is None:
                     existing.slot_id = slot_id
+                # Backfill the portal-confirmed appointment date+window if the first event (booked)
+                # didn't carry it but this one (booked_pdf) does -- never overwrite a value already set.
+                if appointment_ref and not existing.appointment_ref:
+                    existing.appointment_ref = appointment_ref
             else:
                 db.add(M.BookedAppointment(
                     booking_id=w.booking_id, identity_id=w.identity_id,
                     sub_account_id=sub_account_id, slot_id=slot_id,
                     pdf_artifact_id=artifact.id if artifact is not None else None,
+                    appointment_ref=appointment_ref,
                     booked_at=datetime.now(timezone.utc),
                 ))
                 booked_now = (w, sub_account_id, slot_id)
@@ -828,13 +835,15 @@ class EventHub:
                     if m.type == "slots_found":
                         _step("persist_slots", self._persist_slots, wid, m.payload.get("slots", []))
                     if m.type == "booked":
-                        _step("persist_booking", self._persist_booking, wid, m.payload.get("slot"))
+                        _step("persist_booking", self._persist_booking, wid, m.payload.get("slot"),
+                              None, m.payload.get("appointment_ref"))
                     if m.type == "already_booked":
                         _step("mark_already_booked", self._mark_already_booked,
                               wid, m.payload.get("detail", ""))
                     if m.type == "booked_pdf" and m.payload.get("pdf_path"):
                         _step("persist_booked_pdf", self._persist_booked_pdf,
-                              wid, m.payload["pdf_path"], m.payload.get("slot"))
+                              wid, m.payload["pdf_path"], m.payload.get("slot"),
+                              m.payload.get("appointment_ref"))
                     if m.type == "reg_result" and m.payload.get("sub_account_id"):
                         _step("persist_registration_result", self._persist_registration_result,
                               m.payload["sub_account_id"], m.payload.get("outcome", ""), m.payload)
