@@ -3746,6 +3746,49 @@ function RotatingPoolForm({ me, existing, onDone }) {
   );
 }
 
+// Remaining data allowance for a named rotating pool's provider account. Reads the Hub's
+// /rotating-pools/{name}/bandwidth (server-cached 5 min; account-level, not per-pool). Only webshare
+// is wired; other providers show "—". Refreshes every 5 min, matching the server cache.
+function PoolBandwidth({ name, provider }) {
+  const [d, setD] = useState(null);
+  const [err, setErr] = useState("");
+  useEffect(() => {
+    if ((provider || "").toLowerCase() !== "webshare") { setD({ unsupported: true }); return; }
+    let live = true;
+    async function load() {
+      try { const r = await api(`/rotating-pools/${encodeURIComponent(name)}/bandwidth`); if (live) setD(r); }
+      catch (e) { if (live) setErr(e.message); }
+    }
+    load();
+    const t = setInterval(load, 300000);
+    return () => { live = false; clearInterval(t); };
+  }, [name, provider]);
+  if ((provider || "").toLowerCase() !== "webshare" || (d && d.unsupported))
+    return <span className="muted" style={{ fontSize: 12 }}>—</span>;
+  if (err) return <span className="muted" title={err} style={{ fontSize: 12 }}>error</span>;
+  if (!d) return <span className="muted" style={{ fontSize: 12 }}>…</span>;
+  if (!d.ok) {
+    const needToken = String(d.error || "").includes("not set") || String(d.error || "").includes("401");
+    return <span className="muted" title={d.error || ""} style={{ fontSize: 12 }}>
+      {needToken ? "set WEBSHARE_API_TOKEN" : "unavailable"}</span>;
+  }
+  if (d.unlimited) return <span style={{ fontSize: 12 }}>unlimited <span className="muted">({d.used_gb} GB used)</span></span>;
+  const pct = d.limit_gb ? Math.min(100, Math.round((d.used_gb / d.limit_gb) * 100)) : 0;
+  const low = d.remaining_gb != null && d.limit_gb && d.remaining_gb < d.limit_gb * 0.1;
+  return (
+    <div style={{ minWidth: 150 }} title={`used ${d.used_gb} GB of ${d.limit_gb} GB since ${(d.period_start || "").slice(0, 10)}`}>
+      <div style={{ fontSize: 12 }}>
+        <b style={{ color: low ? "#e06c75" : "inherit" }}>{d.remaining_gb} GB</b> left
+        <span className="muted"> / {d.limit_gb} GB</span>
+      </div>
+      <div style={{ height: 5, background: "rgba(128,128,128,0.25)", borderRadius: 3, marginTop: 3 }}>
+        <div style={{ width: pct + "%", height: "100%", borderRadius: 3,
+                      background: low ? "#e06c75" : "#4a9eff" }} />
+      </div>
+    </div>
+  );
+}
+
 function RotatingPoolsPanel({ me }) {
   const { rows, reload } = useList("/rotating-pools");
   const [modal, setModal] = useState(null);   // null | "add" | <pool row for edit>
@@ -3778,11 +3821,12 @@ function RotatingPoolsPanel({ me }) {
       </div>
       {rows.length === 0
         ? <div className="muted">No named rotating pools. The built-in .env pools are still available.</div>
-        : <table className="tbl"><thead><tr><th>Name</th><th>Provider</th><th>Kind</th><th>Credentials</th><th>Active</th><th></th></tr></thead>
+        : <table className="tbl"><thead><tr><th>Name</th><th>Provider</th><th>Kind</th><th>Credentials</th><th>Bandwidth</th><th>Active</th><th></th></tr></thead>
             <tbody>{rows.map((p) => (
               <tr key={p.id} style={{ opacity: p.active ? 1 : 0.5 }}>
                 <td><code>pool:{p.name}</code></td><td>{p.provider}</td><td>{p.kind}</td>
                 <td className="muted" style={{ fontSize: 12 }}>{fieldSummary(p.credentials)}</td>
+                <td><PoolBandwidth name={p.name} provider={p.provider} /></td>
                 <td>{p.active ? "yes" : "no"}</td>
                 <td style={{ whiteSpace: "nowrap" }}>
                   <button className="btn ghost sm" disabled={!op} onClick={() => setModal(p)}>Edit</button>{" "}

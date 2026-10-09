@@ -1892,6 +1892,47 @@ def list_rotating_pools(db: Session = Depends(get_db),
     return [_rotating_pool_out(p) for p in rows]
 
 
+# Per-provider bandwidth cache: {provider: (fetched_at_epoch, result_dict)}. The provider usage API
+# is rate-limited and account-wide (not per named pool), so a short TTL shared across pools of the
+# same provider is both correct and gentle. Module-level: the Hub is a single process.
+_BANDWIDTH_CACHE: dict[str, tuple[float, dict]] = {}
+_BANDWIDTH_TTL = 300.0  # 5 min
+
+
+@app.get("/rotating-pools/{name}/bandwidth")
+def rotating_pool_bandwidth(name: str, db: Session = Depends(get_db),
+                            _v: Principal = Depends(require_viewer)) -> dict:
+    """Remaining data allowance for a NAMED rotating pool's provider account.
+
+    Bandwidth is an ACCOUNT-level figure read from the provider's API with a separate account token
+    (WEBSHARE_API_TOKEN), not from the pool's proxy credentials -- see libs/proxies/usage.py. Cached
+    per provider for 5 min (the account API is rate-limited and the figure moves slowly). Only
+    webshare is wired today; other providers return {ok: False, unsupported: True} rather than erroring
+    so the widget can render a neutral 'n/a'. Never 500s on a provider failure -- degrades to
+    {ok: False, error}."""
+    pool = db.scalar(select(M.RotatingPool).where(M.RotatingPool.name == name))
+    if pool is None:
+        raise HTTPException(404, f"rotating pool {name!r} not found")
+    provider = (pool.provider or "").strip().lower()
+    if provider != "webshare":
+        return {"ok": False, "unsupported": True, "provider": provider,
+                "error": f"bandwidth readout not supported for provider {provider!r}"}
+    now = time.time()
+    cached = _BANDWIDTH_CACHE.get(provider)
+    if cached and (now - cached[0]) < _BANDWIDTH_TTL:
+        return {**cached[1], "provider": provider, "cached": True}
+    from libs.proxies.usage import webshare_usage
+    g = get_global(db)
+    result = webshare_usage(
+        str(g.get("WEBSHARE_API_TOKEN", "") or ""),
+        billing_day=int(g.get("WEBSHARE_BILLING_DAY", 1) or 1))
+    # Only cache a SUCCESSFUL read -- a transient failure (or a just-pasted token) should be retried
+    # on the next poll, not held for 5 min.
+    if result.get("ok"):
+        _BANDWIDTH_CACHE[provider] = (now, result)
+    return {**result, "provider": provider, "cached": False}
+
+
 @app.post("/rotating-pools", status_code=201)
 def create_rotating_pool(body: RotatingPoolCreate, db: Session = Depends(get_db),
                          _op: Principal = Depends(require_operator)) -> dict:

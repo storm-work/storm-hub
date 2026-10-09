@@ -117,6 +117,18 @@ _GLOBAL = [
     _s("CAPSOLVER_KEYS", L.GLOBAL, str, group="credentials",
        note=
        "Comma-separated CapSolver API keys. Credential -- never commit it to source."),
+    _s("WEBSHARE_API_TOKEN", L.GLOBAL, str, "", group="credentials",
+       note=
+       "Webshare ACCOUNT API token (apidocs.webshare.io, 'Authorization: Token ...') -- powers the "
+       "per-pool remaining-bandwidth readout on the Proxies page. DISTINCT from a pool's proxy "
+       "credentials (PREFIX/PASSWORD); this is the account token that can read the data plan's "
+       "limit/usage. Credential -- keep it in .env, never commit it. Empty = the bandwidth widget "
+       "shows 'not configured'."),
+    _s("WEBSHARE_BILLING_DAY", L.GLOBAL, int, 1, group="credentials", min_value=1.0,
+       note=
+       "Day of the month the Webshare plan's bandwidth allowance renews (1-28). Used to compute the "
+       "current billing period for the remaining-bandwidth readout, so 'used' reflects this cycle, "
+       "not a rolling window. Default 1."),
     _s("LOGIN_TOKEN_POOL_TARGET", L.GLOBAL, int, 0, group="credentials", min_value=0.0,
        note=
        "Depth of the SHARED pre-solved login reCAPTCHA token pool kept full by a Hub background "

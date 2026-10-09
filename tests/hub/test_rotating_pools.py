@@ -109,6 +109,42 @@ def test_delete(client):
     assert c.get("/rotating-pools", headers=h).json() == []
 
 
+def test_bandwidth_webshare_returns_remaining(client, monkeypatch):
+    """GET /rotating-pools/{name}/bandwidth calls the webshare usage client and returns remaining GB.
+    The client itself is mocked (no network); this covers the endpoint wiring + shape."""
+    import apps.hub.main as main
+    main._BANDWIDTH_CACHE.clear()
+    c, _ = client
+    h = _op_headers(c)
+    c.post("/rotating-pools", json={
+        "name": "webshare-rot-2", "provider": "webshare", "kind": "rotating",
+        "credentials": {"PREFIX": "acct", "PASSWORD": "p"}}, headers=h)
+    monkeypatch.setattr("libs.proxies.usage.webshare_usage",
+                        lambda token, **k: {"ok": True, "unlimited": False, "limit_gb": 250.0,
+                                            "used_gb": 120.0, "remaining_gb": 130.0,
+                                            "period_start": "2026-10-01T00:00:00Z", "error": None})
+    r = c.get("/rotating-pools/webshare-rot-2/bandwidth", headers=h)
+    assert r.status_code == 200, r.text
+    b = r.json()
+    assert b["ok"] and b["remaining_gb"] == 130.0 and b["provider"] == "webshare"
+
+
+def test_bandwidth_non_webshare_is_unsupported(client):
+    c, _ = client
+    h = _op_headers(c)
+    c.post("/rotating-pools", json={
+        "name": "soax-acct", "provider": "soax", "kind": "rotating",
+        "credentials": {"PACKAGE": "1", "PASSWORD": "2"}}, headers=h)
+    b = c.get("/rotating-pools/soax-acct/bandwidth", headers=h).json()
+    assert b["ok"] is False and b.get("unsupported") is True
+
+
+def test_bandwidth_unknown_pool_404(client):
+    c, _ = client
+    h = _op_headers(c)
+    assert c.get("/rotating-pools/nope/bandwidth", headers=h).status_code == 404
+
+
 def test_create_requires_operator(client):
     c, _ = client
     # no auth header -> not the operator
