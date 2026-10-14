@@ -129,6 +129,20 @@ def test_bandwidth_webshare_returns_remaining(client, monkeypatch):
     assert b["ok"] and b["remaining_gb"] == 130.0 and b["provider"] == "webshare"
 
 
+def test_create_capsolver_pool(client):
+    """capsolver is a valid rotating provider (mobile/residential) -- the create schema must accept
+    it (regression: the provider Literal was soax/webshare only -> 422 on capsolver)."""
+    c, _ = client
+    h = _op_headers(c)
+    r = c.post("/rotating-pools", json={
+        "name": "cp-mobile", "provider": "capsolver", "kind": "mobile",
+        "credentials": {"PACKAGE": "ACCT16HEX", "PASSWORD": "cap-pw"}}, headers=h)
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["provider"] == "capsolver" and body["kind"] == "mobile"
+    assert body["credentials"]["PASSWORD"] == "********" and "cap-pw" not in r.text
+
+
 def test_bandwidth_non_webshare_is_unsupported(client):
     c, _ = client
     h = _op_headers(c)

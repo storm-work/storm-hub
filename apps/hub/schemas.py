@@ -297,10 +297,11 @@ class RotatingPoolOut(BaseModel):
 
 class RotatingPoolCreate(BaseModel):
     name: str
-    provider: Literal["soax", "webshare"] = "soax"
+    provider: Literal["soax", "webshare", "capsolver"] = "soax"
     kind: str = "rotating"
     # Secret account fields for this provider/kind's Pool: soax -> {PACKAGE, PASSWORD},
-    # webshare -> {PREFIX, PASSWORD}. Validated against the provider Pool at the endpoint.
+    # webshare -> {PREFIX, PASSWORD}, capsolver -> {PACKAGE, PASSWORD}. Validated against the provider
+    # Pool at the endpoint. (Keep this Literal in step with libs/proxies/providers' registry.)
     credentials: dict
 
 
