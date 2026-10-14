@@ -26,11 +26,12 @@ from __future__ import annotations
 import os
 
 from .base import Pool, ProviderError, RotatingProvider, new_session_id
+from .capsolver import Capsolver
 from .soax import Soax
 from .webshare import Webshare
 
 _PROVIDERS: dict[str, RotatingProvider] = {
-    p.name: p for p in (Soax(), Webshare())
+    p.name: p for p in (Soax(), Webshare(), Capsolver())
 }
 
 __all__ = ["Pool", "ProviderError", "RotatingProvider", "new_session_id",

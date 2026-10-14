@@ -1045,6 +1045,8 @@ const ROTATING_POOLS = [
   { provider: "soax", kind: "mobile", label: "soax / mobile (self-minted)" },
   { provider: "webshare", kind: "", label: "webshare (any kind)" },
   { provider: "webshare", kind: "rotating", label: "webshare / rotating (self-minted)" },
+  { provider: "capsolver", kind: "mobile", label: "capsolver / mobile (self-minted)" },
+  { provider: "capsolver", kind: "residential", label: "capsolver / residential (self-minted)" },
 ];
 
 function derivePoolOptions(poolRows, rotatingPools = []) {
@@ -1458,10 +1460,10 @@ const _SETTING_SELECT_OPTIONS = {
   ENGINE_MODE: ["sim", "live"],
   // 'all-isp' leases across every ISP pool at once (apps/hub/main.py _all_isp). Not offered for
   // HOLD_PROXY_PROVIDER: the post-swap pool must resolve to a SINGLE static provider.
-  PROXY_PROVIDER: ["soax", "webshare", "all-isp"],
-  HOLD_PROXY_PROVIDER: ["soax", "webshare"],
-  PROXY_KIND: ["", "rotating", "mobile"],
-  HOLD_PROXY_KIND: ["", "rotating", "mobile"],
+  PROXY_PROVIDER: ["soax", "webshare", "capsolver", "all-isp"],
+  HOLD_PROXY_PROVIDER: ["soax", "webshare", "capsolver"],
+  PROXY_KIND: ["", "rotating", "mobile", "residential"],
+  HOLD_PROXY_KIND: ["", "rotating", "mobile", "residential"],
 };
 // Confirmed plain ISO dates (libs/engine/pool_manager.py's date.fromisoformat(CAL_START_DATE/...)).
 const _SETTING_DATE_KEYS = new Set(["CAL_START_DATE", "CAL_END_DATE"]);
@@ -3706,7 +3708,9 @@ function RotatingPoolForm({ me, existing, onDone }) {
   const [fields, setFields] = useState({});
   const [msg, setMsg] = useState("");
   const secretFields = provider === "webshare" ? ["PREFIX", "PASSWORD"] : ["PACKAGE", "PASSWORD"];
-  const kindOptions = provider === "webshare" ? ["rotating"] : ["rotating", "mobile"];
+  const kindOptions = provider === "webshare" ? ["rotating"]
+    : provider === "capsolver" ? ["mobile", "residential"] : ["rotating", "mobile"];
+  const defaultKind = (prov) => prov === "capsolver" ? "mobile" : "rotating";
   async function save() {
     setMsg("");
     const creds = {};
@@ -3726,8 +3730,8 @@ function RotatingPoolForm({ me, existing, onDone }) {
       <div className="field"><label>Pool name</label>
         <input value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. webshare-acct2" style={{ width: "100%" }} /></div>
       <div className="field"><label>Provider</label>
-        <select value={provider} disabled={editing} onChange={(e) => { setProvider(e.target.value); setKind("rotating"); }} style={{ width: "100%" }}>
-          <option value="soax">soax</option><option value="webshare">webshare</option>
+        <select value={provider} disabled={editing} onChange={(e) => { setProvider(e.target.value); setKind(defaultKind(e.target.value)); }} style={{ width: "100%" }}>
+          <option value="soax">soax</option><option value="webshare">webshare</option><option value="capsolver">capsolver</option>
         </select>{editing && <div className="muted" style={{ fontSize: 12 }}>provider is fixed after creation</div>}</div>
       <div className="field"><label>Kind</label>
         <select value={kind} onChange={(e) => setKind(e.target.value)} style={{ width: "100%" }}>

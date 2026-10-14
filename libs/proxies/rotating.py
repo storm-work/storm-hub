@@ -47,12 +47,21 @@ def reseat_geo(url: str, geo: str | None, *, provider: str = "") -> str:
     never bound to a single (possibly throttled) country for its whole run -- the worst case for the
     login throttle (2026-10-01, operator direction).
 
-    Implemented for soax (the rotating production provider), whose country is a URL parameter
-    `-country-cc`. Webshare carries geo inside a provider-specific username prefix that string
-    surgery cannot reseat safely, so a webshare URL is returned UNCHANGED (its geo stays whatever it
-    was minted with). Any unrecognised URL is returned unchanged too (D2: never corrupt a credential
-    we do not understand)."""
+    Implemented for soax (`-country-cc`, lowercase) and capsolver (`-country_CC`, UPPERCASE), the two
+    rotating providers whose country is a URL segment that can be reseated safely. Webshare carries
+    geo inside a provider-specific username prefix that string surgery cannot reseat safely, so a
+    webshare URL is returned UNCHANGED (its geo stays whatever it was minted with). Any unrecognised
+    URL is returned unchanged too (D2: never corrupt a credential we do not understand)."""
     u = url or ""
+    # CAPSOLVER: `-country_CC` (uppercase), inserted between the {TYPE} segment and `-rotate_`.
+    if provider == "capsolver" or "proxy.capsolver.com" in u:
+        cc = (geo or "").strip().upper()
+        if not cc:
+            return re.sub(r"-country_[A-Za-z]{2}", "", u, count=1)
+        if re.search(r"-country_[A-Za-z]{2}", u):
+            return re.sub(r"-country_[A-Za-z]{2}", f"-country_{cc}", u, count=1)
+        # no country yet -> insert it right before the -rotate_ segment
+        return re.sub(r"(-rotate_\d+m)", rf"-country_{cc}\1", u, count=1)
     if not (provider == "soax" or "soax" in u):
         return u
     cc = (geo or "").strip().lower()

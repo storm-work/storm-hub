@@ -18,6 +18,8 @@ ENV = {
     "SOAX_ROTATING_PACKAGE": "352438", "SOAX_ROTATING_PASSWORD": "rot-pw",
     "SOAX_MOBILE_PACKAGE": "350716", "SOAX_MOBILE_PASSWORD": "mob-pw",
     "WEBSHARE_PREFIX": "sodade2026", "WEBSHARE_PASSWORD": "ws-pw",
+    "CAPSOLVER_MOBILE_PACKAGE": "ACCT16HEX", "CAPSOLVER_MOBILE_PASSWORD": "cap-pw",
+    "CAPSOLVER_RESIDENTIAL_PACKAGE": "ACCT16HEX", "CAPSOLVER_RESIDENTIAL_PASSWORD": "cap-pw",
 }
 SETTINGS: dict = {}          # dashboard knobs only; never credentials
 
@@ -63,10 +65,40 @@ def test_webshare_mints_an_all_digit_session_id():
     assert rotating_session_id(rolled).isdigit()
 
 
+def test_capsolver_grammar_matches_the_operator_sample():
+    """Operator-provided 2026-10-14:
+       {PKG}-{TYPE}-country_{CC}-rotate_{N}m-session_{ID}:{PW}@proxy.capsolver.com:36583"""
+    u = mint_rotating_url("capsolver", "mobile", env=ENV, settings=SETTINGS, geo="NL")
+    assert u.startswith("http://ACCT16HEX-mobile-country_NL-rotate_120m-session_")
+    assert u.endswith(":cap-pw@proxy.capsolver.com:36583")
+    # no geo -> the country_ segment is omitted entirely (D2)
+    assert "country_" not in mint_rotating_url("capsolver", "mobile", env=ENV, settings=SETTINGS)
+    # residential pool shares the account but carries its own TYPE segment
+    r = mint_rotating_url("capsolver", "residential", env=ENV, settings=SETTINGS, geo="de")
+    assert "-residential-country_DE-" in r
+
+
+def test_capsolver_rolls_the_session_slot_only():
+    from libs.proxies.rotating import roll_rotating_url, rotating_session_id, reseat_geo
+    u = mint_rotating_url("capsolver", "mobile", env=ENV, settings=SETTINGS, geo="NL")
+    sid = rotating_session_id(u)
+    rolled = roll_rotating_url(u)
+    assert rotating_session_id(rolled) != sid
+    assert rolled.replace(rotating_session_id(rolled), "X") == u.replace(sid, "X")  # only the id moved
+    # reseat uppercases and replaces the country_ segment
+    assert "-country_IT-" in reseat_geo(u, "it")
+    assert "country_" not in reseat_geo(u, None)
+    # insert a country onto a no-geo url (before -rotate_)
+    bare = mint_rotating_url("capsolver", "mobile", env=ENV, settings=SETTINGS)
+    assert "-country_FR-rotate_120m-" in reseat_geo(bare, "fr")
+
+
 @pytest.mark.parametrize("provider,kind,expect", [
     ("soax", "rotating", "-country-de-"),
     ("soax", "mobile", "-country-de-"),
     ("webshare", "rotating", "sodade2026-DE-"),
+    ("capsolver", "mobile", "-country_DE-"),
+    ("capsolver", "residential", "-country_DE-"),
 ])
 def test_geo_is_injected_into_the_credential_per_provider(provider, kind, expect):
     """Geo has to live in the credential: it is the only place either provider accepts it, and a
