@@ -116,6 +116,7 @@ def _build_ops(engine_kind: str, cfg: EngineConfig, payload: dict, bus: Bus, wor
             quest_steps=payload["quest_steps"],
             form_defaults=payload["form_defaults"],
             capsolver_keys=payload["capsolver_keys"],
+            anticaptcha_keys=payload.get("anticaptcha_keys") or [],
             warm_proxy=payload["warm_proxy"],
             proxy_geos=payload.get("proxy_geos"),
             hold_proxy=payload.get("hold_proxy"),

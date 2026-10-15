@@ -105,7 +105,8 @@ def _portal_origin_live(s) -> bool:
 async def _register_one(acct: dict, proxies_cycle, capsolver_keys: list[str], lang: str,
                         email_provider: str, email_cfg: dict, executor: ThreadPoolExecutor,
                         bus: Bus, run_id: str, browser_sem: asyncio.Semaphore,
-                        captcha_solve_proxy: bool = False) -> str:
+                        captcha_solve_proxy: bool = False,
+                        anticaptcha_keys: list[str] | None = None, key_index: int = 0) -> str:
     """Full register+verify flow for one sub-account. Returns 'verified' | 'exists' | 'failed'.
     Every phase transition is reported via reg_progress (ephemeral, UI-only); the single settling
     outcome per phase-boundary (registered / exists / verified / failed) is reg_result, which the Hub
@@ -192,8 +193,15 @@ async def _register_one(acct: dict, proxies_cycle, capsolver_keys: list[str], la
                 # soax/rotating specifically (342 verified registrations, per session.py's note) --
                 # this default just stops it being the only option.
                 solve_proxy = proxy if captcha_solve_proxy else None
+                # LOAD DISTRIBUTION: one key per account from each active solver's list (round-robin by
+                # this account's index), so several keys spread the registration load instead of every
+                # account hammering key #1. The endpoint already filtered the lists to the selected
+                # solver (capsolver-only, anticaptcha-only, or both for 'race').
+                from libs.domain.solver_select import resolve_solver_keys
+                _cap_pick, _ac_pick = resolve_solver_keys(
+                    "race", capsolver_keys, anticaptcha_keys or [], index=key_index)
                 token = await loop.run_in_executor(
-                    executor, race_all, capsolver_keys, [], [], [], "REGISTER_EVISA", solve_proxy)
+                    executor, race_all, _cap_pick, _ac_pick, [], [], "REGISTER_EVISA", solve_proxy)
             except Exception as e:
                 progress(f"CAPTCHA failed: {e}")
                 token = None
@@ -330,11 +338,13 @@ async def _register_one(acct: dict, proxies_cycle, capsolver_keys: list[str], la
         result("failed", detail=reg_result_detail or "exhausted proxy retries")
         return "failed"
 
-    # solver_used is hardcoded: race_all is only ever invoked here with capsolver_keys (anticaptcha/
-    # twocaptcha/capmonster are always passed empty) -- update this if that call ever wires up
-    # additional solvers, since race_all itself doesn't report back which service won.
+    # solver_used reflects which provider lists were active this run (anticaptcha_keys are now wired,
+    # 2026-10-15). race_all itself does not report which service's token won, so for a 'race' we record
+    # "race"; otherwise the single active provider.
+    _solver_used = ("race" if (capsolver_keys and anticaptcha_keys)
+                    else "anticaptcha" if anticaptcha_keys else "capsolver")
     result("registered", email=email_addr, email_pass=email_pass,
-           proxy_id=used_proxy_id, solver_used="capsolver")
+           proxy_id=used_proxy_id, solver_used=_solver_used)
 
     # ── poll inbox, then verify ──────────────────────────────────────────────
     # async_poll_for_tokens can legitimately run for up to EMAIL_POLL_TIMEOUT (240s) with nothing to
@@ -418,19 +428,22 @@ async def _register_one(acct: dict, proxies_cycle, capsolver_keys: list[str], la
 async def _run_all(bus: Bus, run_id: str, accounts: list[dict], proxies: list[dict],
                    capsolver_keys: list[str], lang: str, email_provider: str, email_cfg: dict,
                    concurrency: int, browser_concurrency: int,
-                   captcha_solve_proxy: bool = False) -> None:
+                   captcha_solve_proxy: bool = False,
+                   anticaptcha_keys: list[str] | None = None) -> None:
     proxies_cycle = itertools.cycle(proxies or [{"id": None, "url": None}])
     sem = asyncio.Semaphore(max(1, concurrency))
     browser_sem = asyncio.Semaphore(max(1, browser_concurrency))
     executor = ThreadPoolExecutor(max_workers=max(1, concurrency) * 2 + 10)
 
-    async def bounded(acct: dict) -> str:
+    async def bounded(acct: dict, idx: int) -> str:
         async with sem:
             return await _register_one(acct, proxies_cycle, capsolver_keys, lang, email_provider,
                                        email_cfg, executor, bus, run_id, browser_sem,
-                                       captcha_solve_proxy)
+                                       captcha_solve_proxy, anticaptcha_keys=anticaptcha_keys,
+                                       key_index=idx)
 
-    results = await asyncio.gather(*(bounded(a) for a in accounts), return_exceptions=True)
+    results = await asyncio.gather(*(bounded(a, i) for i, a in enumerate(accounts)),
+                                   return_exceptions=True)
     counts: dict[str, int] = {}
     for r in results:
         k = f"error:{r.__class__.__name__}" if isinstance(r, Exception) else r
@@ -459,6 +472,7 @@ def main() -> int:
     accounts = payload.get("accounts", [])
     proxies = payload.get("proxies") or [{"id": None, "url": None}]
     capsolver_keys = payload.get("capsolver_keys", [])
+    anticaptcha_keys = payload.get("anticaptcha_keys", []) or []
     lang = payload.get("lang", "PT")
     email_provider = payload.get("email_provider", "mailtm")
     email_cfg = payload.get("email_cfg", {})
@@ -472,7 +486,7 @@ def main() -> int:
 
     asyncio.run(_run_all(bus, run_id, accounts, proxies, capsolver_keys, lang,
                          email_provider, email_cfg, concurrency, browser_concurrency,
-                         captcha_solve_proxy))
+                         captcha_solve_proxy, anticaptcha_keys=anticaptcha_keys))
     return 0
 
 

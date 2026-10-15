@@ -434,6 +434,9 @@ class RegistrationRunRequest(BaseModel):
     # for the same reason it does at login.
     geos: str | None = None
     mode: str = "parallel"                   # RegistrationMode value
+    # Optional per-run reCAPTCHA solver override ('capsolver' | 'anticaptcha' | 'race'); None uses the
+    # global REGISTRATION_SOLVER. Keys per solver come from CAPSOLVER_KEYS / ANTICAPTCHA_KEYS.
+    solver: str | None = None
 
 
 class RegistrationJobOut(BaseModel):

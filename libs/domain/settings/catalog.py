@@ -261,6 +261,27 @@ _GLOBAL = [
        note="seconds to keep racing for a better CAPTCHA score after the first acceptable solve"),
     _s("SOLVER_RACE_HARD_TIMEOUT", L.GLOBAL, float, 180.0, _TPL, "solver",
        note="absolute ceiling on one solve race"),
+    # Which reCAPTCHA solver a booking's workers use. The engine still RACES whatever key lists it is
+    # handed (libs/engine/vendor/solver.py's race_all); this picks WHICH lists -- 'capsolver' (only
+    # CAPSOLVER_KEYS), 'anticaptcha' (only ANTICAPTCHA_KEYS; falls back to capsolver if none set so a
+    # misconfig can't brick login), or 'race' (one key from EACH, raced). LOAD IS DISTRIBUTED: each
+    # worker is handed ONE key from the chosen solver (round-robin across the fleet), so N keys spread
+    # the load instead of every worker hammering key #1. Overridable per booking and per worker
+    # template; registration has its own REGISTRATION_SOLVER.
+    _s("RECAPTCHA_SOLVER", L.GLOBAL, str, "capsolver", _BK_TPL, "solver",
+       choices=("capsolver", "anticaptcha", "race"),
+       note="which reCAPTCHA solver this booking uses: 'capsolver' | 'anticaptcha' | 'race' (one key "
+            "from each, raced). Keys per solver live in CAPSOLVER_KEYS / ANTICAPTCHA_KEYS; load is "
+            "distributed one key per worker. Booking/template-overridable."),
+    _s("REGISTRATION_SOLVER", L.GLOBAL, str, "capsolver", group="solver",
+       choices=("capsolver", "anticaptcha", "race"),
+       note="which reCAPTCHA solver account-registration runs use (same choices as RECAPTCHA_SOLVER). "
+            "Registration is not per-booking, so this is the global default; the /registration/run "
+            "request can override it per run."),
+    _s("ANTICAPTCHA_KEYS", L.GLOBAL, str, "", group="credentials",
+       note="Comma-separated AntiCaptcha API keys (anti-captcha.com). Multiple keys are load-balanced "
+            "one per worker, same as CAPSOLVER_KEYS. Credential -- keep it in .env, never commit it. "
+            "Used when RECAPTCHA_SOLVER/REGISTRATION_SOLVER is 'anticaptcha' or 'race'."),
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────

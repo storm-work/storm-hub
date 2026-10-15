@@ -474,8 +474,15 @@ def _start_token_factory() -> None:
         finally:
             db.close()
         target = int(g.get("LOGIN_TOKEN_POOL_TARGET", 0) or 0)
-        caps = [k.strip() for k in str(g.get("CAPSOLVER_KEYS", "")).split(",") if k.strip()]
-        if target <= 0 or not caps:
+        # The shared pre-solved login-token pool honours the SOLVER SELECTION too (global
+        # RECAPTCHA_SOLVER): it races the selected solver's FULL key set (the pool is fleet-wide, not
+        # per-worker, so there is no per-worker distribution here -- every key is fair game).
+        from libs.domain.solver_select import active_solver_lists, parse_keys
+        caps, acs = active_solver_lists(
+            str(g.get("RECAPTCHA_SOLVER", "capsolver")),
+            parse_keys(g.get("CAPSOLVER_KEYS", "")),
+            parse_keys(g.get("ANTICAPTCHA_KEYS", "")))
+        if target <= 0 or not (caps or acs):
             return
         batch = int(g.get("LOGIN_TOKEN_POOL_BATCH", 4) or 4)
         import libs.engine.vendor.solver as _solver
@@ -483,7 +490,7 @@ def _start_token_factory() -> None:
 
         def _login_solve() -> str:
             try:
-                return _solver.race_all(caps, [], [], [], "LOGIN_EVISA", proxy=None) or ""
+                return _solver.race_all(caps, acs, [], [], "LOGIN_EVISA", proxy=None) or ""
             except Exception:
                 return ""
 
@@ -2473,9 +2480,17 @@ def run_registration(body: RegistrationRunRequest, db: Session = Depends(get_db)
         proxies = [{"id": p.id, "url": conn_url(p)} for p in proxy_rows]
 
     g = get_global(db)
-    capsolver_keys = [k.strip() for k in str(g.get("CAPSOLVER_KEYS", "")).split(",") if k.strip()]
-    if not capsolver_keys:
-        raise HTTPException(409, "CAPSOLVER_KEYS not set in global settings")
+    # Registration solver selection (operator 2026-10-15): REGISTRATION_SOLVER (global), overridable
+    # per run via body.solver. active_solver_lists filters to the chosen provider's keys; the registrar
+    # then distributes ONE key per account across them. Keep capsolver_keys as the var name the launch
+    # payload already uses; add anticaptcha_keys alongside.
+    from libs.domain.solver_select import active_solver_lists, parse_keys
+    _reg_solver = str(getattr(body, "solver", None) or g.get("REGISTRATION_SOLVER", "capsolver"))
+    capsolver_keys, anticaptcha_keys = active_solver_lists(
+        _reg_solver, parse_keys(g.get("CAPSOLVER_KEYS", "")), parse_keys(g.get("ANTICAPTCHA_KEYS", "")))
+    if not (capsolver_keys or anticaptcha_keys):
+        raise HTTPException(409, f"no solver keys set for REGISTRATION_SOLVER={_reg_solver!r} "
+                                 f"(set CAPSOLVER_KEYS / ANTICAPTCHA_KEYS in global settings)")
     email_provider = str(g.get("EMAIL_PROVIDER", "") or "mailtm")
     email_cfg = {
         "cf_mail_domain": g.get("CF_MAIL_DOMAIN"),
@@ -2512,7 +2527,8 @@ def run_registration(body: RegistrationRunRequest, db: Session = Depends(get_db)
     _bus.ensure_command_group(run_id)
     _bus.send_command(
         run_id, "launch", cfg={}, accounts=accounts, proxies=proxies,
-        capsolver_keys=capsolver_keys, lang="PT", email_provider=email_provider,
+        capsolver_keys=capsolver_keys, anticaptcha_keys=anticaptcha_keys,
+        lang="PT", email_provider=email_provider,
         email_cfg=email_cfg, concurrency=body.concurrency,
         browser_concurrency=body.browser_concurrency or body.concurrency,
         captcha_solve_proxy=captcha_solve_proxy,
@@ -3592,7 +3608,16 @@ def _do_launch_worker(db: Session, w: M.Worker) -> None:
         quest_steps = get_config(db, "quest_steps", {}) or {}
         form_defaults = get_config(db, "form_defaults", {}) or {}
         g = get_global(db)
-        capsolver_keys = [k.strip() for k in str(g.get("CAPSOLVER_KEYS", "")).split(",") if k.strip()]
+        # SOLVER SELECTION + per-worker key distribution (operator 2026-10-15). The engine still races
+        # whatever key lists it is handed; here we pick the booking's chosen solver (RECAPTCHA_SOLVER,
+        # booking/template-overridable, resolved into `eff`) and hand THIS worker ONE key from that
+        # solver's list -- round-robin by worker id -- so several keys spread the load across the fleet.
+        from libs.domain.solver_select import parse_keys, resolve_solver_keys, rr_index
+        capsolver_keys, anticaptcha_keys = resolve_solver_keys(
+            str(eff.get("RECAPTCHA_SOLVER", "capsolver")),
+            parse_keys(g.get("CAPSOLVER_KEYS", "")),
+            parse_keys(g.get("ANTICAPTCHA_KEYS", "")),
+            index=rr_index(w.id))
         # Sub-account rotation candidates (do_login()'s rotate-after-sticky-exhausted loop): the FULL
         # ranked list, each already carrying its own sub_account_id, so the worker (deliberately
         # DB-less) can rotate entirely locally without a Hub round-trip per attempt.
@@ -3607,6 +3632,7 @@ def _do_launch_worker(db: Session, w: M.Worker) -> None:
             quest_steps=quest_steps,
             form_defaults=form_defaults,
             capsolver_keys=capsolver_keys,
+            anticaptcha_keys=anticaptcha_keys,
             warm_proxy=warm_proxy,
             proxy_geos=_worker_proxy_geos,   # rotating: the geo set the worker varies across per roll
             hold_proxy=hold_proxy,

@@ -5348,7 +5348,7 @@ def test_login_consumes_a_pooled_token_as_pre_token(monkeypatch):
     captured = {}
 
     class _LoginSess:
-        def browser_login(self, user, pw, capsolver_keys=None, pre_token=None):
+        def browser_login(self, user, pw, capsolver_keys=None, anticaptcha_keys=None, pre_token=None):
             captured["pre_token"] = list(pre_token or [])
             return {"status": 200, "body": '{"type":"success"}'}
         def close_browser(self): pass
@@ -5371,7 +5371,7 @@ def test_login_falls_back_to_inline_solve_when_pool_empty(monkeypatch):
     captured = {}
 
     class _LoginSess:
-        def browser_login(self, user, pw, capsolver_keys=None, pre_token=None):
+        def browser_login(self, user, pw, capsolver_keys=None, anticaptcha_keys=None, pre_token=None):
             captured["pre_token"] = list(pre_token or [])
             return {"status": 200, "body": '{"type":"success"}'}
         def close_browser(self): pass

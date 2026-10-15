@@ -606,6 +606,7 @@ class LiveEngineOps(EngineOps):
         form_defaults: dict,
         capsolver_keys: list[str],
         warm_proxy: str,
+        anticaptcha_keys: list[str] | None = None,
         proxy_geos: list[str] | None = None,
         headless: bool = True,
         sub_account_id: str,
@@ -626,6 +627,11 @@ class LiveEngineOps(EngineOps):
         self.quest_steps = quest_steps
         self.form_defaults = form_defaults
         self.capsolver_keys = capsolver_keys
+        # AntiCaptcha keys for this worker (operator solver selection, 2026-10-15). The Hub resolves
+        # RECAPTCHA_SOLVER + distributes ONE key per worker, so this is usually a 1-element list (or
+        # empty when the booking's solver is capsolver). Passed to browser_login + the discovery race
+        # alongside capsolver_keys; the engine's race_all uses whatever non-empty lists it gets.
+        self.anticaptcha_keys = anticaptcha_keys or []
         self.warm_proxy = warm_proxy
         # Exit countries this (rotating) worker varies across on each roll, so it is never bound to
         # one possibly-throttled geo for the whole run (2026-10-01). {pin} if the operator pinned a
@@ -1403,6 +1409,7 @@ class LiveEngineOps(EngineOps):
                 result = self.session.browser_login(
                     self.account["username"], self.account["password"],
                     capsolver_keys=self.capsolver_keys,
+                    anticaptcha_keys=self.anticaptcha_keys,
                     pre_token=_pre_token,
                 )
             except Exception as e:
@@ -3308,7 +3315,8 @@ class LiveEngineOps(EngineOps):
         """One SCHEDULE_EVISA solve, honouring RECAPTCHA_SOLVE_PROXY exactly as the login path does
         (proxyless was 5/5 vs 2/5 proxied on Test 0901). Returns "" on no token."""
         _rc_proxy = self.warm_proxy if self.cfg.solver.solve_proxy else None
-        return race_all(self.capsolver_keys, [], [], [], "SCHEDULE_EVISA", proxy=_rc_proxy) or ""
+        return race_all(self.capsolver_keys, self.anticaptcha_keys, [], [],
+                        "SCHEDULE_EVISA", proxy=_rc_proxy) or ""
 
     def _slots_token(self, race_all) -> str:
         """The token for THIS /slots call. Prefers a fresh pre-solved token (SLOTS_PRESOLVE) so the
