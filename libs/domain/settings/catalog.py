@@ -122,8 +122,8 @@ _GLOBAL = [
        "Webshare ACCOUNT API token (apidocs.webshare.io, 'Authorization: Token ...') -- powers the "
        "per-pool remaining-bandwidth readout on the Proxies page. DISTINCT from a pool's proxy "
        "credentials (PREFIX/PASSWORD); this is the account token that can read the data plan's "
-       "limit/usage. Credential -- keep it in .env, never commit it. Empty = the bandwidth widget "
-       "shows 'not configured'."),
+       "limit/usage. Credential -- set it in Global settings (stored in the DB, masked on read); "
+       "never commit it to source. Empty = the bandwidth widget shows 'not configured'."),
     _s("WEBSHARE_BILLING_DAY", L.GLOBAL, int, 1, group="credentials", min_value=1.0,
        note=
        "Day of the month the Webshare plan's bandwidth allowance renews (1-28). Used to compute the "
@@ -280,8 +280,9 @@ _GLOBAL = [
             "request can override it per run."),
     _s("ANTICAPTCHA_KEYS", L.GLOBAL, str, "", group="credentials",
        note="Comma-separated AntiCaptcha API keys (anti-captcha.com). Multiple keys are load-balanced "
-            "one per worker, same as CAPSOLVER_KEYS. Credential -- keep it in .env, never commit it. "
-            "Used when RECAPTCHA_SOLVER/REGISTRATION_SOLVER is 'anticaptcha' or 'race'."),
+            "one per worker, same as CAPSOLVER_KEYS. Credential -- set it in Global settings (stored in "
+            "the DB, masked on read); never commit it to source. Used when RECAPTCHA_SOLVER / "
+            "REGISTRATION_SOLVER is 'anticaptcha' or 'race'."),
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
