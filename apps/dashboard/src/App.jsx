@@ -4018,10 +4018,13 @@ function GlobalSettingsEditor({ me }) {
               <option value="true">true</option>
               <option value="false">false</option>
             </select>
-          ) : _SETTING_SELECT_OPTIONS[key] ? (
+          ) : ((chosen && chosen.choices && chosen.choices.length) || _SETTING_SELECT_OPTIONS[key]) ? (
+            // The CATALOG's own choices win (same rule as the booking/template editor), with the
+            // hardcoded map as the fallback for keys whose options are UI-derived.
             <select value={val} onChange={(e) => setVal(e.target.value)} style={{ width: "100%" }}>
               <option value="">— choose —</option>
-              {_SETTING_SELECT_OPTIONS[key].map((o) => (<option key={o} value={o}>{o}</option>))}
+              {((chosen && chosen.choices && chosen.choices.length) ? chosen.choices
+                : _SETTING_SELECT_OPTIONS[key]).map((o) => (<option key={o} value={o}>{o}</option>))}
             </select>
           ) : (
             <input value={val} onChange={(e) => setVal(e.target.value)} style={{ width: "100%" }} placeholder="value" />
