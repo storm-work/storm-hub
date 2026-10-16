@@ -1911,6 +1911,29 @@ def test_hybrid_close_browser_off_keeps_the_browser_open():
     assert s.close_calls == 0 and not ops._browser_closed
 
 
+def test_primp_carries_the_FULL_cookie_jar_not_just_the_two_session_cookies():
+    """FULL-JAR REPLAY (2026-10-16). primp used to replay only Vistos_sid + cookiesession1 and DROP
+    every other cookie the browser held -- so any anti-bot/stress clearance cookie the login earned
+    (a DataDome `datadome`, a load-balancer affinity cookie) never reached primp, which is one way it
+    got served the ~44KB interstitial on the quest steps. _primp_creds must now carry the whole jar."""
+    class _JarSession(_CloseSession):
+        def __init__(self):
+            super().__init__()
+            self._cookies = [{"name": "Vistos_sid", "value": "abc"},
+                             {"name": "cookiesession1", "value": "z"},
+                             {"name": "datadome", "value": "CLEARANCE123"},
+                             {"name": "AWSALB", "value": "affinity"}]
+    # browser open (no close) so _primp_creds reads live
+    ops = _make_ops(cfg=_hybrid_cfg(HYBRID_CLOSE_BROWSER=False)); ops.session = _JarSession()
+    cookies, _ = ops._primp_creds()
+    assert cookies == {"Vistos_sid": "abc", "cookiesession1": "z",
+                       "datadome": "CLEARANCE123", "AWSALB": "affinity"}, cookies
+    # and the Phase-C close path caches the full jar too
+    ops2 = _make_ops(cfg=_hybrid_cfg()); ops2.session = _JarSession()
+    ops2._primp_creds()                      # triggers the lazy close + cache
+    assert ops2._hybrid_cookies.get("datadome") == "CLEARANCE123", ops2._hybrid_cookies
+
+
 def test_ensure_browser_for_pdf_reopens_a_cookie_injected_browser(monkeypatch):
     """Phase C PDF: when the hot-path browser was closed, _ensure_browser_for_pdf reopens one with the
     saved jar injected and clears the closed flag."""

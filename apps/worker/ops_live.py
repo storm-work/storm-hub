@@ -1931,6 +1931,22 @@ class LiveEngineOps(EngineOps):
         raw = self.cfg.raw
         return bool(raw.get("HYBRID_MODE", True)) and bool(raw.get(self._HYBRID_LEG_KEYS[leg], True))
 
+    @staticmethod
+    def _jar_to_cookie_map(jar) -> dict:
+        """name->value for EVERY cookie in the browser jar (last wins), so a detached primp request
+        carries the FULL clearance the real-browser login earned -- not just Vistos_sid +
+        cookiesession1. CONFIRMED relevant 2026-10-16: primp replayed only those two and dropped
+        everything else, so if the portal's anti-bot/stress gate issues any other cookie (a DataDome
+        `datadome`, a load-balancer affinity cookie, a reCAPTCHA cookie), primp arrived WITHOUT it and
+        got served the ~44KB interstitial on the quest steps. Carrying the whole jar presents exactly
+        what the browser already passed, so this is not a WAF defeat -- it is replaying our own
+        clearance. Portal-scoped by construction: the jar is read right after a portal-only session."""
+        out: dict = {}
+        for c in (jar or []):
+            if isinstance(c, dict) and c.get("name"):
+                out[c["name"]] = c.get("value", "")
+        return out
+
     def _cache_and_close_browser(self) -> None:
         """Phase C: cache the cookie jar + UA while the browser is still alive, then close it. The
         engine's close_browser() keeps the primp session alive, so the hot path continues browserless."""
@@ -1938,9 +1954,8 @@ class LiveEngineOps(EngineOps):
             self._hybrid_full_jar = self.session.get_all_cookies() or []
         except Exception:
             self._hybrid_full_jar = []
-        self._hybrid_cookies = {c["name"]: c["value"] for c in self._hybrid_full_jar
-                                if isinstance(c, dict)
-                                and c.get("name") in ("Vistos_sid", "cookiesession1")}
+        # FULL jar, not just the two session cookies -- carry the whole clearance to primp.
+        self._hybrid_cookies = self._jar_to_cookie_map(self._hybrid_full_jar)
         try:
             self._hybrid_ua = (self.session.browser_eval("navigator.userAgent") or "").strip() \
                 or "Mozilla/5.0"
@@ -1952,7 +1967,8 @@ class LiveEngineOps(EngineOps):
             self._log(f"hybrid: close_browser raised {type(e).__name__}: {str(e)[:80]}")
         self._browser_closed = True
         self._log(f"hybrid: browser CLOSED after login -- hot path is browserless on primp "
-                  f"({len(self._hybrid_cookies)} session cookies cached)")
+                  f"({len(self._hybrid_cookies)} cookies cached: "
+                  f"{','.join(sorted(self._hybrid_cookies)) or 'none'})")
 
     def _ensure_browser_for_pdf(self) -> None:
         """Phase C: the %PDF artifact needs a browser (MostrarPdf 403s a detached client). When the
@@ -1982,8 +1998,9 @@ class LiveEngineOps(EngineOps):
             self._cache_and_close_browser()
         if self._browser_closed:
             return dict(self._hybrid_cookies), (self._hybrid_ua or "Mozilla/5.0")
-        cookies = {c["name"]: c["value"] for c in (self.session.get_all_cookies() or [])
-                   if isinstance(c, dict) and c.get("name") in ("Vistos_sid", "cookiesession1")}
+        # FULL jar (see _jar_to_cookie_map): carry the whole clearance to primp, not just the two
+        # session cookies, so a WAF/stress clearance cookie the browser holds is replayed too.
+        cookies = self._jar_to_cookie_map(self.session.get_all_cookies())
         try:
             ua = (self.session.browser_eval("navigator.userAgent") or "").strip()
         except Exception:
