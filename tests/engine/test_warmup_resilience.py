@@ -235,10 +235,15 @@ class _BouncingOps(_Ops):
 
 def test_two_consecutive_bounces_trigger_a_re_warm():
     """Two failures in a row is more likely a stale form anchor than two taken slots, and a re-warm
-    is ~38s against a re-login's CAPTCHA solve and sub-account spend."""
+    is ~38s against a re-login's CAPTCHA solve and sub-account spend.
+
+    SCHEDULE mode: the proactive post-bounce re-warm is gated to schedule mode + a non-blind slot
+    (2026-10-16). In auth_only do_apply re-warms unconditionally next round, so a proactive re-warm
+    here is redundant and misleadingly leaves the worker WARMED while KEEPING -- see
+    test_config_and_phases.test_auth_only_does_not_proactively_rewarm_after_bounces."""
     ops = _BouncingOps()
-    cfg = EngineConfig.from_settings({"ROLE": "apply", "APPLY_MAX_ATTEMPTS": 5,
-                                      "APPLY_REWARM_AFTER_BOUNCES": 2})
+    cfg = EngineConfig.from_settings({"ROLE": "apply", "KEEPALIVE_MODE": "schedule",
+                                      "APPLY_MAX_ATTEMPTS": 5, "APPLY_REWARM_AFTER_BOUNCES": 2})
     PhaseMachine(cfg, ops).run()
     # bounces at 1,2,3,4,5 -> re-warm on 2 and 4, park at 5. 1 initial warmup + 2 re-warms.
     # bounces 1..12, re-warm on every 2nd that is not the park boundary (5, 10).
@@ -261,8 +266,8 @@ def test_the_park_bound_still_applies():
 
 def test_rewarm_cadence_is_configurable():
     ops = _BouncingOps()
-    cfg = EngineConfig.from_settings({"ROLE": "apply", "APPLY_MAX_ATTEMPTS": 6,
-                                      "APPLY_REWARM_AFTER_BOUNCES": 3})
+    cfg = EngineConfig.from_settings({"ROLE": "apply", "KEEPALIVE_MODE": "schedule",
+                                      "APPLY_MAX_ATTEMPTS": 6, "APPLY_REWARM_AFTER_BOUNCES": 3})
     PhaseMachine(cfg, ops).run()
     assert ops.warmups > 1, "a cadence of 3 must still produce re-warms"
 

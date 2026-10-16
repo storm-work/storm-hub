@@ -364,6 +364,43 @@ def test_apply_parks_after_a_bounce_storm_instead_of_churning_the_pool():
     assert ops.released < 12
 
 
+def _bounce_rewarm_details(booking, assignment):
+    """Run an apply worker through a bounce storm and return the transition details, so a test can
+    assert whether the proactive post-bounce re-warm fired ('N consecutive bounces: re-warming')."""
+    ops = SimEngineOps(assignment=assignment, apply_outcome="no_slot", stop_after_polls=12)
+    details: list[str] = []
+    PhaseMachine(_cfg(booking={"APPLY_MAX_ATTEMPTS": 6, "APPLY_REWARM_AFTER_BOUNCES": 2, **booking},
+                      ROLE="apply"), ops,
+                 on_transition=lambda sub, detail: details.append(detail or "")).run()
+    return details
+
+
+def test_auth_only_does_not_proactively_rewarm_after_bounces():
+    """CONFUSED-CODE FIX 2026-10-16 (ANA CUNHA TEIXEIRA, blind apply, auth_only). The post-bounce
+    proactive re-warm fired in auth_only, where do_apply ALREADY re-warms unconditionally before the
+    next submit -- so it was pure redundancy and left the worker misleadingly WARMED while KEEPING
+    (auth_only KEEPING is auth-only by definition). It must NOT fire in auth_only."""
+    details = _bounce_rewarm_details(booking={}, assignment={"date": "d1", "period": 3})
+    assert not any("consecutive bounces: re-warming" in d for d in details), details
+
+
+def test_blind_bounce_does_not_proactively_rewarm_even_in_schedule():
+    """A BLIND bounce is a PHANTOM combination, not a lapsed anchor (the blind branch says so) --
+    re-warming the cursor cannot make a phantom slot bookable, so the proactive re-warm must be
+    skipped for blind slots even in schedule mode."""
+    details = _bounce_rewarm_details(booking={"KEEPALIVE_MODE": "schedule"},
+                                     assignment={"date": "d1", "period": 3, "blind": True})
+    assert not any("consecutive bounces: re-warming" in d for d in details), details
+
+
+def test_real_slot_bounce_still_proactively_rewarms_in_schedule():
+    """Control: a REAL (non-blind) slot bounce in SCHEDULE mode KEEPS the proactive re-warm -- it
+    keeps the kept cursor fresh so do_apply applies directly next round. The fix must not leak."""
+    details = _bounce_rewarm_details(booking={"KEEPALIVE_MODE": "schedule"},
+                                     assignment={"date": "d1", "period": 3})
+    assert any("consecutive bounces: re-warming" in d for d in details), details
+
+
 def test_apply_stops_at_the_first_booking():
     ops = SimEngineOps(assignment={"date": "d1", "period": 3}, apply_outcome="booked")
     res = PhaseMachine(_cfg(booking={"APPLY_MAX_ATTEMPTS": 5}, ROLE="apply"), ops).run()

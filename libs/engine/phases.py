@@ -801,20 +801,33 @@ class PhaseMachine:
             # no_slot / bounced: hand the lease back so another worker can try it and so the
             # orchestrator will assign this one something new. The Hub counts these releases -- past
             # FALSE_SLOT_BOUNCE_LIMIT it stops believing the pool and reverts the whole booking.
+            _bounced_blind = bool((slot or {}).get("blind"))
             self.ops.release_slot(slot, "bounce")
             slot = None
             stale_streak = 0
             bounce_streak += 1
             self._to(WorkerSubstate.KEEPING)
+            _ka_mode = (getattr(getattr(self.cfg, "keepalive", None), "mode", "auth_only")
+                        or "auth_only").strip().lower()
             if bounce_streak >= max_bounces:
                 bounce_streak = 0
                 self._park(f"{max_bounces} consecutive bounces")
-            elif bounce_streak % rewarm_after_bounces == 0:
-                # Two bounces in a row is much more likely a stale server-side form anchor than two
-                # genuinely taken slots -- and re-warming is ~38s, against a re-login's CAPTCHA solve
-                # and a slice of the sub-account budget the portal is already penalising us on.
-                # Previously this just retried until it hit max_bounces and parked, so a worker whose
-                # anchor had lapsed spent its whole budget bouncing good slots off the pool.
+            elif (bounce_streak % rewarm_after_bounces == 0
+                  and not _bounced_blind and _ka_mode == "schedule"):
+                # Proactive re-warm BEFORE do_apply's own next-round re-warm -- but ONLY where it can
+                # actually help: a REAL (discovered) slot bounced in SCHEDULE mode, where do_apply
+                # trusts a kept-warm cursor and applies DIRECTLY (is_warmed()), so keeping the cursor
+                # fresh here saves the next round its re-warm. Two real bounces in a row is more
+                # likely a lapsed server-side anchor than two genuinely-taken slots, and re-warming
+                # (~38s) is far cheaper than the re-login it averts.
+                #
+                # DELIBERATELY SKIPPED for (a) BLIND slots -- a blind bounce is a PHANTOM combination,
+                # not a lapsed anchor (see the blind branch above); re-warming the cursor cannot make a
+                # phantom slot bookable, it just burns ~38s per couple of bounces -- and (b) auth_only
+                # -- do_apply re-warms UNCONDITIONALLY before the next submit ("do_apply re-warms on
+                # the way into the next attempt"), so a proactive re-warm here is pure redundancy AND
+                # leaves the worker misleadingly WARMED while KEEPING, when auth_only KEEPING is
+                # auth-only by definition. In both those cases the next do_apply re-warms anyway.
                 self._to(WorkerSubstate.WARMING_UP,
                          detail=f"{bounce_streak} consecutive bounces: re-warming before the next try")
                 if self.ops.do_warmup():
