@@ -2507,3 +2507,33 @@ def test_tick_isolates_a_failing_maintenance_phase_from_the_rest(db):
         setattr(sch, name, (lambda n: (lambda d, now: ran.append(n)))(name))
     sch._tick_once()      # must NOT raise
     assert len(ran) == 5, "a failing maintenance phase must not stop the following phases"
+
+
+# ── blind apply: respect a scheduled slot_open_at (operator 2026-10-16) ───────────────────────────
+def test_blind_mode_fires_slot_open_immediately_when_unscheduled(db):
+    """Blind apply with NO slot_open_at: the seeded pool needs no discovery, so slot-open fires the
+    instant the booking is warming -- apply now."""
+    fired = []
+    sched = _scheduler(on_slot_open=lambda db, bk: fired.append(bk.id))
+    bk = _make_booking(db, settings_json={"BLIND_APPLY_MODE": True})
+    bk.status = BookingStatus.WARMING; bk.slot_open_at = None; db.commit()
+    sched._drive_booking(db, bk, NOW)
+    db.refresh(bk)
+    assert bk.slot_open_fired_at is not None and fired == [bk.id]
+
+
+def test_blind_mode_holds_seeded_pool_until_scheduled_slot_open_at(db):
+    """Blind apply WITH a future slot_open_at: hold the seeded pool until the scheduled instant
+    instead of hammering it early (which would bounce for hours before the portal opens)."""
+    fired = []
+    sched = _scheduler(on_slot_open=lambda db, bk: fired.append(bk.id))
+    bk = _make_booking(db, settings_json={"BLIND_APPLY_MODE": True})
+    bk.status = BookingStatus.WARMING; bk.slot_open_at = NOW + timedelta(hours=4); db.commit()
+    # well before the scheduled time: must NOT fire
+    sched._drive_booking(db, bk, NOW)
+    db.refresh(bk)
+    assert bk.slot_open_fired_at is None and fired == [], "blind must hold until scheduled slot_open_at"
+    # at/after the scheduled time: the normal timed action fires it
+    sched._drive_booking(db, bk, NOW + timedelta(hours=4, seconds=1))
+    db.refresh(bk)
+    assert bk.slot_open_fired_at is not None and fired == [bk.id]

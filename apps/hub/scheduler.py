@@ -260,10 +260,17 @@ class Scheduler:
                 lvl("booking %s: SLOT-OPEN scheduled=%s fired=%s lateness=%.1fs",
                     bk.id, bk.slot_open_at, now.isoformat(), _late)
                 self._fire_slot_open(db, bk, now)
-        # BLIND-APPLY MODE: no discovery waits on a timer, so fire slot-open the instant the booking
-        # is warming/armed; slot-found then fires off the seeded pool below.
+        # BLIND-APPLY MODE: the seeded pool needs no discovery, so there is nothing to WAIT to
+        # discover -- fire slot-open the instant the booking is warming/armed and let slot-found fire
+        # off the seeded pool below. BUT only when the operator did NOT schedule a slot_open_at: if
+        # they set one (e.g. the portal opens its real slots at a known future time and the blind grid
+        # mirrors them), HOLD the seeded pool until that scheduled instant instead of hammering it
+        # early -- applying blind slots before the portal opens them just bounces for hours and burns
+        # exits/accounts. With slot_open_at set, the normal timed action above (plan_booking_actions)
+        # fires slot-open exactly at the scheduled time; with none set, apply immediately as before.
         if (bk.status in (BookingStatus.WARMING, BookingStatus.ARMED)
-                and bk.slot_open_fired_at is None and self._is_blind_mode(db, bk)):
+                and bk.slot_open_fired_at is None and bk.slot_open_at is None
+                and self._is_blind_mode(db, bk)):
             self._fire_slot_open(db, bk, now)
         # Cross-booking feed: mirror a detector booking's finds into this pool (BEFORE the RUNNING
         # branch so injected slots are assignable the same tick). No-op without a feeder.
