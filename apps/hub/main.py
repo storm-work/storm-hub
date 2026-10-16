@@ -105,6 +105,7 @@ from .schemas import (
     IdentityCreate,
     IdentityBulkDelete,
     IdentityBulkDeleteResult,
+    IdentityBulkGroup,
     IdentityBulkPriority,
     IdentityDuplicate,
     IdentityBulkTargetPosto,
@@ -1539,6 +1540,25 @@ def bulk_set_priority(body: IdentityBulkPriority, db: Session = Depends(get_db),
         updated.append(iid)
     db.commit()
     return {"updated": updated}
+
+
+@app.post("/identities/bulk-group")
+def bulk_set_group(body: IdentityBulkGroup, db: Session = Depends(get_db),
+                   _op: Principal = Depends(require_operator)) -> dict:
+    """Set the same group_name on many EXISTING identities at once -- the batch/cohort label used to
+    filter/sort the Identities page and the attach panel. This RELABELS the selected identities; it is
+    NOT /identities/duplicate (which clones into a group). Blank clears the group (NULL). Unknown ids
+    are silently skipped (a stale selection must not block updating the rest), mirroring bulk-priority."""
+    grp = (body.group_name or "").strip() or None
+    updated: list[str] = []
+    for iid in body.identity_ids:
+        ident = db.get(M.Identity, iid)
+        if not ident:
+            continue
+        ident.group_name = grp
+        updated.append(iid)
+    db.commit()
+    return {"updated": updated, "group_name": grp}
 
 
 @app.post("/identities/bulk-target-posto")

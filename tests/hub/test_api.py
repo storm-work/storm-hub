@@ -1956,3 +1956,34 @@ def test_bulk_priority_skips_unknown_ids_instead_of_failing_the_whole_batch(clie
                     json={"identity_ids": [a, "does-not-exist"], "priority": 200}, headers=h)
     assert r.status_code == 200, r.text
     assert r.json()["updated"] == [a]
+
+
+def test_bulk_set_group_relabels_selected_identities(client):
+    """POST /identities/bulk-group sets group_name on the SELECTED existing identities (relabel),
+    and blank clears it -- distinct from /identities/duplicate which clones. Regression for the
+    Identities-page toolbar where the only 'Group' field was wired to Duplicate."""
+    h = _operate_headers(client)
+    a = client.post("/identities", json={"full_name": "A A", "type": "real", "passport_no": "G1"}, headers=h).json()["id"]
+    b = client.post("/identities", json={"full_name": "B B", "type": "real", "passport_no": "G2"}, headers=h).json()["id"]
+    # set a group on both
+    r = client.post("/identities/bulk-group", json={"identity_ids": [a, b], "group_name": " batch-7 "}, headers=h)
+    assert r.status_code == 200, r.text
+    assert sorted(r.json()["updated"]) == sorted([a, b]) and r.json()["group_name"] == "batch-7"
+    rows = {i["id"]: i for i in client.get("/identities", headers=h).json()}
+    assert rows[a]["group_name"] == "batch-7" and rows[b]["group_name"] == "batch-7"
+    # no new identities were created (it relabels, never duplicates)
+    assert len(rows) == 2
+    # blank clears it, unknown ids are skipped (not an error)
+    r2 = client.post("/identities/bulk-group", json={"identity_ids": [a, "nope"], "group_name": ""}, headers=h)
+    assert r2.status_code == 200 and r2.json()["updated"] == [a] and r2.json()["group_name"] is None
+    assert client.get("/identities", headers=h).json()  # still fine
+    rows2 = {i["id"]: i for i in client.get("/identities", headers=h).json()}
+    assert rows2[a]["group_name"] in (None, "") and rows2[b]["group_name"] == "batch-7"
+
+
+def test_bulk_set_group_requires_operator(client):
+    client.post("/auth/bootstrap", json={"username": "a", "password": "p"})
+    tok = client.post("/auth/login", json={"username": "a", "password": "p", "purpose": "view"}).json()["token"]
+    r = client.post("/identities/bulk-group", json={"identity_ids": [], "group_name": "x"},
+                    headers={"Authorization": f"Bearer {tok}"})
+    assert r.status_code == 423

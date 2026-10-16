@@ -2431,6 +2431,15 @@ function Identities({ me, setLeftPanel, setRightPanel }) {
     const n = r.skipped_non_real?.length || 0;
     setMsg(`Set target posto on ${r.updated.length}.` + (n ? ` Skipped ${n} test identit${n === 1 ? "y" : "ies"} (real only).` : ""));
   });
+  // Set the group/batch label on the SELECTED EXISTING identities (relabel), NOT the duplicate's
+  // group. The two were conflated before -- the only "Group" field in the selected toolbar was wired
+  // to Duplicate, so an operator trying to group their selection either did nothing or cloned them.
+  const [bulkGroup, setBulkGroup] = useState("");
+  const setGroupOnSelected = () => act(async () => {
+    const r = await api("/identities/bulk-group",
+      { method: "POST", body: { identity_ids: selectedIds, group_name: bulkGroup.trim() || null } });
+    setMsg(`Set group on ${r.updated.length}` + (r.group_name ? ` → "${r.group_name}".` : " (cleared)."));
+  });
   // Duplicate = clone each selected identity with a passport SUFFIX, no sub-accounts, into an
   // optional group. Reports per-id skips (e.g. passport already exists) rather than failing silently.
   const duplicateSelected = () => act(async () => {
@@ -2576,13 +2585,19 @@ function Identities({ me, setLeftPanel, setRightPanel }) {
           <label style={{ margin: 0 }} title="set target posto on the selected REAL identities; blank clears it">Posto</label>
           <input value={bulkPosto} onChange={(e) => setBulkPosto(e.target.value)} placeholder="5084" style={{ width: 70 }} />
           <button className="btn" disabled={!op} onClick={setTargetPosto}>Set posto</button>
+          <label style={{ margin: 0 }} title="set the group/batch label on the SELECTED identities; blank clears it">Group</label>
+          <input value={bulkGroup} onChange={(e) => setBulkGroup(e.target.value)} placeholder="batch label" style={{ width: 110 }} />
+          <button className="btn" disabled={!op} onClick={setGroupOnSelected}
+                  title="Set this group/batch label on the selected identities (relabel; blank clears it). This does NOT duplicate.">
+            Set group
+          </button>
           <span className="grow" />
           <label style={{ margin: 0 }} title="appended to each selected identity's passport number, e.g. + or ++">Suffix</label>
           <input value={dupSuffix} onChange={(e) => setDupSuffix(e.target.value)} placeholder="+" style={{ width: 50 }} />
-          <label style={{ margin: 0 }}>Group</label>
-          <input value={dupGroup} onChange={(e) => setDupGroup(e.target.value)} placeholder="(keep source's)" style={{ width: 120 }} />
+          <label style={{ margin: 0 }} title="group for the CLONES (blank keeps each source's group)">Dup group</label>
+          <input value={dupGroup} onChange={(e) => setDupGroup(e.target.value)} placeholder="(keep source's)" style={{ width: 110 }} />
           <button className="btn" disabled={!op || !dupSuffix.trim()} onClick={duplicateSelected}
-                  title="Clone each selected identity with the passport suffix. No sub-accounts are copied — the duplicates start empty.">
+                  title="Clone each selected identity with the passport suffix into 'Dup group'. No sub-accounts are copied — the duplicates start empty.">
             Duplicate
           </button>
           <button className="btn ghost" disabled={!op} onClick={deleteSelectedIdentities}

@@ -558,3 +558,11 @@ class IdentityBulkPriority(BaseModel):
     PATCH's own priority field."""
     identity_ids: list[str]
     priority: int
+
+
+class IdentityBulkGroup(BaseModel):
+    """Bulk set the group_name (batch/cohort label) on the SELECTED EXISTING identities. Distinct
+    from /identities/duplicate, which CLONES into a group -- this relabels the ones you picked.
+    Blank/empty clears the group (NULL)."""
+    identity_ids: list[str]
+    group_name: str | None = None
