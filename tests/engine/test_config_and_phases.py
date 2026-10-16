@@ -918,3 +918,22 @@ def test_scout_does_not_rebuild_when_the_probe_passes():
     PhaseMachine(_cfg(ROLE="scout"), ops).run()
     assert ops.warmups == 1    # just the initial slot-open warm-up
     assert ops.logins == 1
+
+
+def test_self_scout_apply_also_probes_before_discovering():
+    """The SAME primp liveness gate now guards the APPLY path's self-scout branch (2026-10-16): a
+    self-scouting apply worker must prove its session healthy before discovering, exactly as a real
+    scout does -- so a dead session is rebuilt first, not discovered into."""
+    fut = _future_weekday()
+    ops = _ProbeGateOps(
+        probe_results=[False, True],          # first self-scout round: dead -> must rebuild first
+        assignment=None, scouts_invalid=True,  # no assignment + scouts dead -> self-scout fallback
+        discover_outcomes={fut: {"outcome": "found", "periods": [4]}},
+    )
+    cfg = EngineConfig.from_settings(resolve({
+        L.BOOKING: {"CAL_START_DATE": fut, "CAL_END_DATE": fut, "CAL_NUM_DAYS": 1},
+        L.TEMPLATE: {"ROLE": "apply"},
+    }))
+    res = PhaseMachine(cfg, ops).run()
+    assert ops.probe_calls >= 1               # the apply path ran the primp probe gate (was scout-only)
+    assert res.outcome == "booked" and WorkerSubstate.DISCOVERING in res.visited

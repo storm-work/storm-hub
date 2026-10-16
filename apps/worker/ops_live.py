@@ -1184,6 +1184,15 @@ class LiveEngineOps(EngineOps):
         """
         if self.session is None:
             return False
+        # HYBRID: prove liveness on PRIMP, the transport discovery will actually use. Under
+        # HYBRID_CLOSE_BROWSER the browser is parked, so a browser_nav probe FAILS every round and
+        # forces a full _rebuild_session (a browser RE-LOGIN) before each discover -- turning a light
+        # primp calendar GET into a per-round login storm. CONFIRMED 2026-10-16 ("Test login 1016"):
+        # scouts churned "re-warm failed; re-login: session not proven healthy before disc" every
+        # round. The discovery GETs themselves prove primp can read the portal, so a primp read is a
+        # valid positive liveness check. Gated on the legs that run on primp (discovery/keepalive).
+        if self._hybrid("DISCOVERY") or self._hybrid("KEEPALIVE"):
+            return self._session_probe_ok_primp()
         probe = self.cfg.keepalive.probe or "home"
         url = HOME_URL if probe == "home" else probe
         try:
@@ -1206,6 +1215,38 @@ class LiveEngineOps(EngineOps):
         state = classify_session_state(page, final_url, warmed=False)
         if state is not SessionState.AUTHENTICATED:
             self._log(f"session_probe_ok: not authenticated ({state}, {len(page)}B) -- not healthy")
+            return False
+        return True
+
+    def _session_probe_ok_primp(self) -> bool:
+        """The hybrid (primp) form of session_probe_ok: prove the session live with a detached
+        session-cookie GET, matching the transport discovery/keepalive use -- so a browserless hot
+        path is never forced to reopen a browser and re-login before a primp discover round. AUTH-
+        LEVEL, the same question the auth_only keepalive asks (classify_session_state warmed=False),
+        just via primp instead of browser_nav. A connection failure here is a dead exit; a redirect to
+        Authentication.jsp / a down page classifies as not-authenticated."""
+        probe = self.cfg.keepalive.probe or "home"
+        url = HOME_URL if probe == "home" else probe
+        try:
+            pc, H = self._primp_client()
+            r = pc.get(url, headers=H)
+            page = r.text or ""
+            final_url = str(getattr(r, "url", url) or url)
+        except Exception as e:
+            self._log(f"session_probe_ok[primp]: GET failed ({str(e)[:100]}) -- not healthy")
+            return False
+        if probe != "home":
+            # Custom KEEPALIVE_PROBE URL: a successful GET is the whole check (mirrors the browser
+            # path, which treats a nav to an arbitrary operator page as the check with no content
+            # opinion).
+            return True
+        if self._is_dead_exit_response(page, final_url):
+            self._log("session_probe_ok[primp]: dead exit -- not healthy")
+            return False
+        state = classify_session_state(page, final_url, warmed=False)
+        if state is not SessionState.AUTHENTICATED:
+            self._log(f"session_probe_ok[primp]: not authenticated ({state}, {len(page)}B) "
+                      f"-- not healthy")
             return False
         return True
 
@@ -1321,6 +1362,14 @@ class LiveEngineOps(EngineOps):
         # the exit demonstrably MOVED and so burned accounts on a stable-but-flagged exit.
         recaptcha_rolls = 0
         max_recaptcha_rolls = max(0, int(self.cfg.raw.get("LOGIN_RECAPTCHA_ROLLS", 3)))
+        # reCAPTCHA SOLVER outages (no token: 180s timeout / all solvers failed). Infrastructure, not
+        # the account's fault AND not the exit's (login solving is ProxyLess) -- so, unlike the
+        # transient/busy/recaptcha budgets, this one retries WITHOUT rolling the exit, and like them
+        # it is not charged to the sub-account. CONFIRMED 2026-10-16: a solver timeout raised
+        # "reCAPTCHA: no token after all attempts", matched no transient marker, and so burned the
+        # account's 2-strike budget on a solver hiccup. See _is_solver_failure.
+        solver_fails = 0
+        max_solver_fails = max(0, int(self.cfg.raw.get("LOGIN_SOLVER_FAILURE_RETRIES", 3)))
         # "Try again later" refusals, each answered by rolling to a DIFFERENT exit before the fleet
         # is told anything. Bounded like `transient` and `ip_moves`, and like them not charged to
         # the sub-account. Its own counter rather than sharing `transient`: a dead tunnel and a
@@ -1328,6 +1377,11 @@ class LiveEngineOps(EngineOps):
         busy_rolls = 0
         max_busy_rolls = max(0, int(self.cfg.raw.get("LOGIN_PORTAL_BUSY_ROLLS", 3)))
         rounds = 0
+        # Set by the solver-outage branch to skip the next round's top-of-loop exit roll: a solver
+        # outage is not the exit's fault (login solving is ProxyLess), so rolling a healthy warm exit
+        # onto a cold one (~30-50% reachable on webshare) would make a solver hiccup compound into a
+        # dead exit. Every OTHER retry reason still rolls as before.
+        skip_roll_this_round = False
         while attempt < sticky_max:
             # Every round here costs a browser launch + a login attempt + a backoff sleep, and the
             # transient/ip_moves/busy_rolls budgets mean `attempt` may not advance for many rounds
@@ -1337,7 +1391,9 @@ class LiveEngineOps(EngineOps):
                 self._log("login: stop observed -- abandoning retries on this sub-account")
                 return False
             rounds += 1
-            if rounds > 1:
+            _do_roll = rounds > 1 and not skip_roll_this_round
+            skip_roll_this_round = False   # consume: the skip only covers the one round after it was set
+            if _do_roll:
                 # Regression (L2/L3, closed by P3): a repeated login failure used to keep retrying
                 # on the SAME proxy forever -- if the exit itself is the problem (burned IP,
                 # rate-limited), no number of retries recovers. Move to a fresh exit before every
@@ -1413,6 +1469,20 @@ class LiveEngineOps(EngineOps):
                     pre_token=_pre_token,
                 )
             except Exception as e:
+                # SOLVER OUTAGE (no token) checked FIRST: it is neither the account's fault nor the
+                # exit's (login solving is ProxyLess), so it must NOT burn the sticky budget AND must
+                # NOT roll the exit -- retry on the SAME exit after a short backoff. Confirmed
+                # 2026-10-16: without this, "reCAPTCHA: no token after all attempts" fell through to
+                # `attempt += 1` and burned real accounts on an anticaptcha timeout.
+                if solver_fails < max_solver_fails and self._is_solver_failure(str(e)):
+                    solver_fails += 1
+                    self._log(f"login: solver outage {solver_fails}/{max_solver_fails} "
+                              f"({str(e)[:90]}) -- NOT charged to {self.sub_account_id[:8]} and NOT "
+                              f"rolling the exit (the solver failed, not the exit); re-solving "
+                              f"(sticky still {attempt}/{sticky_max})")
+                    skip_roll_this_round = True   # keep the warm exit: don't roll for a solver outage
+                    self._backoff_seconds(float(self.cfg.raw.get("LOGIN_THROTTLE_BACKOFF", 0.5)))
+                    continue          # deliberately does NOT advance `attempt` and does NOT roll
                 if transient < max_transient and self._is_transient_login_failure(str(e)):
                     transient += 1
                     self._log(f"login: transient {transient}/{max_transient} "
@@ -1591,6 +1661,26 @@ class LiveEngineOps(EngineOps):
             "err_empty_response", "err_name_not_resolved", "err_socks", "err_address",
             "chromewebdata",            # chrome-error://chromewebdata/ -- navigation never landed
             "failed to fetch",
+            # primp/reqwest transport failures (hybrid detached client): the exception str() carries
+            # no chrome-style code. "error sending request" is reqwest's transport prefix (the request
+            # never completed); the connection-reset/refused/closed phrases are the dead-exit variants.
+            # All mean the request never reached the portal -- an exit fault, not the portal's verdict.
+            "error sending request", "connection refused", "connection reset",
+            "connection closed", "connection error",
+        ))
+
+    @staticmethod
+    def _is_solver_failure(msg: str) -> bool:
+        """The reCAPTCHA SOLVER produced no token -- a solver outage (180s timeout, all solvers
+        failed), NOT a verdict on the account or the exit. browser_login raises 'reCAPTCHA: no token
+        after all attempts' when the token is empty (session.py), and race_all raises 'all N solvers
+        failed'. Charging either to the sub-account's 2-strike sticky budget burns real accounts on a
+        solver hiccup (CONFIRMED 2026-10-16, anticaptcha). Login solving is ProxyLess, so this is also
+        NOT a reason to roll the exit. Kept distinct from _is_transient_login_failure, whose markers
+        are all transport/exit faults that DO warrant a roll."""
+        low = (msg or "").lower()
+        return any(m in low for m in (
+            "no token after all attempts", "solvers failed", "solver timeout", "race_all failed",
         ))
 
     def identity_unavailable(self) -> bool:
@@ -1906,7 +1996,15 @@ class LiveEngineOps(EngineOps):
         it triggers the Phase-C lazy-close and serves the cache when the browser is gone)."""
         import primp
         cookies, ua = self._primp_creds()
-        pc = primp.Client(proxy=self.warm_proxy, verify=False, timeout=45, follow_redirects=True)
+        # connect_timeout + read_timeout are ENFORCED per-request; the constructor `timeout=` is NOT
+        # (proven 2026-10-16: a Client(timeout=45) call stalled on a dead webshare tunnel blocked in
+        # ep_poll for 55-86 min and froze a whole apply fleet non-bookable). These two bound every
+        # hybrid primp call so a dead/stalled exit raises a timeout fast -- which
+        # _is_transient_login_failure matches, so the caller rolls the exit. See HYBRID_PRIMP_*.
+        connect_t = float(self.cfg.raw.get("HYBRID_PRIMP_CONNECT_TIMEOUT", 10.0))
+        read_t = float(self.cfg.raw.get("HYBRID_PRIMP_READ_TIMEOUT", 30.0))
+        pc = primp.Client(proxy=self.warm_proxy, verify=False, timeout=45,
+                          connect_timeout=connect_t, read_timeout=read_t, follow_redirects=True)
         try:
             pc.set_cookies(_PORTAL_ORIGIN + "/", cookies)
         except Exception:
@@ -3216,6 +3314,14 @@ class LiveEngineOps(EngineOps):
         _mode = (getattr(self.cfg.keepalive, "mode", "auth_only") or "auth_only").strip().lower()
         if ok and _mode == "schedule" and self._anchor_src != "chain":
             ok = self._run_warmup_steps()
+            # The re-login self-heals a dead exit (_fresh_login rolls on transient), but the re-warm
+            # that follows does NOT -- it only records _warmup_last_error. If that re-warm failed on a
+            # dead/stalled exit, roll it HERE so the next restore attempt's re-login + re-warm land on
+            # a fresh exit immediately, rather than waiting for a later tick to happen to roll. This
+            # is the recovery half of the 2026-10-16 freeze fix: the HYBRID_PRIMP_* timeouts make the
+            # re-warm FAIL FAST instead of hanging; this makes that fast failure actually progress.
+            if not ok and self._is_transient_login_failure(self._warmup_last_error):
+                self._roll_exit("keepalive restore: re-warm hit a dead exit")
         if ok:
             self._keepalive_restore_attempts = 0
             self._mark_keep_bookable(True)
@@ -3856,6 +3962,19 @@ class LiveEngineOps(EngineOps):
                       f"{sorted(_DISCOVERY_SOURCES)} -- REFUSING it and using 'calendar'. "
                       f"Fix the booking setting; this run is NOT testing what you configured.")
             source = "calendar"
+        # /slots is BROWSER-bound: it delivers the token through the page's own
+        # onCaptchaSuccess->getSlots callback, which a detached primp POST cannot drive (HYBRID_
+        # DISCOVERY hybridises ONLY the calendar leg). Under HYBRID_CLOSE_BROWSER the browser is
+        # parked, so a slots/both round would fail browser_nav every time and fall back to calendar
+        # anyway -- while _discover_via_slots has no reopen guard, so it just burns a failing nav each
+        # round. Degrade to calendar EXPLICITLY when the browser is closed. CONFIRMED 2026-10-16
+        # ("Test login 1016", full-primp + DISCOVERY_SOURCE=both): /slots never ran, calendar found
+        # everything. The clean config for full-primp is DISCOVERY_SOURCE=calendar.
+        if source in ("slots", "both") and getattr(self, "_browser_closed", False):
+            self._log(f"do_discover: DISCOVERY_SOURCE={source!r} needs the browser for /slots, but "
+                      f"the hot path is browserless (HYBRID_CLOSE_BROWSER) -- running calendar "
+                      f"(primp) only. Set DISCOVERY_SOURCE=calendar to make this the configured path.")
+            source = "calendar"
         self._slog("discover_start", dates=len(dates), source=source)
         if source in ("slots", "both"):
             res = self._discover_via_slots(dates)
@@ -4191,8 +4310,15 @@ class LiveEngineOps(EngineOps):
         import primp
         from urllib.parse import urlencode
         cookies, ua = self._primp_creds()   # cached when the Phase-C browser is closed
+        # The constructor `timeout=` is NOT enforced per-request (proven 2026-10-16), so a dead exit
+        # would hang the submit forever. Set a connect_timeout (a dead exit must fail fast at connect)
+        # and pass the submit budget as a PER-REQUEST `timeout` on pc.post, which IS enforced. No
+        # short read_timeout here: a live submit legitimately takes a while (server-side PDF build),
+        # and APPLY_SUBMIT_TIMEOUT is the deliberate total budget for that.
+        connect_t = float(self.cfg.raw.get("HYBRID_PRIMP_CONNECT_TIMEOUT", 10.0))
         pc = primp.Client(proxy=self.warm_proxy, verify=False,
-                          timeout=int(max(5.0, timeout)), follow_redirects=True)
+                          timeout=int(max(5.0, timeout)), connect_timeout=connect_t,
+                          follow_redirects=True)
         try:
             pc.set_cookies(_PORTAL_ORIGIN + "/", cookies)
         except Exception:
@@ -4205,7 +4331,8 @@ class LiveEngineOps(EngineOps):
             "Origin": _PORTAL_ORIGIN,
             "Cookie": "; ".join(f"{k}={v}" for k, v in cookies.items()),
         }
-        r = pc.post(submit_url, data=urlencode(body_dict), headers=headers)
+        r = pc.post(submit_url, data=urlencode(body_dict), headers=headers,
+                    timeout=int(max(5.0, timeout)))
         return (getattr(r, "status_code", None), (getattr(r, "text", "") or ""))
 
     def do_apply(self, slot: dict) -> str:

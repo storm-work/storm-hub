@@ -1307,6 +1307,21 @@ def test_connection_errors_are_transient_credential_rejections_are_not():
         assert t(verdict) is False, verdict
 
 
+def test_primp_transport_errors_are_transient():
+    """The hybrid detached primp client raises plain reqwest transport errors whose str() carries no
+    chrome-style code -- a connect-refused dead exit reads 'error sending request for url (...)' and a
+    stalled read reads 'operation timed out'. Both mean the request never reached the portal (an exit
+    fault), so they MUST classify transient or a dead webshare exit is never rolled. Regression for
+    the 2026-10-16 apply-fleet freeze."""
+    t = LiveEngineOps._is_transient_login_failure
+    for infra in (
+        "error sending request for url (https://pedidodevistos.mne.gov.pt/VistosOnline/)",
+        "error sending request for url (...) > operation timed out",
+        "connection refused", "connection reset by peer", "connection closed before message completed",
+    ):
+        assert t(infra) is True, infra
+
+
 def test_transient_failures_do_not_burn_the_sticky_budget(monkeypatch):
     """The old loop was `for attempt in range(...)` where BOTH branches continue'd, so the transient
     classification advanced the counter identically and had no effect at all -- while logging
@@ -1369,6 +1384,55 @@ def test_transient_budget_is_bounded(monkeypatch):
 
     assert ops._sticky_login_attempts(ops.cfg.login.sticky_retry_max) is False
     assert calls["n"] == 5      # 3 transient (uncharged) + 2 sticky, then give up
+
+
+def test_solver_outage_does_not_burn_the_sticky_budget_or_roll_the_exit(monkeypatch):
+    """CONFIRMED 2026-10-16 ('Test login 1016 - auth'): an anticaptcha 180s timeout raised
+    'reCAPTCHA: no token after all attempts', which matched no transient marker and so was charged as
+    a real login attempt -- burning real accounts on a solver hiccup. A solver outage is neither the
+    account's fault nor the exit's (login solving is ProxyLess), so it must NOT burn the sticky budget
+    AND must NOT roll the exit."""
+    import apps.worker.ops_live as ops_live_mod
+    calls = {"n": 0}
+
+    class _SolverDownThenGood(_FakeSession):
+        def browser_login(self, *a, **k):
+            calls["n"] += 1
+            if calls["n"] <= 4:
+                raise RuntimeError("reCAPTCHA: no token after all attempts")
+            return {"status": 200, "body": '{"type":"success"}'}
+
+    monkeypatch.setattr(ops_live_mod, "get_session", lambda **kw: _SolverDownThenGood())
+    ops = _make_ops(cfg=_cfg(STICKY_RETRY_MAX=2, LOGIN_SOLVER_FAILURE_RETRIES=6))
+    ops._backoff = ops._backoff_seconds = lambda *a, **k: None
+    ops._request_proxy_rotation = lambda phase=None: None
+    rolls = []
+    ops._roll_exit = lambda why: rolls.append(why) or True
+
+    assert ops._sticky_login_attempts(ops.cfg.login.sticky_retry_max) is True
+    assert calls["n"] == 5          # recovered -- never gave up at the 2-attempt sticky budget
+    assert rolls == []              # the exit was NEVER rolled for a solver outage
+
+
+def test_solver_outage_budget_is_bounded(monkeypatch):
+    """Not-charging a solver outage must still terminate on a permanently dead solver."""
+    import apps.worker.ops_live as ops_live_mod
+    calls = {"n": 0}
+
+    class _SolverAlwaysDown(_FakeSession):
+        def browser_login(self, *a, **k):
+            calls["n"] += 1
+            raise RuntimeError("reCAPTCHA: no token after all attempts")
+
+    monkeypatch.setattr(ops_live_mod, "get_session", lambda **kw: _SolverAlwaysDown())
+    ops = _make_ops(cfg=_cfg(STICKY_RETRY_MAX=2, LOGIN_SOLVER_FAILURE_RETRIES=3,
+                             LOGIN_TRANSIENT_RETRY_MAX=0))
+    ops._backoff = ops._backoff_seconds = lambda *a, **k: None
+    ops._request_proxy_rotation = lambda phase=None: None
+    ops._roll_exit = lambda why: True
+
+    assert ops._sticky_login_attempts(ops.cfg.login.sticky_retry_max) is False
+    assert calls["n"] == 5          # 3 solver-outage (uncharged) + 2 sticky, then give up
 
 
 # ── checkpoint restore: bounded, and self-cleaning (confirmed live 2026-08-14) ─
@@ -1623,6 +1687,126 @@ class _FakePrimp:
 def _hybrid_cfg(**booking):
     return EngineConfig.from_settings(resolve(
         {L.TEMPLATE: {"ROLE": "apply"}, L.BOOKING: {"HYBRID_MODE": True, **booking}}))
+
+
+def _authed_home_html():
+    # classify_session_state(warmed=False) needs BOTH home markers to read AUTHENTICATED
+    return "<html><body>solicitar pedido de visto ... consultar pedidos</body></html>"
+
+
+class _ProbeResp:
+    def __init__(self, text, url="https://pedidodevistos.mne.gov.pt/VistosOnline/"):
+        self.text, self.url = text, url
+
+
+def test_session_probe_ok_uses_primp_under_hybrid_not_browser(monkeypatch):
+    """Under full-primp (HYBRID_CLOSE_BROWSER) the browser is parked, so a browser_nav liveness probe
+    would FAIL every round and force a full rebuild+re-login before each discover. CONFIRMED
+    2026-10-16: the probe must run on PRIMP when the discovery/keepalive legs are hybrid."""
+    ops = _make_ops(cfg=_hybrid_cfg())
+    class _NoNav(_FakeSession):
+        def browser_nav(self, *a, **k):
+            raise AssertionError("hybrid session_probe_ok must NOT use browser_nav")
+    ops.session = _NoNav()
+    ops._log = lambda *a, **k: None
+    got = {}
+    class _PC:
+        def get(self, url, headers=None):
+            got["url"] = url
+            return _ProbeResp(_authed_home_html())
+    monkeypatch.setattr(type(ops), "_primp_client", lambda self: (_PC(), {}))
+    assert ops.session_probe_ok() is True
+    assert "pedidodevistos" in got["url"]      # it really probed via primp
+
+
+def test_session_probe_ok_primp_false_on_auth_redirect(monkeypatch):
+    """A primp probe that lands on Authentication.jsp = session lost -> not healthy (triggers rebuild)."""
+    ops = _make_ops(cfg=_hybrid_cfg())
+    ops.session = _FakeSession()
+    ops._log = lambda *a, **k: None
+    class _PC:
+        def get(self, url, headers=None):
+            return _ProbeResp("<html>expired</html>",
+                              url="https://pedidodevistos.mne.gov.pt/VistosOnline/Authentication.jsp")
+    monkeypatch.setattr(type(ops), "_primp_client", lambda self: (_PC(), {}))
+    assert ops.session_probe_ok() is False
+
+
+def test_do_discover_degrades_slots_to_calendar_when_browser_closed():
+    """full-primp: /slots is browser-bound and the browser is parked, so do_discover must degrade a
+    both/slots source to calendar (primp) instead of calling _discover_via_slots on no browser."""
+    ops = _make_ops(cfg=_hybrid_cfg(DISCOVERY_SOURCE="both"))
+    ops._log = ops._slog = lambda *a, **k: None
+    ops._browser_closed = True
+    calls = {"slots": 0, "cal": 0}
+    ops._discover_via_slots = lambda dates: (calls.__setitem__("slots", calls["slots"] + 1), [])[1]
+    ops._discover_via_calendar = lambda dates: (calls.__setitem__("cal", calls["cal"] + 1),
+                                                [{"date": d, "outcome": "empty"} for d in dates])[1]
+    ops._discover_done = lambda res, source: res
+    ops.do_discover(["2026-11-03"])
+    assert calls["slots"] == 0, "the /slots leg must be skipped when the browser is parked"
+    assert calls["cal"] == 1, "calendar (primp) must run instead"
+
+
+def test_do_discover_still_uses_slots_when_browser_open():
+    """The guard is browser-state, not blanket: with an OPEN browser, both still runs /slots first."""
+    ops = _make_ops(cfg=_hybrid_cfg(DISCOVERY_SOURCE="both"))
+    ops._log = ops._slog = lambda *a, **k: None
+    ops._browser_closed = False
+    calls = {"slots": 0}
+    ops._discover_via_slots = lambda dates: (calls.__setitem__("slots", calls["slots"] + 1),
+                                             [{"date": d, "outcome": "empty"} for d in dates])[1]
+    ops._discover_done = lambda res, source: res
+    ops.do_discover(["2026-11-03"])
+    assert calls["slots"] == 1
+
+
+def test_primp_client_sets_enforced_connect_and_read_timeouts(monkeypatch):
+    """primp.Client's constructor `timeout=` is NOT enforced per-request (proven live 2026-10-16: a
+    dead webshare tunnel hung a whole apply fleet in ep_poll for 55-86 min). connect_timeout and
+    read_timeout ARE enforced, so _primp_client must pass them (from HYBRID_PRIMP_* settings)."""
+    import sys
+    captured = {}
+
+    class _CapClient:
+        def __init__(self, **kw):
+            captured.update(kw)
+        def set_cookies(self, *a, **k):
+            pass
+
+    monkeypatch.setitem(sys.modules, "primp", type("m", (), {"Client": _CapClient}))
+    # avoid touching a real browser: serve creds from the Phase-C cache
+    ops = _make_ops(cfg=_hybrid_cfg(HYBRID_PRIMP_CONNECT_TIMEOUT=7.0, HYBRID_PRIMP_READ_TIMEOUT=22.0))
+    ops.session = _FakeSession()
+    ops._browser_closed = True
+    ops._hybrid_cookies = {"Vistos_sid": "x"}
+    ops._hybrid_ua = "UA"
+    ops._primp_client()
+    assert captured.get("connect_timeout") == 7.0, captured
+    assert captured.get("read_timeout") == 22.0, captured
+
+
+def test_keepalive_restore_rolls_exit_when_rewarm_hits_dead_exit(monkeypatch):
+    """Schedule-mode keepalive restore: re-login self-heals (it rolls), but the re-warm that follows
+    only records _warmup_last_error. If that re-warm failed on a dead/stalled exit, the restore must
+    ROLL so the next attempt lands on a fresh exit -- otherwise the worker retries the same dead exit
+    and sits non-bookable. Recovery half of the 2026-10-16 freeze fix."""
+    ops = _make_ops(cfg=_cfg_schedule(), emit=lambda t, **p: None)
+    ops._log = lambda *a, **k: None
+    ops._try_restore_from_checkpoint = lambda: False
+    ops._fresh_login = lambda: True            # re-login succeeds
+    ops._anchor_src = None                     # forces the schedule-mode re-warm
+    rolls = []
+    ops._roll_exit = lambda why: rolls.append(why) or True
+
+    # re-warm fails with a dead-exit (transient) error
+    def _dead_rewarm():
+        ops._warmup_last_error = "error sending request for url (...) > operation timed out"
+        return False
+    ops._run_warmup_steps = _dead_rewarm
+
+    assert ops._attempt_keepalive_restore("dead-trip") is False
+    assert rolls, "a transient re-warm failure must roll the exit"
 
 
 def test_hybrid_gating_is_master_AND_leg():

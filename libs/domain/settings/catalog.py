@@ -648,6 +648,24 @@ _BOOKING = [
        "probe) on the detached primp client, so KEEPING holds a bookable session through the portal's "
        "down-windows without the browser navigating (which would stale the cursor). Effective = "
        "HYBRID_MODE AND HYBRID_KEEPALIVE. Default ON."),
+    _s("HYBRID_PRIMP_CONNECT_TIMEOUT", L.BOOKING, float, 10.0, group="guards", min_value=1.0,
+       note=
+       "Connect timeout (s) for the detached primp client used on every hybrid leg (warmup / "
+       "discovery / keepalive / submit). CRITICAL: primp.Client's constructor `timeout=` is NOT "
+       "enforced per-request, so a webshare exit whose gateway accepts the TCP connection but whose "
+       "upstream is dead would hang a primp call FOREVER -- confirmed live 2026-10-16, a whole apply "
+       "fleet froze in ep_poll for 55-86 min mid re-warm, never cleared `not bookable`, and nobody "
+       "applied though the slot pool was full. connect_timeout + read_timeout ARE enforced, so they "
+       "bound the call and a stall is raised as a timeout (which _is_transient_login_failure matches, "
+       "so the exit is rolled). Keep low -- a live exit connects in ~1-3s."),
+    _s("HYBRID_PRIMP_READ_TIMEOUT", L.BOOKING, float, 30.0, group="guards", min_value=2.0,
+       note=
+       "Read timeout (s) for the detached primp client on every hybrid leg: the max gap with no "
+       "bytes from the portal before the request is aborted. This is the one that catches the live "
+       "freeze (gateway connected, upstream never responds). Enforced by primp (unlike the "
+       "constructor `timeout=`). Keep comfortably above a healthy quest-step response but well under "
+       "any human-noticeable hold -- 30 is a safe default; lower it (~15) alongside "
+       "APPLY_SUBMIT_TIMEOUT when riding a stress window. See [[rewarm-every-round-is-mandatory]]."),
     _s("APPLY_SUBMIT_TIMEOUT", L.BOOKING, float, 100.0, group="guards", min_value=5.0,
        note=
        "STRESS MODE lever. Timeout (s) for the SubmeterVistoCriaPDF submit XHR. Default 100 (the "
@@ -768,6 +786,16 @@ _TEMPLATE = [
             "returned it for BOTH sub-accounts while another logged the SAME accounts in seconds. "
             "Replaces LOGIN_IP_MISMATCH_RETRIES, which only rolled when the exit DEMONSTRABLY moved "
             "and so burned accounts on a stable-but-flagged exit. Set 0 to charge every rejection."),
+    _s("LOGIN_SOLVER_FAILURE_RETRIES", L.TEMPLATE, int, 3, _WRK, "login_resilience", min_value=0.0,
+       note="retries on a reCAPTCHA SOLVER outage (the solver returned no token: a 180s solver "
+            "timeout or all selected solvers failed) before the login round gives up -- and, like "
+            "the reCAPTCHA-verdict and portal-busy budgets, NOT charged to the sub-account's 2-strike "
+            "sticky budget. CONFIRMED 2026-10-16 ('Test login 1016 - auth', anticaptcha): a solver "
+            "timeout raised 'reCAPTCHA: no token after all attempts', which matched no transient "
+            "marker and so was charged as a real login attempt -- a solver hiccup burned real "
+            "accounts. Login solving is ProxyLess, so the exit is NOT rolled here (the exit is fine, "
+            "the solver failed); the worker just backs off LOGIN_THROTTLE_BACKOFF and re-solves. "
+            "Set 0 to charge a no-token solver failure to the account (not recommended)."),
     _s("QUEST_STEP_GAP", L.TEMPLATE, float, 1.0, _WRK, "login_resilience",
        note="seconds (+-30%% jitter) paced before each warm-up questionnaire step and before the "
             "Questionario nav. Ported from storm-auto and then NEVER READ -- the classic unwired "

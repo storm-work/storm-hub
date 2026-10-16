@@ -614,6 +614,19 @@ class PhaseMachine:
                 #
                 # Same code path as the scouts_invalid fallback that was already here; MONO_BOOKING
                 # just stops it being conditional on the scouts having died first.
+                # PROVE the session healthy BEFORE self-discovering -- the same primp liveness gate a
+                # real scout gets in _run_scout (finding #2, extended to the apply path 2026-10-16).
+                # session_probe_ok is hybrid-aware (a primp GET, not a browser_nav), so under full-
+                # primp this does not force a browser reopen; if it fails, rebuild the session FIRST so
+                # the warm-up + discovery below run on a proven-live session rather than a dead exit.
+                # getattr-guarded so a test double without the method keeps its old behaviour.
+                _probe = getattr(self.ops, "session_probe_ok", None)
+                if callable(_probe) and not _probe():
+                    _relogin = getattr(self.ops, "discovery_needs_relogin", None)
+                    _skip = bool(callable(_relogin) and _relogin())
+                    if not self._rebuild_session("self-scout session not proven healthy before "
+                                                 "discover", skip_rewarm=_skip):
+                        return self._fail("self-scout session unrecoverable")
                 # Warm up before self-discovering (2026-09-09): do_discover's slots-mode path
                 # prefers posto_pdf and only degrades to bare posto_id when it's unset -- unlike
                 # do_apply, it has no unconditional re-warm of its own, so a self-scouting apply
