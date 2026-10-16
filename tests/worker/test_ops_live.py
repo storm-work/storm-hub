@@ -1786,6 +1786,69 @@ def test_primp_client_sets_enforced_connect_and_read_timeouts(monkeypatch):
     assert captured.get("read_timeout") == 22.0, captured
 
 
+def test_primp_client_impersonates_the_configured_chrome(monkeypatch):
+    """primp silently falls back to a 'random' fingerprint when `impersonate` is unset -- the strict-
+    window-WAF tell (2026-10-16). _primp_client must pin it to the configured, browser-aligned Chrome."""
+    import sys
+    captured = {}
+
+    class _CapClient:
+        def __init__(self, **kw):
+            captured.update(kw)
+        def set_cookies(self, *a, **k):
+            pass
+
+    monkeypatch.setitem(sys.modules, "primp", type("m", (), {"Client": _CapClient}))
+    ops = _make_ops(cfg=EngineConfig.from_settings(resolve({L.TEMPLATE: {"ROLE": "apply", "PRIMP_IMPERSONATE": "chrome_146"}, L.BOOKING: {"HYBRID_MODE": True}})))
+    ops.session = _FakeSession(); ops._browser_closed = True
+    ops._hybrid_cookies = {"Vistos_sid": "x"}; ops._hybrid_ua = "UA"
+    ops._primp_client()
+    assert captured.get("impersonate") == "chrome_146", captured
+
+
+def test_primp_impersonate_coerces_an_unknown_value_to_the_default():
+    """Defence-in-depth: the catalog `choices` already rejects a non-shipped value at config time, but
+    if one reaches the worker (a non-validated path / loosened choices), _primp_impersonate must coerce
+    it to the default -- never pass it through, since primp would silently degrade it to 'random'."""
+    import apps.worker.ops_live as m
+    logs = []
+    ops = _make_ops(cfg=_hybrid_cfg())
+    ops.cfg.raw["PRIMP_IMPERSONATE"] = "chrome_149"   # a target primp does NOT ship (falls back random)
+    ops._log = lambda t: logs.append(t)
+    assert ops._primp_impersonate() == m._PRIMP_IMPERSONATE_DEFAULT
+    assert any("not a primp-shipped target" in t for t in logs), logs
+    # a valid value passes through unchanged
+    ops2 = _make_ops(cfg=EngineConfig.from_settings(resolve({L.TEMPLATE: {"ROLE": "apply", "PRIMP_IMPERSONATE": "chrome_148"}, L.BOOKING: {"HYBRID_MODE": True}})))
+    ops2._log = lambda t: None
+    assert ops2._primp_impersonate() == "chrome_148"
+
+
+def test_submit_via_primp_also_impersonates_the_configured_chrome(monkeypatch):
+    """The submit client is built separately from _primp_client -- it must impersonate too, or the
+    one request that actually books goes out on a 'random' fingerprint during the strict window."""
+    import sys
+    captured = {}
+
+    class _Resp:
+        status_code = 200
+        text = "ok"
+
+    class _CapClient:
+        def __init__(self, **kw):
+            captured.update(kw)
+        def set_cookies(self, *a, **k):
+            pass
+        def post(self, *a, **k):
+            return _Resp()
+
+    monkeypatch.setitem(sys.modules, "primp", type("m", (), {"Client": _CapClient}))
+    ops = _make_ops(cfg=EngineConfig.from_settings(resolve({L.TEMPLATE: {"ROLE": "apply", "PRIMP_IMPERSONATE": "chrome_148"}, L.BOOKING: {"HYBRID_MODE": True}})))
+    ops.session = _FakeSession(); ops._browser_closed = True
+    ops._hybrid_cookies = {"Vistos_sid": "x"}; ops._hybrid_ua = "UA"; ops.posto_pdf = "3059"
+    ops._submit_via_primp("https://x/SubmeterVistoCriaPDF", {"a": "1"}, 100.0)
+    assert captured.get("impersonate") == "chrome_148", captured
+
+
 def test_keepalive_restore_rolls_exit_when_rewarm_hits_dead_exit(monkeypatch):
     """Schedule-mode keepalive restore: re-login self-heals (it rolls), but the re-warm that follows
     only records _warmup_last_error. If that re-warm failed on a dead/stalled exit, the restore must

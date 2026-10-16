@@ -195,6 +195,14 @@ _SCHED_PAGE_MARKERS = ("getSlots", "captchaDiv", "SubmeterVistoCriaPDF", "f_date
 # catalog because that framework has no enum type -- so the dashboard renders the setting as free
 # text and the worker is the only place that can reject a typo. See the setting's own note.
 _DISCOVERY_SOURCES = frozenset({"calendar", "slots", "both"})
+# Chrome impersonation targets primp 1.3.1 actually ships (probed 2026-10-16). CRITICAL: primp does
+# NOT raise on an unknown value -- it prints "does not exist, using 'random'" and silently degrades to
+# a generic fingerprint, the exact tell the strict-window WAF keys on. So PRIMP_IMPERSONATE is
+# validated against this set before use; an out-of-set value is coerced to the default with a log.
+# Re-probe on a primp/Chromium upgrade (see the PRIMP_IMPERSONATE catalog note).
+_PRIMP_IMPERSONATE_DEFAULT = "chrome_148"   # closest valid match to bundled Chromium 149
+_PRIMP_IMPERSONATE_ALLOWED = frozenset({"chrome_144", "chrome_145", "chrome_146",
+                                        "chrome_147", "chrome_148"})
 # The portal's own "come back later" page. It is served in either language and is NOT about the
 # slot, the session or the network -- the portal simply declined to process the request.
 #
@@ -2007,6 +2015,24 @@ class LiveEngineOps(EngineOps):
             ua = ""
         return cookies, (ua or "Mozilla/5.0")
 
+    def _primp_impersonate(self) -> str:
+        """The validated primp TLS/JA3 impersonation target for the portal hot path. primp silently
+        falls back to a 'random' fingerprint on an unknown value (the exact strict-window-WAF tell this
+        closes), so an out-of-allowlist PRIMP_IMPERSONATE is coerced to the default WITH a log rather
+        than left to degrade. Logged once per worker so the resolved target is visible in a live run."""
+        want = str(self.cfg.raw.get("PRIMP_IMPERSONATE", _PRIMP_IMPERSONATE_DEFAULT) or "").strip()
+        if want not in _PRIMP_IMPERSONATE_ALLOWED:
+            if not getattr(self, "_primp_imp_warned", False):
+                self._log(f"primp: PRIMP_IMPERSONATE={want!r} is not a primp-shipped target "
+                          f"{sorted(_PRIMP_IMPERSONATE_ALLOWED)} -- using {_PRIMP_IMPERSONATE_DEFAULT} "
+                          f"(an unknown value would silently degrade primp to a 'random' fingerprint)")
+                self._primp_imp_warned = True
+            return _PRIMP_IMPERSONATE_DEFAULT
+        if not getattr(self, "_primp_imp_logged", False):
+            self._log(f"primp: impersonating {want} (TLS/JA3 aligned to the browser)")
+            self._primp_imp_logged = True
+        return want
+
     def _primp_client(self):
         """A primp.Client on the worker's warm exit, seeded with the portal cookies, plus the
         (cookie_header, ua) header map to replay on each request. Sources creds via _primp_creds (so
@@ -2020,8 +2046,11 @@ class LiveEngineOps(EngineOps):
         # _is_transient_login_failure matches, so the caller rolls the exit. See HYBRID_PRIMP_*.
         connect_t = float(self.cfg.raw.get("HYBRID_PRIMP_CONNECT_TIMEOUT", 10.0))
         read_t = float(self.cfg.raw.get("HYBRID_PRIMP_READ_TIMEOUT", 30.0))
+        # impersonate the browser's Chrome (TLS/JA3 + header order). Unset = a generic fingerprint the
+        # strict-window WAF distinguishes from the browser that earned the session (MEASURED 2026-10-16).
         pc = primp.Client(proxy=self.warm_proxy, verify=False, timeout=45,
-                          connect_timeout=connect_t, read_timeout=read_t, follow_redirects=True)
+                          connect_timeout=connect_t, read_timeout=read_t,
+                          impersonate=self._primp_impersonate(), follow_redirects=True)
         try:
             pc.set_cookies(_PORTAL_ORIGIN + "/", cookies)
         except Exception:
@@ -4357,7 +4386,7 @@ class LiveEngineOps(EngineOps):
         connect_t = float(self.cfg.raw.get("HYBRID_PRIMP_CONNECT_TIMEOUT", 10.0))
         pc = primp.Client(proxy=self.warm_proxy, verify=False,
                           timeout=int(max(5.0, timeout)), connect_timeout=connect_t,
-                          follow_redirects=True)
+                          impersonate=self._primp_impersonate(), follow_redirects=True)
         try:
             pc.set_cookies(_PORTAL_ORIGIN + "/", cookies)
         except Exception:

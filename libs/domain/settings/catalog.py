@@ -227,6 +227,22 @@ _GLOBAL = [
        "deterministic canvas/WebGL noise, so it may help or HURT; validate login rates live before "
        "leaving it on. Does NOT affect the global 'try again later' throttle (that is a portal "
        "load-shed, not a detection signal). Requires `uv pip install playwright-stealth`."),
+    _s("PRIMP_IMPERSONATE", L.GLOBAL, str, "chrome_148", _TPL, "browser",
+       choices=("chrome_148", "chrome_147", "chrome_146", "chrome_145", "chrome_144"),
+       note=
+       "The TLS/JA3 + header-order profile the detached primp client impersonates on the post-login "
+       "hot path (warmup quest steps, keepalive probe, calendar discovery, submit). MEASURED "
+       "2026-10-16: the portal flips to a STRICT anti-bot posture ~75min before slot-open and serves "
+       "a ~44KB interstitial to primp while the real browser passes -- and primp was running UNSET "
+       "(a generic/random fingerprint) while the browser aligns to the real Chromium (149). Pinning "
+       "primp to the closest valid Chrome profile removes that proxy-independent automation tell. "
+       "COUPLING: this must stay <= the bundled Chromium major AND be a target primp actually ships "
+       "-- primp does NOT raise on an unknown value, it SILENTLY falls back to 'random', which is the "
+       "bug this fixes. chrome_148 is the closest valid match to Chromium 149 (primp 1.3.1 ships "
+       "chrome_144..148; chrome_149 falls back). On a primp or Chromium upgrade, re-probe the valid "
+       "set: `python -c \"import primp; primp.Client(impersonate='chrome_NNN')\"` prints 'does not "
+       "exist, using random' for an invalid one. An out-of-allowlist value here is coerced to the "
+       "default with a log rather than left to degrade to random."),
     # Solver defaults (override-ok at template for A/B)
     _s("LOGIN_CAPSOLVER_ONLY", L.GLOBAL, bool, False, _TPL, "solver",
        note=

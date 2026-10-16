@@ -36,7 +36,13 @@ from pathlib import Path
 
 _SCREENSHOTS_DIR = Path(__file__).parent / "screenshots"
 
-IMPERSONATE = None   # None = primp built-in default; no "does not exist" warning
+# The primp TLS/JA3 + header-order impersonation target for this engine's own primp clients (the
+# login-flow post-challenge calls). Driven by the PRIMP_IMPERSONATE setting via vendor_env so it stays
+# aligned with the Chromium we actually run (the browser version-aligns separately, see the launch
+# block). Unset = primp's generic/random default -- a cheap automation tell the strict-window WAF
+# keys on (MEASURED 2026-10-16). primp does NOT raise on an unknown value; it silently falls back to
+# 'random', so the resolved value is validated at the ops layer before use (ops_live._primp_impersonate).
+IMPERSONATE = os.environ.get("PRIMP_IMPERSONATE") or None
 
 # ── P1 anti-detection flags (all default-OFF → current behavior unchanged; A/B one at a time) ──────────
 # HEADLESS_MODE: 'old' (default, headless=True) | 'new' (Chrome --headless=new, real render path) |
