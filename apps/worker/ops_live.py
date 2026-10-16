@@ -2052,6 +2052,20 @@ class LiveEngineOps(EngineOps):
                               f"({getattr(r, 'status_code', None)}) -- aborting the chain")
                     return False
                 last_html = r.text or ""
+                # WAF CHALLENGE on a quest step (2026-10-16). The portal tightens its anti-bot as
+                # slot-open nears and serves the ~44KB bot-challenge interstitial (status 200) to the
+                # detached primp requests. That page carries no form fields, so it USED to fall through
+                # to `quest_state_stale` -- which reads as "our form lapsed" and the recovery ladder
+                # re-ran the quest chain straight back into the same WAF. Name it for what it is and
+                # mark it like the other exit-flagged failures (`waf`/`challenge` are in
+                # _is_transient_login_failure), so do_apply/keepalive ROLL the exit and back off rather
+                # than hammering: a flagged exit does not un-flag itself.
+                if _is_challenge_body(last_html):
+                    self._warmup_last_error = (f"WAF bot-challenge on quest step {i+1}/{len(steps)} "
+                                               f"({len(last_html)}B)")
+                    self._log(f"hybrid-warm: {self._warmup_last_error} -- NOT a stale form; the exit "
+                              f"is flagged, rolling/backing off (see _is_transient_login_failure)")
+                    return False
             last_fields = _primp_parse_inputs(last_html)
             if not last_fields:
                 self._log(f"hybrid-warm: quest_state_stale (last step yielded no fields, "
@@ -3006,6 +3020,14 @@ class LiveEngineOps(EngineOps):
         else:
             self._mark_keep_bookable(False, why="hybrid keepalive re-warm failed")
             self._slog("keepalive", result="rewarm_failed", mode="schedule", via="primp", ctx=context)
+            # ROLL on a transport/WAF re-warm failure. The schedule keepalive re-warms EVERY cycle, so
+            # a dead exit or a WAF-flagged exit (now classified on quest steps, 2026-10-16) would
+            # otherwise re-warm into the SAME failing exit next cycle, holding the worker not-bookable
+            # indefinitely. A flagged/dead exit does not recover by being retried -- roll to a fresh
+            # one so the next cycle's re-warm has a chance. (A portal-reject re-warm -- csrf/quest-
+            # state -- is NOT transient and correctly does not roll here.)
+            if self._is_transient_login_failure(getattr(self, "_warmup_last_error", "")):
+                self._roll_exit("keepalive[hybrid]: re-warm hit a dead/flagged exit")
         return True
 
     def _do_keepalive(self, context: str) -> None:

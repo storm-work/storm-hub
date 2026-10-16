@@ -1857,6 +1857,23 @@ def test_do_keepalive_hybrid_routes_to_primp():
     assert seen == ["hold"]
 
 
+def test_hybrid_warmup_classifies_a_quest_step_waf_challenge_as_transient():
+    """A quest-step WAF challenge (the ~44KB bot-challenge interstitial the portal serves to primp as
+    slot-open nears) must be named for what it is, NOT fall through to the vaguer quest_state_stale
+    that reads as a 'stale form' and makes the ladder re-run straight back into the same WAF.
+    CONFIRMED live 2026-10-16 (Booking 1016 fleets, 443 x 'quest_state_stale (len=44699)'). The
+    recorded _warmup_last_error must match _is_transient_login_failure so the caller rolls/backs off."""
+    ops = _make_ops(cfg=_hybrid_cfg()); ops.session = _FakeSession()
+    ops._already_booked_signal = lambda *a, **k: None
+    fake = _FakePrimp([("QuestNextQuestion",
+                        _FakeResp("<html>datadome captcha-delivery interstitial</html>", 200, "q"))])
+    ops._primp_client = lambda: (fake, {})
+    assert ops._primp_warmup_chain() is False
+    assert "WAF" in ops._warmup_last_error, ops._warmup_last_error
+    assert LiveEngineOps._is_transient_login_failure(ops._warmup_last_error), \
+        "a quest-step WAF challenge must classify transient so the exit is rolled/backed off"
+
+
 # ── Phase C (HYBRID_CLOSE_BROWSER): close the browser after login, run browserless ──────────────
 class _CloseSession(_FakeSession):
     def __init__(self):
