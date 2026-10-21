@@ -478,9 +478,11 @@ def _start_token_factory() -> None:
         # The shared pre-solved login-token pool honours the SOLVER SELECTION too (global
         # RECAPTCHA_SOLVER): it races the selected solver's FULL key set (the pool is fleet-wide, not
         # per-worker, so there is no per-worker distribution here -- every key is fair game).
-        from libs.domain.solver_select import active_solver_lists, parse_keys
+        from libs.domain.solver_select import active_solver_lists, parse_keys, resolve_selection
+        # The pool pre-solves LOGIN_EVISA tokens, so it honours the LOGIN selection (which 'inherit's
+        # RECAPTCHA_SOLVER by default).
         caps, acs = active_solver_lists(
-            str(g.get("RECAPTCHA_SOLVER", "capsolver")),
+            resolve_selection(g.get("LOGIN_RECAPTCHA_SOLVER"), str(g.get("RECAPTCHA_SOLVER", "capsolver"))),
             parse_keys(g.get("CAPSOLVER_KEYS", "")),
             parse_keys(g.get("ANTICAPTCHA_KEYS", "")))
         if target <= 0 or not (caps or acs):
@@ -3632,12 +3634,19 @@ def _do_launch_worker(db: Session, w: M.Worker) -> None:
         # whatever key lists it is handed; here we pick the booking's chosen solver (RECAPTCHA_SOLVER,
         # booking/template-overridable, resolved into `eff`) and hand THIS worker ONE key from that
         # solver's list -- round-robin by worker id -- so several keys spread the load across the fleet.
-        from libs.domain.solver_select import parse_keys, resolve_solver_keys, rr_index
+        from libs.domain.solver_select import (parse_keys, resolve_solver_keys, rr_index,
+                                               resolve_selection)
+        _caps_all = parse_keys(g.get("CAPSOLVER_KEYS", ""))
+        _ac_all = parse_keys(g.get("ANTICAPTCHA_KEYS", ""))
+        _idx = rr_index(w.id)
+        _base = str(eff.get("RECAPTCHA_SOLVER", "capsolver"))
+        # PER-ACTION solver split (operator 2026-10-21): login and the schedule page can use DIFFERENT
+        # solvers (e.g. anticaptcha for login, capsolver for the schedule page). Each per-action setting
+        # 'inherit's RECAPTCHA_SOLVER unless overridden, so the default is byte-identical to before.
         capsolver_keys, anticaptcha_keys = resolve_solver_keys(
-            str(eff.get("RECAPTCHA_SOLVER", "capsolver")),
-            parse_keys(g.get("CAPSOLVER_KEYS", "")),
-            parse_keys(g.get("ANTICAPTCHA_KEYS", "")),
-            index=rr_index(w.id))
+            resolve_selection(eff.get("LOGIN_RECAPTCHA_SOLVER"), _base), _caps_all, _ac_all, index=_idx)
+        schedule_capsolver_keys, schedule_anticaptcha_keys = resolve_solver_keys(
+            resolve_selection(eff.get("SCHEDULE_RECAPTCHA_SOLVER"), _base), _caps_all, _ac_all, index=_idx)
         # Sub-account rotation candidates (do_login()'s rotate-after-sticky-exhausted loop): the FULL
         # ranked list, each already carrying its own sub_account_id, so the worker (deliberately
         # DB-less) can rotate entirely locally without a Hub round-trip per attempt.
@@ -3653,6 +3662,8 @@ def _do_launch_worker(db: Session, w: M.Worker) -> None:
             form_defaults=form_defaults,
             capsolver_keys=capsolver_keys,
             anticaptcha_keys=anticaptcha_keys,
+            schedule_capsolver_keys=schedule_capsolver_keys,
+            schedule_anticaptcha_keys=schedule_anticaptcha_keys,
             warm_proxy=warm_proxy,
             proxy_geos=_worker_proxy_geos,   # rotating: the geo set the worker varies across per roll
             hold_proxy=hold_proxy,

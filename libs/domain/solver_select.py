@@ -13,6 +13,20 @@ Pure + stateless (the index is supplied by the caller), so it is unit-tested wit
 from __future__ import annotations
 
 SOLVERS = ("capsolver", "anticaptcha", "race")
+# A per-action selection (LOGIN_RECAPTCHA_SOLVER / SCHEDULE_RECAPTCHA_SOLVER) may defer to the
+# booking's RECAPTCHA_SOLVER instead of naming its own solver.
+INHERIT = "inherit"
+
+
+def resolve_selection(value, base: str) -> str:
+    """A per-action solver selection that may `inherit` the booking's base RECAPTCHA_SOLVER.
+
+    Lets login and the schedule page pick DIFFERENT solvers (e.g. anticaptcha for login, capsolver --
+    faster -- for the schedule-page reCAPTCHA), while an unset/`inherit` per-action setting keeps the
+    old single-solver behaviour. `value` is the per-action setting; `base` is RECAPTCHA_SOLVER.
+    """
+    v = str(value or INHERIT).strip().lower()
+    return str(base or "capsolver").strip().lower() if v in ("", INHERIT) else v
 
 
 def parse_keys(raw) -> list[str]:

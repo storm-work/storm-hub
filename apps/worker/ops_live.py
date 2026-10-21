@@ -615,6 +615,8 @@ class LiveEngineOps(EngineOps):
         capsolver_keys: list[str],
         warm_proxy: str,
         anticaptcha_keys: list[str] | None = None,
+        schedule_capsolver_keys: list[str] | None = None,
+        schedule_anticaptcha_keys: list[str] | None = None,
         proxy_geos: list[str] | None = None,
         headless: bool = True,
         sub_account_id: str,
@@ -640,6 +642,16 @@ class LiveEngineOps(EngineOps):
         # empty when the booking's solver is capsolver). Passed to browser_login + the discovery race
         # alongside capsolver_keys; the engine's race_all uses whatever non-empty lists it gets.
         self.anticaptcha_keys = anticaptcha_keys or []
+        # PER-ACTION solver split (operator 2026-10-21): the SCHEDULE-page reCAPTCHA (SCHEDULE_EVISA,
+        # /slots discovery) can use a different solver than login -- e.g. anticaptcha for login,
+        # capsolver (faster) for the schedule page. The Hub resolves LOGIN_/SCHEDULE_RECAPTCHA_SOLVER
+        # into these two key pairs; when unset (older Hub, or both 'inherit') they fall back to the
+        # login keys, so behaviour is unchanged. Login uses self.{capsolver,anticaptcha}_keys; the
+        # schedule-token solve (_solve_schedule_token) uses these.
+        self.schedule_capsolver_keys = (schedule_capsolver_keys if schedule_capsolver_keys is not None
+                                        else capsolver_keys)
+        self.schedule_anticaptcha_keys = (schedule_anticaptcha_keys if schedule_anticaptcha_keys is not None
+                                          else self.anticaptcha_keys) or []
         self.warm_proxy = warm_proxy
         # Exit countries this (rotating) worker varies across on each roll, so it is never bound to
         # one possibly-throttled geo for the whole run (2026-10-01). {pin} if the operator pinned a
@@ -3489,7 +3501,7 @@ class LiveEngineOps(EngineOps):
         """One SCHEDULE_EVISA solve, honouring RECAPTCHA_SOLVE_PROXY exactly as the login path does
         (proxyless was 5/5 vs 2/5 proxied on Test 0901). Returns "" on no token."""
         _rc_proxy = self.warm_proxy if self.cfg.solver.solve_proxy else None
-        return race_all(self.capsolver_keys, self.anticaptcha_keys, [], [],
+        return race_all(self.schedule_capsolver_keys, self.schedule_anticaptcha_keys, [], [],
                         "SCHEDULE_EVISA", proxy=_rc_proxy) or ""
 
     def _slots_token(self, race_all) -> str:

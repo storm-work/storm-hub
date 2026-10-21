@@ -1,6 +1,6 @@
 """libs.domain.solver_select -- solver selection + per-consumer key distribution."""
 from libs.domain.solver_select import (active_solver_lists, parse_keys,
-                                       resolve_solver_keys, rr_index)
+                                       resolve_solver_keys, resolve_selection, rr_index)
 
 CS = ["cap1", "cap2"]
 AC = ["ac1", "ac2", "ac3"]
@@ -39,6 +39,26 @@ def test_active_solver_lists_returns_full_lists_per_selection():
     assert active_solver_lists("anticaptcha", CS, AC) == ([], AC)
     assert active_solver_lists("anticaptcha", CS, []) == (CS, [])   # fallback
     assert active_solver_lists("race", CS, AC) == (CS, AC)
+
+
+def test_resolve_selection_inherits_or_overrides():
+    """Per-action LOGIN_/SCHEDULE_RECAPTCHA_SOLVER: 'inherit'/blank -> the base RECAPTCHA_SOLVER; an
+    explicit solver overrides it -- so login and the schedule page can use different solvers."""
+    assert resolve_selection("inherit", "anticaptcha") == "anticaptcha"
+    assert resolve_selection("", "race") == "race"
+    assert resolve_selection(None, "capsolver") == "capsolver"
+    assert resolve_selection("capsolver", "anticaptcha") == "capsolver"   # explicit overrides base
+    assert resolve_selection("ANTICAPTCHA", "capsolver") == "anticaptcha"  # case/space-normalised
+    assert resolve_selection("inherit", None) == "capsolver"               # base unset -> capsolver
+
+
+def test_login_and_schedule_can_resolve_to_different_solvers():
+    """The operator ask: login via anticaptcha, schedule page via capsolver, same key pools."""
+    base = "race"
+    login = resolve_solver_keys(resolve_selection("anticaptcha", base), CS, AC, index=0)
+    sched = resolve_solver_keys(resolve_selection("capsolver", base), CS, AC, index=0)
+    assert login == ([], ["ac1"])        # login -> anticaptcha
+    assert sched == (["cap1"], [])        # schedule -> capsolver
 
 
 def test_rr_index_is_stable_and_nonnegative():

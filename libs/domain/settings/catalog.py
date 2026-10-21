@@ -286,9 +286,24 @@ _GLOBAL = [
     # template; registration has its own REGISTRATION_SOLVER.
     _s("RECAPTCHA_SOLVER", L.GLOBAL, str, "capsolver", _BK_TPL, "solver",
        choices=("capsolver", "anticaptcha", "race"),
-       note="which reCAPTCHA solver this booking uses: 'capsolver' | 'anticaptcha' | 'race' (one key "
-            "from each, raced). Keys per solver live in CAPSOLVER_KEYS / ANTICAPTCHA_KEYS; load is "
-            "distributed one key per worker. Booking/template-overridable."),
+       note="which reCAPTCHA solver this booking uses by DEFAULT: 'capsolver' | 'anticaptcha' | 'race' "
+            "(one key from each, raced). Keys per solver live in CAPSOLVER_KEYS / ANTICAPTCHA_KEYS; "
+            "load is distributed one key per worker. Booking/template-overridable. Per-ACTION overrides "
+            "below (LOGIN_RECAPTCHA_SOLVER / SCHEDULE_RECAPTCHA_SOLVER) can point login and the "
+            "schedule page at different solvers; left on 'inherit' they both use this value."),
+    _s("LOGIN_RECAPTCHA_SOLVER", L.GLOBAL, str, "inherit", _BK_TPL, "solver",
+       choices=("inherit", "capsolver", "anticaptcha", "race"),
+       note="solver for the LOGIN reCAPTCHA (action LOGIN_EVISA) specifically. 'inherit' (default) = "
+            "use RECAPTCHA_SOLVER. Set it to split transports -- e.g. LOGIN_RECAPTCHA_SOLVER=anticaptcha "
+            "while SCHEDULE_RECAPTCHA_SOLVER=capsolver, so login uses the solver with the better login "
+            "pass-rate and the schedule page uses the faster one. Same CAPSOLVER_KEYS/ANTICAPTCHA_KEYS "
+            "pools and one-key-per-worker distribution."),
+    _s("SCHEDULE_RECAPTCHA_SOLVER", L.GLOBAL, str, "inherit", _BK_TPL, "solver",
+       choices=("inherit", "capsolver", "anticaptcha", "race"),
+       note="solver for the SCHEDULE-PAGE reCAPTCHA (action SCHEDULE_EVISA -- /slots discovery) "
+            "specifically. 'inherit' (default) = use RECAPTCHA_SOLVER. Pair with LOGIN_RECAPTCHA_SOLVER "
+            "to solve login and the schedule page with different providers (e.g. capsolver here for "
+            "speed). Same key pools and distribution as RECAPTCHA_SOLVER."),
     _s("REGISTRATION_SOLVER", L.GLOBAL, str, "capsolver", group="solver",
        choices=("capsolver", "anticaptcha", "race"),
        note="which reCAPTCHA solver account-registration runs use (same choices as RECAPTCHA_SOLVER). "

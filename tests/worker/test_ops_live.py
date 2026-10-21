@@ -88,6 +88,32 @@ def test_identity_id_defaults_to_sub_account_id_if_not_given():
     assert ops.identity_id == "sub-1"
 
 
+def test_schedule_keys_fall_back_to_login_keys_by_default():
+    """Per-action solver split: with no schedule_* keys (older Hub, or both 'inherit'), the schedule
+    page uses the SAME keys as login -- byte-identical to the pre-split behaviour."""
+    ops = _make_ops(capsolver_keys=["login_cap"], anticaptcha_keys=["login_ac"])
+    assert ops.schedule_capsolver_keys == ops.capsolver_keys == ["login_cap"]
+    assert ops.schedule_anticaptcha_keys == ops.anticaptcha_keys == ["login_ac"]
+
+
+def test_schedule_token_uses_schedule_keys_not_login_keys():
+    """Operator 2026-10-21: login and the schedule page can use different solvers. The schedule-token
+    solve must race the SCHEDULE keys, leaving login on its own keys."""
+    ops = _make_ops(capsolver_keys=["login_cap"], anticaptcha_keys=["login_ac"],
+                    schedule_capsolver_keys=["sched_cap"], schedule_anticaptcha_keys=["sched_ac"])
+    captured = {}
+
+    def fake_race(cs, ac, a, b, action, proxy=None):
+        captured.update(cs=cs, ac=ac, action=action)
+        return "tok"
+
+    assert ops._solve_schedule_token(fake_race) == "tok"
+    assert captured["cs"] == ["sched_cap"] and captured["ac"] == ["sched_ac"]
+    assert captured["action"] == "SCHEDULE_EVISA"
+    # login keys are untouched
+    assert ops.capsolver_keys == ["login_cap"] and ops.anticaptcha_keys == ["login_ac"]
+
+
 def test_identity_id_explicit_overrides_default():
     ops = _make_ops(identity_id="identity-42")
     assert ops.identity_id == "identity-42"
