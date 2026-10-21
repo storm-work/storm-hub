@@ -159,15 +159,38 @@ def parse_identities_labeled(text: str, *, default_type: str = "real") -> tuple[
     NO sub-accounts (those are generated + registered separately). Nationality is mapped, DOB normalized.
     """
     errors: list[str] = []
-    # split into blocks on the === header; keep content after each header
-    blocks = re.split(r"^===.*?===\s*$", text, flags=re.MULTILINE)
     out: list[ParsedIdentity] = []
-    for blk in blocks:
-        fields: dict[str, str] = {}
-        for line in blk.splitlines():
-            if ":" in line:
-                k, _, v = line.partition(":")
-                fields[k.strip().lower()] = v.strip()
+    # Split into per-identity records. A record is delimited by a `=== ... ===` header OR by the start
+    # of a new `First Name` line -- paria OCR exports come in BOTH shapes. Splitting on the header
+    # ALONE collapsed a headerless 67-record file into ONE block whose field-dict kept only the LAST
+    # record's values, so only one identity imported (CONFIRMED 2026-10-21). Accumulate fields
+    # line-by-line and flush the current record on either delimiter.
+    records: list[dict[str, str]] = []
+    cur: dict[str, str] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        # Any `==...==` separator line is a record header (OCR exports vary: `=== x.jpeg ===`,
+        # `== (1) ===`, etc.). 2+ leading and trailing `=` covers them all; field lines carry a colon
+        # and never start with `==`, so there's no false match.
+        if line.startswith("==") and line.endswith("=="):
+            if cur:
+                records.append(cur)
+                cur = {}
+            continue
+        if ":" not in raw:
+            continue
+        k, _, v = raw.partition(":")
+        key = k.strip().lower()
+        # A fresh `First Name` (the record's first field) begins the NEXT record when the current one
+        # already has one -- this is the headerless delimiter the docstring promises.
+        if key == "first name" and "first name" in cur:
+            records.append(cur)
+            cur = {}
+        cur[key] = v.strip()
+    if cur:
+        records.append(cur)
+
+    for fields in records:
         first = fields.get("first name")
         last = fields.get("last name")
         if not (first or last):

@@ -71,6 +71,25 @@ def test_parse_paria_labeled_via_autodetect():
     assert a.sub_accounts == []                   # generated/registered separately
 
 
+def test_labeled_records_split_on_first_name_and_varied_headers():
+    """CONFIRMED 2026-10-21: a real 67-identity paria export used `== (N) ===` headers (not the
+    `=== ... ===` the splitter matched) AND relied on nothing else, so EVERY record collapsed into
+    one block whose field-dict kept only the LAST -- exactly one identity imported. Records must split
+    on a new `First Name` AND on any `==...==` header variant. Exercises both here."""
+    # record 1: the odd `== (N) ===` header shape; record 2: NO header at all (bare First Name)
+    txt = ("== (1) ===\nFirst Name      : NANIA\nLast Name       : BAFILE\n"
+           "Date of Birth   : 16-03-1985\nGender          : F\n"
+           "Nationality     : GUINEENSE\nPassport Number : C00462666\n\n"
+           "First Name      : KILLIAN KAEL\nLast Name       : XAVIER DOS SANTOS\n"
+           "Date of Birth   : 24-09-2021\nGender          : M\n"
+           "Nationality     : CABO-VERDIANA\nPassport Number : PA470021\n")
+    idents, errors = parse_identities(txt)
+    assert not errors
+    assert [i.full_name for i in idents] == ["NANIA BAFILE", "KILLIAN KAEL XAVIER DOS SANTOS"]
+    assert [i.passport_no for i in idents] == ["C00462666", "PA470021"]
+    assert [i.nationality for i in idents] == ["GNB", "CPV"]   # GUINEENSE->GNB, CABO-VERDIANA->CPV
+
+
 # ── geo must be set when a proxy row is CREATED, not only by the backfill migration ───────────
 def test_parse_geo_reads_both_provider_credential_formats():
     from apps.hub.importers import parse_geo
