@@ -94,9 +94,15 @@ def random_birthdate() -> str:
     return d.strftime("%Y-%m-%d")
 
 
+# TEST passports carry ONE MORE digit than a real one so a generated test identity can never collide
+# with a real passport (import dedups by passport, [[identity-passport-dedup]]). Real Cabo-Verde
+# passports are `PA` + 6 digits (e.g. PA470021); test docs are `PA` + 7 digits -- a longer string that
+# no real `PA` passport can equal, so test identities never dedup against (or shadow) a real one.
+_TEST_TRAVELDOC_DIGITS = 7
+
 def random_traveldoc(existing: set[str]) -> str:
     for _ in range(1000):
-        td = "PA" + "".join(random.choices(string.digits, k=6))
+        td = "PA" + "".join(random.choices(string.digits, k=_TEST_TRAVELDOC_DIGITS))
         if td not in existing:
             existing.add(td)
             return td

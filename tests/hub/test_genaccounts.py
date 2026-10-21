@@ -53,11 +53,15 @@ def test_gen_subaccounts_count():
     assert all(s.status == "new" and s.password and not s.email for s in subs)
 
 
-def test_traveldoc_unique_pa_format():
+def test_traveldoc_is_distinct_from_real_passports():
+    """TEST passports are PA + SEVEN digits -- one more than a real Cabo-Verde PA+6 passport
+    (e.g. PA470021) -- so a generated test identity can never collide with / dedup against a real one
+    on import (2026-10-21)."""
     seen = set()
     for _ in range(50):
         td = random_traveldoc(seen)
-        assert re.fullmatch(r"PA\d{6}", td)
+        assert re.fullmatch(r"PA\d{7}", td), td          # 7 digits, not 6
+        assert not re.fullmatch(r"PA\d{6}", td)          # never the real PA+6 shape
     assert len(seen) == 50
 
 
