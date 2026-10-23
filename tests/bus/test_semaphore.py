@@ -37,10 +37,12 @@ def test_release_frees_a_slot(r):
 
 
 def test_expired_holder_self_heals_without_release(r):
-    sem = RedisSemaphore(r, "sem:test", limit=1, ttl=0.05)
+    # TTL 0.5 s, not 0.05: under full-suite load the gap between w1's acquire and w2's first
+    # acquire could itself exceed 50 ms, so w1 had already expired and the `is False` line flaked.
+    sem = RedisSemaphore(r, "sem:test", limit=1, ttl=0.5)
     sem.acquire("w1")
     assert sem.acquire("w2") is False
-    time.sleep(0.1)   # w1's TTL elapses -- no release() call, just time passing
+    time.sleep(0.7)   # w1's TTL elapses -- no release() call, just time passing
     assert sem.acquire("w2") is True   # self-healed, no explicit cleanup needed
 
 

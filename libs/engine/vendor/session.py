@@ -699,6 +699,19 @@ class PlaywrightSession:
         self._error: Exception | None = None
         self._thread.start()
         if not self._ready.wait(timeout=120):
+            # F49 (run 1023): the caller never gets this object, so nothing would ever close() it --
+            # the hung worker thread's Chromium was orphaned (x200 inits, 210 orphans, ~1,065 chrome
+            # procs, load ~12), and every re-login during the outage started another one. Same
+            # force-kill close()/close_browser() use for a hung worker. The driver pid is captured
+            # right after Playwright starts, so it is set for any hang in launch or the bootstrap
+            # navs; a hang inside Playwright's own start (no pid yet) has no browser to leak.
+            _kill_proc_tree(self._driver_pid)
+            if self._xvfb_proc is not None:
+                try:
+                    self._xvfb_proc.terminate()
+                except Exception:
+                    pass
+                self._xvfb_proc = None
             raise RuntimeError("PlaywrightSession init timed out (>120s)")
         if self._error:
             raise self._error
