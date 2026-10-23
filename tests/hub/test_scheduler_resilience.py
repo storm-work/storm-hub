@@ -2537,3 +2537,50 @@ def test_blind_mode_holds_seeded_pool_until_scheduled_slot_open_at(db):
     sched._drive_booking(db, bk, NOW + timedelta(hours=4, seconds=1))
     db.refresh(bk)
     assert bk.slot_open_fired_at is not None and fired == [bk.id]
+
+
+# ── F48 (run 1023): seeded guesses must not silence the self-scout fallback ──────────────────────
+def test_blind_seeded_slots_do_not_suppress_the_self_scout_fallback(db):
+    """Run 1023: 50 blind slots kept the pool 'live' while every submit against them came back
+    not-bookable, so 120 logged-in appliers never looked for a real slot."""
+    bus = _FakeBus()
+    sched = _scheduler(bus=bus)
+    bk = _make_booking(db, slot_found_fired_at=NOW)
+    ident = _make_identity(db)
+    db.add(M.Slot(booking_id=bk.id, posto_id="5084", date="2026-11-09", period=3,
+                  status=SlotStatus.AVAILABLE, source="blind"))
+    _make_worker(db, bk, ident, role=WorkerRole.APPLY, substate=WorkerSubstate.KEEPING)
+    db.commit()
+
+    sched._maybe_self_scout(db, bk, NOW)
+
+    assert any(t == "assign" and p.get("scouts_invalid") for _w, t, p in bus.sent)
+
+
+def test_a_feeder_bookings_scouting_detector_counts_as_a_scout(db):
+    """Cross-booking feed: a detector booking that is actually scouting is discovering for us."""
+    bus = _FakeBus()
+    sched = _scheduler(bus=bus)
+    det = _make_booking(db)
+    ident = _make_identity(db)
+    _make_worker(db, det, ident, role=WorkerRole.SCOUT, substate=WorkerSubstate.KEEPING)
+    bk = _make_booking(db, discovery_feeder_booking_ids=[det.id])
+    _make_worker(db, bk, ident, role=WorkerRole.APPLY, substate=WorkerSubstate.KEEPING)
+
+    sched._maybe_self_scout(db, bk, NOW)
+
+    assert bus.sent == []
+
+
+def test_a_feeder_detector_stuck_at_the_login_wall_does_not(db):
+    bus = _FakeBus()
+    sched = _scheduler(bus=bus)
+    det = _make_booking(db)
+    ident = _make_identity(db)
+    _make_worker(db, det, ident, role=WorkerRole.SCOUT, substate=WorkerSubstate.LOGGING_IN)
+    bk = _make_booking(db, discovery_feeder_booking_ids=[det.id])
+    _make_worker(db, bk, ident, role=WorkerRole.APPLY, substate=WorkerSubstate.KEEPING)
+
+    sched._maybe_self_scout(db, bk, NOW)
+
+    assert any(t == "assign" and p.get("scouts_invalid") for _w, t, p in bus.sent)

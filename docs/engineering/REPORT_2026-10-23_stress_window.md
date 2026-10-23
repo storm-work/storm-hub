@@ -117,3 +117,15 @@ at 12:31 through respawns. That made the afternoon an unplanned first test.
 **Conclusion:** with F40/F41, stress no longer costs us logins, and warm-up recovers as soon as the
 portal does. The binding constraint is now **targets (F48)**, then login supply and KEEPING
 truthfulness (F43/F44).
+
+## G. Implemented 2026-10-23 (later)
+
+- **PortalPulse** (`libs/bus/portal_pulse.py`, `GET /portal/pulse`): real-time fleet-wide liveness,
+  the hammer trigger (held workers wake on any answer), and fleet evidence for portal-down vs
+  exit-dead. Measured while building it: the server IP gets the edge's 403; soax exits get the
+  44,699 B bot challenge in 1-2 s; webshare exits reach ipify but fail the portal tunnel in 3.3 s.
+- **F42** connect timeout 30 s · **F43** Chrome error page detected anywhere in the body ·
+  **F44** primp keepalive requires the login marker · **F46** blind bounces never park ·
+  **F48** blind seeds no longer suppress self-scouting; feeder scouts count only while scouting.
+- Still open: F45 (pre-warm timing, needs Q29), F47 evidence capture, F49 init-timeout chrome kill,
+  login token pool consumer.

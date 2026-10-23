@@ -688,17 +688,27 @@ class Scheduler:
         # are actively applying to every slot there is, the pool is transiently at zero AVAILABLE,
         # and that must not be read as exhaustion or the fallback would fire on every busy tick.
         # CLOSED (retired) and TAKEN (booked) are not inventory -- nothing can be applied to them.
+        #
+        # BLIND-SEEDED slots are NOT inventory for this purpose (F48, run 1023). They are the
+        # operator's guesses, not evidence that anyone can SEE real slots -- and on run 1023 they
+        # kept the pool "live" while every submit against them came back 66 KB not-bookable, so the
+        # one mechanism that turns 120 logged-in appliers into slot finders could never fire.
         live_inventory = db.scalar(select(func.count(M.Slot.id)).where(
             M.Slot.booking_id == bk.id,
             M.Slot.status.in_([SlotStatus.AVAILABLE, SlotStatus.LEASED]),
+            M.Slot.source != "blind",
         )) or 0
         if live_inventory:
             return
         last = self._last_self_scout.get(bk.id, 0)
         if time.time() - last < _SELF_SCOUT_THROTTLE:
             return
+        # Scouts that count: this booking's AND its detector feeders' (cross-booking slot feed). A
+        # feeder whose scouts are past the login wall is discovering for us; one stuck at the wall
+        # (run 1023's Browser detector: 2 logins in 41 attempts, zero discovery) is not.
+        scout_booking_ids = [bk.id, *(getattr(bk, "discovery_feeder_booking_ids", None) or [])]
         scouts = db.scalars(select(M.Worker).where(
-            M.Worker.booking_id == bk.id, M.Worker.role == WorkerRole.SCOUT)).all()
+            M.Worker.booking_id.in_(scout_booking_ids), M.Worker.role == WorkerRole.SCOUT)).all()
         if scouts and any(_scout_is_actually_scouting(s) for s in scouts):
             return   # at least one scout is past the login wall -- no fallback needed
         self._last_self_scout[bk.id] = time.time()

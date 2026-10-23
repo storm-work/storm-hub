@@ -880,6 +880,17 @@ a competitor had already registered a request for that passport.
 - **MEASURED:** both detectors found 0 slots (0 `discover_end`); both mains had only their 50
   blind-seeded slots. All 77 Browser submits after recovery hit blind slots and got 66 KB
   `form_stale`. Even a perfect warm-up fleet books nothing without real slots.
+- **Why discovery was blind:** the detector scouts never got past login (Browser detector scout:
+  41 login attempts 08:33-10:22, 35 "try again later", 2 successes, zero discovery requests),
+  while 120 APPLY workers were logged in. The self-scout fallback, the mechanism that turns
+  logged-in appliers into finders, could not fire, for two reasons:
+  - `SELF_SCOUT_FALLBACK=False` was set on both mains.
+  - Its "no live inventory" gate counted the 50 blind seeds as inventory.
+- **Fixed 2026-10-23 (gate):** blind-seeded slots no longer count as inventory for the fallback,
+  and a feeder (detector) booking's scouts count as this booking's scouts only while they are
+  actually scouting.
+- **OPS:** `SELF_SCOUT_FALLBACK=True` (the catalog default) on the main booking is required for
+  the gate to matter.
 
 ## F49 — Init-timeout Chrome leak amplifies host overload
 - **Class:** INFRA / APP
