@@ -5872,3 +5872,54 @@ def test_edge_answering_others_means_my_no_answer_is_my_exit():
                      error=("error sending request for url (https://pedidodevistos.mne.gov.pt/"
                             "VistosOnline/) > client error (Connect) > tunnel error: unsuccessful"))
     assert ops.warmup_failure_kind() == "unreachable" and len(rolls) == 1
+
+
+# ── F43: the headless=new Chrome error page must read as a dead exit ─────────────────────────────
+_NETERR = pathlib.Path(__file__).resolve().parents[1] / "fixtures" / "chrome_neterror_headless_new.html"
+
+
+def test_the_186kb_headless_new_error_page_is_a_dead_exit():
+    """Run 1023: 343/376 of these read 'inconclusive' because the [:4000] scan never reached the
+    first ERR_ (char ~144,000) and final_url was the requested URL, not chrome-error://."""
+    page = _NETERR.read_text()
+    assert len(page) > 150_000 and page.find("ERR_") > 4000, "fixture must reproduce the miss"
+    ops = _make_ops()
+    assert ops._is_dead_exit_response(page, "https://pedidodevistos.mne.gov.pt/VistosOnline/")
+
+
+def test_a_real_portal_page_is_not_a_dead_exit():
+    ops = _make_ops()
+    assert not ops._is_dead_exit_response(_authed_home_html(), "https://pedidodevistos.mne.gov.pt/VistosOnline/")
+    assert not ops._is_dead_exit_response("<html><body class='x'>" + "a" * 200_000 + "</body></html>",
+                                          "https://pedidodevistos.mne.gov.pt/VistosOnline/")
+
+
+# ── F44: the primp auth_only keepalive must prove the LOGIN, not just that the portal answered ────
+def _ka_primp(page):
+    ops = _make_ops(cfg=_hybrid_cfg()); ops.session = _FakeSession()
+    fake = _FakePrimp([("VistosOnline", _FakeResp(page, 200, "https://pedidodevistos.mne.gov.pt/VistosOnline/"))])
+    ops._primp_client = lambda: (fake, {})
+    restores, logs = [], []
+    ops._attempt_keepalive_restore = lambda ctx="": (restores.append(ctx), True)[1]
+    ops._log = logs.append
+    return ops, restores, logs
+
+
+def test_primp_keepalive_ok_only_with_the_auth_gated_marker():
+    ops, restores, logs = _ka_primp(_authed_home_html())
+    assert ops._do_keepalive_primp("hold") is True
+    assert any("result=ok" in l for l in logs) and not restores
+
+
+def test_primp_keepalive_a_bot_challenge_is_not_ok():
+    """Run 1023: the Primp fleet's 'ok' was reachability -- a challenge page counted as a live login."""
+    ops, restores, logs = _ka_primp('<html><script src="/ch/bd.js"></script>' + "x" * 44000 + "</html>")
+    ops._do_keepalive_primp("hold")
+    assert not any("result=ok" in l for l in logs), "a challenge is not proof of a login"
+    assert any("result=inconclusive" in l for l in logs) and not restores
+
+
+def test_primp_keepalive_logged_out_home_re_authenticates():
+    ops, restores, logs = _ka_primp("<html><body>Solicitar pedido de visto | Entrar</body></html>")
+    ops._do_keepalive_primp("hold")
+    assert restores == ["hold"] and any("result=expired" in l for l in logs)

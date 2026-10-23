@@ -253,6 +253,11 @@ _ALREADY_BOOKED_MARKERS = (
 # the F41 portal-down check, which is only for requests that got no answer at all.
 _PORTAL_ANSWERED_MARKERS = ("datadome", "waf", "waiting room", "bot challenge", "challenge")
 
+# Chrome's own net-error page: `<body class="neterror" ...>` and the loadTimeData JSON
+# `"errorCode":"ERR_PROXY_CONNECTION_FAILED"`. Neither can occur on a portal page.
+_CHROME_NET_ERROR_PAGE = re.compile(
+    r'<body[^>]*\bclass="[^"]*\bneterror\b|"errorCode"\s*:\s*"(?:net::)?ERR_[A-Z_]+"')
+
 
 def _classify_gettime_page(html: str) -> str:
     """Name the page gettime answered with, so a rejection is actionable rather than a mystery."""
@@ -1768,6 +1773,13 @@ class LiveEngineOps(EngineOps):
         re-probed the same dead exit forever. Reuses the login path's transient-marker set."""
         if "chrome-error" in (final_url or "").lower():
             return True
+        # F43 (run 1023): under --headless=new Chrome's error page is ~186 KB, its first `ERR_` sits
+        # at char ~144,000 and it carries no 'chrome-error' string, so the [:4000] scan below missed
+        # it -- 343/376 dead-exit keepalives read 'unrecognised pre-warm response (185266B) --
+        # inconclusive' and the worker stayed KEEPING on a dead exit. Chrome's own structural
+        # signature (measured on a local capture, 186,599 B) is unambiguous and cheap to search.
+        if _CHROME_NET_ERROR_PAGE.search(page or ""):
+            return True
         return (self._is_transient_login_failure(final_url or "")
                 or self._is_transient_login_failure((page or "")[:4000]))
 
@@ -2205,7 +2217,7 @@ class LiveEngineOps(EngineOps):
         # ep_poll for 55-86 min and froze a whole apply fleet non-bookable). These two bound every
         # hybrid primp call so a dead/stalled exit raises a timeout fast -- which
         # _is_transient_login_failure matches, so the caller rolls the exit. See HYBRID_PRIMP_*.
-        connect_t = float(self.cfg.raw.get("HYBRID_PRIMP_CONNECT_TIMEOUT", 10.0))
+        connect_t = float(self.cfg.raw.get("HYBRID_PRIMP_CONNECT_TIMEOUT", 30.0))
         read_t = float(self.cfg.raw.get("HYBRID_PRIMP_READ_TIMEOUT", 30.0))
         # impersonate the browser's Chrome (TLS/JA3 + header order). Unset = a generic fingerprint the
         # strict-window WAF distinguishes from the browser that earned the session (MEASURED 2026-10-16).
@@ -3243,6 +3255,25 @@ class LiveEngineOps(EngineOps):
         self._keepalive_dead_streak = 0
         self._portal_down_streak = 0
         if not sched:
+            # F44 (run 1023): this returned `ok` for ANY page that was neither an auth redirect nor a
+            # dead exit -- a bot challenge, a maintenance page, a logged-out home -- so "keeping" on
+            # the Primp fleet meant "the portal answered", never "we are logged in". Classify it the
+            # way the browser keepalive does: "consultar pedidos" is the auth-gated marker.
+            verdict = classify_session_state(page, final_url, warmed=False)
+            if verdict == SessionState.SESSION_EXPIRED:
+                self._log(f"keepalive[hybrid]: logged out (home without the auth-gated menu, "
+                          f"{context}) -- re-authenticating")
+                self._slog("keepalive", result="expired", mode="auth_only", via="primp", ctx=context)
+                self._attempt_keepalive_restore(context)
+                return True
+            if verdict != SessionState.AUTHENTICATED:
+                # PORTAL_ERROR (refusal/challenge/maintenance) or UNKNOWN: no proof either way. Not
+                # proof of a login, so it does not count as `ok`; re-probe next cycle.
+                self._log(f"keepalive[hybrid]: {verdict.value} ({len(page)}B, {context}) -- "
+                          f"login not confirmed, will re-probe")
+                self._slog("keepalive", result="inconclusive", mode="auth_only", via="primp",
+                           verdict=verdict.value, bytes=len(page), ctx=context)
+                return True
             if getattr(self, "_keep_unbookable", False):
                 self._mark_keep_bookable(True)
             self._slog("keepalive", result="ok", mode="auth_only", via="primp", ctx=context)
@@ -4597,7 +4628,7 @@ class LiveEngineOps(EngineOps):
         # and pass the submit budget as a PER-REQUEST `timeout` on pc.post, which IS enforced. No
         # short read_timeout here: a live submit legitimately takes a while (server-side PDF build),
         # and APPLY_SUBMIT_TIMEOUT is the deliberate total budget for that.
-        connect_t = float(self.cfg.raw.get("HYBRID_PRIMP_CONNECT_TIMEOUT", 10.0))
+        connect_t = float(self.cfg.raw.get("HYBRID_PRIMP_CONNECT_TIMEOUT", 30.0))
         pc = primp.Client(proxy=self.warm_proxy, verify=False,
                           timeout=int(max(5.0, timeout)), connect_timeout=connect_t,
                           impersonate=self._primp_impersonate(), follow_redirects=True)

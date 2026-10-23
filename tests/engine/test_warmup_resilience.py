@@ -374,3 +374,45 @@ def test_rebuild_session_rides_out_the_outage_instead_of_re_logging_in():
     PhaseMachine(cfg, ops).run()
     assert ops.logins == 1, f"re-logged in {ops.logins - 1}x into a portal outage"
     assert ops.waits == 6 and ops.warmups == 8   # 1 + 6 held re-warms, then 1 rebuild on round 2
+
+
+# ── F46: an invalid BLIND slot is never a verdict on the session (operator rule, 2026-10-23) ───────
+class _BlindStaleOps(_BouncingOps):
+    """Every seeded (blind) slot comes back form_stale -- the portal's 'not bookable'."""
+    def __init__(self, blind=True, **kw):
+        super().__init__(**kw)
+        self._blind, self.parks, self.relogins = blind, 0, 0
+
+    def await_assignment(self):
+        s = super().await_assignment()
+        return None if s is None else {**s, "blind": self._blind}
+
+    def do_apply(self, slot):
+        self.applies += 1
+        return "form_stale" if self._blind else "bounced"
+
+
+def _parks(ops, **raw):
+    import libs.engine.phases as ph
+    seen = []
+    orig = ph.PhaseMachine._park
+    def _spy(self, why):
+        seen.append(why)
+        return orig(self, why)
+    cfg = EngineConfig.from_settings({"ROLE": "apply", "APPLY_MAX_ATTEMPTS": 2, **raw})
+    m = PhaseMachine(cfg, ops)
+    m._park = lambda why: _spy(m, why)
+    m.run()
+    return seen
+
+
+def test_invalid_blind_slots_never_park_a_worker():
+    ops = _BlindStaleOps(blind=True)
+    assert _parks(ops) == [], "seeded phantoms parked a healthy worker (run 1023: 6 Primp workers)"
+    assert ops.applies == ops.MAX_ASSIGNMENTS, "it simply took the next slot every time"
+    assert ops.logins == 1, "and never re-logged in over a phantom"
+
+
+def test_real_slot_bounces_still_park():
+    """The soak10 protection stays for discovered slots: one broken session must not bounce a pool."""
+    assert _parks(_BlindStaleOps(blind=False)) != []

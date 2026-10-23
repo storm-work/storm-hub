@@ -700,7 +700,7 @@ _BOOKING = [
        "probe) on the detached primp client, so KEEPING holds a bookable session through the portal's "
        "down-windows without the browser navigating (which would stale the cursor). Effective = "
        "HYBRID_MODE AND HYBRID_KEEPALIVE. Default ON."),
-    _s("HYBRID_PRIMP_CONNECT_TIMEOUT", L.BOOKING, float, 10.0, group="guards", min_value=1.0,
+    _s("HYBRID_PRIMP_CONNECT_TIMEOUT", L.BOOKING, float, 30.0, group="guards", min_value=1.0,
        note=
        "Connect timeout (s) for the detached primp client used on every hybrid leg (warmup / "
        "discovery / keepalive / submit). CRITICAL: primp.Client's constructor `timeout=` is NOT "
@@ -709,7 +709,11 @@ _BOOKING = [
        "fleet froze in ep_poll for 55-86 min mid re-warm, never cleared `not bookable`, and nobody "
        "applied though the slot pool was full. connect_timeout + read_timeout ARE enforced, so they "
        "bound the call and a stall is raised as a timeout (which _is_transient_login_failure matches, "
-       "so the exit is rolled). Keep low -- a live exit connects in ~1-3s."),
+       "so the exit is rolled). Default RAISED 10 -> 30 on 2026-10-23 (F42): a STRESSED portal took "
+       "25.6 s to accept a connection, and at 10 s the whole Primp fleet of run 1023 was locked out "
+       "after recovery (35/35 warm-ups, then 1,298 more, died on 'client error (Connect)') while "
+       "browsers squeezed through. Any bound prevents the hang; a dead webshare tunnel fails in ~3 s "
+       "regardless ('tunnel error'), and PortalPulse tells a dead exit from a slow portal."),
     _s("HYBRID_PRIMP_READ_TIMEOUT", L.BOOKING, float, 30.0, group="guards", min_value=2.0,
        note=
        "Read timeout (s) for the detached primp client on every hybrid leg: the max gap with no "

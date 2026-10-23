@@ -914,9 +914,19 @@ class PhaseMachine:
             self.ops.release_slot(slot, "bounce")
             slot = None
             stale_streak = 0
-            bounce_streak += 1
-            self._to(WorkerSubstate.KEEPING)
-            _ka_mode = (getattr(getattr(self.cfg, "keepalive", None), "mode", "auth_only")
+            # F46, operator rule (2026-10-23): with seeded blind slots most combinations are phantom
+            # by construction, so an invalid blind slot is NOT a verdict on this session -- take the
+            # next slot. Counting it toward the park brake parked healthy workers on run 1023 ("N
+            # consecutive bounces") while real-looking capacity sat idle. The brake still counts
+            # REAL slots (the soak10 protection against one broken session bouncing a good pool); a
+            # blind slot retires on its own via BLIND_MAX_BOUNCES (Hub, events.py).
+            if not _bounced_blind:
+                bounce_streak += 1
+            # Say what it was: the submit-side log reads "session/form state lost, or the slot was
+            # taken", which for a seeded slot sends operators hunting a session problem that is not there.
+            self._to(WorkerSubstate.KEEPING,
+                     detail="blind slot not bookable -- taking the next slot" if _bounced_blind else "")
+            _ka_mode =(getattr(getattr(self.cfg, "keepalive", None), "mode", "auth_only")
                         or "auth_only").strip().lower()
             if bounce_streak >= max_bounces:
                 bounce_streak = 0
