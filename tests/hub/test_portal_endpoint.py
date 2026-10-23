@@ -122,3 +122,25 @@ def test_clear_booking_checkpoints_is_scoped_to_that_booking(client, tmp_path, m
 def test_clear_booking_checkpoints_404s_for_a_missing_booking(client):
     c, _ = client
     assert c.delete("/bookings/nope/checkpoints", headers=_op(c)).status_code == 404
+
+
+def test_portal_pulse_endpoint_and_booking_payload(client):
+    """GET /portal/pulse is the fleet-wide real-time view; the booking's portal payload carries it."""
+    from libs.bus.portal_pulse import PortalPulse
+    c, fr = client
+    h = _op(c)
+    bid = c.post("/bookings", json={"name": "b", "type": "test", "posto_id": "5084"}, headers=h).json()["id"]
+
+    assert c.get("/portal/pulse", headers=h).json()["state"] == "unknown"
+    p = PortalPulse(fr)
+    p.observe("noanswer", src="probe:soax1"); p.tick()
+    p.observe("up", ms=900, src="w:abc"); p.tick()
+    body = c.get("/portal/pulse", headers=h).json()
+    assert body["state"] == "up" and body["last_up_ms"] == 900
+    assert [t["state"] for t in body["transitions"]][:2] == ["up", "down"]
+    assert c.get(f"/bookings/{bid}/portal", headers=h).json()["pulse"]["state"] == "up"
+
+
+def test_portal_pulse_needs_a_viewer(client):
+    c, _ = client
+    assert c.get("/portal/pulse").status_code in (401, 403)

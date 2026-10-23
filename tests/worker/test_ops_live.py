@@ -5812,3 +5812,63 @@ def test_stress_wait_hears_a_stop():
     t0 = time.time()
     assert ops.stress_wait() is True
     assert time.time() - t0 < 0.5, "a stop must not wait out the gap"
+
+
+# ── PortalPulse wiring: workers report what they see, and wake on any answer ──────────────────────
+def _pulse_ops(**booking):
+    import fakeredis
+    from libs.bus.portal_pulse import PortalPulse
+    ops, rolls = _stress_ops(**booking)
+    ops._pulse = PortalPulse(fakeredis.FakeStrictRedis(decode_responses=True))
+    return ops, rolls
+
+
+def test_warm_up_outcomes_feed_the_pulse():
+    ops, _ = _pulse_ops()
+    ops._note_portal("warmup", 30.0, ok=False, error=_CONNECT_TIMEOUT)      # exit alive -> noanswer
+    assert ops._pulse.state()["state"] == "down"
+    ops._note_portal("warmup", 40.0, ok=True)
+    assert ops._pulse.state()["state"] == "up"
+
+
+def test_a_quest_503_is_reported_degraded():
+    ops, _ = _pulse_ops()
+    ops._note_portal("warmup", 9.0, ok=False,
+                     error="quest step 1 never returned 200 after 3 attempts (HTTP 503)")
+    assert ops._pulse.counts()["degraded"] == 1
+
+
+def test_fleet_sees_portal_up_so_my_no_answer_is_my_exit():
+    """If others are getting answers right now, 'exit reaches the internet' is not enough -- this
+    exit cannot reach the PORTAL. Roll at once instead of holding for PORTAL_DOWN_EXIT_ROLL_S."""
+    ops, rolls = _pulse_ops()
+    ops._pulse.observe("up", src="other-worker")
+    ops._note_portal("warmup", 30.0, ok=False, error=_CONNECT_TIMEOUT)
+    assert ops.warmup_failure_kind() == "unreachable" and len(rolls) == 1
+
+
+def test_stress_wait_wakes_the_moment_anyone_sees_the_portal_answer():
+    ops, _ = _pulse_ops(STRESS_HOLD_GAP=30)
+    import threading
+    threading.Timer(0.4, lambda: ops._pulse.observe("up", src="prober")).start()
+    t0 = time.time()
+    assert ops.stress_wait() is False
+    assert time.time() - t0 < 4.0, "must not wait out the 30 s gap once the portal answers"
+
+
+def test_keepalive_and_submit_results_feed_the_pulse():
+    ops, _ = _pulse_ops()
+    ops._slog("keepalive", result="ok", ctx="hold")
+    ops._slog("apply_submit", status=200, len=66181)
+    assert ops._pulse.counts()["up"] == 2
+
+
+def test_edge_answering_others_means_my_no_answer_is_my_exit():
+    """MEASURED 2026-10-23: soax exits got the portal's edge in 1-2 s while webshare exits reached
+    ipify but failed the portal tunnel. Fleet 'reachable' must also make my exit the suspect."""
+    ops, rolls = _pulse_ops()
+    ops._pulse.observe("refused", src="probe:soax1")
+    ops._note_portal("warmup", 3.0, ok=False,
+                     error=("error sending request for url (https://pedidodevistos.mne.gov.pt/"
+                            "VistosOnline/) > client error (Connect) > tunnel error: unsuccessful"))
+    assert ops.warmup_failure_kind() == "unreachable" and len(rolls) == 1

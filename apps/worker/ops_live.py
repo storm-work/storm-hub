@@ -38,6 +38,7 @@ from urllib.parse import urlencode
 from datetime import date
 
 from libs.bus.portal_liveness import PortalLiveness
+from libs.bus.portal_pulse import PortalPulse
 from libs.bus.semaphore import RedisSemaphore
 from libs.engine import checkpoint as ckpt
 from libs.engine.config import EngineConfig
@@ -736,6 +737,7 @@ class LiveEngineOps(EngineOps):
         self._apply_sem: RedisSemaphore | None = None
         self._pool_sem: RedisSemaphore | None = None
         self._liveness: PortalLiveness | None = None
+        self._pulse: PortalPulse | None = None
         # Set by _sticky_login_attempts when the portal serves its maintenance page, read by
         # _fresh_login to abandon sub-account rotation (down for everyone -- see the login path).
         self._saw_maintenance: bool = False
@@ -801,6 +803,9 @@ class LiveEngineOps(EngineOps):
                     _pool_limit,
                 )
             self._liveness = PortalLiveness(redis_client, booking_id)
+            # Fleet-wide real-time liveness (libs/bus/portal_pulse.py): every portal answer this
+            # worker gets anyway is reported, and stress holds wake the moment anyone sees an answer.
+            self._pulse = PortalPulse(redis_client)
 
     # ── shared warm-up ──────────────────────────────────────────────────────────
     def discovery_needs_relogin(self) -> bool:
@@ -1061,6 +1066,15 @@ class LiveEngineOps(EngineOps):
         log = getattr(self, "_log", None)
         if callable(log):
             log(_kv(ctx))
+        # PortalPulse feed from the lifecycle events that already prove (or disprove) a portal answer.
+        if event == "keepalive":
+            res = fields.get("result")
+            if res == "ok":
+                self._pulse_obs("up")
+            elif res == "portal_down_hold":
+                self._pulse_obs("noanswer")
+        elif event == "apply_submit" and fields.get("len"):
+            self._pulse_obs("up")            # any submit answer, booked or not, is the app answering
 
     def _new_sig_id(self) -> str:
         """Mint a fresh correlation id for a signal-handling round and make it the one _slog stamps
@@ -1545,6 +1559,7 @@ class LiveEngineOps(EngineOps):
                 self._clear_anchor()
                 if self._liveness is not None:
                     self._liveness.record_alive()      # the portal served a successful login
+                self._pulse_obs("up")
                 return True
             # A rejection can ALSO be infrastructure: the vendored login returns 200 with an error
             # body for "datadome_challenge_on_post" (the exit IP is flagged) and for a navigation
@@ -1596,6 +1611,7 @@ class LiveEngineOps(EngineOps):
                 # worker burning accounts against a down portal without freezing the whole fleet.
                 if self._liveness is not None:
                     self._liveness.record_down(self.sub_account_id)
+                self._pulse_obs("degraded")          # maintenance page: the app is down for everyone
                 self._saw_maintenance = True
                 self._log("login: portal MAINTENANCE page ('Serviço Indisponível') -- portal marked "
                           "DOWN for the dashboard; NOT rotating exit/account (down for everyone), "
@@ -1902,6 +1918,7 @@ class LiveEngineOps(EngineOps):
         if ok:
             if phase == "warmup":
                 self._last_warm_kind = "ok"
+            self._pulse_obs("up")
             self._portal_down_since = None    # the portal answered -- any down-window is over
             base = self._PHASE_BASELINE.get(phase, 0.0)
             if self._health.is_slow_against(phase, base):
@@ -1916,6 +1933,10 @@ class LiveEngineOps(EngineOps):
             # still reaches the internet, the PORTAL is down, which is slowness to wait out (keep the
             # exit and the login), not a dead tunnel to roll off. ~9,800 rolls in one run were this.
             kind = "slow" if self._portal_down_not_exit(phase) else "unreachable"
+            if kind == "slow":
+                self._pulse_obs("noanswer")
+        elif re.search(r"\b50[234]\b", error or ""):
+            self._pulse_obs("degraded")      # the portal answered, with an error
         if phase == "warmup":
             self._last_warm_kind = kind
         self._health.observe_failure(kind)
@@ -1963,6 +1984,12 @@ class LiveEngineOps(EngineOps):
             return False
         return classify_failure(error) == "unreachable" or self._is_transient_login_failure(error)
 
+    def _pulse_obs(self, outcome: str, ms: float | None = None) -> None:
+        """Report one portal answer (or non-answer) to the fleet-wide PortalPulse. Never raises."""
+        p = getattr(self, "_pulse", None)
+        if p is not None:
+            p.observe(outcome, ms=ms, src=f"w:{str(getattr(self, 'identity_id', '') or '')[:8]}")
+
     def _portal_down_not_exit(self, why: str) -> bool:
         """F41: True when the exit still reaches the internet while the portal gave no answer -- the
         PORTAL is down, so keep the exit (and the login bound to it) instead of rolling.
@@ -1978,6 +2005,23 @@ class LiveEngineOps(EngineOps):
         disables the check entirely (always False = the old roll-on-every-failure behaviour)."""
         if not bool(self.cfg.raw.get("STRESS_HOLD", True)):
             return False
+        # FLEET EVIDENCE FIRST. If others are getting answers from the portal right now -- the app
+        # (up), its errors (degraded) or even just its edge/WAF (reachable) -- and this exit got NONE,
+        # the problem is this exit: roll it now rather than trusting "exit reaches the internet" for
+        # PORTAL_DOWN_EXIT_ROLL_S. MEASURED 2026-10-23: webshare exits reached ipify yet failed the
+        # portal tunnel in 3.3 s while soax exits got answers in 1-2 s. 'flapping' (mixed) and
+        # 'down'/'unknown' fall through to the exit's own check.
+        _p = getattr(self, "_pulse", None)
+        if _p is not None:
+            try:
+                _st = _p.state()["state"]
+                if _st in ("up", "reachable", "degraded"):
+                    self._log(f"portal-down check ({why}): the fleet sees the portal answering "
+                              f"({_st}) -- this exit is the problem, rolling")
+                    self._portal_down_since = None
+                    return False
+            except Exception:
+                pass
         moved = self._note_exit_ip(f"portal-down check ({why})")
         if moved or not self._exit_probe_ok:
             self._portal_down_since = None
@@ -2013,11 +2057,20 @@ class LiveEngineOps(EngineOps):
         Drains the bus while it waits -- is_stopped() only reads a flag that a wait_*/poll sets, and a
         holding worker is not inside any wait_*, so without this it would be deaf to `stop`."""
         gap = max(1.0, float(self.cfg.raw.get("STRESS_HOLD_GAP", 15.0) or 15.0))
-        end = time.time() + gap * random.uniform(0.8, 1.2)
+        started = time.time()
+        end = started + gap * random.uniform(0.8, 1.2)
+        pulse = getattr(self, "_pulse", None)
         while True:
             self._poll_signals()
             if self.is_stopped():
                 return True
+            # THE HAMMER TRIGGER. The portal's up-windows are 30-90 s; waiting out a 15 s gap can
+            # spend a third of one. The moment ANY worker or the Hub prober sees the application
+            # answer, retry now -- after a 0-2 s stagger so a whole held fleet does not land on the
+            # recovering portal in the same instant and knock it straight back over.
+            if pulse is not None and pulse.last_up_at() > started:
+                time.sleep(random.uniform(0.0, 2.0))
+                return self.is_stopped()
             left = end - time.time()
             if left <= 0:
                 return False
@@ -2210,6 +2263,10 @@ class LiveEngineOps(EngineOps):
                                              "Referer": QUEST_URL, "Sec-Fetch-Mode": "cors",
                                              "Sec-Fetch-Dest": "empty", "Sec-Fetch-Site": "same-origin"})
                     status = getattr(r, "status_code", None)
+                    if status == 200:
+                        self._pulse_obs("up")
+                    elif status is not None and status >= 500:
+                        self._pulse_obs("degraded")
                     if status == 200 or attempt == _retries:
                         break
                     if _bk_base > 0:

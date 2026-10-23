@@ -140,6 +140,27 @@ _GLOBAL = [
        "solves on expiry. See libs/bus/token_pool.py."),
     _s("LOGIN_TOKEN_POOL_BATCH", L.GLOBAL, int, 4, group="credentials", min_value=1.0,
        note="Max concurrent CapSolver solves per factory cycle when refilling the login token pool."),
+    # ── PortalPulse: real-time portal liveness (libs/bus/portal_pulse.py, 2026-10-23) ──────────
+    _s("PORTAL_PULSE", L.GLOBAL, bool, True, group="portal_pulse",
+       note=
+       "Run the Hub's active portal prober while any booking is RUNNING: an anonymous GET of the "
+       "portal home page every PORTAL_PULSE_INTERVAL s from the server and PORTAL_PULSE_EXITS "
+       "residential exits, recorded into the fleet-wide PortalPulse that workers also feed from their "
+       "own requests. Held workers wake the moment anyone sees the portal answer (the hammer trigger). "
+       "Off = workers still report and read the pulse; only the active probing stops."),
+    _s("PORTAL_PULSE_INTERVAL", L.GLOBAL, float, 3.0, group="portal_pulse", min_value=1.0,
+       note=
+       "Seconds between probes per vantage (+-20%). Probes overlap (up to 3 in flight per vantage), "
+       "so a 25 s slow accept never blinds the prober. Bandwidth ~28 KB per probe per exit."),
+    _s("PORTAL_PULSE_PROVIDER", L.GLOBAL, str, "soax", group="portal_pulse",
+       note=
+       "Rotating provider (or pool:<name>) the prober mints its residential exits from. Needed to see "
+       "the APPLICATION: the Hub server's own IP is refused by the portal edge (403 'try again later', "
+       "measured 2026-10-23), so it can only show whether the edge is reachable. Empty or 'none' = "
+       "server vantage only."),
+    _s("PORTAL_PULSE_EXITS", L.GLOBAL, int, 2, group="portal_pulse", min_value=0.0,
+       note="How many residential exits the prober probes from (each re-minted when its own IP-echo "
+            "control fails or the edge refuses it)."),
     # ── rotating-pool credentials: DELIBERATELY ABSENT ───────────────────────────────────────
     # ROTATING CREDENTIALS ARE NOT SETTINGS (operator direction 2026-09-16). SOAX_ROTATING_PACKAGE
     # /_PASSWORD, SOAX_MOBILE_*, WEBSHARE_PREFIX/_PASSWORD were briefly catalogued here and have

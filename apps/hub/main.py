@@ -513,6 +513,71 @@ def _stop_token_factory() -> None:
     _token_factory_stop.set()
 
 
+_pulse_stop = threading.Event()
+_pulse_thread: "threading.Thread | None" = None
+_PULSE_ACTIVE_STATUSES = (BookingStatus.WARMING, BookingStatus.ARMED, BookingStatus.RUNNING)
+
+
+def _start_portal_pulse() -> None:
+    """Start the active PortalPulse prober (libs/bus/portal_pulse.py) if PORTAL_PULSE is on.
+
+    Vantages: the server itself (shows only whether the portal's EDGE is reachable -- the server IP
+    is refused, 403 'try again later', measured 2026-10-23) plus PORTAL_PULSE_EXITS residential
+    exits minted Hub-side exactly as worker exits are (creds never leave the Hub). Probes only while
+    a booking is WARMING/ARMED/RUNNING -- residential bytes cost money. Best-effort: never blocks
+    the Hub."""
+    global _pulse_thread
+    if _pulse_thread is not None and _pulse_thread.is_alive():
+        return
+    try:
+        from libs.bus.portal_pulse import Vantage, run_pulse_prober
+        db = SessionLocal()
+        try:
+            g = resolve({L.GLOBAL: get_global(db)})
+            raw_global = get_global(db)
+            provider = str(g.get("PORTAL_PULSE_PROVIDER") or "").strip()
+            prov, kind, creds = (None, None, None)
+            if provider and provider.lower() != "none":
+                try:
+                    prov, kind, creds = _resolve_rotating_pool(db, provider, None)
+                except HTTPException as e:       # missing/inactive pool: server vantage only
+                    logger.warning("portal pulse prober: PORTAL_PULSE_PROVIDER %r unusable (%s) -- "
+                                   "probing from the server only", provider, e.detail)
+        finally:
+            db.close()
+        if not bool(g.get("PORTAL_PULSE", True)):
+            logger.info("portal pulse prober: off (PORTAL_PULSE=false)")
+            return
+        vantages = [Vantage("server", lambda: None)]
+        if prov:
+            def _mint(prov=prov, kind=kind, creds=creds):
+                return mint_rotating_url(prov, kind, settings=raw_global, creds=creds)
+            vantages += [Vantage(f"{prov}{i + 1}", _mint)
+                         for i in range(int(g.get("PORTAL_PULSE_EXITS", 2) or 0))]
+
+        def _active() -> bool:
+            s = SessionLocal()
+            try:
+                return s.scalar(select(M.Booking.id).where(
+                    M.Booking.status.in_(_PULSE_ACTIVE_STATUSES)).limit(1)) is not None
+            finally:
+                s.close()
+
+        _pulse_stop.clear()
+        _pulse_thread = threading.Thread(
+            target=run_pulse_prober, name="portal-pulse", daemon=True,
+            kwargs=dict(redis_client=_bus.r, stop_event=_pulse_stop, vantages=vantages,
+                        interval=float(g.get("PORTAL_PULSE_INTERVAL", 3.0) or 3.0),
+                        active=_active, log=lambda m: logger.info("%s", m)))
+        _pulse_thread.start()
+    except Exception:
+        logger.exception("portal pulse prober: failed to start")
+
+
+def _stop_portal_pulse() -> None:
+    _pulse_stop.set()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
@@ -551,11 +616,13 @@ async def lifespan(app: FastAPI):
     event_hub.start()          # background thread tailing the evt stream -> DB + WS
     scheduler.start()          # auto-ops: scheduled start + slot-open + slot assignment
     _start_token_factory()     # shared pre-solved login-token pool (OFF unless LOGIN_TOKEN_POOL_TARGET>0)
+    _start_portal_pulse()      # real-time portal liveness prober (only probes while a booking is live)
     yield
     # Release open dashboard sockets FIRST: uvicorn will not complete shutdown while one is still
     # being served, and ws_events blocks forever on its queue by construction.
     event_hub.close_subscribers()
     _stop_token_factory()
+    _stop_portal_pulse()
     scheduler.stop()
     event_hub.stop()
     audit_writer.stop()        # flushes whatever is still queued before the process goes away
@@ -2960,7 +3027,25 @@ def get_booking_portal(booking_id: str, db: Session = Depends(get_db),
     instead of being acted on by freezing the fleet. Read-only."""
     if not db.get(M.Booking, booking_id):
         raise HTTPException(404, "booking not found")
-    return PortalLiveness(_bus.r, booking_id).state()
+    out = PortalLiveness(_bus.r, booking_id).state()
+    try:
+        from libs.bus.portal_pulse import PortalPulse
+        out["pulse"] = PortalPulse(_bus.r).state()     # fleet-wide, real-time (see /portal/pulse)
+    except Exception:
+        out["pulse"] = None
+    return out
+
+
+@app.get("/portal/pulse")
+def get_portal_pulse(n: int = 100, _v: Principal = Depends(require_viewer)) -> dict:
+    """Real-time, fleet-wide portal liveness (libs/bus/portal_pulse.py): the current state over the
+    last ~20 s (up / flapping / degraded / down / reachable / unknown), outcome counts, when the
+    application last answered and how fast, the recent state transitions, and the closed state
+    windows -- i.e. the MEASURED up/down cycle the hammer has to ride. Read-only."""
+    from libs.bus.portal_pulse import PortalPulse
+    p = PortalPulse(_bus.r)
+    n = max(1, min(int(n), 1000))
+    return {"now": time.time(), **p.state(), "transitions": p.history(n), "windows": p.windows(n)}
 
 
 @app.post("/bookings/{booking_id}/duplicate", response_model=BookingOut, status_code=201)
