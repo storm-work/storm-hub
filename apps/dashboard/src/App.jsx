@@ -348,6 +348,34 @@ function useOne(path, { pollMs = 0 } = {}) {
   return data;
 }
 
+// Real-time, fleet-wide portal pulse (libs/bus/portal_pulse.py) -- rides on the booking's portal
+// payload as `pulse`. States over the last ~20 s: up / flapping / degraded / down / reachable /
+// unknown. "reachable" = only the portal's edge/bot-gate answered (anonymous probes cannot see the
+// application); "up" needs a logged-in worker to have been served.
+function PulseBadge({ pulse }) {
+  if (!pulse) return null;
+  const st = pulse.state || "unknown";
+  const meta = {
+    up: { cls: "ok", label: "pulse UP", color: "#3fb950" },
+    flapping: { cls: "warn", label: "pulse flapping", color: "#d29922" },
+    degraded: { cls: "warn", label: "pulse degraded", color: "#d29922" },
+    reachable: { cls: "", label: "pulse edge-only", color: "#58a6ff" },
+    down: { cls: "err", label: "pulse DOWN", color: "#f85149" },
+    unknown: { cls: "", label: "pulse ?", color: "#8b949e" },
+  }[st] || { cls: "", label: "pulse ?", color: "#8b949e" };
+  const c = pulse.counts || {};
+  const age = pulse.up_age_s != null ? `${Math.round(pulse.up_age_s)}s ago` : "never";
+  const tip = `Fleet-wide, last ${pulse.window_s || 20}s: up ${c.up || 0} · degraded ${c.degraded || 0} · `
+    + `refused ${c.refused || 0} · no answer ${c.noanswer || 0}. App last answered ${age}`
+    + `${pulse.last_up_ms ? ` (${pulse.last_up_ms} ms)` : ""}. Held workers retry the moment it answers.`;
+  return (
+    <span className={`pill ${meta.cls}`} title={tip} style={{ display: "inline-flex", alignItems: "center", gap: 5 }}>
+      <span style={{ width: 8, height: 8, borderRadius: "50%", background: meta.color, display: "inline-block" }} />
+      {meta.label}{st !== "up" && pulse.up_age_s != null ? ` · up ${Math.round(pulse.up_age_s)}s ago` : ""}
+    </span>
+  );
+}
+
 // Portal liveness pill for the booking header. state() from PortalLiveness: alive / down / unknown.
 function PortalBadge({ portal }) {
   if (!portal) return null;
@@ -956,6 +984,7 @@ function BookingOverview({ me, booking, events, workers, allBookings, onBookingC
       <div className="row muted" style={{ fontSize: 13, marginBottom: 6, gap: 14, flexWrap: "wrap", alignItems: "center" }}>
         <span>status: <b>{booking.status}</b></span>
         <PortalBadge portal={portal} />
+        <PulseBadge pulse={portal && portal.pulse} />
         {portal && typeof portal.login_attempts_1m === "number" && (
           <span title="login SHOTS taken in the last minute across this booking's fleet. The portal throttle is a global lottery (~1% served on identical requests), so bookings scale with shots — watch this climb when tuning throughput.">
             🎯 {portal.login_attempts_1m} login shots/min
