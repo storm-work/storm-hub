@@ -256,3 +256,24 @@ Measured 2026-08-27 on `Test 2032`: ESPERANCA CUNHA held **8.1 minutes** before 
 
 Test it on a posto that has slots (3018 has 75) and read the appliers' `PRE-SUBMIT doc` line at
 assignment time.
+
+## Q27 — Does a login survive a portal outage?
+Run 1023: portal unusable ~10:15-11:40, no successful keepalive for ~80 min, maintenance page ~11:17.
+No worker carried a pre-outage login through it -- 75 discarded theirs at 10:47-10:53 (F40), and every
+post-recovery warm-up followed a fresh login (11:54-12:09). So the question was never tested. Sessions
+otherwise live 3+ h (§27), but a portal-side event can wipe them all at once (§29), and a maintenance
+restart is the obvious candidate. **Settled by:** the hold-through-stress change -- a held worker's
+first post-recovery request answers it (warm-up succeeds vs Authentication.jsp redirect). Log it.
+
+## Q28 — Does an exit change invalidate the login?
+The code assumes yes (every roll is followed by a re-login). One observation says no: `q21_test_1`
+moved exit at t=109 min and stayed AUTHENTICATED for 69 more minutes (Q19 update). If no, rolling a
+dead exit under a held login is cheap and F41's hold matters less; if yes, every unnecessary roll
+costs a login. **Settled by:** after a forced roll under a held session, probe the auth-gated
+`/VistosOnline/Pedidos` before re-logging in. n>=10 across both providers.
+
+## Q29 — How long does a warmed cursor stay bookable?
+Gates F45 (warm before the portal degrades). Q24 already records two TTL figures 3x apart; the
+`KEEPING_IS_AUTHED_ONLY` model says the cursor is nav-bound, not time-bound. **Settled by:** warm N
+workers, hold without navigating, submit at staggered delays against a real slot window, read
+PRE-SUBMIT + response size.

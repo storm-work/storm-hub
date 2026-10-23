@@ -5698,3 +5698,117 @@ def test_login_falls_back_to_inline_solve_when_pool_empty(monkeypatch):
     ops._save_checkpoint = lambda *a, **k: None
     assert ops._fresh_login() is True
     assert captured["pre_token"] == [""]   # empty holder -> browser_login solves inline
+
+
+# ── F40/F41: hold the login through portal stress (run 1023, 2026-10-23) ─────────────────────────
+# Run 1023 rolled exits ~9,800 times into a portal that was not accepting connections (the exits all
+# reached ipify), and every roll threw away a login. These pin the classification that stops that.
+_CONNECT_TIMEOUT = ("error sending request for url (https://pedidodevistos.mne.gov.pt/VistosOnline/) "
+                    "> client error (Connect) > operation timed out")
+
+
+def _stress_ops(*, exit_ok=True, **booking):
+    ops = _make_ops(cfg=_hybrid_cfg(**booking)); ops.session = _FakeSession()
+    rolls = []
+    ops._roll_exit = lambda why: (rolls.append(why), True)[1]
+
+    def _probe(when):
+        ops._exit_probe_ok = exit_ok
+        ops._exit_ip = "1.2.3.4" if exit_ok else None
+        return False
+    ops._note_exit_ip = _probe
+    return ops, rolls
+
+
+def test_no_answer_to_a_live_exit_is_portal_down_not_a_dead_exit():
+    ops, rolls = _stress_ops(exit_ok=True)
+    ops._note_portal("warmup", 30.0, ok=False, error=_CONNECT_TIMEOUT)
+    assert ops.warmup_failure_kind() == "slow", "a down portal is slowness to wait out"
+    assert rolls == [], "rolling a live exit throws away the login bound to it"
+
+
+def test_no_answer_and_a_dead_exit_still_rolls():
+    ops, rolls = _stress_ops(exit_ok=False)
+    ops._note_portal("warmup", 3.0, ok=False, error="net::ERR_TUNNEL_CONNECTION_FAILED")
+    assert ops.warmup_failure_kind() == "unreachable"
+    assert len(rolls) == 1
+
+
+def test_the_portal_down_verdict_is_bounded_then_rolls_anyway():
+    """A webshare tunnel failure can be exit-specific even when the exit reaches ipify (F2)."""
+    ops, rolls = _stress_ops(exit_ok=True, PORTAL_DOWN_EXIT_ROLL_S=900)
+    ops._portal_down_since = time.time() - 1000
+    ops._note_portal("warmup", 30.0, ok=False, error=_CONNECT_TIMEOUT)
+    assert ops.warmup_failure_kind() == "unreachable" and len(rolls) == 1
+    assert ops._portal_down_since is None, "the bound restarts after the roll"
+
+
+def test_a_portal_answer_resets_the_portal_down_clock():
+    ops, _ = _stress_ops(exit_ok=True)
+    ops._portal_down_since = time.time() - 500
+    ops._note_portal("warmup", 30.0, ok=True)
+    assert ops._portal_down_since is None and ops._last_warm_kind == "ok"
+
+
+def test_stress_hold_off_restores_the_old_roll_on_every_failure():
+    ops, rolls = _stress_ops(exit_ok=True, STRESS_HOLD=False)
+    ops._note_portal("warmup", 3.0, ok=False, error="net::ERR_TUNNEL_CONNECTION_FAILED")
+    assert ops.warmup_failure_kind() == "unreachable" and len(rolls) == 1
+
+
+def test_a_waf_answer_is_not_portal_down_and_still_rolls_once():
+    """The portal ANSWERED with a bot gate: that is a verdict on the exit, not an outage."""
+    ops, rolls = _stress_ops(exit_ok=True)
+    ops._warmup_last_error = "WAF bot-challenge on quest step 1/7 (44699B)"
+    ops._note_portal("warmup", 5.0, ok=False, error=ops._warmup_last_error)
+    assert ops.warmup_failure_kind() == "unknown"
+    ops._roll_after_failed_warm("apply: dead exit at round-start re-warm")
+    assert rolls == ["apply: dead exit at round-start re-warm"]
+
+
+def test_no_second_roll_after_a_portal_down_warm_failure():
+    """do_apply / keepalive used to roll again on the transient marker, undoing the F41 keep."""
+    ops, rolls = _stress_ops(exit_ok=True)
+    ops._warmup_last_error = _CONNECT_TIMEOUT
+    ops._note_portal("warmup", 30.0, ok=False, error=_CONNECT_TIMEOUT)
+    ops._roll_after_failed_warm("apply: dead exit at round-start re-warm")
+    assert rolls == []
+
+
+def test_the_failure_kind_is_per_attempt_not_inherited():
+    """A non-portal failure (stale form, login redirect) must not inherit an earlier 'slow', or the
+    stress hold would hold a logged-out session forever."""
+    ops, _ = _stress_ops()
+    ops._last_warm_kind = "slow"
+
+    def _chain():
+        ops._warmup_last_error = ""
+        return False
+    ops._primp_warmup_chain = _chain
+    assert ops._run_warmup_steps() is False
+    assert ops.warmup_failure_kind() == "unknown"
+
+
+def test_hybrid_quest_503_is_retried_then_reported_as_portal_slowness():
+    """The primp chain aborted on the FIRST 503 and never told _note_portal, so a hybrid worker's
+    stressed warm-up was always 'unknown' -> straight down the re-login ladder."""
+    ops, rolls = _stress_ops()
+    ops.cfg.raw.update(QUEST_STEP_RETRIES=3, QUEST_STEP_BACKOFF=0)   # template-layer knobs
+    fake =_FakePrimp([("QuestNextQuestion", _FakeResp("Service Unavailable", 503, "q"))])
+    ops._primp_client = lambda: (fake, {})
+    assert ops._run_warmup_steps() is False
+    assert sum("QuestNextQuestion" in u for u in fake.gets) == 3, "the SAME step is retried"
+    assert "HTTP 503" in ops._warmup_last_error
+    assert ops.warmup_failure_kind() == "slow" and rolls == []
+
+
+def test_stress_wait_hears_a_stop():
+    ops, _ = _stress_ops(STRESS_HOLD_GAP=1)
+
+    class _Sig:
+        stopped = False
+        def poll(self): self.stopped = True
+    ops._signals = _Sig()
+    t0 = time.time()
+    assert ops.stress_wait() is True
+    assert time.time() - t0 < 0.5, "a stop must not wait out the gap"

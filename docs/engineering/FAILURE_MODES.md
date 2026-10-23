@@ -768,3 +768,121 @@ that ever registered -- are exactly ISO-3.
 - **Recovery:** re-anchor (one navigation) on a live exit; roll the exit only if that fails.
 - **Not exposed:** login (submits via a DOM `form.submit()` navigation — immune), warmup/apply
   (no long gap before their in-page fetch), calendar discovery and keepalive (navigation-based).
+
+---
+
+# Run 1023 (2026-10-23) — the stress-window failure modes
+
+Booking 1023 w Browser (61 apply) + w Primp (62 apply), each fed by a detector, posto 5084: **0
+appointments**. Portal healthy until ~10:15, then 503s on `QuestNextQuestion` (10:39-11:06),
+maintenance (~11:17), mostly not accepting connections (11:15-11:40), recovered ~11:40-11:58. Full
+narrative + target design: `REPORT_2026-10-23_stress_window.md`. The reference success: identity
+PA508829 (worker 689db64b) re-logged in 12:02, completed the whole warm-up (every quest step,
+`Formulario?copy=true` 864 KB, ScheduleController 200) in ~2 min -- and was turned away only because
+a competitor had already registered a request for that passport.
+
+## F40 — One failed re-warm during portal stress throws the login away
+- **Class:** APP
+- **Code path:** `_rebuild_session` (libs/engine/phases.py), reached from the apply loop's
+  `outcome == "session"` branch. Re-warm once; if that fails, re-login -- with **no** slow/portal-down
+  guard. `_warm_with_recovery` has exactly that guard ("portal slow, not broken -- holding rather
+  than re-logging in"); the apply ladder never got it. The `session` branch also counts every such
+  failure toward `max_session_failures`.
+- **MEASURED:** 75/123 apply workers dropped a live login at 10:47-10:53 after their signal-time
+  re-warm hit a 503 (classified `[slow]`). Only 25 got back in (11:23-12:06); re-login during the
+  outage succeeded 0 times before 11:23. PA508829's two failed re-warms were both `[slow]` and it
+  still re-logged in.
+- **Why it matters:** after recovery every LOGGED-IN Browser worker warmed in 1-2 min. The login,
+  not the warm-up, was the critical path -- and we threw 75 logins away at the start of the outage.
+- **Fixed 2026-10-23 (`STRESS_HOLD`, default on):** on a slow/portal-down warm-up failure the login
+  is held -- `_rebuild_session` and `_warm_with_recovery` re-warm in process (`_ride_out_stress`,
+  paced by `STRESS_HOLD_GAP`), the apply loop releases the slot without counting a session failure
+  and lets the next assignment's re-warm be the retry. The first portal answer decides (warmed ->
+  apply; logged out -> re-login at once). Capped by `STRESS_HOLD_MAX_S` (2 h), then the old ladder.
+  Also fixed: `_warm_with_recovery`'s old "holding" path returned False, which `_warm_if_needed`
+  turned into `_fail` = respawn = a fresh login; and the primp warm-up never reported to
+  `_note_portal`, so hybrid workers could never be classified slow at all.
+
+## F41 — Portal down is read as "exit dead": roll + re-login, ~9,800 times
+- **Class:** APP
+- **Code path:** `_record_portal`'s failure branch rolls the exit on every `unreachable`
+  (apps/worker/ops_live.py ~1897); do_apply rolls on a transient re-warm error (~4521); the keepalive
+  and login transient paths roll too. `ERR_TUNNEL` / connect timeout is ambiguous: dead exit OR
+  portal not accepting connections.
+- **MEASURED:** ~9,800 exit rolls in one run (webshare ~6,850 / soax ~2,920). Control at 11:44:
+  16 fresh exits all reached ipify in <1 s; the portal took 25.6 s on 1 soax exit, 40 s+ timeouts on
+  7, ConnectError on 8/8 webshare. Direct TCP from the server to portal:443 also timed out.
+- **Caveat:** for webshare a tunnel failure CAN be exit-specific (rolling once took portal
+  reachability 25% -> 83%, F2), so "exit reaches ipify" is necessary but not sufficient -- a hold
+  must be bounded and fall back to a roll.
+- **Fixed 2026-10-23:** `_note_portal` asks the exit (`_portal_down_not_exit`, via `_note_exit_ip`)
+  on every no-answer failure: exit alive => `slow` (keep exit + login), else `unreachable` (roll).
+  Same check guards the keepalive dead-exit/dead-trip paths and both discovery rolls; the second
+  roll do_apply/keepalive did on the transient marker now only fires for a portal-answered WAF flag
+  (`_roll_after_failed_warm`). Trusted for `PORTAL_DOWN_EXIT_ROLL_S` (900 s), then rolls anyway.
+  `observe_exit_ip` itself was unbounded (constructor-only primp timeout) and is now enforced.
+
+## F42 — Primp's 10 s connect timeout locked the hybrid fleet out after recovery
+- **Class:** OPS / APP
+- **MEASURED:** Primp booking: 12 workers re-logged in after recovery, **0 warmed**; 35/35 warm-up
+  attempts after 11:15 failed `client error (Connect) > operation timed out` on `/` at
+  `HYBRID_PRIMP_CONNECT_TIMEOUT=10`. Browser workers (`NAV_TIMEOUT_SCALE=4`) squeezed through the
+  same portal. A measured stressed-portal connect took 25.6 s.
+- **Fix:** connect timeout ~40 s for stress (the 10 s value was chosen to stop dead tunnels hanging
+  primp for an hour -- F-primp-timeout -- which any bounded value achieves).
+
+## F43 — The browser keepalive cannot see Chrome's own error page under `--headless=new`
+- **Class:** APP (regression of the dead-exit-page class after the anti-detect flip)
+- **Cause:** `_is_dead_exit_response` scans `page[:4000]` + `final_url`. Under `--headless=new`
+  Chrome's net-error page is ~186 KB with the first `ERR_` at char ~144,000 and no `chrome-error`
+  string in the body (old headless rendered a 39-byte stub).
+- **MEASURED:** 343/376 dead-exit keepalives read as `unrecognised pre-warm response (185266B) --
+  inconclusive, will re-probe`; of 35 Browser workers "keeping" at the signal only 6 had a verified
+  authenticated keepalive in the previous ~20 min.
+- **Fix:** read the live `location.href` (`chrome-error://`) and/or scan the whole page for the
+  net-error signature; test with a 186 KB fixture.
+
+## F44 — Primp auth_only keepalive "ok" never checks the login
+- **Class:** APP
+- **Cause:** `_do_keepalive_primp` returns ok for any page that is not an Authentication.jsp redirect
+  and not a dead exit; it never requires the logged-in marker.
+- **Effect:** "keeping" on the Primp fleet meant "the portal answered", not "we are logged in".
+- **Fix:** `classify_session_state(page, final_url, warmed=False)` as the browser path does.
+
+## F45 — auth_only defers the multi-request warm-up INTO the stress window
+- **Class:** OPS / design
+- **MEASURED:** hold healthy 08:45-10:00 (~150 ok keepalives / 15 min); the warm-ups all ran at the
+  signal (10:47+), where a 6+ request chain met 503s: 0/~260 completed before 11:41.
+- **Fix:** warm before the portal degrades (schedule mode / timed pre-warm) so the signal-time
+  action is one submit; open question how long a warmed cursor stays bookable.
+
+## F46 — Blind invalid slots are treated as a degrading session
+- **Class:** APP
+- **Already right:** blind `form_stale` -> `no_slot` (phases.py), Hub retires the phantom after
+  `BLIND_MAX_BOUNCES`, the false-slot revert is disabled while blind slots exist.
+- **Gaps:** blind bounces count toward `APPLY_MAX_ATTEMPTS` and PARK a healthy worker after 5; the
+  next round's mandatory re-warm failing (portal down) escalates to `session` -> re-login (F40);
+  the log calls it "session/form state lost". Operator rule: invalid seeded slot = take the next
+  slot, never a session verdict.
+
+## F47 — The race for an identity is lost on login latency
+- **Class:** SERVER / OPS
+- **Evidence:** PA508829 reached ScheduleController at 12:05 and got the portal's "applicant already
+  has a request" page (1.27 MB vs ~55 KB normal): someone registered that passport first. We had no
+  submit and no booking for it. The portal allows one request per passport per 5 days, so every
+  minute between recovery and our first submit is a minute a competitor can take the identity.
+- **Observability gap:** only the first 300 chars of the verdict page are logged (a DOCTYPE); save
+  the page (or its visible text) as evidence next time.
+- **Note:** a duplicate of the same person (`PA508829+`) was attached to the parallel Primp booking.
+
+## F48 — Detection went blind under stress, so a warmed fleet could only fire at phantoms
+- **Class:** APP / SERVER
+- **MEASURED:** both detectors found 0 slots (0 `discover_end`); both mains had only their 50
+  blind-seeded slots. All 77 Browser submits after recovery hit blind slots and got 66 KB
+  `form_stale`. Even a perfect warm-up fleet books nothing without real slots.
+
+## F49 — Init-timeout Chrome leak amplifies host overload
+- **Class:** INFRA / APP
+- **MEASURED:** `PlaywrightSession init timed out (>120s)` x200; 139 workers, ~1,065 chrome procs,
+  210 orphaned, load ~12. The hung init thread is never force-killed (`_kill_proc_tree`), and every
+  re-login during the outage started another browser.

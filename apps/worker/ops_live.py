@@ -247,6 +247,11 @@ _ALREADY_BOOKED_MARKERS = (
     "ja tem um pedido registado",
 )
 
+# A failure carrying one of these came FROM the portal -- it answered, with a bot gate -- so it is a
+# verdict on the exit's reputation (roll it), never evidence that the portal is down. Excluded from
+# the F41 portal-down check, which is only for requests that got no answer at all.
+_PORTAL_ANSWERED_MARKERS = ("datadome", "waf", "waiting room", "bot challenge", "challenge")
+
 
 def _classify_gettime_page(html: str) -> str:
     """Name the page gettime answered with, so a rejection is actionable rather than a mystery."""
@@ -737,6 +742,16 @@ class LiveEngineOps(EngineOps):
         # Last _run_warmup_steps exception message; lets do_apply distinguish a dead-exit re-warm
         # failure (roll the exit) from a portal rejection (keep it). See _run_warmup_steps.
         self._warmup_last_error: str = ""
+        # How the LAST warm-up failed ("slow" | "unreachable" | "unknown", "ok" on success) -- set by
+        # _note_portal, reset at the start of every _run_warmup_steps. warmup_failure_kind() reads
+        # this, not the health streaks, so a non-exception failure (stale form, login redirect) can
+        # never inherit an earlier attempt's "slow" and be held as portal stress forever (F40).
+        self._last_warm_kind: str = "unknown"
+        # F41: when this worker first saw "exit alive, portal not answering" without a portal success
+        # since -- bounds how long that verdict is trusted before rolling anyway. None = no such run.
+        self._portal_down_since: float | None = None
+        # Whether the most recent _note_exit_ip actually read an address (the exit reaches the net).
+        self._exit_probe_ok: bool = False
         # Set when the portal says this applicant ALREADY HAS a request ("Este requerente já tem um
         # pedido registado" -- a JS alert). The identity is permanently unusable for this run (a
         # competitor booked it, or it applied within the last 5 days), so the worker must STOP and
@@ -1013,6 +1028,7 @@ class LiveEngineOps(EngineOps):
                 pass
         self.warm_proxy = rolled
         self._exit_ip = None          # a new exit: the next observation is a baseline, not a change
+        self._portal_down_since = None  # a portal-down verdict was about the OLD exit (F41)
         self._log(f"proxy: rolled to a fresh sticky exit [{_proxy_label(rolled)}] ({why})")
         return True
 
@@ -1884,6 +1900,9 @@ class LiveEngineOps(EngineOps):
         """
         self._health.observe(phase, seconds, ok=ok)
         if ok:
+            if phase == "warmup":
+                self._last_warm_kind = "ok"
+            self._portal_down_since = None    # the portal answered -- any down-window is over
             base = self._PHASE_BASELINE.get(phase, 0.0)
             if self._health.is_slow_against(phase, base):
                 self._log(f"portal: {phase} running slow -- median "
@@ -1891,6 +1910,14 @@ class LiveEngineOps(EngineOps):
             return
 
         kind = classify_failure(error)
+        if self._is_transport_failure(error):
+            # F41 (run 1023): the request got NO answer -- a dead exit OR a portal that is not
+            # accepting connections, and the error text cannot tell them apart. Ask the exit: if it
+            # still reaches the internet, the PORTAL is down, which is slowness to wait out (keep the
+            # exit and the login), not a dead tunnel to roll off. ~9,800 rolls in one run were this.
+            kind = "slow" if self._portal_down_not_exit(phase) else "unreachable"
+        if phase == "warmup":
+            self._last_warm_kind = kind
         self._health.observe_failure(kind)
         self._log(f"{phase} failed [{kind}] after {seconds:.0f}s: {error[:140]}")
 
@@ -1917,15 +1944,84 @@ class LiveEngineOps(EngineOps):
                        **self._health.snapshot())
 
     def warmup_failure_kind(self) -> str:
-        """How the last portal interaction failed -- "slow" | "unreachable" | "portal" | "unknown".
+        """How the LAST warm-up failed -- "slow" | "unreachable" | "unknown".
 
-        The phase machine uses this to keep a SLOW window from escalating into a re-login.
+        The phase machine uses this to keep a SLOW window from escalating into a re-login. Per
+        attempt, not the health streak: a warm-up that failed for a non-portal reason (stale form,
+        login redirect, csrf) records nothing in the streak, so reading the streak let it inherit an
+        earlier attempt's "slow" -- and the stress hold (F40) would then hold a logged-out session.
         """
-        if self._health.slow_streak:
-            return "slow"
-        if self._health.unreachable_streak:
-            return "unreachable"
-        return "unknown"
+        kind = getattr(self, "_last_warm_kind", "unknown")
+        return kind if kind in ("slow", "unreachable") else "unknown"
+
+    def _is_transport_failure(self, error: str) -> bool:
+        """The request got no answer from the portal at all (tunnel/connect/timeout/failed fetch),
+        as opposed to an answer we did not like. A bot-gate answer (WAF/challenge) is excluded: the
+        portal DID answer, and what it said is about the exit."""
+        low = (error or "").lower()
+        if not low or any(m in low for m in _PORTAL_ANSWERED_MARKERS):
+            return False
+        return classify_failure(error) == "unreachable" or self._is_transient_login_failure(error)
+
+    def _portal_down_not_exit(self, why: str) -> bool:
+        """F41: True when the exit still reaches the internet while the portal gave no answer -- the
+        PORTAL is down, so keep the exit (and the login bound to it) instead of rolling.
+
+        Run 1023 control, 11:44: 16 fresh exits all reached ipify in <1s while the portal
+        connect-timed-out on 15 of them, and direct TCP from the server to portal:443 timed out too.
+        Every one of those failures was being answered with a roll + re-login.
+
+        BOUNDED. A webshare tunnel failure can be specific to one exit even when that exit reaches
+        ipify (rolling once took portal reachability 25% -> 83%, FAILURE_MODES F2), so the verdict
+        is trusted for PORTAL_DOWN_EXIT_ROLL_S since the first one without a portal success in
+        between; past that this returns False and the caller rolls as before. STRESS_HOLD=False
+        disables the check entirely (always False = the old roll-on-every-failure behaviour)."""
+        if not bool(self.cfg.raw.get("STRESS_HOLD", True)):
+            return False
+        moved = self._note_exit_ip(f"portal-down check ({why})")
+        if moved or not self._exit_probe_ok:
+            self._portal_down_since = None
+            return False                  # exit moved or unreadable: this one really is the problem
+        now = time.time()
+        if self._portal_down_since is None:
+            self._portal_down_since = now
+        held = now - self._portal_down_since
+        limit = max(0.0, float(self.cfg.raw.get("PORTAL_DOWN_EXIT_ROLL_S", 900.0) or 0.0))
+        if held >= limit:
+            self._log(f"portal-down check ({why}): exit {self._exit_ip} reaches the net but the portal "
+                      f"has not answered it for {held:.0f}s (>= {limit:.0f}s) -- may be exit-specific, "
+                      f"rolling after all")
+            self._portal_down_since = None
+            return False
+        self._log(f"portal-down check ({why}): exit {self._exit_ip} reaches the net, the portal does "
+                  f"not answer -- PORTAL DOWN, keeping the exit and the login ({held:.0f}s)")
+        return True
+
+    def _roll_after_failed_warm(self, why: str) -> None:
+        """Roll after a failed warm-up ONLY for a portal-answered exit flag (WAF/challenge).
+
+        A transport failure was already decided by _note_portal: dead exit -> it rolled; portal down
+        -> it deliberately KEPT the exit (F41). Rolling again here on the transient marker undid
+        exactly that, and double-rolled the dead-exit case."""
+        if (self._is_transient_login_failure(getattr(self, "_warmup_last_error", ""))
+                and self.warmup_failure_kind() == "unknown"):
+            self._roll_exit(why)
+
+    def stress_wait(self) -> bool:
+        """One paced pause inside a stress hold (F40); True if a stop arrived.
+
+        Drains the bus while it waits -- is_stopped() only reads a flag that a wait_*/poll sets, and a
+        holding worker is not inside any wait_*, so without this it would be deaf to `stop`."""
+        gap = max(1.0, float(self.cfg.raw.get("STRESS_HOLD_GAP", 15.0) or 15.0))
+        end = time.time() + gap * random.uniform(0.8, 1.2)
+        while True:
+            self._poll_signals()
+            if self.is_stopped():
+                return True
+            left = end - time.time()
+            if left <= 0:
+                return False
+            time.sleep(min(1.0, left))
 
     # ── HYBRID: detached-primp transport for the post-login steps ──────────────
     # CONFIRMED end-to-end 2026-10-08 (3 live bookings): the portal's only post-login gate is
@@ -2099,15 +2195,31 @@ class LiveEngineOps(EngineOps):
                 return False
             base_qs = {"lang": "PT", "nacionalidade": self.nationality}
             last_html = ""
+            # Same retry budget + growing backoff as the browser chain (QUEST_STEP_RETRIES /
+            # QUEST_STEP_BACKOFF). This aborted on the FIRST non-200, so under a 503 storm a primp
+            # worker re-ran the whole chain -- home, Questionario, step 1 -- for every blip the browser
+            # chain simply retried. Retrying the SAME step is safe: a 503 never reached the app, so
+            # the server-side cursor did not advance.
+            _retries = max(1, int(self.cfg.raw.get("QUEST_STEP_RETRIES", _QUEST_STEP_RETRIES)))
+            _bk_base = max(0.0, float(self.cfg.raw.get("QUEST_STEP_BACKOFF", 1.5)))
             for i, step in enumerate(steps):
                 url = f"{QUEST_NEXT}?{urlencode({**base_qs, **step})}"
-                r = pc.get(url, headers={**H, "Accept": "text/plain, */*; q=0.01",
-                                         "X-Requested-With": "XMLHttpRequest", "Referer": QUEST_URL,
-                                         "Sec-Fetch-Mode": "cors", "Sec-Fetch-Dest": "empty",
-                                         "Sec-Fetch-Site": "same-origin"})
-                if getattr(r, "status_code", None) != 200:
-                    self._log(f"hybrid-warm: quest step {i+1}/{len(steps)} non-200 "
-                              f"({getattr(r, 'status_code', None)}) -- aborting the chain")
+                for attempt in range(1, _retries + 1):
+                    r = pc.get(url, headers={**H, "Accept": "text/plain, */*; q=0.01",
+                                             "X-Requested-With": "XMLHttpRequest",
+                                             "Referer": QUEST_URL, "Sec-Fetch-Mode": "cors",
+                                             "Sec-Fetch-Dest": "empty", "Sec-Fetch-Site": "same-origin"})
+                    status = getattr(r, "status_code", None)
+                    if status == 200 or attempt == _retries:
+                        break
+                    if _bk_base > 0:
+                        time.sleep(min(_bk_base * (2 ** (attempt - 1)), 8.0) * random.uniform(0.7, 1.3))
+                if status != 200:
+                    # Recorded, not just logged: "HTTP 503" is what tells _note_portal this was the
+                    # PORTAL being slow (hold the login), not our session or exit failing.
+                    self._warmup_last_error = (f"quest step {i+1}/{len(steps)} never returned 200 "
+                                               f"after {_retries} attempts (HTTP {status})")
+                    self._log(f"hybrid-warm: {self._warmup_last_error} -- aborting the chain")
                     return False
                 last_html = r.text or ""
                 # WAF CHALLENGE on a quest step (2026-10-16). The portal tightens its anti-bot as
@@ -2229,7 +2341,9 @@ class LiveEngineOps(EngineOps):
                 gettime_body = r.text or ""
             except Exception as e:
                 self._log(f"hybrid-discover: gettime GET failed ({str(e)[:90]}) -- all FAILED")
-                if self._is_transient_login_failure(str(e)):
+                if (self._is_transient_login_failure(str(e))
+                        and not (self._is_transport_failure(str(e))
+                                 and self._portal_down_not_exit("hybrid-discover"))):
                     self._roll_exit("hybrid-discover: dead tunnel at gettime")
                 return [{"date": d, "outcome": "failed"} for d in dates]
             gt_status = classify_gettime_body(gettime_body)
@@ -2289,8 +2403,16 @@ class LiveEngineOps(EngineOps):
         # HYBRID: run the whole chain on the detached primp client (no browser nav). Same contract
         # (anchor on success, _warmup_last_error taxonomy, already-booked detection), so every caller
         # -- do_warmup, do_apply's round-start re-warm, _do_keepalive, _rebuild_session -- is unchanged.
+        self._last_warm_kind = "unknown"
         if self._hybrid("WARMUP"):
-            return self._primp_warmup_chain()
+            # The primp chain never reported to _note_portal, so a hybrid worker's warm-up failures
+            # were always kind "unknown": no slow-portal hold, no portal-down check, every stressed
+            # failure went straight down the re-login ladder (0/62 of the Primp fleet warmed after
+            # recovery on run 1023). Report it here, exactly as the browser chain does below.
+            _t0 = time.time()
+            ok = self._primp_warmup_chain()
+            self._note_portal("warmup", time.time() - _t0, ok=ok, error=self._warmup_last_error)
+            return ok
         _t0 = time.time()
         # Records the last EXCEPTION message so a caller can tell a dead-exit warmup failure (roll
         # the exit) from a portal rejection (do not). Cleared each run; only the except path below
@@ -2883,6 +3005,7 @@ class LiveEngineOps(EngineOps):
         # portal, so it should not touch DataDome at all -- but "should not" is exactly the
         # reasoning that produced that bug, so when a browser is already open we use it and take no
         # chances. primp remains the fallback only when there is no session to borrow.
+        self._exit_probe_ok = False     # read by the F41 portal-down check: did the exit answer?
         try:
             from libs.proxies.exit_ip import IP_ECHO_URL, exit_changed, observe_exit_ip
         except Exception:
@@ -2924,6 +3047,7 @@ class LiveEngineOps(EngineOps):
                 return False
         if ip is None:
             return False    # unknown, NEVER treated as changed -- see exit_changed's docstring
+        self._exit_probe_ok = True
         prev = getattr(self, "_exit_ip", None)
         moved = exit_changed(prev, ip)
         if moved:
@@ -3040,6 +3164,9 @@ class LiveEngineOps(EngineOps):
                       f"streak={self._keepalive_dead_streak}/{dead_trip} ({context})")
             if self._keepalive_dead_streak >= dead_trip:
                 self._keepalive_dead_streak = 0
+                if self._is_transport_failure(str(e)) and self._portal_down_not_exit("keepalive[hybrid]"):
+                    self._slog("keepalive", result="portal_down_hold", via="primp", ctx=context)
+                    return True      # F41: portal down, exit alive -- hold the login, re-probe next cycle
                 self._roll_exit("keepalive[hybrid]: dead exit")
                 self._attempt_keepalive_restore(context)
             return True
@@ -3049,6 +3176,9 @@ class LiveEngineOps(EngineOps):
             self._attempt_keepalive_restore(context)
             return True
         if self._is_dead_exit_response(page, final_url):
+            if self._portal_down_not_exit("keepalive[hybrid]"):
+                self._slog("keepalive", result="portal_down_hold", via="primp", ctx=context)
+                return True          # F41: the tunnel page is the PORTAL refusing, not the exit
             self._log(f"keepalive[hybrid]: dead exit ({len(page)}B, {context}) -- rolling + restoring")
             self._roll_exit("keepalive[hybrid]: dead exit")
             self._attempt_keepalive_restore(context)
@@ -3084,8 +3214,7 @@ class LiveEngineOps(EngineOps):
             # indefinitely. A flagged/dead exit does not recover by being retried -- roll to a fresh
             # one so the next cycle's re-warm has a chance. (A portal-reject re-warm -- csrf/quest-
             # state -- is NOT transient and correctly does not roll here.)
-            if self._is_transient_login_failure(getattr(self, "_warmup_last_error", "")):
-                self._roll_exit("keepalive[hybrid]: re-warm hit a dead/flagged exit")
+            self._roll_after_failed_warm("keepalive[hybrid]: re-warm hit a dead/flagged exit")
         return True
 
     def _do_keepalive(self, context: str) -> None:
@@ -3152,6 +3281,9 @@ class LiveEngineOps(EngineOps):
                     return
                 page = self._keepalive_read_page()
                 if self._is_dead_exit_response(page, final_url):
+                    if self._portal_down_not_exit("keepalive[schedule]"):
+                        self._slog("keepalive", result="portal_down_hold", ctx=context)
+                        return       # F41: portal down, exit alive -- hold the login
                     self._log(f"keepalive[schedule]: DEAD EXIT / chrome-error ({len(page)}B, "
                               f"{context}) -- rolling to a fresh exit and re-authenticating")
                     self._roll_exit("keepalive: dead exit (schedule probe)")
@@ -3254,6 +3386,9 @@ class LiveEngineOps(EngineOps):
             # inconclusive: roll to a fresh one and re-authenticate on it, the same action the login
             # path already takes when the very same markers arrive as a raised exception.
             if self._is_dead_exit_response(page, final_url):
+                if self._portal_down_not_exit("keepalive"):
+                    self._slog("keepalive", result="portal_down_hold", bytes=len(page), ctx=context)
+                    return           # F41: portal down, exit alive -- hold the login
                 self._log(f"keepalive: DEAD EXIT / chrome-error ({len(page)}B, "
                           f"exit={getattr(self, '_exit_ip', None)}, {context}) -- rolling to a fresh "
                           f"exit and re-authenticating rather than re-probing a dead tunnel")
@@ -3306,6 +3441,16 @@ class LiveEngineOps(EngineOps):
                                              f"streak={self._keepalive_dead_streak}/{dead_trip} ({context})")
             self._slog("keepalive", result="probe_failed", error_type=type(e).__name__,
                        streak=f"{self._keepalive_dead_streak}/{dead_trip}", ctx=context)
+            if (self._keepalive_dead_streak >= dead_trip and self._is_transport_failure(str(e))
+                    and self._portal_down_not_exit("keepalive")):
+                # F41: the probes failed because the PORTAL is not answering an exit that still
+                # reaches the net. Unlike KEEPALIVE_STRESS_HOLD's string heuristic above this asks the
+                # exit, so it also covers ERR_TUNNEL (the proxy could not reach the PORTAL) -- the
+                # dominant webshare error on run 1023. Hold the login; the check itself is bounded.
+                self._keepalive_dead_streak = 0
+                self._slog("keepalive", result="portal_down_hold", error_type=type(e).__name__,
+                           ctx=context)
+                return
             if self._keepalive_dead_streak >= dead_trip:
                 self._keepalive_dead_streak = 0
                 self._portal_down_streak = 0
@@ -3400,8 +3545,8 @@ class LiveEngineOps(EngineOps):
             # a fresh exit immediately, rather than waiting for a later tick to happen to roll. This
             # is the recovery half of the 2026-10-16 freeze fix: the HYBRID_PRIMP_* timeouts make the
             # re-warm FAIL FAST instead of hanging; this makes that fast failure actually progress.
-            if not ok and self._is_transient_login_failure(self._warmup_last_error):
-                self._roll_exit("keepalive restore: re-warm hit a dead exit")
+            if not ok:
+                self._roll_after_failed_warm("keepalive restore: re-warm hit a dead exit")
         if ok:
             self._keepalive_restore_attempts = 0
             self._mark_keep_bookable(True)
@@ -4122,7 +4267,7 @@ class LiveEngineOps(EngineOps):
                     # A CONFIRMED dead exit (chrome-error/tunnel) will fail identically every round;
                     # roll it now so the scout loop's rebuild re-logs in on a fresh exit, instead of
                     # re-probing the dead tunnel forever ([[dead_exit_page_not_rolled]]).
-                    if _dead:
+                    if _dead and not self._portal_down_not_exit("discovery"):
                         self._roll_exit("discovery: dead tunnel at gettime")
                     break
             if not _gt_ok:
@@ -4518,8 +4663,9 @@ class LiveEngineOps(EngineOps):
                     self._log("do_apply: identity is unavailable (already has a request) -- "
                               "releasing the slot and stopping the worker")
                     return "already_booked"
-                if self._is_transient_login_failure(getattr(self, "_warmup_last_error", "")):
-                    self._roll_exit("apply: dead exit at round-start re-warm")
+                # (A transport failure was already classified -- and rolled, or deliberately kept
+                # for a portal-down window -- by _note_portal; see _roll_after_failed_warm.)
+                self._roll_after_failed_warm("apply: dead exit at round-start re-warm")
                 self._log("do_apply: re-warm at round start failed -- session problem, not the slot")
                 return "session"
 

@@ -714,6 +714,31 @@ _BOOKING = [
        "survives a portal_unreachable (the submit never reached the portal), so in schedule mode the "
        "retry is a ~3s direct-apply. Bounded by APPLY_MAX_ATTEMPTS (the park brake still applies). "
        "Pair with a low APPLY_SUBMIT_TIMEOUT and schedule keepalive mode."),
+    # F40/F41 (run 1023, 2026-10-23): hold the login through a stressed portal instead of re-logging
+    # in and rolling exits into an outage. See docs/engineering/REPORT_2026-10-23_stress_window.md.
+    _s("STRESS_HOLD", L.BOOKING, bool, True, group="guards",
+       note=
+       "STRESS MODE (default ON). When a warm-up fails because the PORTAL is slow or down (503, slow "
+       "accept, or no answer to an exit that still reaches the internet), KEEP the login and re-warm "
+       "on it until the portal answers -- no re-login, no exit roll, not counted as a session "
+       "failure. The first answer decides: warmed -> apply; logged out -> re-login at once. Run 1023: "
+       "75/123 workers threw away a live login on ONE failed re-warm and only 25 got back in; after "
+       "recovery every logged-in worker warmed in 1-2 min. OFF = the old behaviour exactly."),
+    _s("STRESS_HOLD_MAX_S", L.BOOKING, float, 7200.0, group="guards", min_value=0.0,
+       note=
+       "Longest a single STRESS_HOLD lasts (s) before the old ladder (rebuild / re-login) resumes. "
+       "Default 2 h -- run 1023's outage was ~85 min. 0 = never hold."),
+    _s("STRESS_HOLD_GAP", L.BOOKING, float, 15.0, group="guards", min_value=1.0,
+       note=
+       "Pause (s, +-20% jitter) between re-warm attempts while holding through portal stress. The "
+       "portal comes back in 30-90 s up-windows, so this should be well under that; each attempt is "
+       "itself 30-110 s under stress."),
+    _s("PORTAL_DOWN_EXIT_ROLL_S", L.BOOKING, float, 900.0, group="guards", min_value=0.0,
+       note=
+       "How long (s) to trust 'this exit reaches the internet but the portal does not answer it' as "
+       "PORTAL DOWN (keep the exit + login) before rolling the exit anyway. Bounded because a webshare "
+       "tunnel failure can be exit-specific (one roll took reachability 25% -> 83%). Resets on any "
+       "portal answer or roll. Run 1023 rolled exits ~9,800 times into a down portal. Needs STRESS_HOLD."),
     # Consecutive apply bounces across the fleet after which the Hub stops believing its own slot
     # pool. Operator's call 2026-08-14: "even when there are some slots found - they may be false
     # positive. if applying keeps being failed then regard the slots as false, and revert to hold."

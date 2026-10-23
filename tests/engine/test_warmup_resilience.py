@@ -184,7 +184,24 @@ def test_a_slow_portal_never_costs_a_re_login():
     res = _machine(ops, REWARM_MAX_ATTEMPTS=2).run()
 
     assert ops.logins == 1, f"re-logged in {ops.logins}x over portal slowness"
-    assert res.outcome == "failed"      # still terminal -- resilience is not "never fail"
+    # F40 (run 1023): the login is HELD and re-warmed in process until the portal answers -- the
+    # double's outage lifts after 99 failed warm-ups. This used to log "holding" and return False,
+    # and the caller then failed the worker into a respawn = a FRESH login, the very thing avoided.
+    assert res.outcome == "warmed" and ops.warmups == 100
+
+
+def test_a_capped_stress_hold_still_terminates_without_a_re_login():
+    """Resilience is not "never fail": past STRESS_HOLD_MAX_S a still-slow portal ends the worker."""
+    ops = _SlowPortalOps(kind="slow")
+    res = _machine(ops, REWARM_MAX_ATTEMPTS=2, STRESS_HOLD_MAX_S=30, STRESS_HOLD_GAP=10).run()
+    assert res.outcome == "failed" and ops.logins == 1
+    assert ops.warmups == 1 + 2 + 3      # initial + REWARM_MAX_ATTEMPTS + 30s/10s held re-warms
+
+
+def test_stress_hold_off_keeps_the_old_slow_portal_behaviour():
+    ops = _SlowPortalOps(kind="slow")
+    res = _machine(ops, REWARM_MAX_ATTEMPTS=2, STRESS_HOLD=False).run()
+    assert res.outcome == "failed" and ops.logins == 1 and ops.warmups == 3
 
 
 def test_an_unreachable_portal_still_escalates():
@@ -271,3 +288,89 @@ def test_rewarm_cadence_is_configurable():
     PhaseMachine(cfg, ops).run()
     assert ops.warmups > 1, "a cadence of 3 must still produce re-warms"
 
+
+
+# ── F40: hold the login through portal stress (run 1023, 2026-10-23) ─────────────────────────
+class _StressedApplyOps(_AlwaysSessionOps):
+    """do_apply's round-start re-warm keeps failing because the PORTAL is down (kind slow)."""
+    def __init__(self, rounds=20, kind="slow", **kw):
+        super().__init__(**kw)
+        self._rounds, self._kind, self.waits = rounds, kind, 0
+
+    def warmup_failure_kind(self): return self._kind
+    def stress_wait(self):
+        self.waits += 1
+        return False
+    def is_stopped(self): return self.applies >= self._rounds
+
+
+def test_a_portal_outage_at_apply_holds_the_login():
+    """Run 1023: 75/123 workers threw a live login away on ONE failed re-warm (portal 503). Now the
+    login is held, the next assignment's re-warm is the retry, and it never counts toward the cap."""
+    ops = _StressedApplyOps(rounds=20)
+    cfg = EngineConfig.from_settings({"ROLE": "apply", "APPLY_MAX_ATTEMPTS": 2})   # cap would be 6
+    res = PhaseMachine(cfg, ops).run()
+
+    assert res.outcome == "stopped", f"{res.outcome} {res.detail}"
+    assert ops.applies == 20 and ops.released == 20, "every slot still handed back unpenalised"
+    assert ops.logins == 1, "no re-login over portal stress"
+    assert ops.warmups == 0, "no rebuild re-warm -- the next do_apply's re-warm IS the retry"
+    assert ops.waits == 20
+
+
+def test_the_apply_stress_hold_is_capped_then_the_old_ladder_resumes():
+    ops = _StressedApplyOps(rounds=100)
+    cfg = EngineConfig.from_settings({"ROLE": "apply", "APPLY_MAX_ATTEMPTS": 2,
+                                      "STRESS_HOLD_MAX_S": 30, "STRESS_HOLD_GAP": 10})
+    res = PhaseMachine(cfg, ops).run()
+    assert res.outcome == "failed" and "session unrecoverable" in res.detail
+    assert ops.waits == 3, "30s / 10s = 3 holds"
+    assert ops.applies == 3 + 6, "then the old cap (APPLY_MAX_ATTEMPTS*3) applies unchanged"
+
+
+def test_stress_hold_off_is_the_old_apply_behaviour():
+    ops = _StressedApplyOps(rounds=100)
+    cfg = EngineConfig.from_settings({"ROLE": "apply", "APPLY_MAX_ATTEMPTS": 2, "STRESS_HOLD": False})
+    res = PhaseMachine(cfg, ops).run()
+    assert res.outcome == "failed" and ops.applies == 6 and ops.waits == 0
+
+
+def test_an_unreachable_exit_at_apply_is_not_held():
+    ops = _StressedApplyOps(rounds=100, kind="unreachable")
+    cfg = EngineConfig.from_settings({"ROLE": "apply", "APPLY_MAX_ATTEMPTS": 2})
+    res = PhaseMachine(cfg, ops).run()
+    assert res.outcome == "failed" and ops.applies == 6 and ops.waits == 0
+
+
+class _RebuildStressOps(_AlwaysSessionOps):
+    """do_apply fails `session` for a non-stress reason; the rebuild's re-warm then meets a portal
+    outage that lifts after `outage` more attempts."""
+    def __init__(self, outage=5):
+        super().__init__(warmup_failures=1 + outage)
+        self._k, self.waits = "unknown", 0
+
+    def do_apply(self, slot):
+        self.applies += 1
+        self._k = "unknown"
+        return "session"
+
+    def do_warmup(self):
+        ok = super().do_warmup()
+        self._k = "ok" if ok else "slow"
+        return ok
+
+    def warmup_failure_kind(self): return "slow" if self._k == "slow" else "unknown"
+    def stress_wait(self):
+        self.waits += 1
+        return False
+    def is_stopped(self): return self.applies >= 2
+
+
+def test_rebuild_session_rides_out_the_outage_instead_of_re_logging_in():
+    """PA508829 (run 1023): both re-warms in _rebuild_session failed [slow] and it re-logged in
+    anyway, into the outage. Now it re-warms on the same login until the portal answers."""
+    ops = _RebuildStressOps(outage=5)
+    cfg = EngineConfig.from_settings({"ROLE": "apply", "APPLY_MAX_ATTEMPTS": 5})
+    PhaseMachine(cfg, ops).run()
+    assert ops.logins == 1, f"re-logged in {ops.logins - 1}x into a portal outage"
+    assert ops.waits == 6 and ops.warmups == 8   # 1 + 6 held re-warms, then 1 rebuild on round 2

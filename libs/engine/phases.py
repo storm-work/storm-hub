@@ -151,6 +151,59 @@ class PhaseMachine:
         self._to(WorkerSubstate.FAILED)
         return PhaseResult("failed", self._sub, step, self.visited)
 
+    # ── F40: hold the login through a stressed portal (run 1023, 2026-10-23) ──────────────────
+    # 75/123 apply workers threw away a live login at 10:47-10:53 because ONE re-warm hit a portal
+    # 503; re-login during the outage then failed for 30-75 min and only 25 ever got back in. After
+    # recovery every LOGGED-IN worker warmed in 1-2 min -- the login, not the warm-up, was the critical
+    # path, and the portal's slowness said nothing about it. Meanwhile a competitor registered one of
+    # our identities first. STRESS_HOLD (default on) keeps the login and re-warms on it until the
+    # portal answers; the first answer decides (warmed -> carry on, logged out -> re-login at once),
+    # which is right whether or not a login survives an outage (OPEN_QUESTIONS Q27).
+    def _portal_stressed(self) -> bool:
+        """Did the last warm-up fail because the PORTAL was slow or down -- a 503, a slow accept, or
+        no answer to an exit that still reaches the internet (ops_live classifies that last case as
+        slow, F41) -- rather than because of our session or our exit?"""
+        return getattr(self.ops, "warmup_failure_kind", lambda: "unknown")() == "slow"
+
+    def _stress_hold_on(self) -> bool:
+        return bool(self.cfg.raw.get("STRESS_HOLD", True))
+
+    def _stress_wait(self) -> bool:
+        """One paced pause inside a stress hold; True if a stop arrived. ops.stress_wait drains the
+        bus while it waits -- is_stopped() alone only reads a flag a wait_* call sets."""
+        wait = getattr(self.ops, "stress_wait", None)
+        if callable(wait):
+            return bool(wait())
+        self.ops.poll_gap()
+        return bool(getattr(self.ops, "is_stopped", lambda: False)())
+
+    def _ride_out_stress(self, why: str) -> str:
+        """Keep the login and re-warm on it -- same session, same exit -- until the portal answers.
+
+        Returns "warmed", "stopped", "unavailable" (the portal said the applicant already has a
+        request), or "escalate": the failure stopped being portal stress (e.g. the first answer after
+        recovery is a login redirect), or STRESS_HOLD_MAX_S passed. Bounded by time AND by attempts
+        (cap / STRESS_HOLD_GAP), so a wait that returns instantly can never spin unbounded."""
+        cap = max(0.0, float(self.cfg.raw.get("STRESS_HOLD_MAX_S", 7200.0) or 0.0))
+        gap = max(1.0, float(self.cfg.raw.get("STRESS_HOLD_GAP", 15.0) or 15.0))
+        max_tries = max(1, int(cap / gap))
+        unavail = getattr(self.ops, "identity_unavailable", lambda: False)
+        t0 = time.time()
+        tries = 0
+        while self._portal_stressed() and tries < max_tries and time.time() - t0 < cap:
+            tries += 1
+            self._to(WorkerSubstate.KEEPING,
+                     detail=(f"portal slow/down -- holding the login, re-warm {tries} "
+                             f"({int(time.time() - t0)}s held): {why}"))
+            if self._stress_wait():
+                return "stopped"
+            self._to(WorkerSubstate.WARMING_UP, detail=f"stress hold re-warm {tries}: {why}")
+            if self.ops.do_warmup():
+                return "warmed"
+            if unavail():
+                return "unavailable"
+        return "escalate"
+
     def _warm_with_recovery(self, why: str) -> bool:
         """Recover a FAILED warm-up WITHOUT discarding the authenticated session.
 
@@ -195,12 +248,21 @@ class PhaseMachine:
         # the binding constraint, to arrive back at the same slow portal. Keep re-warming instead;
         # systemic slowness is now surfaced to the operator via PortalLiveness (the booking-wide
         # breaker that used to back the fleet off was removed 2026-09-23).
-        kind = getattr(self.ops, "warmup_failure_kind", lambda: "unknown")()
-        if kind == "slow":
-            self._to(WorkerSubstate.KEEPING,
-                     detail=f"portal slow, not broken -- holding rather than re-logging in: {why}")
-            self.ops.poll_gap()
-            return False
+        if self._portal_stressed():
+            if not self._stress_hold_on():
+                self._to(WorkerSubstate.KEEPING,
+                         detail=f"portal slow, not broken -- holding rather than re-logging in: {why}")
+                self.ops.poll_gap()
+                return False
+            # F40: this used to log "holding" and then return False -- and _warm_if_needed turned
+            # that into _fail("warmup"): the process exited and respawned into a FRESH login, the
+            # exact thing the message said it was avoiding. Actually hold: re-warm in process.
+            ride = self._ride_out_stress(why)
+            if ride == "warmed":
+                return True
+            if ride in ("stopped", "unavailable") or self._portal_stressed():
+                return False          # stop / already-booked, or still stressed past the cap
+            # The portal answered and it was not a warm session -- fall through to the re-login rung.
 
         # Re-warm alone has stopped rebuilding the anchor -- only a fresh login will (storm-auto
         # abc5). Still in-process: same worker, same proxy, same sub-account. NEVER for an
@@ -283,6 +345,11 @@ class PhaseMachine:
             return None
         self._to(WorkerSubstate.WARMING_UP)
         if not self.ops.do_warmup() and not self._warm_with_recovery(why):
+            if getattr(self.ops, "is_stopped", lambda: False)():
+                # A stop that landed during a stress hold is a stop, not a warm-up failure (FAILED is
+                # what the Hub respawns on).
+                return PhaseResult("stopped", self._sub, f"stopped while warming: {why}",
+                                   self.visited)
             # ALREADY-BOOKED is terminal: the warmup found the portal saying this applicant already
             # has a request, so the identity is unusable and re-warming/respawning only grinds it.
             # do_warmup already emitted `already_booked` (Hub retires the identity); STOP, never fail
@@ -465,6 +532,22 @@ class PhaseMachine:
             self._to(WorkerSubstate.KEEPING)
             self.ops.poll_gap()
             return True
+        # F40: THE gap run 1023 fell through. This ladder re-logged in after one failed re-warm with
+        # no slow-portal guard (_warm_with_recovery has had one since Phase 3). PA508829's two re-warm
+        # failures were both classified [slow] -- portal 503s -- and it re-logged in anyway, into an
+        # outage. A slow/down portal is not a lost session: hold it and re-warm on it.
+        if self._stress_hold_on() and self._portal_stressed():
+            ride = self._ride_out_stress(why)
+            if ride == "warmed":
+                self._to(WorkerSubstate.WARMED)
+                self._to(WorkerSubstate.KEEPING)
+                return True
+            if ride in ("stopped", "unavailable"):
+                # Not a failed rebuild: the caller's loop sees the stop, and the next do_apply/warm-up
+                # re-reads the portal's already-has-a-request verdict and ends the worker properly.
+                return True
+            # escalate: the portal answered with something other than a warm session (or the hold
+            # cap passed) -- the re-login below is now the right rung.
         # Re-warm couldn't rebuild the workflow anchor -- only a fresh login will (abc5).
         self._to(WorkerSubstate.KEEPING, detail=f"re-warm failed; re-login: {why}")
         self._to(WorkerSubstate.LOGGING_IN)
@@ -576,6 +659,8 @@ class PhaseMachine:
         bounce_streak = 0
         session_streak = 0
         unreachable_streak = 0
+        stress_since = None              # F40: when the current portal-stress hold began
+        stress_tries = 0
         slot = None                      # a form_stale retry KEEPS its slot across iterations
         while True:
             if self.ops.is_stopped():
@@ -663,6 +748,8 @@ class PhaseMachine:
                 return PhaseResult("dry_run", self._sub, "no_book: not submitted", self.visited)
             attempts += 1
             outcome = self.ops.do_apply(slot)
+            if outcome != "session":
+                stress_since = None       # the portal gave a real answer -- any stress hold is over
             # Terminal event of the assignment signal round (shares the `sig` minted when the
             # assignment was received): the booked/form_stale/no_slot/session/... verdict, so one
             # round traces received -> accepted -> warmup -> apply_submit -> result end to end.
@@ -743,6 +830,28 @@ class PhaseMachine:
                 # bounces", and drive the Hub's false-slot revert on real slots (live 2026-08-15).
                 self.ops.release_slot(slot, "session")
                 slot = None
+                # F40: the re-warm failed because the PORTAL is slow/down, not because the session
+                # is. Hold the login and let the NEXT assignment's mandatory round-start re-warm be
+                # the retry: no rebuild (it would warm twice at the very moment the portal recovers,
+                # ~2 min each under stress), no re-login, and not a session failure toward the cap.
+                # Bounded by STRESS_HOLD_MAX_S, after which the old ladder below resumes. The KEEPING
+                # detail carries no not-bookable marker on purpose: the Hub must keep assigning.
+                if self._stress_hold_on() and self._portal_stressed():
+                    cap = max(0.0, float(self.cfg.raw.get("STRESS_HOLD_MAX_S", 7200.0) or 0.0))
+                    gap = max(1.0, float(self.cfg.raw.get("STRESS_HOLD_GAP", 15.0) or 15.0))
+                    if stress_since is None:
+                        stress_since, stress_tries = time.time(), 0
+                    stress_tries += 1
+                    held = time.time() - stress_since
+                    # Time AND attempts, like _ride_out_stress, so an instant wait cannot spin.
+                    if held < cap and stress_tries <= max(1, int(cap / gap)):
+                        self._to(WorkerSubstate.KEEPING,
+                                 detail=(f"portal slow/down -- holding the login ({int(held)}s); "
+                                         f"re-warming on the next assignment"))
+                        self._stress_wait()   # a stop is seen by the loop head's is_stopped()
+                        continue
+                    # Cap passed: stress_since is deliberately NOT reset, so every further `session`
+                    # takes the old ladder until the portal gives a real answer (reset above).
                 session_streak += 1
                 self._to(WorkerSubstate.KEEPING, detail="re-warm failed; rebuilding session")
                 if session_streak >= max_session_failures:

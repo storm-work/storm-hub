@@ -30,10 +30,31 @@ def test_a_html_error_page_is_not_mistaken_for_an_address(monkeypatch):
 
     class _C:
         def __init__(self, **kw): pass
-        def get(self, url):
+        def get(self, url, **kw):
             class _R: text = "<html><body>502 Bad Gateway</body></html>"
             return _R()
 
     import types
     monkeypatch.setitem(__import__("sys").modules, "primp", types.SimpleNamespace(Client=_C))
     assert mod.observe_exit_ip("http://x:1") is None
+
+
+def test_the_probe_is_bounded_per_request(monkeypatch):
+    """primp 1.3.1 ignores the constructor timeout per request (a dead tunnel hung hybrid calls for
+    55-86 min). The probe now gates the F41 portal-down check, so every enforced timeout is passed."""
+    import types
+    import libs.proxies.exit_ip as mod
+
+    seen = {}
+
+    class _C:
+        def __init__(self, **kw): seen["client"] = kw
+        def get(self, url, **kw):
+            seen["get"] = kw
+            class _R: text = "1.2.3.4"
+            return _R()
+
+    monkeypatch.setitem(__import__("sys").modules, "primp", types.SimpleNamespace(Client=_C))
+    assert mod.observe_exit_ip("http://x:1", timeout=5) == "1.2.3.4"
+    assert seen["client"]["connect_timeout"] == 5 and seen["client"]["read_timeout"] == 5
+    assert seen["get"]["timeout"] == 5

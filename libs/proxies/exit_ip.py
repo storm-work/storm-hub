@@ -55,8 +55,13 @@ def observe_exit_ip(conn_url: str, timeout: float = 8.0) -> str | None:
         return None
     for url in _ECHO_URLS:
         try:
-            c = primp.Client(proxy=conn_url, verify=False, follow_redirects=True, timeout=timeout)
-            body = (c.get(url).text or "").strip()
+            # primp 1.3.1 does NOT enforce the constructor `timeout=` per request (a dead tunnel hung
+            # hybrid calls 55-86 min, 2026-10-16); connect_timeout/read_timeout and the per-request
+            # timeout ARE enforced. This probe now gates the F41 portal-down check, so it must be
+            # genuinely bounded.
+            c = primp.Client(proxy=conn_url, verify=False, follow_redirects=True, timeout=timeout,
+                             connect_timeout=timeout, read_timeout=timeout)
+            body = (c.get(url, timeout=timeout).text or "").strip()
         except Exception:
             continue
         # Guard against an echo that answers with an HTML error page rather than an address.
