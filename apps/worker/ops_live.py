@@ -1756,10 +1756,22 @@ class LiveEngineOps(EngineOps):
             dlg = self.session.browser_last_dialog() if self.session is not None else None
         except Exception:
             dlg = None
-        for text in ((dlg or ""), *(b or "" for b in bodies)):
+        for i, text in enumerate(((dlg or ""), *(b or "" for b in bodies))):
             low = text.lower()
-            if any(m in low for m in _ALREADY_BOOKED_MARKERS):
-                return text[:300]
+            hit = next((m for m in _ALREADY_BOOKED_MARKERS if m in low), None)
+            if hit is None:
+                continue
+            # F47 (run 1023): this returned text[:300], which for a page body is ~30 blank lines and
+            # a DOCTYPE -- the identity was retired with no record of WHAT the portal said, and five
+            # identities were lost to competitors that day. Return the visible words AROUND the
+            # marker, and keep the whole page (a body, not the dialog) as evidence.
+            at = low.find(hit)
+            snippet = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", text[max(0, at - 200):at + 300])).strip()
+            if i > 0:
+                path = self._save_submit_body(text, "already_booked")
+                if path:
+                    snippet += f" [page saved: {path}]"
+            return snippet[:600]
         return None
 
     def _is_dead_exit_response(self, page: str, final_url: str) -> bool:
@@ -1995,6 +2007,26 @@ class LiveEngineOps(EngineOps):
         if not low or any(m in low for m in _PORTAL_ANSWERED_MARKERS):
             return False
         return classify_failure(error) == "unreachable" or self._is_transient_login_failure(error)
+
+    def _portal_clock(self) -> dict:
+        """F47: where in the portal's up/down cycle THIS moment is -- the pulse state, how long it has
+        been in it (`portal_state_s`, from the Hub prober's transition log) and how long since anyone
+        last saw the application answer (`portal_up_age_s`). Stamped on every submit so the race
+        against competitors ('time from recovery to our first submit, per identity') is read off the
+        log instead of reconstructed. Empty when there is no pulse; never raises."""
+        p = getattr(self, "_pulse", None)
+        if p is None:
+            return {}
+        try:
+            st = p.state()
+            out = {"portal": st["state"]}
+            if st.get("since"):
+                out["portal_state_s"] = round(time.time() - st["since"], 1)
+            if st.get("up_age_s") is not None:
+                out["portal_up_age_s"] = st["up_age_s"]
+            return out
+        except Exception:
+            return {}
 
     def _pulse_obs(self, outcome: str, ms: float | None = None) -> None:
         """Report one portal answer (or non-answer) to the fleet-wide PortalPulse. Never raises."""
@@ -2356,7 +2388,7 @@ class LiveEngineOps(EngineOps):
             if booked_sig:
                 self._identity_unavailable = True
                 self._log(f"hybrid-warm: portal says this applicant ALREADY HAS a request "
-                          f"({booked_sig[:120]!r}) -- retiring the identity")
+                          f"({booked_sig[:400]!r}) -- retiring the identity")
                 if self._emit is not None:
                     self._emit("already_booked", detail=booked_sig)
                 return False
@@ -2739,7 +2771,7 @@ class LiveEngineOps(EngineOps):
             if booked_sig:
                 self._identity_unavailable = True
                 self._log(f"do_warmup: portal says this applicant ALREADY HAS a request "
-                          f"({booked_sig[:120]!r}) -- retiring the identity and STOPPING this worker")
+                          f"({booked_sig[:400]!r}) -- retiring the identity and STOPPING this worker")
                 if self._emit is not None:
                     self._emit("already_booked", detail=booked_sig)
                 return False
@@ -4866,7 +4898,7 @@ class LiveEngineOps(EngineOps):
                 # Structured, back-traceable submit event: len is the booked(~1.5KB) vs
                 # form_stale(~66KB questionnaire) discriminator, round_ms is the hot-period latency.
                 self._slog("apply_submit", status=_status, len=len(html), round_ms=_round_ms,
-                           slot=slot)
+                           slot=slot, **self._portal_clock())
             except Exception as e:
                 self._log(f"do_apply: SubmeterVistoCriaPDF XHR failed: {e}")
                 return "bounced"

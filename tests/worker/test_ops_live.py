@@ -5923,3 +5923,27 @@ def test_primp_keepalive_logged_out_home_re_authenticates():
     ops, restores, logs = _ka_primp("<html><body>Solicitar pedido de visto | Entrar</body></html>")
     ops._do_keepalive_primp("hold")
     assert restores == ["hold"] and any("result=expired" in l for l in logs)
+
+
+# ── F47: keep the evidence when the portal turns an identity away; time the race ─────────────────
+def test_already_booked_returns_the_words_and_saves_the_page(tmp_path):
+    """Run 1023 logged a DOCTYPE for this verdict (text[:300] of a page that starts with blank
+    lines), so the reason five identities were lost left no record."""
+    ops = _make_ops(); ops.session = _FakeSession()
+    page = ("\r\n" * 40 + "<!DOCTYPE HTML><html><body>" + "x" * 5000 +
+            "<script>alert('Este requerente já tem um pedido registado. Poderá inserir novo 5 dias "
+            "após o pedido anterior.')</script></body></html>")
+    sig = ops._already_booked_signal(page, "")
+    assert "já tem um pedido registado" in sig and "DOCTYPE" not in sig
+    assert "[page saved:" in sig
+    saved = sig.split("[page saved: ", 1)[1].rstrip("]")
+    assert pathlib.Path(saved).read_bytes().decode("utf-8") == page   # bytes: keep the \r\n
+
+
+def test_submits_carry_the_portal_clock():
+    ops, _ = _pulse_ops()
+    ops._pulse.observe("up", src="w:other")
+    ops._pulse.tick()
+    clock = ops._portal_clock()
+    assert clock["portal"] == "up" and clock["portal_state_s"] >= 0 and clock["portal_up_age_s"] >= 0
+    assert _make_ops()._portal_clock() == {}, "no pulse -> nothing stamped"
