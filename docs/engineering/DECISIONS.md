@@ -783,3 +783,28 @@ mirrored into a precious *main* booking's pool, firing the main's slot-open, wit
 **Why:** it decouples the risk of discovery (burning identities/exits on scanning) from the booking
 that must stay pristine for the submit. **Reverse if:** the mirror ever injects a slot the main
 booking's posto cannot book — the posto-match guard is what prevents that and must stay.
+
+### D49. The browser path is the default; primp is opt-in and degrades itself on the bot challenge
+Defaults revised 2026-10-26 from the run-1023 / Test-3059 evidence (each catalog note carries its reason):
+
+| Setting | Was | Now | Evidence |
+|---|---|---|---|
+| `HYBRID_MODE` | True | **False** | The portal's bot challenge (44,699 B) blocks detached primp whenever it runs strict (2026-10-16, 2026-10-23 pm, 2026-10-26 am). The browser passes. Both reference bookings (0925, 1002) ran on the browser path. |
+| `DISCOVERY_SOURCE` | calendar | **slots** | The source of both reference bookings; the browser path supports it (/slots is browser-only). |
+| `KEEPALIVE_MODE` | auth_only | **schedule** | auth_only pushes the warm-up into the stress window (run 1023: 0 of ~260). schedule warms during the hold and booked 12 on 1002. Counter-point: 1016 booked 2 schedule vs 3 auth_only in a calm window. |
+| `NAV_TIMEOUT_SCALE` | 1.0 | **4.0** | Matches every seeded template (production). |
+| `KEEPALIVE_STRESS_HOLD` | False | **True** | Stress recipe; a portal-down window must not cost a held login. |
+| `STRESS_RETRY_GAP` | 0 | **3** | Stress recipe: a submit that never reached the portal keeps its slot and fires again after 3 s. |
+
+**Kept as they are, on evidence:**
+- `PROXY_PROVIDER=soax`: webshare exits fail the portal tunnel as of 2026-10-23/26.
+- `PROXY_GEOS` blank: soax logins are 3.1% with no country set vs 2.8% for DE/IT across 57,556 attempts; the DE/IT lift is a webshare effect.
+- `APPLY_SUBMIT_TIMEOUT=100`: no clean submit-only latency data.
+- `LOGIN_TOKEN_POOL_TARGET=0`: paid per solve; operator's call.
+- `HOLD_PROXY_PROVIDER`: only used when swap is on.
+
+**Code that goes with it:**
+- A primp warm-up or keepalive that meets the bot challenge degrades that worker to the browser path for the rest of its process, on the same login (a cookie-injected browser is reopened if it was closed). On 2026-10-26 one did a re-login instead, at a ~6% login rate.
+- The browser-init deadline scales with `NAV_TIMEOUT_SCALE`: `max(120, 30 + 70 x scale)` s, F4 rule. The fixed 120 s killed 12 starts on 2026-10-26 whose bootstrap can take ~290 s at scale 4.
+
+**Reverse if:** a measured strict window shows primp passing again. Or schedule mode shows form_stale on direct submits often enough that auth_only's per-submit warm-up wins.

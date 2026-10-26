@@ -40,3 +40,28 @@ def test_init_timeout_before_playwright_started_kills_nothing(monkeypatch):
     with pytest.raises(RuntimeError, match="init timed out"):
         session.PlaywrightSession(proxy=None)
     assert killed == [None]              # _kill_proc_tree(None) is a no-op by contract
+
+
+def test_the_init_deadline_covers_the_bootstrap_at_the_configured_nav_scale(monkeypatch):
+    """F4 rule: a caller deadline below the callee's worst case abandons live work. At production's
+    NAV_TIMEOUT_SCALE=4 the bootstrap navs alone can take ~290 s; the old fixed 120 s killed 12
+    browser starts on 2026-10-26."""
+    seen = []
+
+    class _Rec(threading.Event):
+        def wait(self, timeout=None):
+            if timeout is not None:          # only the init deadline waits with a timeout
+                seen.append(timeout)
+            return False
+    monkeypatch.setattr(session, "_kill_proc_tree", lambda pid: None)
+    monkeypatch.setattr(session.threading, "Event", _Rec)
+    monkeypatch.setattr(session.PlaywrightSession, "_worker", lambda self: None)
+    monkeypatch.setenv("NAV_TIMEOUT_SCALE", "4")
+    with pytest.raises(RuntimeError, match=r"init timed out \(>310s\)"):
+        session.PlaywrightSession(proxy=None)
+    assert seen == [310.0]
+    monkeypatch.setenv("NAV_TIMEOUT_SCALE", "1")
+    seen.clear()
+    with pytest.raises(RuntimeError, match=r"\(>120s\)"):
+        session.PlaywrightSession(proxy=None)
+    assert seen == [120.0], "scale 1 keeps the old 120 s floor"

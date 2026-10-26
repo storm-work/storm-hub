@@ -28,13 +28,19 @@ def _origin_reply(js, otherwise=""):
     return otherwise
 
 
+# The auth_only / calendar model these unit tests were written against. Production DEFAULTS moved on
+# 2026-10-26 (browser path, KEEPALIVE_MODE=schedule, DISCOVERY_SOURCE=slots -- see the catalog notes);
+# the behaviour under these modes did not, so the tests pin the mode they exercise instead of
+# inheriting whatever the default is. Schedule-mode tests use _cfg_schedule.
+_UNIT_MODE = {"HYBRID_MODE": False, "KEEPALIVE_MODE": "auth_only", "DISCOVERY_SOURCE": "calendar"}
+
+
 def _cfg(**template):
-    # HYBRID_MODE defaults ON in production (full-primp workflow), but these unit tests pin the
-    # BROWSER transport they assert against; a test exercising the hybrid/primp path builds a cfg
-    # with HYBRID_MODE on explicitly (e.g. via _cfg_schedule(booking=...)). HYBRID_MODE is a BOOKING
-    # setting, so it goes in the BOOKING layer, not TEMPLATE.
+    # Browser transport (HYBRID_MODE off, the production default since 2026-10-26); a test exercising
+    # the hybrid/primp path builds a cfg with HYBRID_MODE on explicitly (_hybrid_cfg). HYBRID_MODE is a
+    # BOOKING setting, so it goes in the BOOKING layer, not TEMPLATE.
     return EngineConfig.from_settings(
-        resolve({L.TEMPLATE: {"ROLE": "apply", **template}, L.BOOKING: {"HYBRID_MODE": False}}))
+        resolve({L.TEMPLATE: {"ROLE": "apply", **template}, L.BOOKING: dict(_UNIT_MODE)}))
 
 
 _REAL_SAVE_SUBMIT_BODY = LiveEngineOps._save_submit_body
@@ -1712,7 +1718,7 @@ class _FakePrimp:
 
 def _hybrid_cfg(**booking):
     return EngineConfig.from_settings(resolve(
-        {L.TEMPLATE: {"ROLE": "apply"}, L.BOOKING: {"HYBRID_MODE": True, **booking}}))
+        {L.TEMPLATE: {"ROLE": "apply"}, L.BOOKING: {**_UNIT_MODE, "HYBRID_MODE": True, **booking}}))
 
 
 def _authed_home_html():
@@ -5947,3 +5953,61 @@ def test_submits_carry_the_portal_clock():
     clock = ops._portal_clock()
     assert clock["portal"] == "up" and clock["portal_state_s"] >= 0 and clock["portal_up_age_s"] >= 0
     assert _make_ops()._portal_clock() == {}, "no pulse -> nothing stamped"
+
+
+# ── 2026-10-26: primp met the bot challenge -> degrade to the browser on the SAME login ───────────
+def _waf_ops():
+    ops = _make_ops(cfg=_hybrid_cfg()); ops.session = _FakeSession()
+    reopens = []
+
+    def _reopen(why):
+        reopens.append(why)
+        ops._browser_closed = False
+        return True
+    ops._reopen_browser = _reopen
+    return ops, reopens
+
+
+def test_a_primp_warmup_challenge_degrades_to_the_browser_chain_not_a_relogin():
+    """Test 3059 (2026-10-26): logins ran at ~6%; a hybrid scout's primp warm-up got the 44,699 B
+    challenge and the ladder re-logged in, throwing the login away. Now the same round warms through
+    the browser on the same login, and primp is off for the rest of the process."""
+    ops, reopens = _waf_ops()
+    ops._browser_closed = True
+
+    def _primp_chain():
+        ops._warmup_last_error = "WAF bot-challenge on quest step 1/7 (44699B)"
+        return False
+    ops._primp_warmup_chain = _primp_chain
+    browser_runs = []
+    ops._ensure_portal_origin = lambda why: (browser_runs.append(why), False)[1]   # stop the browser chain early
+    ops._run_warmup_steps()
+    assert reopens and browser_runs == ["the warm-up chain"], "the browser chain ran this same round"
+    assert ops._primp_blocked and not ops._hybrid("WARMUP") and not ops._hybrid("SUBMIT")
+    assert not ops._hybrid("CLOSE_BROWSER"), "and the reopened browser is not closed again"
+
+
+def test_a_non_waf_primp_failure_does_not_degrade():
+    ops, reopens = _waf_ops()
+
+    def _primp_chain():
+        ops._warmup_last_error = "quest step 1/7 never returned 200 after 3 attempts (HTTP 503)"
+        return False
+    ops._primp_warmup_chain = _primp_chain
+    assert ops._run_warmup_steps() is False
+    assert not reopens and not ops._primp_blocked and ops._hybrid("WARMUP")
+
+
+def test_a_primp_keepalive_challenge_degrades_too():
+    ops, restores, logs = _ka_primp('<html><script src="/ch/bd.js"></script>' + "x" * 44000 + "</html>")
+    reopens = []
+    ops._reopen_browser = lambda why: (reopens.append(why), True)[1]
+    ops._do_keepalive_primp("hold")
+    assert reopens and ops._primp_blocked and not restores
+
+
+def test_hybrid_is_off_by_default():
+    """2026-10-26: the browser path is the default; primp is opt-in for a known-permissive window."""
+    ops = _make_ops(cfg=EngineConfig.from_settings(resolve({L.TEMPLATE: {"ROLE": "apply"}})))
+    ops.session = _FakeSession()
+    assert not ops._hybrid("WARMUP") and not ops._hybrid("SUBMIT")

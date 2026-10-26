@@ -1145,7 +1145,7 @@ class Scheduler:
         # frozen effective_settings_json is launch-time; this pushes the LIVE booking value each
         # dispatch. do_discover honours it over its own cfg when present (a scout with no bus source
         # keeps its frozen value, so tests/older workers are unaffected).
-        source = str(self._effective_booking_setting(db, bk, "DISCOVERY_SOURCE", "calendar") or "calendar")
+        source = str(self._effective_booking_setting(db, bk, "DISCOVERY_SOURCE", "slots") or "slots")
         if cached_special_days is not None:
             self._bus.send_command(chosen, "discover", dates=dates,
                                    special_days=cached_special_days, source=source)

@@ -706,6 +706,10 @@ class LiveEngineOps(EngineOps):
         # built (re-login / PDF reopen), and the lazy-close in _primp_client re-closes on the next
         # primp step.
         self._browser_closed = False
+        # Set when a primp warm-up met the portal's bot challenge: primp is blocked for this worker,
+        # so every hybrid leg is off for the rest of the process and the worker runs the browser path
+        # on the SAME login (see _degrade_to_browser). A respawn starts clean.
+        self._primp_blocked = False
         self._hybrid_cookies: dict = {}
         self._hybrid_full_jar: list = []
         self._hybrid_ua: str = ""
@@ -2139,10 +2143,10 @@ class LiveEngineOps(EngineOps):
         """True when hybrid is on for this leg: master HYBRID_MODE AND the per-leg HYBRID_<leg>.
         Both default ON (see catalog). A browserless session (no self.session) can't seed primp
         cookies, so hybrid is forced off there -- defensive, this path always has a browser."""
-        if self.session is None:
+        if self.session is None or getattr(self, "_primp_blocked", False):
             return False
         raw = self.cfg.raw
-        return bool(raw.get("HYBRID_MODE", True)) and bool(raw.get(self._HYBRID_LEG_KEYS[leg], True))
+        return bool(raw.get("HYBRID_MODE", False)) and bool(raw.get(self._HYBRID_LEG_KEYS[leg], True))
 
     @staticmethod
     def _jar_to_cookie_map(jar) -> dict:
@@ -2183,24 +2187,48 @@ class LiveEngineOps(EngineOps):
                   f"({len(self._hybrid_cookies)} cookies cached: "
                   f"{','.join(sorted(self._hybrid_cookies)) or 'none'})")
 
-    def _ensure_browser_for_pdf(self) -> None:
-        """Phase C: the %PDF artifact needs a browser (MostrarPdf 403s a detached client). When the
-        hot-path browser was closed, reopen a fresh one on the SAME exit with the saved jar injected
-        (authed, skips the WAF challenge). Terminal step -- the worker ends after a booking, so this
-        reopened browser is cleaned up on worker exit; the next primp step (none, post-booking) would
-        re-close it via the lazy-close anyway."""
+    def _reopen_browser(self, why: str) -> bool:
+        """Phase C: when the hot-path browser was closed after login, reopen a fresh one on the SAME
+        exit with the saved jar injected -- authenticated, the same login, no new solve. True when a
+        live browser is available afterwards (including when it never closed)."""
         if not self._browser_closed:
-            return
+            return True
         try:
             self._close_session_quietly()
             self.session = get_session(
                 proxy=self.warm_proxy, inject_cookies_full=self._hybrid_full_jar,
                 headless=self.headless, fp_seed=self.account.get("username"))
             self._browser_closed = False
-            self._log("hybrid: reopened a cookie-injected browser for the PDF")
+            self._log(f"hybrid: reopened a cookie-injected browser ({why})")
+            return True
         except Exception as e:
-            self._log(f"hybrid: PDF browser reopen failed ({type(e).__name__}: {str(e)[:80]}) "
-                      f"-- booking IS confirmed, PDF missing")
+            self._log(f"hybrid: browser reopen failed for {why} ({type(e).__name__}: {str(e)[:80]})")
+            return False
+
+    def _ensure_browser_for_pdf(self) -> None:
+        """Phase C: the %PDF artifact needs a browser (MostrarPdf 403s a detached client). Terminal
+        step -- the worker ends after a booking, so this reopened browser is cleaned up on exit."""
+        if not self._reopen_browser("the PDF"):
+            self._log("hybrid: booking IS confirmed, PDF missing (no browser)")
+
+    def _degrade_to_browser(self, why: str) -> bool:
+        """The portal's bot challenge met a detached primp request: stop using primp for the rest of
+        this process and carry on on the BROWSER path with the SAME login.
+
+        WHY (2026-10-26, Test 3059): a hybrid scout logged in after ~8 attempts (logins ran at ~6%),
+        its primp warm-up got the 44,699 B challenge on a quest step, the ladder read that as a broken
+        warm-up and RE-LOGGED IN -- throwing away the scarcest thing the run had. The browser passes
+        the same gate; the login is fine. Sticky for the process: the strict posture lasts (~75 min
+        before slot-open on 2026-10-16), and flapping transports would hit it again. False only when
+        a closed browser cannot be reopened (the caller then falls back to its old handling)."""
+        if not self._reopen_browser(f"primp blocked: {why}"):
+            return False
+        self._primp_blocked = True
+        self._log(f"hybrid: primp met the bot challenge ({why}) -- this worker now runs the BROWSER "
+                  f"path on the same login for the rest of the process")
+        if self._emit is not None:
+            self._emit("log_line", text=f"hybrid: degraded to the browser path ({why})")
+        return True
 
     def _primp_creds(self):
         """(cookies_dict, ua) for a detached primp request, and the Phase-C lazy-close trigger: when
@@ -2512,8 +2540,11 @@ class LiveEngineOps(EngineOps):
             # recovery on run 1023). Report it here, exactly as the browser chain does below.
             _t0 = time.time()
             ok = self._primp_warmup_chain()
-            self._note_portal("warmup", time.time() - _t0, ok=ok, error=self._warmup_last_error)
-            return ok
+            if (ok or not self._warmup_last_error.startswith("WAF bot-challenge")
+                    or not self._degrade_to_browser(self._warmup_last_error)):
+                self._note_portal("warmup", time.time() - _t0, ok=ok, error=self._warmup_last_error)
+                return ok
+            # Degraded: fall through to the BROWSER chain below, same login, same exit, this round.
         _t0 = time.time()
         # Records the last EXCEPTION message so a caller can tell a dead-exit warmup failure (roll
         # the exit) from a portal rejection (do not). Cleared each run; only the except path below
@@ -3298,6 +3329,11 @@ class LiveEngineOps(EngineOps):
                 self._slog("keepalive", result="expired", mode="auth_only", via="primp", ctx=context)
                 self._attempt_keepalive_restore(context)
                 return True
+            if verdict == SessionState.PORTAL_ERROR and _is_challenge_body(page) \
+                    and self._degrade_to_browser("keepalive got the bot challenge"):
+                self._slog("keepalive", result="inconclusive", mode="auth_only", via="primp",
+                           verdict="challenge_degraded", bytes=len(page), ctx=context)
+                return True          # the next cycle probes through the browser (hybrid now off)
             if verdict != SessionState.AUTHENTICATED:
                 # PORTAL_ERROR (refusal/challenge/maintenance) or UNKNOWN: no proof either way. Not
                 # proof of a login, so it does not count as `ok`; re-probe next cycle.
@@ -3536,7 +3572,7 @@ class LiveEngineOps(EngineOps):
             _portal_down = any(m in _low for m in ("err_timed_out", "timed out", "timeout",
                               "err_connection_closed", "err_connection_reset",
                               "err_connection_refused", "err_empty_response"))
-            if (bool(self.cfg.raw.get("KEEPALIVE_STRESS_HOLD", False))
+            if (bool(self.cfg.raw.get("KEEPALIVE_STRESS_HOLD", True))
                     and _portal_down and not _proxy_dead):
                 self._portal_down_streak = getattr(self, "_portal_down_streak", 0) + 1
                 _patience = max(1, int(self.cfg.keepalive.dead_trip)) * 4

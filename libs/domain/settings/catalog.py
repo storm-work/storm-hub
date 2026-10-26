@@ -496,9 +496,10 @@ _BOOKING = [
        note=
        "Days forward to scan when CAL_END_DATE is empty. 0 = the posto's own default horizon."),
     # Discovery / pool policy
-    _s("DISCOVERY_SOURCE", L.BOOKING, str, "calendar", group="discovery",
+    _s("DISCOVERY_SOURCE", L.BOOKING, str, "slots", group="discovery",
        choices=("calendar", "slots", "both"),
-       note="Which endpoint discovery reads. One of: calendar | slots | both. "
+       note="DEFAULT REVISED 2026-10-26 -> slots: the source both reference bookings used (0925, 1002) and the one the browser path (now default) supports; calendar remains for full-primp runs (/slots is browser-only). "
+            "Which endpoint discovery reads. One of: calendar | slots | both. "
             "calendar = gettime + getPeriodosOcupados (default, the path this project has "
             "actually booked with). slots = the portal's own page-world flow, delivering a "
             "SCHEDULE_EVISA token through window.onCaptchaSuccess so its getSlots() populates "
@@ -650,8 +651,9 @@ _BOOKING = [
        "A bounce must never end the run -- the authed session is the expensive thing. Note the park "
        "is only 3 poll gaps (~15-20s), which measurement showed is too short to brake a repeating "
        "failure."),
-    _s("HYBRID_MODE", L.BOOKING, bool, True, group="guards",
+    _s("HYBRID_MODE", L.BOOKING, bool, False, group="guards",
        note=
+       "DEFAULT REVISED 2026-10-26 -> False (BROWSER PATH): the portal's bot challenge blocks detached primp whenever it runs strict -- 44,699 B interstitial on anonymous and quest-step primp requests (2026-10-16 strict window, 2026-10-23 afternoon, 2026-10-26 morning), while the real browser passes. Both reference bookings ran on the browser path (0925 with PDF, 1002 x12). Turn ON only for a known-permissive window; a primp warm-up that meets the challenge now degrades that worker to the browser for the rest of its process instead of re-logging in. Original note: "
        "FULL HYBRID (CONFIRMED end-to-end 2026-10-08, 3 live bookings): run as many steps as possible "
        "on a DETACHED primp client on the worker's SAME sticky exit with the browser's cookies, keeping "
        "the browser ONLY for the two steps that genuinely need it -- LOGIN (reCAPTCHA token lifecycle) "
@@ -730,8 +732,9 @@ _BOOKING = [
        "attempt per 100s. Lower it to ~15-20 so a down-portal submit FAILS FAST (portal_unreachable) "
        "and the worker can re-fire several times per up-window ('ride the window'). Too low risks "
        "aborting a slow-but-live submit; 15-20 is the stress sweet spot, 100 for a healthy portal."),
-    _s("STRESS_RETRY_GAP", L.BOOKING, float, 0.0, group="guards", min_value=0.0,
+    _s("STRESS_RETRY_GAP", L.BOOKING, float, 3.0, group="guards", min_value=0.0,
        note=
+       "DEFAULT REVISED 2026-10-26 -> 3 (the stress recipe): a submit that never reached the portal keeps its slot and fires again after 3 s instead of releasing it and waiting a Hub round-trip -- riding the portal's 30-90 s up-windows. Bounded by the park brake. Original note: "
        "STRESS MODE lever. 0 (default) = OFF: on portal_unreachable the worker releases the slot and "
        "waits a full HOLD_POLL_GAP, re-leasing via the Hub next tick. When > 0, the worker instead "
        "KEEPS its assigned slot and retries the submit after this short gap (s) -- no slot release, "
@@ -795,10 +798,12 @@ _BOOKING = [
 # ─────────────────────────────────────────────────────────────────────────────
 _TEMPLATE = [
     # Login / warmup resilience
-    _s("NAV_TIMEOUT_SCALE", L.TEMPLATE, float, 1.0, _WRK, "login_resilience",
+    _s("NAV_TIMEOUT_SCALE", L.TEMPLATE, float, 4.0, _WRK, "login_resilience",
        note=
        "Multiplier on every browser navigation timeout. Raise when the portal is slow -- a SLOW "
-       "portal is not a broken session, and a re-login cannot make it faster. Production runs at "
+       "portal is not a broken session, and a re-login cannot make it faster. DEFAULT REVISED 2026-10-26 "
+       "1.0 -> 4.0 to match every seeded template (production). The browser-init deadline now scales "
+       "with it (session.py) so a slow bootstrap is not killed at a fixed 120 s. Production runs at "
        "4.0."),
     _s("LOGIN_FIELD_RETRIES", L.TEMPLATE, int, 3, _WRK, "login_resilience",
        note=
@@ -995,9 +1000,10 @@ _TEMPLATE = [
        "2026-09-09 (consolidated after the Test 0907/0907-auth A/B) -- keepalive only ever "
        "verifies the AUTH session is alive, never the booking form-state, which do_apply/"
        "do_discover establish fresh on demand instead of keepalive trying to keep it warm."),
-    _s("KEEPALIVE_MODE", L.BOOKING, str, "auth_only", _WRK, "keepalive",
+    _s("KEEPALIVE_MODE", L.BOOKING, str, "schedule", _WRK, "keepalive",
        choices=("auth_only", "schedule"),
        note=
+       "DEFAULT REVISED 2026-10-26 -> schedule: auth_only DEFERS the multi-request warm-up to the signal, i.e. INTO the portal's stress window -- run 1023 warmed 0 of ~260 between 10:30 and 11:10 after a healthy 08:45-10:00 hold. schedule warms during the hold and keeps the cursor fresh, so the signal-time action is (when the cursor is still within FORM_STATE_TTL) a direct submit; it booked 12 on 1002. Cost: a re-warm per worker every ~0.75 x FORM_STATE_TTL. Mixed counter-evidence: 1016 (calm window, hybrid) booked 2 in schedule vs 3 in auth_only. Original note: "
        "Keepalive strategy for a holding worker. 'auth_only' (DEFAULT, the proven model): probe the "
        "authenticated HOME page; booking form-state is NEVER kept warm (do_apply re-warms every round "
        "regardless; warmup is deferred to the signal). 'schedule' (EAGER-warmup model, operator "
@@ -1022,8 +1028,9 @@ _TEMPLATE = [
        "and accepts that a slot-open landing in the lapse window pays a ~50s re-warm (it still books). "
        "Ignored in auth_only mode. CONFIRMED live 2026-10-02 that schedule direct-apply books (~3s "
        "submit); see docs."),
-    _s("KEEPALIVE_STRESS_HOLD", L.BOOKING, bool, False, _WRK, "keepalive",
+    _s("KEEPALIVE_STRESS_HOLD", L.BOOKING, bool, True, _WRK, "keepalive",
        note=
+       "DEFAULT REVISED 2026-10-26 -> True: part of the measured stress recipe, and consistent with STRESS_HOLD (default on): a portal-down window must not cost a held login. Bounded (~4x KEEPALIVE_DEAD_TRIP), and a real dead exit still rolls. Original note: "
        "STRESS MODE lever. When the portal is up 30-90s then down, a held warm session is gold -- "
        "re-login is the hardest thing in stress. By default a keepalive probe failure counts toward "
        "KEEPALIVE_DEAD_TRIP and, past it, ROLLS the exit + re-authenticates -- which during a "

@@ -803,7 +803,7 @@ class PhaseMachine:
                 # re-assignment round-trip + a full poll_gap -- so we fire the instant the portal is
                 # back up ("ride the window"). Still bounded by the park brake below so a portal that
                 # stays down does not spin forever.
-                stress_gap = max(0.0, float(self.cfg.raw.get("STRESS_RETRY_GAP", 0.0) or 0.0))
+                stress_gap = max(0.0, float(self.cfg.raw.get("STRESS_RETRY_GAP", 3.0) or 0.0))
                 if stress_gap > 0 and unreachable_streak < max_unreachable:
                     self._to(WorkerSubstate.KEEPING,
                              detail=f"portal unreachable x{unreachable_streak}; stress retry")

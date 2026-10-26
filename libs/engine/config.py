@@ -122,7 +122,7 @@ class EngineConfig:
             no_book=bool(no_book or g("no_book", False)),
             warmup_only=bool(g("WARMUP_ONLY", False)),
             login=LoginConfig(
-                nav_timeout_scale=float(g("NAV_TIMEOUT_SCALE", 1.0)),
+                nav_timeout_scale=float(g("NAV_TIMEOUT_SCALE", 4.0)),
                 field_retries=int(g("LOGIN_FIELD_RETRIES", 3)),
                 storm_retries=int(g("LOGIN_STORM_RETRIES", 8)),
                 sticky_retry_max=int(g("STICKY_RETRY_MAX", 2)),
@@ -142,7 +142,7 @@ class EngineConfig:
                 dead_trip=int(g("KEEPALIVE_DEAD_TRIP", 3)),
                 probe=str(g("KEEPALIVE_PROBE", "home") or "home"),
                 jitter=float(g("KEEPALIVE_JITTER", 30.0)),
-                mode=str(g("KEEPALIVE_MODE", "auth_only") or "auth_only").strip().lower(),
+                mode=str(g("KEEPALIVE_MODE", "schedule") or "schedule").strip().lower(),
             ),
             hold_swap=HoldSwapConfig(
                 swap_after_login=bool(g("HOLD_SWAP_AFTER_LOGIN", False)),
@@ -154,7 +154,7 @@ class EngineConfig:
                 session_preserving_fanout=bool(g("SESSION_PRESERVING_FANOUT", True)),
             ),
             discovery=DiscoveryConfig(
-                source=str(g("DISCOVERY_SOURCE", "calendar")),
+                source=str(g("DISCOVERY_SOURCE", "slots")),
                 nav_retries=int(g("DISCOVERY_NAV_RETRIES", 0)),
                 nav_backoff=float(g("DISCOVERY_NAV_BACKOFF", 0.75)),
                 gettime_cache_secs=float(g("GETTIME_CACHE_SECS", 300.0)),

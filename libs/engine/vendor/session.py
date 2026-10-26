@@ -698,7 +698,14 @@ class PlaywrightSession:
         self._ready   = threading.Event()
         self._error: Exception | None = None
         self._thread.start()
-        if not self._ready.wait(timeout=120):
+        # The deadline must COVER the work it waits for (FAILURE_MODES F4: a caller timeout below the
+        # callee's worst case abandons a still-live operation). The bootstrap inside _worker navigates
+        # HOME (30 s) + AUTH (25 s) + waits for the form (15 s), each x NAV_TIMEOUT_SCALE, plus launch
+        # and a 10 s settle -- ~290 s at production's scale 4, against a FIXED 120 s here. On
+        # 2026-10-26 (Test 3059 x2) that killed 12 browser starts on a slow-but-answering portal, each
+        # then restarted from scratch into the same slow navs. 120 s stays the floor (scale 1).
+        _init_deadline = max(120.0, 30.0 + 70.0 * _nav_scale())
+        if not self._ready.wait(timeout=_init_deadline):
             # F49 (run 1023): the caller never gets this object, so nothing would ever close() it --
             # the hung worker thread's Chromium was orphaned (x200 inits, 210 orphans, ~1,065 chrome
             # procs, load ~12), and every re-login during the outage started another one. Same
@@ -712,7 +719,7 @@ class PlaywrightSession:
                 except Exception:
                     pass
                 self._xvfb_proc = None
-            raise RuntimeError("PlaywrightSession init timed out (>120s)")
+            raise RuntimeError(f"PlaywrightSession init timed out (>{_init_deadline:.0f}s)")
         if self._error:
             raise self._error
 

@@ -22,7 +22,11 @@ def test_catalog_every_setting_has_single_home_and_valid_overrides():
 
 def test_defaults_populate_effective_config():
     eff = resolve({})
-    assert eff["NAV_TIMEOUT_SCALE"] == 1.0
+    # Defaults revised 2026-10-26 (browser path): see the catalog notes for the evidence.
+    assert eff["NAV_TIMEOUT_SCALE"] == 4.0
+    assert eff["HYBRID_MODE"] is False and eff["KEEPALIVE_MODE"] == "schedule"
+    assert eff["DISCOVERY_SOURCE"] == "slots" and eff["STRESS_RETRY_GAP"] == 3.0
+    assert eff["KEEPALIVE_STRESS_HOLD"] is True and eff["STRESS_HOLD"] is True
     assert eff["SCOUT_POOL"] is True
     assert eff["DISCOVERY_MIN_INTERVAL"] == 30.0   # rotation pacing (replaced DISCOVERY_MODE et al.)
     assert eff["auto_ops"] is False

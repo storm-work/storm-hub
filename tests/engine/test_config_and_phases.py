@@ -23,7 +23,8 @@ def test_engine_config_from_resolved_settings():
     cfg = EngineConfig.from_settings(eff)
     assert cfg.role == WorkerRole.APPLY
     assert cfg.login.nav_timeout_scale == 4.0 and cfg.login.field_retries == 4
-    assert cfg.discovery.source == "calendar" and cfg.pool.multi_capacity is True
+    # DISCOVERY_SOURCE default moved calendar -> slots on 2026-10-26 (browser path is the default).
+    assert cfg.discovery.source == "slots" and cfg.pool.multi_capacity is True
 
 
 def test_scout_role_implies_capture_only_default():
@@ -38,7 +39,12 @@ def test_no_book_flag_forced_from_booking():
 
 # ── phase machine (scout/apply model) ─────────────────────────────────────────
 def _cfg(booking=None, **template):
-    return EngineConfig.from_settings(resolve({L.BOOKING: booking or {}, L.TEMPLATE: template}))
+    # Pins the auth_only / calendar / no-stress-retry model these tests were written against; the
+    # production DEFAULTS moved on 2026-10-26 (schedule, slots, STRESS_RETRY_GAP=3) without changing
+    # the behaviour under these modes. A test that needs another mode passes it in `booking`.
+    pinned = {"KEEPALIVE_MODE": "auth_only", "DISCOVERY_SOURCE": "calendar", "STRESS_RETRY_GAP": 0.0}
+    return EngineConfig.from_settings(resolve({L.BOOKING: {**pinned, **(booking or {})},
+                                               L.TEMPLATE: template}))
 
 
 # ── KEEPALIVE_MODE fork: schedule warms BEFORE keeping (eager model); auth_only defers it ───────
