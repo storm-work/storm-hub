@@ -50,7 +50,13 @@ def map_event_to_update(event_type: str, payload: dict) -> dict:
         upd: dict = {}
         if sub:
             upd["substate"] = sub
-        if payload.get("detail"):
+            # The detail describes THIS substate, so a substate change always writes it -- None when
+            # empty. It used to be written only when non-empty, so a worker that recovered to KEEPING
+            # (`_mark_keep_bookable(True)` sends detail="") kept its old "not bookable: ..." text, and
+            # _assign_slots excludes KEEPING workers carrying that prefix: a healthy worker invisible to
+            # slot assignment. 29 such episodes on 1023 / 3059 w slots (2026-10-23..26).
+            upd["substate_detail"] = payload.get("detail") or None
+        elif payload.get("detail"):
             upd["substate_detail"] = payload["detail"]
         return upd
     if event_type == "terminal":

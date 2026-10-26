@@ -2605,7 +2605,7 @@ def test_keepalive_recovers_bookable_after_a_prior_not_bookable_marking():
                          "terminar sessão</body></html>")
     ops._keep_unbookable = True
     bookable_calls = []
-    ops._mark_keep_bookable = lambda ok, why="": bookable_calls.append(ok)
+    ops._mark_keep_bookable = lambda ok, why="", **k: bookable_calls.append(ok)
     ops._do_keepalive("test")
     assert bookable_calls == [True]
 
@@ -2646,7 +2646,7 @@ def test_schedule_keepalive_rewarms_when_cursor_absent():
     warm = []
     ops._run_warmup_steps = lambda: (warm.append(1), True)[1]
     bookable = []
-    ops._mark_keep_bookable = lambda ok, why="": bookable.append(ok)
+    ops._mark_keep_bookable = lambda ok, why="", **k: bookable.append(ok)
     ops._do_keepalive("test")
     assert warm == [1], "cursor absent -> must re-warm to keep a bookable session"
     assert bookable == [True]
@@ -2667,7 +2667,7 @@ def test_schedule_keepalive_rewarm_failure_marks_not_bookable_without_dropping_a
     restore = []
     ops._attempt_keepalive_restore = lambda context="": restore.append(context)
     bookable = []
-    ops._mark_keep_bookable = lambda ok, why="": bookable.append(ok)
+    ops._mark_keep_bookable = lambda ok, why="", **k: bookable.append(ok)
     ops._do_keepalive("test")
     assert bookable == [False], "a failed re-warm marks not-bookable (shows WARMING_UP)"
     assert restore == [], "a re-warm failure must NOT throw away the authenticated session"
@@ -4482,7 +4482,7 @@ class _MarkRecordingOps:
     def __init__(self, ops):
         self.ops = ops
         self.calls = []
-        ops._mark_keep_bookable = lambda bookable, why="": self.calls.append((bookable, why))
+        ops._mark_keep_bookable = lambda bookable, why="", **k: self.calls.append((bookable, why))
 
 
 def test_a_session_rebuild_marks_the_worker_unbookable_for_its_duration(monkeypatch):
@@ -6011,3 +6011,69 @@ def test_hybrid_is_off_by_default():
     ops = _make_ops(cfg=EngineConfig.from_settings(resolve({L.TEMPLATE: {"ROLE": "apply"}})))
     ops.session = _FakeSession()
     assert not ops._hybrid("WARMUP") and not ops._hybrid("SUBMIT")
+
+
+# ── 2026-10-26: verify a reported login; say what a rebuild is ───────────────────────────────────
+_LOGGED_OUT_HOME = "<html><body>Solicitar pedido de visto | Entrar</body></html>"
+
+
+def _verify_login_ops(monkeypatch, pages):
+    """A login that always reports success; `pages` is the home page the browser shows after each."""
+    import apps.worker.ops_live as m
+    calls = {"login": 0}
+
+    class _LoginSess:
+        def browser_login(self, user, pw, capsolver_keys=None, anticaptcha_keys=None, pre_token=None):
+            calls["login"] += 1
+            return {"status": 200, "body": '{"type":"success"}'}
+
+        def browser_eval(self, js, timeout=None):
+            if "outerHTML" in js:
+                return pages[min(calls["login"], len(pages)) - 1]
+            if "location.href" in js:
+                return "https://pedidodevistos.mne.gov.pt/VistosOnline/"
+            return True
+        def close_browser(self): pass
+        def get_all_cookies(self): return [{"name": "Vistos_sid", "value": "x"}]
+
+    monkeypatch.setattr(m, "get_session", lambda **kw: _LoginSess())
+    ops = _make_ops()
+    logs = []
+    ops._log = logs.append
+    ops._note_exit_ip = lambda *a, **k: None
+    ops._close_session_quietly = lambda: None
+    ops._save_checkpoint = lambda *a, **k: None
+    ops._backoff = lambda *a, **k: None
+    return ops, calls, logs
+
+
+def test_a_login_that_lands_logged_out_is_retried_not_accepted(monkeypatch):
+    """Test 1026 (600d47f8): a 46 KB 'success' held a dead session for 10 min."""
+    ops, calls, logs = _verify_login_ops(monkeypatch, [_LOGGED_OUT_HOME, _authed_home_html()])
+    assert ops._fresh_login() is True
+    assert calls["login"] == 2, "the logged-out landing was retried"
+    assert any("WITHOUT the logged-in menu" in l for l in logs)
+
+
+def test_a_verified_login_is_accepted_first_time(monkeypatch):
+    ops, calls, _ = _verify_login_ops(monkeypatch, [_authed_home_html()])
+    assert ops._fresh_login() is True and calls["login"] == 1
+
+
+def test_an_unreadable_post_login_page_keeps_the_old_behaviour(monkeypatch):
+    """No evidence either way (neither marker) -> accept, as before; only positive evidence of a
+    logged-out page triggers a retry."""
+    ops, calls, _ = _verify_login_ops(monkeypatch, ["<html><body>loading...</body></html>"])
+    assert ops._fresh_login() is True and calls["login"] == 1
+
+
+def test_a_reauthenticating_holder_is_shown_as_logging_in_not_warming_up():
+    """auth_only has no form to warm: a re-login read as 'warming_up before slot-open' (Test 1026,
+    43/123 at the signal on run 1023). Still not KEEPING, so the Hub assigns it nothing."""
+    ops = _make_ops()
+    ev = []
+    ops._emit = lambda kind, **kw: ev.append((kind, kw))
+    ops._mark_keep_bookable(False, "re-authenticating: rebuilding the session", substate="logging_in")
+    ops._mark_keep_bookable(False, "schedule keepalive re-warm failed")
+    assert ev[0][1]["substate"] == "logging_in" and ev[0][1]["detail"].startswith("not bookable:")
+    assert ev[1][1]["substate"] == "warming_up", "a form re-warm still reads warming_up"

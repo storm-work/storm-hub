@@ -1557,6 +1557,21 @@ class LiveEngineOps(EngineOps):
                           f" acct={self.sub_account_id[:8]}]: {e}")
                 self._backoff(attempt)
                 continue
+            if self._is_login_success(result) and self._verify_logged_in() == "logged_out":
+                # The vendored login reported success because the browser LANDED on the home page,
+                # but that page carries the public menu without the logged-in one: not a login.
+                # MEASURED 2026-10-26 (Test 1026, worker 600d47f8): a 46,069 B "success" (every real
+                # one since 2026-10-23 was 58-59 KB) held a dead session for 10 min until the first
+                # keepalive found it logged out. Retry now, uncharged -- the portal accepted nothing
+                # wrong about the credentials -- within the transient budget.
+                if transient < max_transient:
+                    transient += 1
+                    self._log(f"login: landed on the home page WITHOUT the logged-in menu -- not a "
+                              f"login; retrying (transient {transient}/{max_transient}, not charged)")
+                    self._backoff(transient)
+                    continue
+                self._log("login: home page without the logged-in menu again -- transient budget "
+                          "spent, accepting it; the first keepalive will re-check")
             if self._is_login_success(result):
                 self._restore_stage = "none"
                 # Regression (N4): a brand-new session has zero server-side form state, but
@@ -1674,6 +1689,30 @@ class LiveEngineOps(EngineOps):
                     return False
             self._backoff(attempt)
         return False
+
+    def _verify_logged_in(self) -> str:
+        """Right after a reported login success: does the page actually carry the logged-in menu?
+        "ok" (AUTHENTICATED), "logged_out" (the public home WITHOUT "consultar pedidos" -- positive
+        evidence of no login), or "unknown" (no browser, unreadable, or neither marker -- no
+        evidence either way, so the caller keeps its old behaviour). Reads the settled page the way
+        the keepalive does; one browser_eval, no navigation. Never raises."""
+        if self.session is None or getattr(self, "_browser_closed", False):
+            return "unknown"
+        try:
+            page = self._keepalive_read_page()
+            try:
+                href = self.session.browser_eval("location.href") or ""
+            except Exception:
+                href = ""
+            verdict = classify_session_state(page or "", href if isinstance(href, str) else "",
+                                             warmed=False)
+        except Exception:
+            return "unknown"
+        if verdict == SessionState.AUTHENTICATED:
+            return "ok"
+        if verdict == SessionState.SESSION_EXPIRED:
+            return "logged_out"
+        return "unknown"
 
     @staticmethod
     def _is_login_success(result: object) -> bool:
@@ -3193,7 +3232,7 @@ class LiveEngineOps(EngineOps):
         self._exit_ip = ip
         return moved
 
-    def _mark_keep_bookable(self, bookable: bool, why: str = "") -> None:
+    def _mark_keep_bookable(self, bookable: bool, why: str = "", *, substate: str = "warming_up") -> None:
         """Reflect whether this holding worker has a LIVE, bookable session -- and make KEEPING mean
         HEALTHY (operator 2026-09-26).
 
@@ -3216,8 +3255,12 @@ class LiveEngineOps(EngineOps):
         if bookable:
             self._emit("status_change", substate="keeping", detail="")
         else:
-            # WARMING_UP, not KEEPING: the session is not a live hold -- it is being rebuilt.
-            self._emit("status_change", substate="warming_up", detail=f"{NOT_BOOKABLE_PREFIX} {why}")
+            # Not KEEPING: the session is not a live hold. Say WHAT is being rebuilt (2026-10-26,
+            # operator): `warming_up` for a form re-warm (schedule mode), `logging_in` for a
+            # re-authentication -- before, both read `warming_up`, so an auth_only worker being
+            # re-logged in looked like it was warming up ahead of slot-open (43/123 at the signal
+            # on run 1023, Test 1026). Either way the Hub assigns it nothing (substate != KEEPING).
+            self._emit("status_change", substate=substate, detail=f"{NOT_BOOKABLE_PREFIX} {why}")
 
     def _keepalive_read_page(self) -> str:
         """Read the probe page ONCE it has settled, so a still-navigating home page is not misread
@@ -3622,7 +3665,8 @@ class LiveEngineOps(EngineOps):
                 # spurious "Execution context was destroyed" nav race (6-8 per worker per hold in
                 # the 17:15 run), and marking on those would delete real capacity over nothing.
                 # The dead-trip is the point at which this code already believes the session is gone.
-                self._mark_keep_bookable(False, f"keepalive dead-trip ({context})")
+                self._mark_keep_bookable(False, f"re-authenticating: keepalive dead-trip ({context})",
+                                         substate="logging_in")
                 # A SESSION THAT IS NOT VALID FOR ITS PURPOSE IS NOT WORTH KEEPING (operator
                 # principle, 2026-09-11). This used to also refuse to restore when slot_found had
                 # not fired yet -- the LOOSE HOLD rule, whose premise was that a pre-slot-found
@@ -3675,7 +3719,7 @@ class LiveEngineOps(EngineOps):
         # This is the marker that already exists for exactly this purpose; it simply was not set
         # here. Cleared on success below, and left set on failure -- a worker whose restore failed
         # is not bookable either, and the next successful restore or re-warm clears it.
-        self._mark_keep_bookable(False, "rebuilding the session")
+        self._mark_keep_bookable(False, "re-authenticating: rebuilding the session", substate="logging_in")
         try:
             if self.session is not None:
                 self.session.close_browser()
