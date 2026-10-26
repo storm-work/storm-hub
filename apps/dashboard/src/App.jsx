@@ -4218,6 +4218,14 @@ function Templates({ me }) {
               <option value="headful">headful — visible, best vs WAF (heavy)</option>
               <option value="old">old — headless, detectable</option>
             </select></div>
+          <div className="field" style={{ margin: 0, minWidth: 200 }}>
+            <label>Browser backend</label>
+            <select value={parsedSettings.BROWSER_BACKEND ?? "chromium"} style={{ width: "100%" }}
+              onChange={(e) => mergeSettings({ BROWSER_BACKEND: e.target.value })}
+              title="chromium = the engine's own browser + fingerprint (every confirmed booking). donut = each session runs in a Donut Browser (Wayfern) profile; Wayfern owns the fingerprint and Browser mode does not apply. Needs the Donut app running on the host and DONUT_API_TOKEN in Global settings.">
+              <option value="chromium">chromium — engine browser (default)</option>
+              <option value="donut">donut — Donut/Wayfern profile</option>
+            </select></div>
           <div className="field" style={{ margin: 0, minWidth: 220 }}>
             <label>Post-hold phase proxy pool{!swapOn ? " (enabled when swap is on)" : ""}</label>
             <select value={holdPoolValue} disabled={!swapOn} style={{ width: "100%" }}

@@ -117,6 +117,14 @@ _GLOBAL = [
     _s("CAPSOLVER_KEYS", L.GLOBAL, str, group="credentials",
        note=
        "Comma-separated CapSolver API keys. Credential -- never commit it to source."),
+    _s("DONUT_API_URL", L.GLOBAL, str, "http://127.0.0.1:10108", group="credentials",
+       note=
+       "Donut Browser Local API base URL (BROWSER_BACKEND=donut). The app binds 127.0.0.1:10108, or a "
+       "random free port if that one was busy at startup -- the Local API tab shows which."),
+    _s("DONUT_API_TOKEN", L.GLOBAL, str, "", group="credentials",
+       note=
+       "Donut Browser Local API bearer token (Donut > Integrations > Local API). Credential -- set "
+       "it in Global settings (stored in the DB, masked on read); never commit it to source."),
     _s("WEBSHARE_API_TOKEN", L.GLOBAL, str, "", group="credentials",
        note=
        "Webshare ACCOUNT API token (apidocs.webshare.io, 'Authorization: Token ...') -- powers the "
@@ -224,6 +232,36 @@ _GLOBAL = [
     _s("DRIVER", L.GLOBAL, str, "playwright", _TPL, "browser",
        note=
        "Browser automation driver. 'playwright' is the only path exercised in production here."),
+    # Where the browser comes from (libs/engine/vendor/donut.py). Settable per TEMPLATE so one booking
+    # can run a Donut fleet beside a Chromium fleet on the same exits/accounts -- the A/B that decides
+    # whether Donut is worth it. Every booking confirmed so far ran on 'chromium'.
+    _s("BROWSER_BACKEND", L.GLOBAL, str, "chromium", _TPL, "browser",
+       choices=("chromium", "donut"),
+       note=
+       "Browser source. 'chromium' (default) = the engine launches Playwright's Chromium with its "
+       "own fingerprint + stealth (every confirmed booking ran on this). 'donut' = each session runs "
+       "in a Donut Browser (Wayfern) profile attached over CDP; Wayfern owns the fingerprint, so the "
+       "engine's fingerprint pool, version alignment, stealth script and HEADLESS_MODE do not apply. "
+       "Needs the Donut app running on this host, signed in to a plan with automation, Local API "
+       "on, and DONUT_API_TOKEN set. Login/warm-up/apply flows are unchanged."),
+    _s("DONUT_HEADLESS", L.GLOBAL, bool, True, _TPL, "browser",
+       note=
+       "BROWSER_BACKEND=donut only: start Donut profiles headless. Off = a real window, which needs "
+       "the Donut app itself to run on a display (Xvfb) -- heavier per session."),
+    _s("DONUT_PROFILE_OS", L.GLOBAL, str, "windows", _TPL, "browser",
+       choices=("windows", "macos", "linux"),
+       note=
+       "BROWSER_BACKEND=donut only: the OS the Wayfern fingerprint claims, fixed when a profile is "
+       "created. A fingerprint OS other than this host's (Linux) needs a plan with cross-OS "
+       "fingerprints -- Donut answers 402 otherwise."),
+    _s("DONUT_PROFILE_SCOPE", L.GLOBAL, str, "account", _TPL, "browser",
+       choices=("account", "session"),
+       note=
+       "BROWSER_BACKEND=donut only. 'account' (default) = one persistent profile per sub-account: the "
+       "same device across that account's logins (what DETERMINISTIC_FP does for Chromium), cookies "
+       "cleared on close, and created once -- so it stays under Donut's hourly new-fingerprint limit. "
+       "'session' = a throwaway profile per session (new device every time; every launch counts "
+       "against that limit)."),
     _s("DETERMINISTIC_FP", L.GLOBAL, bool, True, _TPL, "browser",
        note=
        "Derive a STABLE browser fingerprint per sub-account, so the same account presents the same "

@@ -808,3 +808,14 @@ Defaults revised 2026-10-26 from the run-1023 / Test-3059 evidence (each catalog
 - The browser-init deadline scales with `NAV_TIMEOUT_SCALE`: `max(120, 30 + 70 x scale)` s, F4 rule. The fixed 120 s killed 12 starts on 2026-10-26 whose bootstrap can take ~290 s at scale 4.
 
 **Reverse if:** a measured strict window shows primp passing again. Or schedule mode shows form_stale on direct submits often enough that auth_only's per-submit warm-up wins.
+
+### D50. Donut Browser is an opt-in browser backend, not a replacement
+`BROWSER_BACKEND=donut` (default `chromium`) runs each session in a Donut/Wayfern profile attached
+over CDP; see DONUT_BACKEND.md. Built 2026-10-26 at the operator's request (paid plan + API token in
+hand). It sits behind a template-level setting so it can be A/B'd against the Chromium path inside
+one booking, on the same exits and accounts.
+**Why not the default:** no booking has run on it; our evidence says login rejections track exit
+reputation and portal throttling more than the browser fingerprint (the browser already passes
+the bot challenge), and Donut's CDP rate limit (100/min, scope undocumented) may make it unusable.
+**Adopt if:** the operator A/B shows a clear login/warm-up gain at fleet scale. **Remove if:** the
+probe or the A/B shows the CDP/automation limits block a normal login.

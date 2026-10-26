@@ -28,7 +28,13 @@ VENDOR_ENV_KNOBS = (
     "HUMAN_BEHAVIOR", "WEBRTC_BLOCK", "PLAYWRIGHT_STEALTH", "HEADLESS_MODE", "DRIVER", "LOGIN_CAPSOLVER_ONLY",
     "LOGIN_ANTICAPTCHA_ONLY", "RECAPTCHA_SOLVE_PROXY", "SOLVER_RACE_GRACE",
     "SOLVER_RACE_HARD_TIMEOUT", "PRIMP_IMPERSONATE",
+    "BROWSER_BACKEND", "DONUT_API_URL", "DONUT_API_TOKEN", "DONUT_HEADLESS", "DONUT_PROFILE_OS",
+    "DONUT_PROFILE_SCOPE",
 )
+
+# Exported like any other knob, but never echoed: apply()'s return value goes into the worker's event
+# log ("vendor env applied: ...").
+_SECRET_KNOBS = frozenset({"DONUT_API_TOKEN"})
 
 
 def apply(settings: dict) -> dict[str, str]:
@@ -51,5 +57,5 @@ def apply(settings: dict) -> dict[str, str]:
         else:
             text = str(value)
         os.environ[key] = text
-        exported[key] = text
+        exported[key] = ("•••set" if text else "") if key in _SECRET_KNOBS else text
     return exported
