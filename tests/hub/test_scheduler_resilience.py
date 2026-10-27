@@ -1624,6 +1624,7 @@ def test_orphan_cmd_streams_are_swept():
     from libs.bus.bus import Bus
     bus = Bus(r)
     sched = _scheduler(redis_client=r, bus=bus)
+    sched._stream_idle_s = lambda key: 3600.0      # these orphans are old; age has its own tests below
 
     db = _launch_failed_db()
     bk = _make_booking(db)
@@ -1638,6 +1639,56 @@ def test_orphan_cmd_streams_are_swept():
 
     remaining = {k.split(":", 1)[1] for k in r.scan_iter("cmd:*")}
     assert remaining == {w.id}, f"expected only the live worker's stream, got {remaining}"
+
+
+def test_a_registration_runs_fresh_launch_command_is_never_swept():
+    """Registration runs (reg-...) have a command stream and no Worker row, so the sweep treated each as
+    an orphan. It deleted run reg-95d33f911358's `launch` seconds after the Hub wrote it; the registrar
+    then waited forever. A stream touched recently must survive the sweep whatever the worker table says."""
+    r = fakeredis.FakeStrictRedis(decode_responses=True)
+    from libs.bus.bus import Bus
+    bus = Bus(r)
+    sched = _scheduler(redis_client=r, bus=bus)
+    sched._stream_idle_s = lambda key: 4.0
+    db = _launch_failed_db()
+    bus.send_command("reg-abc123", "launch", accounts=[])
+
+    sched._sweep_orphan_streams(db, NOW)
+
+    assert [k for k in r.scan_iter("cmd:*")] == ["cmd:reg-abc123"]
+    assert r.xlen("cmd:reg-abc123") == 1, "the launch command must still be there for the registrar to read"
+
+
+def test_a_stream_of_unknown_age_is_left_alone_and_an_old_orphan_is_still_swept():
+    r = fakeredis.FakeStrictRedis(decode_responses=True)
+    from libs.bus.bus import Bus
+    bus = Bus(r)
+    sched = _scheduler(redis_client=r, bus=bus)
+    db = _launch_failed_db()
+    bus.send_command("reg-unknown", "launch")
+    bus.send_command("ghost-old", "ping")
+    sched._stream_idle_s = lambda key: None if "reg-unknown" in key else 7200.0
+
+    sched._sweep_orphan_streams(db, NOW)
+
+    assert {k.split(":", 1)[1] for k in r.scan_iter("cmd:*")} == {"reg-unknown"}
+
+
+def test_stream_idle_reads_redis_idletime_and_degrades_to_none():
+    class _R:
+        def object(self, what, key):
+            return 42
+    class _Bus:
+        r = _R()
+    sched = _scheduler(redis_client=None, bus=_Bus())
+    assert sched._stream_idle_s("cmd:x") == 42.0
+
+    class _Broken:
+        def object(self, *a): raise RuntimeError("no idletime under this policy")
+        def xinfo_stream(self, *a): raise RuntimeError("gone")
+    class _Bus2:
+        r = _Broken()
+    assert _scheduler(redis_client=None, bus=_Bus2())._stream_idle_s("cmd:x") is None
 
 
 def test_the_sweep_is_time_gated_so_it_is_not_a_hot_path():
