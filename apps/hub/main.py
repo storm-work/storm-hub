@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import random
 import re
 import threading
@@ -607,6 +608,9 @@ async def lifespan(app: FastAPI):
         # fp_seed=NONE. Exactly the harsher-instrument problem this block was written to prevent,
         # still happening. Confirmed live 2026-08-15 in the session banner of a Hub-side probe.
         exported = vendor_env.apply(resolve({L.GLOBAL: get_global(db)}))
+        # Hub probes stay on Chromium whatever BROWSER_BACKEND says: a proxy screen is not worth a
+        # Donut launch, and every one would count against Donut's hourly automation limits.
+        os.environ["BROWSER_BACKEND"] = exported["BROWSER_BACKEND"] = "chromium"
         logger.info("vendor env applied for Hub-side proxy probes: %s", exported)
         db.close()
         supervisor.reconcile({wid: "apps.worker" for wid in running_ids})

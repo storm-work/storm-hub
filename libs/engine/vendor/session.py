@@ -34,6 +34,8 @@ import threading
 import time
 from pathlib import Path
 
+import donut as _donut
+
 _SCREENSHOTS_DIR = Path(__file__).parent / "screenshots"
 
 # The primp TLS/JA3 + header-order impersonation target for this engine's own primp clients (the
@@ -688,6 +690,8 @@ class PlaywrightSession:
                                    # force-killed if a hung worker prevents graceful close (see _kill_proc_tree)
         self._xvfb_proc = None     # a virtual display started for HEADLESS_MODE=headful on a display-less
                                    # host; terminated in close() so it doesn't leak
+        self._donut_lease = None   # BROWSER_BACKEND=donut: the running Donut profile; stopped through
+                                   # Donut's API on every teardown path (killing the driver does not stop it)
         # Last JS alert()/confirm() message the portal raised, captured by a page dialog handler and
         # read from the main thread. The portal signals "this applicant already has a request" as a
         # JS ALERT ("Este requerente já tem um pedido registado"), which Playwright auto-dismisses --
@@ -713,6 +717,7 @@ class PlaywrightSession:
             # right after Playwright starts, so it is set for any hang in launch or the bootstrap
             # navs; a hang inside Playwright's own start (no pid yet) has no browser to leak.
             _kill_proc_tree(self._driver_pid)
+            _donut.release(self._donut_lease)
             if self._xvfb_proc is not None:
                 try:
                     self._xvfb_proc.terminate()
@@ -746,128 +751,143 @@ class PlaywrightSession:
         browser = None
         pw = None
         page = None
+        # Launch-to-ready timing, per backend: the A/B report (probes/backend_ab.py) reads these two
+        # lines to compare how long a session takes to become usable on chromium vs donut.
+        _t_launch = time.time()
+        _backend = "donut" if _donut.enabled() else "chromium"
+        print(f"[session] launch begin backend={_backend}")
         try:
-            server, username, password = _parse_proxy(self._playwright_proxy)
-            proxy_config = None
-            if server:
-                proxy_config = {"server": server}
-                if username:
-                    proxy_config["username"] = username
-                if password:
-                    proxy_config["password"] = password
-
-            if self._fp_override:
-                ua, sec_ch_ua, vp_w, vp_h, platform = self._fp_override
-                print(f"[session] fp restored  ua=...{ua[55:85]}  vp={vp_w}x{vp_h}")
+            if _donut.enabled():
+                # BROWSER_BACKEND=donut: the browser is a Donut (Wayfern) profile we attach to over CDP;
+                # Wayfern owns the fingerprint, so none of the Chromium launch/fingerprint code below runs.
+                pw = sync_playwright().start()
+                try:
+                    self._driver_pid = pw._impl_obj._connection._transport._proc.pid
+                except Exception:
+                    self._driver_pid = None
+                browser, ctx = self._launch_donut(pw)
             else:
-                ua, sec_ch_ua, vp_w, vp_h, platform = _pick_fingerprint(self._fp_seed)
-            self._fp = (ua, sec_ch_ua, vp_w, vp_h, platform)
-            tz = _get_proxy_timezone(self.proxy)
+                server, username, password = _parse_proxy(self._playwright_proxy)
+                proxy_config = None
+                if server:
+                    proxy_config = {"server": server}
+                    if username:
+                        proxy_config["username"] = username
+                    if password:
+                        proxy_config["password"] = password
 
-            # P1 launch flags (default-off): browser mode + WebRTC leak block.
-            _args = ["--disable-blink-features=AutomationControlled",
-                     "--disable-dev-shm-usage", "--no-sandbox"]
-            if WEBRTC_BLOCK:
-                # WebRTC uses ONLY the proxy path → no STUN leak of the server's real IP.
-                _args.append("--force-webrtc-ip-handling-policy=disable_non_proxied_udp")
-            if HEADLESS_MODE == "new":
-                _launch_headless = False; _args.append("--headless=new")
-            elif HEADLESS_MODE == "headful":
-                # Headful needs a real display. Reuse $DISPLAY if the operator set one (e.g. ran the
-                # supervisor under xvfb-run); otherwise best-effort start a per-process Xvfb. If no
-                # display can be had, DON'T crash the worker -- fall back to --headless=new (which is
-                # still far less detectable than old) with a loud warning.
-                _disp, self._xvfb_proc = _ensure_headful_display()
-                if _disp:
-                    os.environ["DISPLAY"] = _disp
-                    _launch_headless = False
-                    print(f"[session] browser mode = headful on DISPLAY={_disp}"
-                          + ("  (auto-Xvfb)" if self._xvfb_proc is not None else "  ($DISPLAY)"))
+                if self._fp_override:
+                    ua, sec_ch_ua, vp_w, vp_h, platform = self._fp_override
+                    print(f"[session] fp restored  ua=...{ua[55:85]}  vp={vp_w}x{vp_h}")
                 else:
-                    print("[session] HEADLESS_MODE=headful but no display and no Xvfb available "
-                          "-- falling back to --headless=new")
+                    ua, sec_ch_ua, vp_w, vp_h, platform = _pick_fingerprint(self._fp_seed)
+                self._fp = (ua, sec_ch_ua, vp_w, vp_h, platform)
+                tz = _get_proxy_timezone(self.proxy)
+
+                # P1 launch flags (default-off): browser mode + WebRTC leak block.
+                _args = ["--disable-blink-features=AutomationControlled",
+                         "--disable-dev-shm-usage", "--no-sandbox"]
+                if WEBRTC_BLOCK:
+                    # WebRTC uses ONLY the proxy path → no STUN leak of the server's real IP.
+                    _args.append("--force-webrtc-ip-handling-policy=disable_non_proxied_udp")
+                if HEADLESS_MODE == "new":
                     _launch_headless = False; _args.append("--headless=new")
-            else:
-                _launch_headless = self._headless
-            if HEADLESS_MODE in ("new", "headful"):
-                print(f"[session] browser mode = {HEADLESS_MODE}"
-                      + ("  +webrtc-block" if WEBRTC_BLOCK else ""))
-            # Single per-session flag-dump so EVERY run's log verifiably shows exactly which anti-detection
-            # branches are active (no more guessing whether an A/B argument actually took effect).
-            print(f"[session] ANTIDETECT flags: headless={HEADLESS_MODE} stealth_harden={int(STEALTH_HARDEN)} "
-                  f"det_fp={int(DETERMINISTIC_FP)} webrtc_block={int(WEBRTC_BLOCK)} human={int(HUMAN_BEHAVIOR)} "
-                  f"native_solve={int(os.environ.get('NATIVE_SOLVE','').strip()=='1')} "
-                  f"driver={os.environ.get('DRIVER','playwright').strip() or 'playwright'} "
-                  f"fp_seed={'set' if self._fp_seed else 'NONE'}")
+                elif HEADLESS_MODE == "headful":
+                    # Headful needs a real display. Reuse $DISPLAY if the operator set one (e.g. ran the
+                    # supervisor under xvfb-run); otherwise best-effort start a per-process Xvfb. If no
+                    # display can be had, DON'T crash the worker -- fall back to --headless=new (which is
+                    # still far less detectable than old) with a loud warning.
+                    _disp, self._xvfb_proc = _ensure_headful_display()
+                    if _disp:
+                        os.environ["DISPLAY"] = _disp
+                        _launch_headless = False
+                        print(f"[session] browser mode = headful on DISPLAY={_disp}"
+                              + ("  (auto-Xvfb)" if self._xvfb_proc is not None else "  ($DISPLAY)"))
+                    else:
+                        print("[session] HEADLESS_MODE=headful but no display and no Xvfb available "
+                              "-- falling back to --headless=new")
+                        _launch_headless = False; _args.append("--headless=new")
+                else:
+                    _launch_headless = self._headless
+                if HEADLESS_MODE in ("new", "headful"):
+                    print(f"[session] browser mode = {HEADLESS_MODE}"
+                          + ("  +webrtc-block" if WEBRTC_BLOCK else ""))
+                # Single per-session flag-dump so EVERY run's log verifiably shows exactly which anti-detection
+                # branches are active (no more guessing whether an A/B argument actually took effect).
+                print(f"[session] ANTIDETECT flags: headless={HEADLESS_MODE} stealth_harden={int(STEALTH_HARDEN)} "
+                      f"det_fp={int(DETERMINISTIC_FP)} webrtc_block={int(WEBRTC_BLOCK)} human={int(HUMAN_BEHAVIOR)} "
+                      f"native_solve={int(os.environ.get('NATIVE_SOLVE','').strip()=='1')} "
+                      f"driver={os.environ.get('DRIVER','playwright').strip() or 'playwright'} "
+                      f"fp_seed={'set' if self._fp_seed else 'NONE'}")
 
-            pw = sync_playwright().start()
-            # Capture the driver (node) subprocess pid so close() can force-kill this session's whole
-            # browser subtree if the worker thread ever hangs (dead-proxy nav) and can't close gracefully.
-            try:
-                self._driver_pid = pw._impl_obj._connection._transport._proc.pid
-            except Exception:
-                self._driver_pid = None
-            browser = pw.chromium.launch(
-                headless=_launch_headless,
-                args=_args,
-                proxy=proxy_config,
-                # Pass the env EXPLICITLY so headful Chromium actually sees DISPLAY. Relying on
-                # inheritance failed live 2026-09-23: Xvfb sockets existed but Chromium still died
-                # "launched a headed browser without a XServer running" -- the DISPLAY set on
-                # os.environ mid-launch did not reach the Playwright-spawned browser. This is the
-                # env the browser process gets.
-                env=dict(os.environ),
-            )
-            # ALIGN THE ADVERTISED VERSION WITH THE BROWSER WE ARE ACTUALLY RUNNING.
-            #
-            # _FP_POOL hardcodes Chrome 130/131. The Chromium that Playwright now ships is 149. So
-            # every request advertised Chrome/131 while presenting 149's TLS handshake, JS feature
-            # set and header ordering -- an 18-version mismatch, and one of the cheapest automation
-            # signals there is to detect. It is also PROXY-INDEPENDENT, which is exactly the
-            # operator's observation (2026-08-24): manual Chrome books fine through the very same
-            # webshare and soax exits that our sessions cannot use.
-            #
-            # The pool was presumably correct when this engine was proven -- a Playwright upgrade
-            # moved the browser and left the fingerprint behind, silently. Deriving the major
-            # version from browser.version keeps them aligned across every future upgrade instead
-            # of re-rotting; the pool still supplies the viewport/platform/brand variety it exists
-            # for.
-            try:
-                _real_major = (browser.version or "").split(".")[0]
-                if _real_major.isdigit() and _real_major not in ua:
-                    import re as _re
-                    _old_major = (_re.search(r"Chrome/(\d+)", ua) or [None, "?"])[1]
-                    ua = _re.sub(r"(Chrome|Edg)/\d+", lambda m: f"{m.group(1)}/{_real_major}", ua)
-                    # Only the REAL brands get the version bumped. The deliberately-fake
-                    # "Not_A Brand" entry carries its own arbitrary version (the working HAR shows
-                    # "Not;A=Brand";v="99" beside "Google Chrome";v="139"), and rewriting it to
-                    # match would itself be an anomaly.
-                    sec_ch_ua = _re.sub(
-                        r'("(?:Google Chrome|Chromium|Microsoft Edge)";v=")\d+"',
-                        lambda m: f'{m.group(1)}{_real_major}"', sec_ch_ua)
-                    self._fp = (ua, sec_ch_ua, vp_w, vp_h, platform)
-                    print(f"[session] fp version aligned: claimed Chrome/{_old_major} -> "
-                          f"actual Chrome/{_real_major}")
-            except Exception as _ve:
-                print(f"[session] fp version alignment skipped: {_ve}")
+                pw = sync_playwright().start()
+                # Capture the driver (node) subprocess pid so close() can force-kill this session's whole
+                # browser subtree if the worker thread ever hangs (dead-proxy nav) and can't close gracefully.
+                try:
+                    self._driver_pid = pw._impl_obj._connection._transport._proc.pid
+                except Exception:
+                    self._driver_pid = None
+                browser = pw.chromium.launch(
+                    headless=_launch_headless,
+                    args=_args,
+                    proxy=proxy_config,
+                    # Pass the env EXPLICITLY so headful Chromium actually sees DISPLAY. Relying on
+                    # inheritance failed live 2026-09-23: Xvfb sockets existed but Chromium still died
+                    # "launched a headed browser without a XServer running" -- the DISPLAY set on
+                    # os.environ mid-launch did not reach the Playwright-spawned browser. This is the
+                    # env the browser process gets.
+                    env=dict(os.environ),
+                )
+                # ALIGN THE ADVERTISED VERSION WITH THE BROWSER WE ARE ACTUALLY RUNNING.
+                #
+                # _FP_POOL hardcodes Chrome 130/131. The Chromium that Playwright now ships is 149. So
+                # every request advertised Chrome/131 while presenting 149's TLS handshake, JS feature
+                # set and header ordering -- an 18-version mismatch, and one of the cheapest automation
+                # signals there is to detect. It is also PROXY-INDEPENDENT, which is exactly the
+                # operator's observation (2026-08-24): manual Chrome books fine through the very same
+                # webshare and soax exits that our sessions cannot use.
+                #
+                # The pool was presumably correct when this engine was proven -- a Playwright upgrade
+                # moved the browser and left the fingerprint behind, silently. Deriving the major
+                # version from browser.version keeps them aligned across every future upgrade instead
+                # of re-rotting; the pool still supplies the viewport/platform/brand variety it exists
+                # for.
+                try:
+                    _real_major = (browser.version or "").split(".")[0]
+                    if _real_major.isdigit() and _real_major not in ua:
+                        import re as _re
+                        _old_major = (_re.search(r"Chrome/(\d+)", ua) or [None, "?"])[1]
+                        ua = _re.sub(r"(Chrome|Edg)/\d+", lambda m: f"{m.group(1)}/{_real_major}", ua)
+                        # Only the REAL brands get the version bumped. The deliberately-fake
+                        # "Not_A Brand" entry carries its own arbitrary version (the working HAR shows
+                        # "Not;A=Brand";v="99" beside "Google Chrome";v="139"), and rewriting it to
+                        # match would itself be an anomaly.
+                        sec_ch_ua = _re.sub(
+                            r'("(?:Google Chrome|Chromium|Microsoft Edge)";v=")\d+"',
+                            lambda m: f'{m.group(1)}{_real_major}"', sec_ch_ua)
+                        self._fp = (ua, sec_ch_ua, vp_w, vp_h, platform)
+                        print(f"[session] fp version aligned: claimed Chrome/{_old_major} -> "
+                              f"actual Chrome/{_real_major}")
+                except Exception as _ve:
+                    print(f"[session] fp version alignment skipped: {_ve}")
 
-            ctx_kwargs = dict(
-                user_agent=ua,
-                viewport={"width": vp_w, "height": vp_h},
-                screen={"width": vp_w, "height": vp_h},
-                locale="pt-PT",   # PT-consistent: lang=PT session -> Portuguese-speaking browser
-                timezone_id=tz,
-                extra_http_headers={
-                    "sec-ch-ua":          sec_ch_ua,
-                    "sec-ch-ua-mobile":   "?0",
-                    "sec-ch-ua-platform": f'"{platform}"',
-                },
-            )
-            if self._storage_state:
-                ctx_kwargs["storage_state"] = self._storage_state
-                print(f"[session] restoring session from {self._storage_state}")
-            ctx = browser.new_context(**ctx_kwargs)
-            ctx.add_init_script(_make_stealth_script(vp_w, vp_h, self._fp_seed, ua))
+                ctx_kwargs = dict(
+                    user_agent=ua,
+                    viewport={"width": vp_w, "height": vp_h},
+                    screen={"width": vp_w, "height": vp_h},
+                    locale="pt-PT",   # PT-consistent: lang=PT session -> Portuguese-speaking browser
+                    timezone_id=tz,
+                    extra_http_headers={
+                        "sec-ch-ua":          sec_ch_ua,
+                        "sec-ch-ua-mobile":   "?0",
+                        "sec-ch-ua-platform": f'"{platform}"',
+                    },
+                )
+                if self._storage_state:
+                    ctx_kwargs["storage_state"] = self._storage_state
+                    print(f"[session] restoring session from {self._storage_state}")
+                ctx = browser.new_context(**ctx_kwargs)
+                ctx.add_init_script(_make_stealth_script(vp_w, vp_h, self._fp_seed, ua))
 
             # Pre-inject saved cookies so the server skips the WAF challenge
             # (used when reopening a browser for email verification after closing
@@ -887,7 +907,11 @@ class PlaywrightSession:
                 ])
                 print(f"[session] pre-injected {len(self._inject_cookies)} cookies (verify mode)")
 
-            page = ctx.new_page()
+            # A Donut profile opens with its own first tab -- drive that one rather than leave an
+            # extra blank tab beside it.
+            page = ctx.pages[0] if (self._donut_lease and ctx.pages) else ctx.new_page()
+            if self._donut_lease:
+                self._log_donut_fingerprint(page)
 
             # CAPTURE JS DIALOGS. The portal raises "Este requerente já tem um pedido registado"
             # (this applicant already has a request) as a JS alert(); with no handler Playwright
@@ -918,7 +942,7 @@ class PlaywrightSession:
             # script above is the proven path, and playwright-stealth can OVERRIDE its canvas/WebGL
             # noise (breaking determinism) -- so it is gated for A/B rather than silently always-on
             # the moment the package is installed. Validate LIVE before making it default.
-            if os.environ.get("PLAYWRIGHT_STEALTH", "0").strip() == "1":
+            if os.environ.get("PLAYWRIGHT_STEALTH", "0").strip() == "1" and not self._donut_lease:
                 try:
                     from playwright_stealth import Stealth
                     Stealth().apply_stealth_sync(page)
@@ -995,6 +1019,7 @@ class PlaywrightSession:
                     self._cookie_header = "; ".join(f"{k}={v}" for k, v in cookie_dict.items())
                     print(f"[session] cookies -> header fallback: {cookie_names}")
             self._primp = primp_client
+            print(f"[session] ready backend={_backend} in {time.time() - _t_launch:.1f}s")
             self._ready.set()
 
             # -- Event loop: wait for verify or close commands -----------------
@@ -1380,6 +1405,9 @@ class PlaywrightSession:
                     pw.stop()
             except Exception:
                 pass
+            # Over CDP, browser.close() only disconnects -- the Donut profile keeps running until
+            # Donut is told to stop it.
+            _donut.release(self._donut_lease)
             # Terminate a private Xvfb this session started, even if the browser LAUNCH failed (the
             # caller's close() never runs when __init__ raises, so this is the only cleanup for a
             # failed-launch headful worker -- otherwise every failed headful launch leaks a display).
@@ -1390,6 +1418,38 @@ class PlaywrightSession:
                     pass
                 self._xvfb_proc = None
             print(f"[session] browser closed")
+
+    def _launch_donut(self, pw):
+        """BROWSER_BACKEND=donut: start this session's Donut profile on our exit and attach to it.
+        Runs on the worker thread. Returns (browser, ctx) like the Chromium launch does."""
+        self._donut_lease = _donut.launch(self.proxy, self._fp_seed)
+        browser = _donut.connect(pw, self._donut_lease, timeout_s=30.0 * _nav_scale())
+        ctx = browser.contexts[0] if browser.contexts else browser.new_context()
+        # No engine fingerprint in this mode (Wayfern's is the only one), so SAVE_STATE writes no
+        # companion fingerprint profile and a restore cannot force one onto the profile.
+        self._fp = None
+        if self._storage_state:
+            # A Donut profile's context already exists, so storage_state cannot be passed at
+            # creation; the jar is what a restore needs (the portal keeps no state in localStorage).
+            try:
+                _st = _json.loads(Path(self._storage_state).read_text(encoding="utf-8"))
+                ctx.add_cookies(_st.get("cookies") or [])
+                print(f"[session] restoring session cookies from {self._storage_state}")
+            except Exception as _re:
+                print(f"[session] restore from {self._storage_state} failed: {_re}")
+        return browser, ctx
+
+    def _log_donut_fingerprint(self, page) -> None:
+        """One line of what Wayfern presents, so every Donut session's log shows the device the
+        portal sees -- the Chromium path's equivalent is the ANTIDETECT flags line."""
+        try:
+            fp = page.evaluate("""() => ({ua: navigator.userAgent, platform: navigator.platform,
+                tz: Intl.DateTimeFormat().resolvedOptions().timeZone, langs: navigator.languages,
+                webdriver: navigator.webdriver, cores: navigator.hardwareConcurrency,
+                screen: screen.width + 'x' + screen.height})""")
+            print(f"[session] donut fingerprint: {fp}")
+        except Exception as _fe:
+            print(f"[session] donut fingerprint read failed: {_fe}")
 
     def _take_screenshot(self, page, username: str, stage: str) -> None:
         """Save a screenshot from within the browser worker thread (no queue)."""
@@ -2740,6 +2800,7 @@ class PlaywrightSession:
             # Graceful shutdown hung (worker stuck in a browser op) → force-kill the driver subtree so the
             # Chromium can't leak. primp (Rust, separate) is unaffected and carries the session forward.
             _kill_proc_tree(self._driver_pid)
+            _donut.release(self._donut_lease)
             print("[session] browser close hung — force-killed driver tree (primp session active)")
 
     def save_state(self, path) -> None:
@@ -2811,6 +2872,7 @@ class PlaywrightSession:
             # graceful close timed out → worker is wedged in a hung browser op. SIGKILL the node+chromium
             # subtree; the wedged op then errors out and the thread unwinds.
             _kill_proc_tree(self._driver_pid)
+            _donut.release(self._donut_lease)
         # Terminate the private Xvfb (if this session started one for headful) so it doesn't leak.
         if self._xvfb_proc is not None:
             try:
