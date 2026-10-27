@@ -403,6 +403,13 @@ def classify_session_state(page: str, final_url: str, *, warmed: bool) -> Sessio
 # keepalive-restore retry budget once a worker enters the "session is dead" state.
 _MAX_KEEPALIVE_RESTORE_ATTEMPTS = 3
 
+# Consecutive INCONCLUSIVE keepalive reads (neither the logged-in nor the logged-out marker) before
+# the worker stops trusting its hold and proves the session with a decisive Schedule.jsp read.
+# Measured 2026-10-27 (Test 1026): an apply worker answered "unrecognised pre-warm response (1920B)"
+# on 11 consecutive cycles (~105 min) after an exit-IP change and stayed KEEPING the whole time --
+# "no evidence" had been promoted to "healthy" by simply doing nothing.
+_KEEPALIVE_UNKNOWN_TRIP = 2
+
 # storm-auto's QUEST_STEP_RETRIES (default 3): re-attempt a questionnaire step that doesn't return
 # 200, "like a manual page refresh". Not a settings-catalog knob -- it is a retry shape, and the
 # proven value is the one that matters.
@@ -3544,6 +3551,8 @@ class LiveEngineOps(EngineOps):
             self._keepalive_dead_streak = 0
             self._portal_down_streak = 0
             state = classify_session_state(page, final_url, warmed=False)
+            if state != SessionState.UNKNOWN:
+                self._keepalive_unknown_streak = 0
             if state == SessionState.AUTHENTICATED:
                 # Only fires on a RECOVERY transition (was marked not-bookable, e.g. by the
                 # dead-trip branch below), matching the original behaviour of never emitting a
@@ -3598,9 +3607,16 @@ class LiveEngineOps(EngineOps):
             # UNKNOWN: no positive AND no negative evidence -- there is no form-state to re-warm
             # (auth-only holding never establishes one), so this is always "inconclusive, wait for
             # the next cycle" now, never a re-warm trigger.
+            self._keepalive_unknown_streak = getattr(self, "_keepalive_unknown_streak", 0) + 1
             self._log(f"keepalive: unrecognised pre-warm response ({len(page)}B, {context}) -- "
-                      f"inconclusive, will re-probe")
-            self._slog("keepalive", result="inconclusive", bytes=len(page), ctx=context)
+                      f"inconclusive, will re-probe "
+                      f"(streak={self._keepalive_unknown_streak}/{_KEEPALIVE_UNKNOWN_TRIP})")
+            self._slog("keepalive", result="inconclusive", bytes=len(page), ctx=context,
+                       streak=f"{self._keepalive_unknown_streak}/{_KEEPALIVE_UNKNOWN_TRIP}")
+            if self._keepalive_unknown_streak == 1:
+                self._save_keepalive_page(page, "inconclusive")
+            if self._keepalive_unknown_streak >= _KEEPALIVE_UNKNOWN_TRIP:
+                self._prove_or_restore_inconclusive(context)
         except Exception as e:
             # STRESS MODE (KEEPALIVE_STRESS_HOLD): a HELD warm session is gold when re-login is the
             # hardest thing in stress, so do NOT roll + re-authenticate it merely because the PORTAL
@@ -3691,6 +3707,44 @@ class LiveEngineOps(EngineOps):
                                                       "session dead rather than rebuilding it")
                 else:
                     self._attempt_keepalive_restore(context)
+
+    def _save_keepalive_page(self, html: str, kind: str) -> str:
+        """Keep the page a keepalive could not classify. DIAGNOSTIC only: the 1920B page behind the
+        2026-10-27 105-minute hold was never captured, so what it was is still unknown. Best-effort."""
+        from pathlib import Path as _Path
+        try:
+            d = _Path(__file__).resolve().parents[2] / "var" / "keepalive"
+            d.mkdir(parents=True, exist_ok=True)
+            p = d / f"{self.identity_id}_{kind}_{int(time.time())}.html"
+            p.write_text(html or "", encoding="utf-8", errors="replace")
+            return str(p)
+        except Exception as e:      # pragma: no cover - diagnostics must never break a keepalive
+            self._log(f"keepalive: could not save the {kind} page ({e})")
+            return ""
+
+    def _prove_or_restore_inconclusive(self, context: str) -> None:
+        """KEEPING is healthy, and "no evidence" is not evidence. After _KEEPALIVE_UNKNOWN_TRIP
+        inconclusive home reads, ask a question the session can only answer if it is logged in: does
+        Schedule.jsp render its scheduling markers? Yes -> the hold is proven, carry on. No -> the
+        session is not a live hold; re-authenticate (bounded by _MAX_KEEPALIVE_RESTORE_ATTEMPTS).
+        A portal that is down while our exit is alive (F41) proves nothing about the session, so that
+        case keeps holding and keeps the streak instead of burning a login."""
+        self._keepalive_unknown_streak = 0
+        if self._probe_alive():
+            self._log(f"keepalive: inconclusive home reads, but Schedule.jsp renders -- session proven "
+                      f"live ({context})")
+            self._slog("keepalive", result="ok", mode="auth_only", cursor="schedule_probe", ctx=context)
+            if getattr(self, "_keep_unbookable", False):
+                self._mark_keep_bookable(True)
+            return
+        if self._portal_down_not_exit("keepalive[inconclusive]"):
+            self._keepalive_unknown_streak = _KEEPALIVE_UNKNOWN_TRIP - 1
+            self._slog("keepalive", result="portal_down_hold", ctx=context)
+            return
+        self._log(f"keepalive: {_KEEPALIVE_UNKNOWN_TRIP} inconclusive reads and Schedule.jsp does not "
+                  f"render -- the hold is unproven; re-authenticating ({context})")
+        self._slog("keepalive", result="expired", reason="unproven_hold", ctx=context)
+        self._attempt_keepalive_restore(context)
 
     def _attempt_keepalive_restore(self, context: str = "") -> bool:
         """Returns whether the session came back. The session looks dead -- try the same checkpoint-restore-then-fresh-login chain a fresh

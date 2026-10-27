@@ -2895,6 +2895,70 @@ def test_unrecognised_prewarm_response_is_inconclusive_not_healthy_not_dead():
         "UNKNOWN must not be reported as healthy"
 
 
+# ── KEEPING is healthy: "no evidence" must not stay healthy forever (2026-10-27, Test 1026) ──
+_UNCLASSIFIABLE = "<html><body>x</body></html>"        # neither marker -> SessionState.UNKNOWN
+
+
+def _unknown_ops(probe_alive, *, portal_down=False):
+    ops = _keepalive_ops(_UNCLASSIFIABLE, warmed=False)
+    ops._probe_alive = lambda: probe_alive
+    ops._portal_down_not_exit = lambda where="": portal_down
+    ops._save_keepalive_page = lambda html, kind: ""
+    ops.restores, ops.marks = [], []
+    ops._attempt_keepalive_restore = lambda context="": ops.restores.append(context)
+    ops._mark_keep_bookable = lambda bookable, why="", **k: ops.marks.append(bookable)
+    return ops
+
+
+def test_one_inconclusive_keepalive_still_just_waits():
+    ops = _unknown_ops(probe_alive=False)
+    ops._probe_alive = lambda: pytest.fail("a single inconclusive read must not escalate")
+    ops._do_keepalive("test")
+    assert ops.restores == []
+
+
+def test_repeated_inconclusive_keepalives_re_authenticate_when_schedule_does_not_render():
+    ops = _unknown_ops(probe_alive=False)
+    ops._do_keepalive("test")
+    ops._do_keepalive("test")
+    assert ops.restores == ["test"], "an unproven hold must be re-authenticated, not kept forever"
+
+
+def test_repeated_inconclusive_keepalives_are_cleared_when_schedule_renders():
+    ops = _unknown_ops(probe_alive=True)
+    ops._keep_unbookable = True
+    ops._do_keepalive("test")
+    ops._do_keepalive("test")
+    assert ops.restores == [], "a session that renders Schedule.jsp is proven live"
+    assert ops.marks == [True], "and a worker marked not-bookable is returned to KEEPING"
+    assert ops._keepalive_unknown_streak == 0
+
+
+def test_inconclusive_streak_holds_through_a_portal_down_window_without_burning_a_login():
+    ops = _unknown_ops(probe_alive=False, portal_down=True)
+    ops._do_keepalive("test")
+    ops._do_keepalive("test")           # trips the probe: Schedule.jsp fails, but the PORTAL is down
+    assert ops.restores == []
+    assert ops._keepalive_unknown_streak == 1, "streak kept one short of the trip"
+    ops._do_keepalive("test")           # so the very next cycle re-decides, still without a login
+    assert ops.restores == [] and ops._keepalive_unknown_streak == 1
+    ops._portal_down_not_exit = lambda where="": False
+    ops._do_keepalive("test")           # portal back, session still unprovable -> now re-authenticate
+    assert ops.restores == ["test"]
+
+
+def test_a_definite_keepalive_verdict_resets_the_inconclusive_streak():
+    ops = _unknown_ops(probe_alive=False)
+    ops._do_keepalive("test")
+    assert ops._keepalive_unknown_streak == 1
+    ops.session = _KeepaliveSession("<html>solicitar pedido de visto consultar pedidos</html>")
+    ops._do_keepalive("test")
+    assert ops._keepalive_unknown_streak == 0
+    ops.session = _KeepaliveSession(_UNCLASSIFIABLE)
+    ops._do_keepalive("test")           # streak restarts from 1, so no escalation
+    assert ops.restores == []
+
+
 def test_exit_ip_change_is_informational_and_does_not_override_a_healthy_classification():
     """Q16 (confirmed): an exit change does not by itself invalidate the portal session. The
     classifier must never consult _note_exit_ip's result -- an authenticated page stays
