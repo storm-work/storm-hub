@@ -27,6 +27,34 @@ SOLVER_RACE_HARD_TIMEOUT = float(os.environ.get("SOLVER_RACE_HARD_TIMEOUT", "180
 # Thread-local avoids the module-level monkey-patch race condition with concurrent race_all calls.
 _thread_stop: threading.local = threading.local()
 
+# A libs.domain.solver_keys.KeyBook, installed once per process (solver_keys.install). When set, race_all
+# picks each provider's key PER SOLVE from the whole list it is handed -- spread evenly across keys, skipping
+# one that is out of balance and failing over to the next -- instead of always using the list's first key.
+# None keeps the original behaviour exactly (first key of each list), so a process that never installs it,
+# and every test double, is unchanged.
+KEY_BOOK = None
+
+
+def _solve_with_failover(label, fn, keys, action, proxy_info, session_cookies):
+    book = KEY_BOOK
+    if book is None:
+        return fn(keys[0], action, proxy_info, session_cookies)
+    last = None
+    for key in book.order(label, keys):
+        print(f"[solver] {label} using key ...{str(key)[-4:]}")
+        try:
+            token = fn(key, action, proxy_info, session_cookies)
+        except Exception as e:
+            last = e
+            if book.report_fail(label, key, e):
+                print(f"[solver] {label} key ...{str(key)[-4:]} is out of service ({str(e)[:140]}) -- "
+                      f"marked dead, trying the next key")
+                continue
+            raise
+        book.report_ok(label, key)
+        return token
+    raise last
+
 SITE_KEY   = "6LdOB9crAAAAADT4RFruc5sPmzLKIgvJVfL830d4"
 AUTH_URL   = "https://pedidodevistos.mne.gov.pt/VistosOnline/Authentication.jsp"
 SCHED_URL  = "https://pedidodevistos.mne.gov.pt/VistosOnline/Schedule.jsp"
@@ -146,15 +174,15 @@ def race_all(capsolver_keys: list[str], anticaptcha_keys: list[str],
     """
     proxy_info = _parse_proxy(proxy)
 
-    tasks: list[tuple[str, callable, str]] = []
+    tasks: list[tuple[str, callable, list[str]]] = []
     if capsolver_keys:
-        tasks.append(("capsolver",   _capsolver,   capsolver_keys[0]))
+        tasks.append(("capsolver",   _capsolver,   list(capsolver_keys)))
     if anticaptcha_keys:
-        tasks.append(("anticaptcha", _anticaptcha, anticaptcha_keys[0]))
+        tasks.append(("anticaptcha", _anticaptcha, list(anticaptcha_keys)))
     if twocaptcha_keys:
-        tasks.append(("2captcha",    _twocaptcha,  twocaptcha_keys[0]))
+        tasks.append(("2captcha",    _twocaptcha,  list(twocaptcha_keys)))
     if capmonster_keys:
-        tasks.append(("capmonster",  _capmonster,  capmonster_keys[0]))
+        tasks.append(("capmonster",  _capmonster,  list(capmonster_keys)))
 
     if not tasks:
         raise RuntimeError("race_all: no solver keys configured")
@@ -167,10 +195,10 @@ def race_all(capsolver_keys: list[str], anticaptcha_keys: list[str],
     done = threading.Event()
     stop = threading.Event()  # signals threads to stop polling
 
-    def _run_guarded(label: str, fn: callable, key: str) -> None:
+    def _run_guarded(label: str, fn: callable, keys: list[str]) -> None:
         _thread_stop.stop = stop  # bind this thread's stop event for _poll to check
         try:
-            token = fn(key, action, proxy_info, session_cookies)
+            token = _solve_with_failover(label, fn, keys, action, proxy_info, session_cookies)
             s = score_token(token)
             with lock:
                 results.append((token, s))
@@ -193,8 +221,8 @@ def race_all(capsolver_keys: list[str], anticaptcha_keys: list[str],
                     done.set()
 
     threads = [
-        threading.Thread(target=_run_guarded, args=(label, fn, key), daemon=True)
-        for label, fn, key in tasks
+        threading.Thread(target=_run_guarded, args=(label, fn, keys), daemon=True)
+        for label, fn, keys in tasks
     ]
     for t in threads:
         t.start()

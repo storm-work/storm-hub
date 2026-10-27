@@ -81,3 +81,20 @@ def resolve_solver_keys(solver: str, capsolver_all, anticaptcha_all, *,
     if s == "race":
         return pick(cs), pick(ac)
     return pick(cs), []   # 'capsolver' (default / unknown)
+
+
+def rotated_solver_lists(solver: str, capsolver_all, anticaptcha_all, *,
+                         index: int = 0) -> tuple[list[str], list[str]]:
+    """The FULL key lists for a selection, rotated so list[0] is this consumer's round-robin key.
+
+    The vendored race_all now picks each solve's key from the whole list (solver_keys.KeyBook: even spread
+    across keys, skipping one that is out of balance), so consumers hand it every key. The rotation keeps
+    the old per-consumer behaviour for anything that still reads only list[0] (the DataDome solve) and for
+    a process that never installed a book -- there list[0] IS the single key resolve_solver_keys picked."""
+    cs, ac = active_solver_lists(solver, capsolver_all, anticaptcha_all)
+
+    def rot(lst: list[str]) -> list[str]:
+        i = index % len(lst) if lst else 0
+        return lst[i:] + lst[:i]
+
+    return rot(cs), rot(ac)
