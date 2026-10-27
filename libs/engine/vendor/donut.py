@@ -76,6 +76,17 @@ def _headless() -> bool:
     return os.environ.get("DONUT_HEADLESS", "1").strip() != "0"
 
 
+def _throttle_enabled() -> bool:
+    return os.environ.get("DONUT_CDP_THROTTLE", "1").strip() != "0"
+
+
+def _env_float(key: str, default: float) -> float:
+    try:
+        return float(os.environ.get(key, "").strip() or default)
+    except ValueError:
+        return default
+
+
 def _profile_os() -> str:
     return os.environ.get("DONUT_PROFILE_OS", "").strip().lower() or "windows"
 
@@ -165,6 +176,7 @@ class Lease:
     scope: str
     name: str
     released: bool = False
+    throttle: object | None = None      # cdp_throttle.CdpThrottle, once connect() has put it in front
 
     @property
     def cdp_url(self) -> str:
@@ -285,16 +297,59 @@ def _launch_once(proxy_url: str | None, fp_seed: str | None) -> Lease:
     return lease
 
 
+def _browser_ws(lease: Lease) -> str:
+    """The profile's browser-level CDP websocket (what connect_over_cdp resolves from the http URL)."""
+    r = httpx.get(lease.cdp_url + "/json/version", timeout=5)
+    r.raise_for_status()
+    ws = str(r.json().get("webSocketDebuggerUrl") or "")
+    if not ws:
+        raise DonutError(f"{lease.cdp_url}/json/version has no webSocketDebuggerUrl")
+    return ws
+
+
+def _start_throttle(lease: Lease) -> str | None:
+    """Put the rate-limit relay (cdp_throttle) in front of this profile; returns the endpoint to attach
+    to, or None to attach directly. Never fatal: a session must not be lost to its own safety net."""
+    if not _throttle_enabled():
+        return None
+    try:
+        import cdp_throttle
+        if lease.throttle is None:
+            lease.throttle = cdp_throttle.CdpThrottle(
+                _browser_ws(lease),
+                per_min=_env_float("DONUT_CDP_PER_MIN", 90.0),
+                burst=int(_env_float("DONUT_CDP_BURST", 180)))
+            return lease.throttle.start()
+        return lease.throttle.url
+    except Exception as e:
+        print(f"[donut] CDP throttle relay unavailable ({e}) -- attaching directly, no pacing")
+        _stop_throttle(lease)
+        return None
+
+
+def _stop_throttle(lease: Lease) -> None:
+    t, lease.throttle = lease.throttle, None
+    if t is None:
+        return
+    try:
+        t.stop()
+        print(f"[donut] {t.summary()}")
+    except Exception:
+        pass
+
+
 def connect(pw, lease: Lease, timeout_s: float = 30.0):
-    """connect_over_cdp, retried while the freshly started profile opens its debugging port."""
+    """connect_over_cdp, retried while the freshly started profile opens its debugging port. The
+    attach goes through the rate-limit relay unless DONUT_CDP_THROTTLE is off."""
     deadline = time.monotonic() + timeout_s
     last = None
     while time.monotonic() < deadline:
         try:
-            return pw.chromium.connect_over_cdp(lease.cdp_url, timeout=10_000)
+            return pw.chromium.connect_over_cdp(_start_throttle(lease) or lease.cdp_url, timeout=10_000)
         except Exception as e:
             last = e
             time.sleep(1.0)
+    _stop_throttle(lease)
     raise DonutError(f"could not attach to Donut profile {lease.name} at {lease.cdp_url}: {last}")
 
 
@@ -304,6 +359,7 @@ def release(lease: Lease | None) -> None:
     if lease is None or lease.released:
         return
     lease.released = True
+    _stop_throttle(lease)
     try:
         api = _Api()
     except DonutError:

@@ -262,6 +262,22 @@ _GLOBAL = [
        "cleared on close, and created once -- so it stays under Donut's hourly new-fingerprint limit. "
        "'session' = a throwaway profile per session (new device every time; every launch counts "
        "against that limit)."),
+    _s("DONUT_CDP_THROTTLE", L.GLOBAL, bool, True, _TPL, "browser",
+       note=
+       "BROWSER_BACKEND=donut only. Route the session's CDP socket through a local relay that paces "
+       "the commands Donut rate-limits (Runtime.evaluate / callFunctionOn, ~100/min per PROFILE, "
+       "~200 burst) and resends any it still rejects, so the engine never sees the throttle. Without "
+       "it Playwright reports the throttle as 'Execution context was destroyed', which the engine "
+       "reads as a dead exit and answers with proxy rolls and re-logins. Off = attach directly."),
+    _s("DONUT_CDP_PER_MIN", L.GLOBAL, float, 90.0, _TPL, "browser", min_value=1.0,
+       note=
+       "BROWSER_BACKEND=donut only. Sustained counted commands per minute the relay lets through per "
+       "profile. Donut documents 100/min (measured ~98/min); the default leaves headroom. Lower it if "
+       "the log shows 'resending' lines (the relay paced too loosely)."),
+    _s("DONUT_CDP_BURST", L.GLOBAL, int, 180, _TPL, "browser", min_value=1.0,
+       note=
+       "BROWSER_BACKEND=donut only. Counted commands the relay lets through at once before pacing "
+       "starts. Donut's own burst measured ~200-214 per profile; one login uses ~73."),
     _s("DETERMINISTIC_FP", L.GLOBAL, bool, True, _TPL, "browser",
        note=
        "Derive a STABLE browser fingerprint per sub-account, so the same account presents the same "
