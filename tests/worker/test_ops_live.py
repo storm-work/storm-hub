@@ -43,6 +43,15 @@ def _cfg(**template):
         resolve({L.TEMPLATE: {"ROLE": "apply", **template}, L.BOOKING: dict(_UNIT_MODE)}))
 
 
+@pytest.fixture(autouse=True)
+def _no_account_rest(request, monkeypatch):
+    """The per-account hourly shot cap would make every login-loop test that fires one username more
+    than 3 times wait for an hour. Off by default here; the `test_account_rest_*` tests exercise it."""
+    if request.node.name.startswith("test_account_rest_"):
+        return
+    monkeypatch.setattr(LiveEngineOps, "_account_cap", lambda self: (0, 3600.0))
+
+
 _REAL_SAVE_SUBMIT_BODY = LiveEngineOps._save_submit_body
 
 
@@ -6141,3 +6150,174 @@ def test_a_reauthenticating_holder_is_shown_as_logging_in_not_warming_up():
     ops._mark_keep_bookable(False, "schedule keepalive re-warm failed")
     assert ev[0][1]["substate"] == "logging_in" and ev[0][1]["detail"].startswith("not bookable:")
     assert ev[1][1]["substate"] == "warming_up", "a form re-warm still reads warming_up"
+
+
+# ── ACCOUNT REST: per-username hourly shot cap (2026-10-27) ────────────────────────────────────
+class _FakeZ:
+    """The four redis calls the ledger uses, backed by a dict -- shared between ops like the real thing."""
+    def __init__(self):
+        self.z = {}
+    def zadd(self, key, mapping):
+        self.z.setdefault(key, {}).update(mapping)
+    def zremrangebyscore(self, key, lo, hi):
+        self.z[key] = {m: sc for m, sc in self.z.get(key, {}).items() if not (lo <= sc <= hi)}
+    def zrange(self, key, a, b, withscores=False):
+        return sorted(self.z.get(key, {}).items(), key=lambda kv: kv[1])
+    def expire(self, key, secs):
+        pass
+
+
+def _rest_ops(accounts=None, redis=None, cap=3):
+    cfg = _cfg(LOGIN_ACCOUNT_HOURLY_CAP=cap)
+    ops = _make_ops(cfg=cfg, accounts=accounts, redis_client=redis)
+    ops._log = lambda *a, **k: None
+    return ops
+
+
+def test_account_rest_blocks_the_shot_that_would_exceed_the_cap():
+    ops = _rest_ops()
+    for _ in range(2):
+        ops._note_account_shot("alice")
+    assert ops._account_rest_s("alice") == 0, "2 shots of a cap of 3: still ready"
+    ops._note_account_shot("alice")
+    wait = ops._account_rest_s("alice")
+    assert 3500 < wait <= 3600, f"a full cap rests until the OLDEST shot ages out, got {wait}"
+    assert ops._account_rest_s("bob") == 0, "the cap is per username"
+
+
+def test_account_rest_cap_zero_disables_it():
+    ops = _rest_ops(cap=0)
+    for _ in range(50):
+        ops._note_account_shot("alice")
+    assert ops._account_rest_s("alice") == 0
+
+
+def test_account_rest_ledger_is_shared_through_redis():
+    r = _FakeZ()
+    a, b = _rest_ops(redis=r), _rest_ops(redis=r)
+    for _ in range(3):
+        a._note_account_shot("Alice")
+    assert b._account_rest_s("alice") > 0, "a different worker (or a respawn) must see the same shots"
+
+
+def test_account_rest_a_redis_outage_never_blocks_a_login():
+    class _Down:
+        def __getattr__(self, name):
+            raise ConnectionError("redis down")
+    ops = _rest_ops(redis=_Down())
+    ops._note_account_shot("alice")                 # falls back to the in-process ledger
+    assert ops._account_rest_s("alice") == 0
+
+
+def _two_accounts():
+    return [{"sub_account_id": "sub-A", "username": "alice", "password": "p"},
+            {"sub_account_id": "sub-B", "username": "bob", "password": "p"}]
+
+
+def test_account_rest_fresh_login_skips_a_resting_account_for_a_rested_one():
+    ops = _rest_ops(accounts=_two_accounts(), cap=2)
+    ops.sub_account_id = "sub-A"
+    for _ in range(2):
+        ops._note_account_shot("alice")
+    tried = []
+    ops._sticky_login_attempts = lambda n: tried.append(ops.sub_account_id) or True
+    ops._rest_wait = lambda s: pytest.fail("a rested account exists; nothing should wait")
+    assert ops._fresh_login() is True
+    assert tried == ["sub-B"]
+
+
+def test_account_rest_fresh_login_waits_when_every_account_is_resting():
+    ops = _rest_ops(accounts=_two_accounts(), cap=1)
+    ops.sub_account_id = "sub-A"
+    ops._note_account_shot("alice")
+    ops._note_account_shot("bob")
+    waits = []
+
+    def _wait(seconds):
+        waits.append(seconds)
+        ops._acct_ledger.clear()                    # the hour passes
+        return True
+    ops._rest_wait = _wait
+    ops._sticky_login_attempts = lambda n: True
+    assert ops._fresh_login() is True
+    assert len(waits) == 1 and waits[0] > 0, waits
+
+
+def test_account_rest_stop_during_a_rest_abandons_the_login():
+    ops = _rest_ops(accounts=_two_accounts(), cap=1)
+    ops._note_account_shot("alice")
+    ops._note_account_shot("bob")
+    ops._rest_wait = lambda s: False                # stopped meanwhile
+    ops._sticky_login_attempts = lambda n: pytest.fail("must not fire while resting")
+    assert ops._fresh_login() is False
+
+
+def test_account_rest_cap_reached_mid_round_leaves_the_account_and_flags_it():
+    ops = _rest_ops(cap=1)
+    ops._note_account_shot("u")                     # the account in _make_ops is "u"
+    ops.session = None
+    assert ops._sticky_login_attempts(2) is False
+    assert ops._account_cut_short is True
+
+
+def _shots_after(monkeypatch, outcome):
+    """Drive ONE login round whose browser_login yields `outcome` (a dict result or an exception to
+    raise) and return how many shots the account ledger recorded."""
+    import apps.worker.ops_live as ops_live_mod
+
+    class _S(_FakeSession):
+        def browser_login(self, *a, **k):
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+    monkeypatch.setattr(ops_live_mod, "get_session", lambda **kw: _S())
+    ops = _make_ops(cfg=_cfg(STICKY_RETRY_MAX=1, LOGIN_TRANSIENT_RETRY_MAX=0, LOGIN_PORTAL_BUSY_ROLLS=0,
+                             LOGIN_RECAPTCHA_ROLLS=0, LOGIN_SOLVER_FAILURE_RETRIES=0,
+                             LOGIN_ACCOUNT_HOURLY_CAP=50))
+    ops._backoff = lambda n: None
+    ops._backoff_seconds = lambda s: None
+    ops._request_proxy_rotation = lambda phase=None: None
+    ops._roll_exit = lambda why="": True
+    ops._liveness = _RecordingLiveness()
+    ops._log = lambda *a, **k: None
+    ops._verify_logged_in = lambda: "logged_in"
+    ops._sticky_login_attempts(1)
+    return len(ops._account_shots(ops.account["username"], 3600.0))
+
+
+def test_account_rest_counts_a_try_again_later_throttle(monkeypatch):
+    assert _shots_after(monkeypatch, {"status": 200, "body": _BUSY_BODY}) == 1
+
+
+def test_account_rest_counts_a_wrong_credentials_rejection(monkeypatch):
+    body = '{"type":"error","description":"login_failed_auth_redirect"}'
+    assert _shots_after(monkeypatch, {"status": 200, "body": body}) == 1
+
+
+def test_account_rest_counts_a_successful_login(monkeypatch):
+    assert _shots_after(monkeypatch, {"status": 200, "body": '{"type":"success"}'}) == 1
+
+
+def test_account_rest_does_not_count_a_recaptcha_token_verdict(monkeypatch):
+    body = '{"type":"error","description":"Por favor, confirma o reCAPTCHA"}'
+    assert _shots_after(monkeypatch, {"status": 200, "body": body}) == 0
+
+
+def test_account_rest_does_not_count_a_solver_outage(monkeypatch):
+    assert _shots_after(monkeypatch, RuntimeError("reCAPTCHA: no token after all attempts")) == 0
+
+
+def test_account_rest_does_not_count_a_dead_tunnel_or_waf_challenge(monkeypatch):
+    assert _shots_after(monkeypatch, RuntimeError("net::ERR_TUNNEL_CONNECTION_FAILED")) == 0
+    body = '{"type":"error","description":"datadome_challenge_on_post"}'
+    assert _shots_after(monkeypatch, {"status": 200, "body": body}) == 0
+    assert _shots_after(monkeypatch, {"status": 200, "body": "chrome-error://chromewebdata/"}) == 0
+
+
+def test_account_rest_does_not_count_the_maintenance_page(monkeypatch):
+    assert _shots_after(monkeypatch, {"status": 200, "body": _MAINT_BODY}) == 0
+
+
+def test_account_rest_does_not_count_an_empty_answer(monkeypatch):
+    assert _shots_after(monkeypatch, {"status": 200, "body": ""}) == 0

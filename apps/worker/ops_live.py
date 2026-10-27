@@ -1371,38 +1371,147 @@ class LiveEngineOps(EngineOps):
         started_with = self.sub_account_id
         start_idx = next((i for i, a in enumerate(self.accounts)
                           if a.get("sub_account_id") == self.sub_account_id), 0)
-        ordered = self.accounts[start_idx:] + self.accounts[:start_idx]
+        all_ordered = self.accounts[start_idx:] + self.accounts[:start_idx]
         self._saw_maintenance = False
-        for i, candidate in enumerate(ordered):
-            # A maintenance page is down-for-everyone: rotating to the next sub-account would hit
-            # the same page and burn it for nothing. _sticky_login_attempts sets this flag and
-            # returns False; abandon the rotation and let the fleet breaker gate re-entry.
-            if self._saw_maintenance:
-                self._log("login: portal in maintenance -- abandoning sub-account rotation "
-                          "(down for everyone), waiting on the fleet breaker")
-                return False
-            # STOP IS CHECKED BETWEEN EVERY SUB-ACCOUNT (2026-09-11). This whole chain -- and
-            # _sticky_login_attempts below it -- used to run to completion with no bus contact at
-            # all, so a worker that entered a login storm went DEAF to stop/assign/self-scout for
-            # as long as the storm lasted. CONFIRMED LIVE 2026-09-07: one worker ground from 18:04
-            # to past 18:31 (27+ minutes, 6 transient rolls x multiple sub-accounts) with zero
-            # response to the bus. Worst case is ~39 rounds (13 per sub-account x 3), each a
-            # browser launch + login attempt plus backoff, so the deaf window could be far longer
-            # than that. The Hub was never the bottleneck (it delivers in ~2s, measured); the
-            # worker simply never looked.
+        while True:
+            # ACCOUNT REST (2026-10-27). The portal's "try again later" tracks how often THIS username
+            # was tried recently, not a global dice roll (24,880 logins: 0 prior attempts in the hour
+            # 25% success, 3-9 prior 3.2%, 10+ prior 0.02% -- and 71% of our shots were in that last
+            # bucket). So an account at its hourly cap is skipped for the next one that has rested,
+            # and when EVERY candidate is resting the worker waits for the earliest to recover rather
+            # than firing the shots that are worth ~nothing.
+            ordered = [c for c in all_ordered if self._account_rest_s(c.get("username")) <= 0]
+            resting = len(ordered) < len(all_ordered)
+            if not ordered:
+                wait = min(self._account_rest_s(c.get("username")) for c in all_ordered)
+                if not self._rest_wait(wait):
+                    return False
+                continue
+            self._account_cut_short = False
+            for i, candidate in enumerate(ordered):
+                # A maintenance page is down-for-everyone: rotating to the next sub-account would hit
+                # the same page and burn it for nothing. _sticky_login_attempts sets this flag and
+                # returns False; abandon the rotation and let the fleet breaker gate re-entry.
+                if self._saw_maintenance:
+                    self._log("login: portal in maintenance -- abandoning sub-account rotation "
+                              "(down for everyone), waiting on the fleet breaker")
+                    return False
+                # STOP IS CHECKED BETWEEN EVERY SUB-ACCOUNT (2026-09-11). This whole chain -- and
+                # _sticky_login_attempts below it -- used to run to completion with no bus contact at
+                # all, so a worker that entered a login storm went DEAF to stop/assign/self-scout for
+                # as long as the storm lasted. CONFIRMED LIVE 2026-09-07: one worker ground from 18:04
+                # to past 18:31 (27+ minutes, 6 transient rolls x multiple sub-accounts) with zero
+                # response to the bus. Worst case is ~39 rounds (13 per sub-account x 3), each a
+                # browser launch + login attempt plus backoff, so the deaf window could be far longer
+                # than that. The Hub was never the bottleneck (it delivers in ~2s, measured); the
+                # worker simply never looked.
+                if self.is_stopped():
+                    self._log("login: stop observed -- abandoning sub-account rotation")
+                    return False
+                if i > 0:
+                    self._log(f"login: sticky retries exhausted on this sub-account -- rotating to "
+                              f"candidate {i + 1}/{len(ordered)} ({candidate.get('sub_account_id')})")
+                self.account = candidate
+                self.sub_account_id = candidate.get("sub_account_id", self.sub_account_id)
+                if self._sticky_login_attempts(self.cfg.login.sticky_retry_max):
+                    if self.sub_account_id != started_with and self._emit is not None:
+                        self._emit("account_rotated", sub_account_id=self.sub_account_id)
+                    return True
+            # Every ready candidate failed. If any account was out of shots (skipped up front, or hit
+            # its cap mid-round) this is a pause, not a verdict: wait for it and go again.
+            if (resting or self._account_cut_short) and not self.is_stopped() \
+                    and not self._saw_maintenance:
+                wait = min(self._account_rest_s(c.get("username")) for c in all_ordered)
+                if wait > 0 and self._rest_wait(wait):
+                    continue
+            return False
+
+    # ── ACCOUNT REST: a per-username hourly shot cap (shared across workers via Redis) ─────────────
+    def _account_cap(self) -> tuple[int, float]:
+        return (max(0, int(self.cfg.raw.get("LOGIN_ACCOUNT_HOURLY_CAP", 3))),
+                max(60.0, float(self.cfg.raw.get("LOGIN_ACCOUNT_WINDOW_S", 3600.0))))
+
+    def _account_shots(self, username: str, window: float) -> list[float]:
+        """Timestamps (ascending) of this username's login shots inside the window. Redis when we
+        have it, so a respawned worker and every other worker see the same ledger; the in-process
+        dict is the fallback (and what a redis outage degrades to -- never blocks a login)."""
+        now = time.time()
+        if self._redis is not None:
+            try:
+                key = f"login:acct:{(username or '').lower()}"
+                self._redis.zremrangebyscore(key, 0, now - window)
+                return sorted(float(sc) for _m, sc in self._redis.zrange(key, 0, -1, withscores=True))
+            except Exception:
+                pass
+        ledger = getattr(self, "_acct_ledger", {})
+        return sorted(t for t in ledger.get((username or "").lower(), []) if t > now - window)
+
+    def _account_rest_s(self, username: str | None) -> float:
+        """Seconds until `username` may be fired again (0 = ready). The shot that would exceed the
+        cap waits for the oldest shot in the window to age out."""
+        cap, window = self._account_cap()
+        if cap <= 0 or not username:
+            return 0.0
+        shots = self._account_shots(username, window)
+        if len(shots) < cap:
+            return 0.0
+        return max(1.0, shots[len(shots) - cap] + window - time.time())
+
+    def _note_account_shot(self, username: str | None) -> None:
+        cap, window = self._account_cap()
+        if cap <= 0 or not username:
+            return
+        now, u = time.time(), username.lower()
+        if self._redis is not None:
+            try:
+                key = f"login:acct:{u}"
+                self._redis.zadd(key, {f"{now:.3f}:{random.getrandbits(24):06x}": now})
+                self._redis.expire(key, int(window) + 120)
+                return
+            except Exception:
+                pass
+        if not hasattr(self, "_acct_ledger"):
+            self._acct_ledger = {}
+        self._acct_ledger.setdefault(u, []).append(now)
+
+    def _count_login_shot(self, result: object) -> None:
+        """Charge a login to the account's hourly cap ONLY when the portal itself answered it about
+        THIS username: it let us in, or it refused (the 'try again later' throttle, wrong
+        credentials / auth redirect). The cap exists to mirror the portal's per-username attempt
+        tally, so a shot the portal never judged must not spend the allowance:
+
+          * a raised failure -- solver outage / timeout, dead tunnel, browser crash: no verdict at all;
+          * 'Por favor, confirma o reCAPTCHA' -- our token or exit, not a verdict on the account
+            (the same reason it is never charged to the 2-strike sticky budget);
+          * a WAF/DataDome challenge or chrome-error page -- the portal never saw the credentials;
+          * the maintenance page -- down for everyone, nothing was tallied.
+        Never raises: it runs inside the login try-block and must not change its outcome."""
+        try:
+            if not self._is_login_success(result):
+                reason = _login_reject_reason(result)
+                body = (result.get("body") or "").strip() if isinstance(result, dict) else ""
+                if (not body or self._is_transient_login_failure(reason)
+                        or _is_recaptcha_verdict(reason)
+                        or self._is_solver_failure(reason) or _is_maintenance(reason)):
+                    return
+            self._note_account_shot(self.account.get("username"))
+        except Exception:
+            pass
+
+    def _rest_wait(self, seconds: float) -> bool:
+        """Sit out an account rest (chunked, bus-responsive). False when stopped meanwhile."""
+        self._close_session_quietly()     # no browser held open through a rest that can last an hour
+        cap, window = self._account_cap()
+        self._log(f"login: every sub-account is at its {cap}-shots/{int(window // 60)}min cap -- the "
+                  f"portal throttles an over-tried username (measured 0.02% success past 10/hour vs "
+                  f"25% fresh); resting {int(seconds // 60)}m{int(seconds % 60):02d}s instead of firing")
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            self._poll_signals()
             if self.is_stopped():
-                self._log("login: stop observed -- abandoning sub-account rotation")
                 return False
-            if i > 0:
-                self._log(f"login: sticky retries exhausted on this sub-account -- rotating to "
-                          f"candidate {i + 1}/{len(ordered)} ({candidate.get('sub_account_id')})")
-            self.account = candidate
-            self.sub_account_id = candidate.get("sub_account_id", self.sub_account_id)
-            if self._sticky_login_attempts(self.cfg.login.sticky_retry_max):
-                if self.sub_account_id != started_with and self._emit is not None:
-                    self._emit("account_rotated", sub_account_id=self.sub_account_id)
-                return True
-        return False
+            time.sleep(min(2.0, max(0.0, deadline - time.time())))
+        return True
 
     def _sticky_login_attempts(self, sticky_max: int) -> bool:
         """Spend up to `sticky_max` attempts ON THIS SUB-ACCOUNT, plus a separate, bounded budget for
@@ -1455,6 +1564,11 @@ class LiveEngineOps(EngineOps):
             # spends most of a storm. See _fresh_login's comment for the confirmed incident.
             if self.is_stopped():
                 self._log("login: stop observed -- abandoning retries on this sub-account")
+                return False
+            if self._account_rest_s(self.account.get("username")) > 0:
+                self._log(f"login: {self.sub_account_id[:8]} is at its hourly shot cap -- leaving it "
+                          f"to rest and moving on")
+                self._account_cut_short = True
                 return False
             rounds += 1
             _do_roll = rounds > 1 and not skip_roll_this_round
@@ -1534,6 +1648,7 @@ class LiveEngineOps(EngineOps):
                     anticaptcha_keys=self.anticaptcha_keys,
                     pre_token=_pre_token,
                 )
+                self._count_login_shot(result)
             except Exception as e:
                 # SOLVER OUTAGE (no token) checked FIRST: it is neither the account's fault nor the
                 # exit's (login solving is ProxyLess), so it must NOT burn the sticky budget AND must
@@ -1661,7 +1776,7 @@ class LiveEngineOps(EngineOps):
                 # fire again immediately; LOGIN_THROTTLE_BACKOFF (default 0.5s, jittered) is the only
                 # pause, just enough to avoid a tight loop around the ~15s browser+solve cost.
                 self._log(f"login: 'try again later' ({busy_rolls}/{max_busy_rolls}) -- rolling to a "
-                          f"fresh exit and firing again immediately (throttle is a global lottery)")
+                          f"fresh exit; the account's shot cap decides whether it fires again")
                 self._roll_exit(f"portal busy {busy_rolls}/{max_busy_rolls}")
                 self._backoff_seconds(float(self.cfg.raw.get("LOGIN_THROTTLE_BACKOFF", 0.5)))
                 continue

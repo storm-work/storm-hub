@@ -860,9 +860,24 @@ _TEMPLATE = [
     # again immediately -- just enough jitter to avoid a tight loop around the ~15s browser+solve.
     _s("LOGIN_THROTTLE_BACKOFF", L.TEMPLATE, float, 0.5, _WRK, "login_resilience", min_value=0.0,
        note="seconds a worker pauses after a 'try again later' throttle before firing again on a "
-            "fresh exit. Default 0.5. The throttle is a global lottery, not our-rate-limiting, so "
-            "this is deliberately near-zero to MAXIMISE login shots -- raise it only if a near-zero "
-            "retry rate is causing a different problem (it does not reduce the portal's throttle)."),
+            "fresh exit. Default 0.5. NOTE the throttle is per-account, not a global lottery "
+            "(see LOGIN_ACCOUNT_HOURLY_CAP): the pause itself buys little, the per-account shot cap "
+            "is what protects the account."),
+    _s("LOGIN_ACCOUNT_HOURLY_CAP", L.TEMPLATE, int, 3, _WRK, "login_resilience", min_value=0.0,
+       note="max login shots per sub-account username inside LOGIN_ACCOUNT_WINDOW_S (default 1h), "
+            "counted across ALL workers and respawns through a Redis ledger (login:acct:<username>). "
+            "A worker whose account is at the cap moves to a sub-account that has rested, and when "
+            "every one of its accounts is at the cap it waits for the earliest to recover instead of "
+            "firing. MEASURED 2026-10-26 over 24,880 login POSTs: the portal's 'try again later' "
+            "tracks recent attempts on the SAME username -- 0 prior attempts in the hour 25% success, "
+            "1-2 prior 14%, 3-9 prior 3.2%, 10+ prior 0.02% -- and 71% of our shots were in the 10+ "
+            "bucket (Test 1026: 2,093 shots on 12 accounts, 6 logins). 3 keeps every shot in the "
+            "0-2 prior buckets. 0 disables the cap (the pre-2026-10-27 fire-again-immediately "
+            "behaviour). Only logins the PORTAL answered about the username count (success, 'try again "
+            "later', wrong credentials); a raised failure, solver timeout, reCAPTCHA-token verdict, "
+            "WAF challenge, dead tunnel or maintenance page does not."),
+    _s("LOGIN_ACCOUNT_WINDOW_S", L.TEMPLATE, float, 3600.0, _WRK, "login_resilience", min_value=60.0,
+       note="the rolling window (seconds) LOGIN_ACCOUNT_HOURLY_CAP is counted over. Default 3600."),
     _s("LOGIN_RECAPTCHA_ROLLS", L.TEMPLATE, int, 3, _WRK, "login_resilience", min_value=0.0,
        note="fresh exits to roll through on a 'Por favor, confirma o reCAPTCHA' verdict before the "
             "rejection is charged to the sub-account. This verdict is an EXIT/token problem, not the "
