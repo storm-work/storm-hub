@@ -491,6 +491,8 @@ def _start_token_factory() -> None:
         batch = int(g.get("LOGIN_TOKEN_POOL_BATCH", 4) or 4)
         import libs.engine.vendor.solver as _solver
         from libs.bus.token_pool import run_token_factory
+        from libs.domain import solver_keys
+        solver_keys.install(_bus.r)       # the pool spends EVERY key in turn, not always the first
 
         def _login_solve() -> str:
             try:
@@ -3749,7 +3751,7 @@ def _do_launch_worker(db: Session, w: M.Worker) -> None:
         # whatever key lists it is handed; here we pick the booking's chosen solver (RECAPTCHA_SOLVER,
         # booking/template-overridable, resolved into `eff`) and hand THIS worker ONE key from that
         # solver's list -- round-robin by worker id -- so several keys spread the load across the fleet.
-        from libs.domain.solver_select import (parse_keys, resolve_solver_keys, rr_index,
+        from libs.domain.solver_select import (parse_keys, rotated_solver_lists, rr_index,
                                                resolve_selection)
         _caps_all = parse_keys(g.get("CAPSOLVER_KEYS", ""))
         _ac_all = parse_keys(g.get("ANTICAPTCHA_KEYS", ""))
@@ -3758,9 +3760,12 @@ def _do_launch_worker(db: Session, w: M.Worker) -> None:
         # PER-ACTION solver split (operator 2026-10-21): login and the schedule page can use DIFFERENT
         # solvers (e.g. anticaptcha for login, capsolver for the schedule page). Each per-action setting
         # 'inherit's RECAPTCHA_SOLVER unless overridden, so the default is byte-identical to before.
-        capsolver_keys, anticaptcha_keys = resolve_solver_keys(
+        # The worker gets EVERY key of the chosen solver (rotated so its own pick is first): each solve then
+        # takes the next live key from the fleet-wide rotation and steps past one that is out of balance
+        # (libs/domain/solver_keys, installed in the worker). Handing it ONE key froze the choice at launch.
+        capsolver_keys, anticaptcha_keys = rotated_solver_lists(
             resolve_selection(eff.get("LOGIN_RECAPTCHA_SOLVER"), _base), _caps_all, _ac_all, index=_idx)
-        schedule_capsolver_keys, schedule_anticaptcha_keys = resolve_solver_keys(
+        schedule_capsolver_keys, schedule_anticaptcha_keys = rotated_solver_lists(
             resolve_selection(eff.get("SCHEDULE_RECAPTCHA_SOLVER"), _base), _caps_all, _ac_all, index=_idx)
         # Sub-account rotation candidates (do_login()'s rotate-after-sticky-exhausted loop): the FULL
         # ranked list, each already carrying its own sub_account_id, so the worker (deliberately

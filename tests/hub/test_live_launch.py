@@ -1231,3 +1231,20 @@ def test_account_geo_pin_helper_ignores_junk():
     assert hub_main._account_geo_pin({}, NS(registered_geo=None)) is None
     assert hub_main._account_geo_pin({}, NS(registered_geo="D3")) is None
     assert hub_main._account_geo_pin({}, None) is None
+
+
+# ── solver keys: the worker gets EVERY key of the chosen solver (rotated), not one frozen at launch ──
+def test_a_worker_launch_carries_every_key_of_the_chosen_solver_rotated_by_worker(client, monkeypatch):
+    from libs.domain.solver_select import rr_index
+    h = _operate_headers(client)
+    assert client.put("/settings/global", json={"values": {
+        "CAPSOLVER_KEYS": "c1,c2", "ANTICAPTCHA_KEYS": "a1,a2,a3", "RECAPTCHA_SOLVER": "anticaptcha"}},
+        headers=h).status_code == 200
+    _iid, _bid, w = _geo_booking(client, h, "Keys")
+    captured = _spy_launch(monkeypatch)
+    assert client.post(f"/workers/{w['id']}/launch", headers=h).status_code == 200
+    start = rr_index(w["id"]) % 3
+    expect = ["a1", "a2", "a3"][start:] + ["a1", "a2", "a3"][:start]
+    assert captured["anticaptcha_keys"] == expect, "all three keys, this worker's own pick first"
+    assert captured["capsolver_keys"] == [], "the other solver is not handed over when it is not selected"
+    assert captured["schedule_anticaptcha_keys"] == expect

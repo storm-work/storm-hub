@@ -223,12 +223,13 @@ async def _register_one(acct: dict, proxies_cycle, capsolver_keys: list[str], la
                 # soax/rotating specifically (342 verified registrations, per session.py's note) --
                 # this default just stops it being the only option.
                 solve_proxy = proxy if captcha_solve_proxy else None
-                # LOAD DISTRIBUTION: one key per account from each active solver's list (round-robin by
-                # this account's index), so several keys spread the registration load instead of every
-                # account hammering key #1. The endpoint already filtered the lists to the selected
+                # LOAD DISTRIBUTION: race_all takes every solve's key from the WHOLE list (fleet-wide
+                # round-robin, skipping a key that is out of balance -- solver_keys, installed in main()),
+                # so a one- or two-account run no longer leans on key #1 and an empty key costs nothing.
+                # The list is rotated by this account's index so list[0] still differs per account. The endpoint already filtered the lists to the selected
                 # solver (capsolver-only, anticaptcha-only, or both for 'race').
-                from libs.domain.solver_select import resolve_solver_keys
-                _cap_pick, _ac_pick = resolve_solver_keys(
+                from libs.domain.solver_select import rotated_solver_lists
+                _cap_pick, _ac_pick = rotated_solver_lists(
                     "race", capsolver_keys, anticaptcha_keys or [], index=key_index)
                 token = await loop.run_in_executor(
                     executor, race_all, _cap_pick, _ac_pick, [], [], "REGISTER_EVISA", solve_proxy)
@@ -526,6 +527,9 @@ def main() -> int:
         from libs.engine import vendor_env
         exported = vendor_env.apply(vendor_settings)
         print(f"[registrar] vendor env applied: {exported}", flush=True)
+
+    from libs.domain import solver_keys
+    solver_keys.install(getattr(bus, "r", None))
 
     asyncio.run(_run_all(bus, run_id, accounts, proxies, capsolver_keys, lang,
                          email_provider, email_cfg, concurrency, browser_concurrency,

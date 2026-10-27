@@ -99,6 +99,8 @@ def _build_ops(engine_kind: str, cfg: EngineConfig, payload: dict, bus: Bus, wor
         emit("log_line", text=f"vendor env applied: {exported}")
         from .ops_live import LiveEngineOps
         redis_client = bus.r if hasattr(bus, "r") else None
+        from libs.domain import solver_keys
+        solver_keys.install(redis_client)   # per-solve key choice: even spread + skip an empty key
         ops = LiveEngineOps(
             cfg,
             account=payload["account"],
