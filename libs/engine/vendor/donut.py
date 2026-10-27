@@ -54,6 +54,20 @@ class DonutError(RuntimeError):
     pass
 
 
+class DonutRateLimited(DonutError):
+    """HTTP 429: Donut's hourly limit on profile runs or on new fingerprints. Carries Retry-After."""
+    def __init__(self, msg: str, retry_after: float):
+        super().__init__(msg)
+        self.retry_after = retry_after
+
+
+# Longest single Retry-After we sit out inside one launch before giving up on it (seconds). A longer
+# wait means the hourly budget is spent: failing the launch fast lets the login loop back off as
+# infrastructure instead of holding a worker thread for most of an hour.
+_MAX_RATE_WAIT = 120.0
+_RATE_RETRIES = 2
+
+
 def enabled() -> bool:
     return os.environ.get("BROWSER_BACKEND", "chromium").strip().lower() == "donut"
 
@@ -93,9 +107,15 @@ class _Api:
                              f"is the Donut app running with its Local API enabled?") from e
         if r.status_code == 204:
             return None
+        if r.status_code == 429:
+            try:
+                ra = float(r.headers.get("Retry-After") or (r.json() or {}).get("retryAfterSeconds") or 60)
+            except (ValueError, TypeError, AttributeError):
+                ra = 60.0
+            raise DonutRateLimited(f"Donut {method} {path} -> HTTP 429 (rate limited, "
+                                   f"Retry-After={ra:.0f}s): {r.text[:160]}", ra)
         if r.status_code >= 400:
-            hint = {401: "token rejected", 402: "plan does not include automation",
-                    429: f"rate limited, Retry-After={r.headers.get('Retry-After', '?')}s"}
+            hint = {401: "token rejected", 402: "plan does not include automation"}
             raise DonutError(f"Donut {method} {path} -> HTTP {r.status_code}"
                              f"{' (' + hint[r.status_code] + ')' if r.status_code in hint else ''}: "
                              f"{r.text[:200]}")
@@ -212,9 +232,27 @@ def _ensure_profile(api: _Api, name: str, proxy_id: str | None, scope: str) -> s
     return pid
 
 
+def _rate_limited(fn, *args):
+    """Run `fn`, sitting out Donut 429s (Retry-After, bounded by _MAX_RATE_WAIT) up to _RATE_RETRIES
+    times. Every exit roll is a new profile run, so the hourly run limit is the one most likely to
+    bite; waiting it out keeps the same account and exit instead of rolling into another 429."""
+    for attempt in range(_RATE_RETRIES + 1):
+        try:
+            return fn(*args)
+        except DonutRateLimited as e:
+            if attempt == _RATE_RETRIES or e.retry_after > _MAX_RATE_WAIT:
+                raise
+            print(f"[donut] {e} -- waiting {e.retry_after:.0f}s ({attempt + 1}/{_RATE_RETRIES})")
+            time.sleep(e.retry_after)
+
+
 def launch(proxy_url: str | None, fp_seed: str | None) -> Lease:
     """Create/refresh this session's profile on `proxy_url` and start it. Returns the lease whose
     cdp_url Playwright connects to. Raises DonutError with an operator-readable reason."""
+    return _rate_limited(_launch_once, proxy_url, fp_seed)
+
+
+def _launch_once(proxy_url: str | None, fp_seed: str | None) -> Lease:
     api = _Api()
     scope = _scope() if fp_seed else "session"
     if scope == "account":

@@ -128,6 +128,7 @@ def test_operator_readable_errors(api, monkeypatch):
     with pytest.raises(donut.DonutError, match="plan does not include automation"):
         donut.launch(None, fp_seed=None)
     api.fail = {("POST", "/v1/profiles"): 429}
+    monkeypatch.setattr(donut.time, "sleep", lambda s: None)   # a 429 is now waited out, then re-raised
     with pytest.raises(donut.DonutError, match="Retry-After=60"):
         donut.launch(None, fp_seed=None)
     monkeypatch.setenv("DONUT_API_TOKEN", "")
@@ -193,3 +194,42 @@ def test_init_timeout_stops_the_donut_profile(monkeypatch):
     with pytest.raises(RuntimeError, match="init timed out"):
         session.PlaywrightSession(proxy=None)
     assert released == ["lease"]
+
+
+# ── 429: wait out Retry-After instead of rolling into another run ─────────────────────────────────
+def test_a_rate_limited_run_is_waited_out_then_succeeds(api, monkeypatch):
+    """Every exit roll is a new profile run, so Donut's hourly run limit is the likeliest to bite.
+    Sitting out a short Retry-After keeps the account and exit; rolling would just spend another run."""
+    waits = []
+    monkeypatch.setattr(donut.time, "sleep", waits.append)
+    real = api.__call__
+    hits = {"n": 0}
+
+    def once_429(method, url, **kw):
+        if method == "POST" and url.endswith("/run") and hits["n"] == 0:
+            hits["n"] += 1
+            return httpx.Response(429, text="hourly limit", headers={"Retry-After": "30"})
+        return real(method, url, **kw)
+    monkeypatch.setattr(donut.httpx, "request", once_429)
+    lease = donut.launch(None, fp_seed="acct-1")
+    assert lease.port == 9301 and 30.0 in waits
+
+
+def test_a_long_retry_after_fails_fast(api, monkeypatch):
+    waits = []
+    monkeypatch.setattr(donut.time, "sleep", waits.append)
+    api.fail = {("POST", "/v1/profiles"): 429}
+    monkeypatch.setattr(donut.httpx, "request", lambda m, u, **kw: httpx.Response(
+        429, text="hourly limit", headers={"Retry-After": "1800"}))
+    with pytest.raises(donut.DonutRateLimited):
+        donut.launch(None, fp_seed=None)
+    assert waits == [], "a half-hour wait must not hold the worker thread"
+
+
+def test_donut_infrastructure_failures_are_never_charged_to_the_account():
+    from apps.worker.ops_live import LiveEngineOps
+    for msg in ("Donut POST /v1/profiles/x/run -> HTTP 429 (rate limited, Retry-After=30s): limit",
+                "Donut API unreachable at http://127.0.0.1:10108 (ConnectError: refused)",
+                "could not attach to Donut profile storm-abc at http://127.0.0.1:9301: timeout",
+                "Donut run returned no remote_debugging_port: {}"):
+        assert LiveEngineOps._is_transient_login_failure(msg), msg

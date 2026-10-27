@@ -1767,6 +1767,11 @@ class LiveEngineOps(EngineOps):
             # All mean the request never reached the portal -- an exit fault, not the portal's verdict.
             "error sending request", "connection refused", "connection reset",
             "connection closed", "connection error",
+            # BROWSER_BACKEND=donut: the browser itself could not be had -- Donut's hourly run limit
+            # (429), the app unreachable, or the profile's CDP port never opened. Infrastructure, never
+            # a verdict on the credentials, so it must not spend the sub-account's sticky budget.
+            "donut api unreachable", "http 429 (rate limited", "could not attach to donut profile",
+            "returned no remote_debugging_port",
         ))
 
     @staticmethod
