@@ -35,7 +35,7 @@ from .providers import ProviderError, new_session_id
 RotatingPoolError = ProviderError
 
 __all__ = ["RotatingPoolError", "ProviderError", "mint_rotating_url", "roll_rotating_url",
-           "rotating_session_id", "new_session_id", "reseat_geo"]
+           "rotating_session_id", "new_session_id", "reseat_geo", "pin_geo", "url_country"]
 
 
 def reseat_geo(url: str, geo: str | None, *, provider: str = "") -> str:
@@ -70,6 +70,68 @@ def reseat_geo(url: str, geo: str | None, *, provider: str = "") -> str:
     if re.search(r"-country-[a-z]{2}", u, flags=re.I):
         return re.sub(r"-country-[a-z]{2}", f"-country-{cc}", u, count=1, flags=re.I)
     return re.sub(r"(package-[A-Za-z0-9]+)", rf"\1-country-{cc}", u, count=1)
+
+
+def _webshare_segs(url: str):
+    """(scheme, segs, sep, pwd, hostport) for a webshare-grammar URL -- username `PREFIX[-CC]-ID` --
+    or None. Same recogniser as the provider itself, so this never reseats a username it would not roll."""
+    from .providers.base import split_url
+    from .providers.webshare import _is_session_segment
+    parts = split_url(url)
+    if parts is None:
+        return None
+    scheme, user, sep, pwd, hostport = parts
+    segs = user.split("-")
+    if len(segs) < 2 or not _is_session_segment(segs[-1]):
+        return None
+    return scheme, segs, sep, pwd, hostport
+
+
+def _is_webshare(url: str) -> bool:
+    return "soax" not in (url or "") and "capsolver" not in (url or "") and _webshare_segs(url) is not None
+
+
+def _reseat_webshare(url: str, geo: str | None) -> str:
+    """webshare carries its country as an UPPERCASE segment between the prefix and the session id
+    (`PREFIX-CC-ID`). Only the two shapes we mint are rewritten (`PREFIX-ID`, `PREFIX-CC-ID`); anything
+    else comes back unchanged, because a prefix we cannot delimit could swallow a real segment (D2).
+    Reached only through pin_geo -- reseat_geo keeps leaving webshare exits as minted."""
+    parts = _webshare_segs(url)
+    if parts is None:
+        return url
+    scheme, segs, sep, pwd, hostport = parts
+    cc = (geo or "").strip().upper()
+    if len(segs) == 3 and re.fullmatch(r"[A-Za-z]{2}", segs[1]):
+        segs = [segs[0], segs[2]] if not cc else [segs[0], cc, segs[2]]
+    elif len(segs) == 2:
+        segs = segs if not cc else [segs[0], cc, segs[1]]
+    else:
+        return url
+    return f"{scheme}://{'-'.join(segs)}{sep}{pwd}@{hostport}"
+
+
+def pin_geo(url: str, geo: str | None, *, provider: str = "") -> str:
+    """Like reseat_geo, but also reseats a WEBSHARE credential. reseat_geo deliberately leaves webshare
+    alone (its minted geo stays), because the per-roll geo VARIATION must not start rewriting webshare
+    usernames. A per-account country PIN is a different, explicit request -- this account must exit from
+    its registration country -- so it uses this. Anything unrecognised comes back unchanged."""
+    if provider == "webshare" or (not provider and _is_webshare(url or "")):
+        return _reseat_webshare(url or "", geo)
+    return reseat_geo(url, geo, provider=provider)
+
+
+def url_country(url: str | None) -> str | None:
+    """The exit country a proxy URL asks for (UPPERCASE ISO code), or None when it names none or the
+    grammar is not one we recognise. soax `-country-cc`, capsolver `-country_CC`, webshare `PREFIX-CC-ID`.
+    This reads what the CREDENTIAL requests; it does not look at the IP (see exit_ip.lookup_exit_country)."""
+    u = url or ""
+    m = re.search(r"-country[-_]([A-Za-z]{2})(?![A-Za-z])", u)
+    if m:
+        return m.group(1).upper()
+    parts = _webshare_segs(u) if _is_webshare(u) else None
+    if parts and len(parts[1]) == 3 and re.fullmatch(r"[A-Za-z]{2}", parts[1][1]):
+        return parts[1][1].upper()
+    return None
 
 
 def mint_rotating_url(provider: str, kind: str | None = None, *, settings: dict | None = None,

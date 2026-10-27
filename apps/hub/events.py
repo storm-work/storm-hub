@@ -221,7 +221,8 @@ class EventHub:
         finally:
             db.close()
 
-    def _handle_proxy_request(self, worker_id: str, phase: str, bus, health_check=None) -> None:
+    def _handle_proxy_request(self, worker_id: str, phase: str, bus, health_check=None,
+                              geo: str | None = None) -> None:
         """P3 -- proxy rotation, spec'd directly by the operator: a worker asks the Hub ("the proxy
         provider") for a rotation and gets back a proxy drawn from the pool matching its CURRENT
         phase -- PROXY_PROVIDER/PROXY_KIND (the same settings _do_launch_worker's phase-1 lease
@@ -316,6 +317,11 @@ class EventHub:
             # that clear the login wall stop being the ones it uses.
             from apps.hub.main import _geos, _pools, _static_pool
             geos = _geos(geo_setting)
+            # ACCOUNT_GEO_PIN: the worker names the country its CURRENT sub-account is pinned to; a
+            # rotation must stay inside it, ahead of the booking's PROXY_GEOS.
+            _pin = str(geo or "").strip().upper()
+            if _pin and eff.get("ACCOUNT_GEO_PIN", True) and not w.proxy_geo:
+                geos = {_pin}
             # Same reasoning as geos directly above: a rotation must stay inside the NAMED ISP pools
             # the booking was assigned. Without this a worker that loses its static exit would be
             # re-leased out of some other booking's purchase -- and an ISP proxy is a finite,
@@ -785,6 +791,20 @@ class EventHub:
             if job is not None and payload.get("solver_used"):
                 job.solver_used = payload["solver_used"]
 
+            if outcome in ("registered", "exists", "verified"):
+                # The device this registration ran on. Newest success wins ("the last profile the
+                # registration succeeded at"); a result that carries none (older registrar, a failed
+                # read) never blanks what an earlier one recorded.
+                _dev = {k: payload.get(k) for k in ("browser_backend", "donut_profile", "fingerprint_hash")}
+                _geo = str(payload.get("registered_geo") or "").strip().upper()[:2] or None
+                if any(_dev.values()) or _geo:
+                    for k, v in _dev.items():
+                        if v:
+                            setattr(sa, k, str(v)[:32])
+                    if _geo:
+                        sa.registered_geo = _geo
+                    sa.fingerprint_recorded_at = datetime.now(timezone.utc)
+
             if payload.get("email"):
                 sa.email = payload["email"]
             if payload.get("email_pass"):
@@ -857,7 +877,8 @@ class EventHub:
                         _step("release_on_terminal", self._release_on_terminal, wid, bus)
                     if m.type == "proxy_request":
                         self._proxy_executor.submit(
-                            self._handle_proxy_request, wid, m.payload.get("phase", "warmup"), bus)
+                            self._handle_proxy_request, wid, m.payload.get("phase", "warmup"), bus,
+                            None, m.payload.get("geo"))
                     if m.type == "dates_reported":
                         self.dates_reported.setdefault(wid, []).append(m.payload.get("outcomes", []))
                     if m.type == "slot_released":

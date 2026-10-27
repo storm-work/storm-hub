@@ -662,3 +662,92 @@ def test_recaptcha_fail_budget_stays_within_the_portals_hard_limit():
         "the portal blocks access after 2 reCAPTCHA failures -- the budget must never exceed 2")
     assert RECAPTCHA_FAIL_BUDGET >= 2, (
         "budget < 2 means no fresh-exit retry at all -- a single flagged exit would kill the account")
+
+
+# ── registration records WHERE an account was registered from (device + exit country) ──────────────
+def _persist_result(TestSession, sid, outcome, payload):
+    import apps.hub.db as hub_db
+    import apps.hub.events as events_mod
+    orig = hub_db.SessionLocal
+    hub_db.SessionLocal = TestSession
+    events_mod.SessionLocal = TestSession
+    try:
+        hub = events_mod.EventHub.__new__(events_mod.EventHub)
+        hub._persist_registration_result(sid, outcome, payload)
+    finally:
+        hub_db.SessionLocal = orig
+        events_mod.SessionLocal = orig
+
+
+def _sub(TestSession, sid):
+    from libs.db import models as M
+    db = TestSession()
+    try:
+        sa = db.get(M.SubAccount, sid)
+        return {k: getattr(sa, k) for k in ("browser_backend", "donut_profile", "fingerprint_hash",
+                                            "registered_geo", "fingerprint_recorded_at")}
+    finally:
+        db.close()
+
+
+def test_reg_result_records_the_registration_device_on_the_sub_account(client):
+    c, TestSession = client
+    h = _op_headers(c)
+    _iid, subs = _make_identity_with_subs(c, h, n=1)
+    sid = subs[0]["id"]
+    assert _sub(TestSession, sid)["registered_geo"] is None
+    _persist_result(TestSession, sid, "registered", {
+        "email": "a@b.com", "browser_backend": "donut", "donut_profile": "storm-0123456789ab",
+        "fingerprint_hash": "f00dfeed12345678", "registered_geo": " de "})
+    got = _sub(TestSession, sid)
+    assert got["browser_backend"] == "donut" and got["donut_profile"] == "storm-0123456789ab"
+    assert got["fingerprint_hash"] == "f00dfeed12345678"
+    assert got["registered_geo"] == "DE", "stored upper-case and trimmed"
+    assert got["fingerprint_recorded_at"] is not None
+
+
+def test_a_later_result_without_a_device_never_blanks_the_recorded_one(client):
+    c, TestSession = client
+    h = _op_headers(c)
+    _iid, subs = _make_identity_with_subs(c, h, n=1)
+    sid = subs[0]["id"]
+    _persist_result(TestSession, sid, "registered", {"fingerprint_hash": "aaaa", "registered_geo": "IT"})
+    _persist_result(TestSession, sid, "verified", {})                       # verify step carries no device
+    _persist_result(TestSession, sid, "failed", {"fingerprint_hash": "zzzz", "registered_geo": "ES"})
+    got = _sub(TestSession, sid)
+    assert got["fingerprint_hash"] == "aaaa" and got["registered_geo"] == "IT", \
+        "only a SUCCESSFUL registration records a device, and an empty result never blanks one"
+    _persist_result(TestSession, sid, "registered", {"fingerprint_hash": "bbbb", "registered_geo": "PT"})
+    got = _sub(TestSession, sid)
+    assert got["fingerprint_hash"] == "bbbb" and got["registered_geo"] == "PT", "the LAST success wins"
+
+
+def test_run_registration_sends_the_browser_settings_to_the_registrar(client, monkeypatch):
+    """The registrar is a separate process that never received BROWSER_BACKEND / DONUT_*, so a global
+    BROWSER_BACKEND=donut was silently ignored by registration (accounts registered from one device and
+    booked from another). The launch payload must carry them, and carry them from the GLOBAL layer."""
+    c, _ = client
+    h = _op_headers(c)
+    iid = c.post("/identities", json={"full_name": "Ana Silva", "type": "test"}, headers=h).json()["id"]
+    c.post("/identities/gen-subaccounts", json={"identity_ids": [iid], "count": 1}, headers=h)
+    sid = next(s["id"] for s in c.get("/sub-accounts", headers=h).json() if s["identity_id"] == iid)
+    put = c.put("/settings/global", json={"values": {"CAPSOLVER_KEYS": "key1", "BROWSER_BACKEND": "donut",
+                                                      "DONUT_PROFILE_KEEP_STATE": True}}, headers=h)
+    assert put.status_code == 200, put.text
+    c.post("/proxies", json={"provider": "soax", "kind": "static", "endpoint": "1.2.3.4:5000"}, headers=h)
+
+    import apps.hub.main as hub_main
+    captured = {}
+    orig_send = hub_main._bus.send_command
+
+    def _spy(worker_id, type, **payload):
+        if type == "launch":
+            captured.update(payload)
+        return orig_send(worker_id, type, **payload)
+
+    monkeypatch.setattr(hub_main._bus, "send_command", _spy)
+    r = c.post("/registration/run", json={"sub_account_ids": [sid]}, headers=h)
+    assert r.status_code == 200, r.text
+    vs = captured["vendor_settings"]
+    assert vs["BROWSER_BACKEND"] == "donut" and vs["DONUT_PROFILE_KEEP_STATE"] is True
+    assert set(vs) <= set(__import__("libs.engine.vendor_env", fromlist=["x"]).VENDOR_ENV_KNOBS)

@@ -70,6 +70,29 @@ def observe_exit_ip(conn_url: str, timeout: float = 8.0) -> str | None:
     return None
 
 
+def lookup_exit_country(conn_url: str, timeout: float = 8.0) -> str | None:
+    """The ISO country (UPPERCASE) of the exit this proxy is presenting, from a geolocation service
+    (ipwho.is, ipapi.co) -- NOT the portal. None when it could not be determined; callers must treat
+    None as "unknown", never as a country. Used when a credential does not name its country
+    (webshare / an unconstrained soax mint), so a registration can still record where it ran."""
+    try:
+        import primp
+    except ImportError:
+        return None
+    for url, keys in (("https://ipwho.is/json/", ("country_code",)), ("https://ipapi.co/json/", ("country_code", "country"))):
+        try:
+            c = primp.Client(proxy=conn_url, verify=False, follow_redirects=True, timeout=timeout,
+                             connect_timeout=timeout, read_timeout=timeout)
+            data = c.get(url, timeout=timeout).json()
+        except Exception:
+            continue
+        for k in keys:
+            cc = str((data or {}).get(k) or "").strip().upper()
+            if len(cc) == 2 and cc.isalpha():
+                return cc
+    return None
+
+
 def exit_changed(before: str | None, after: str | None) -> bool:
     """True only when BOTH addresses are known and they differ.
 
