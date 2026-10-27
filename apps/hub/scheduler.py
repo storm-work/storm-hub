@@ -311,6 +311,27 @@ class Scheduler:
 
     # ── F1: Redis state must not outlive the workers it belongs to ────────────
     _STREAM_SWEEP_EVERY = 300.0      # seconds; this is reconciliation, not a hot path
+    # A stream touched inside this window is never swept, whatever the worker table says. Registration
+    # runs (`reg-...`) have a command stream but NEVER a Worker row, so the sweep saw every one as an
+    # orphan: it deleted a run's `launch` between the Hub's XADD and the registrar's first read (a few
+    # seconds after spawn), and the registrar then waited forever on a command that no longer existed
+    # (2026-10-27, run reg-95d33f911358). Real orphans are by definition idle, so a recency guard costs
+    # only a slightly later cleanup.
+    _STREAM_SWEEP_MIN_IDLE = 600.0
+
+    def _stream_idle_s(self, key: str) -> float | None:
+        """Seconds since this stream was last read or written, or None when Redis cannot say (an
+        unknown age is treated as young by the caller: a leaked stream is cheap, a deleted launch
+        command is a stuck run)."""
+        try:
+            return float(self._bus.r.object("idletime", key))
+        except Exception:
+            pass
+        try:
+            ms = int(str(self._bus.r.xinfo_stream(key).get("last-generated-id", "0-0")).split("-")[0])
+            return max(0.0, time.time() - ms / 1000.0) if ms else None
+        except Exception:
+            return None
 
     def _sweep_orphan_streams(self, db, now: datetime) -> None:
         """Delete cmd:<worker_id> streams whose worker row no longer exists.
@@ -343,6 +364,9 @@ class Scheduler:
             for key in self._bus.r.scan_iter("cmd:*", count=500):
                 worker_id = key.split(":", 1)[1] if ":" in key else ""
                 if worker_id and worker_id not in live:
+                    idle = self._stream_idle_s(key)
+                    if idle is None or idle < self._STREAM_SWEEP_MIN_IDLE:
+                        continue            # young or unknowable: a registration run's launch lives here
                     self._bus.delete_worker_stream(worker_id)
                     removed += 1
             if removed:
