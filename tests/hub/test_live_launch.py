@@ -1152,3 +1152,82 @@ def test_the_bookings_named_pools_actually_constrain_the_launch_lease(client, mo
     leased = client.get(f"/proxies?limit=10", headers=h).json()
     held = [p for p in leased if p["endpoint"] == "10.0.0.2:8000"]
     assert held and held[0].get("pool_name") == "someone-elses"
+
+
+# ── ACCOUNT_GEO_PIN: a sub-account runs from the country its registration succeeded from ────────────
+def _set_registered_geo(client, identity_id, geo, fp="abc123"):
+    from libs.db import models as M
+    from sqlalchemy import select
+    db = client._Session()
+    try:
+        for sa in db.scalars(select(M.SubAccount).where(M.SubAccount.identity_id == identity_id)).all():
+            sa.registered_geo, sa.fingerprint_hash = geo, fp
+        db.commit()
+    finally:
+        db.close()
+
+
+def _geo_booking(client, h, name, settings=None):
+    tpl = client.post("/templates", json={"name": name, "role": "apply", "settings": {}}, headers=h).json()
+    iid = client.post("/identities", json={"full_name": name, "type": "real"}, headers=h).json()["id"]
+    _gen_verified_subs(client, h, iid)
+    bid = client.post("/bookings", json={
+        "name": name, "type": "real", "posto_id": "5084",
+        "settings": {"ENGINE_MODE": "live", "PROXY_PROVIDER": "soax", "PROXY_GEOS": "PT,IT", **(settings or {})}},
+        headers=h).json()["id"]
+    w = client.post(f"/bookings/{bid}/identities", json={"identity_id": iid, "template_id": tpl["id"]},
+                    headers=h).json()
+    return iid, bid, w
+
+
+def test_a_registered_account_launches_from_its_registration_country(client, monkeypatch):
+    h = _operate_headers(client)
+    iid, _bid, w = _geo_booking(client, h, "AcctGeo")
+    _set_registered_geo(client, iid, "DE")
+    captured = _spy_launch(monkeypatch)
+    assert client.post(f"/workers/{w['id']}/launch", headers=h).status_code == 200
+    assert "-country-de-" in captured["warm_proxy"], captured["warm_proxy"]
+    assert captured["proxy_geos"] == ["DE"], "the set is the account's country, not the booking's PT,IT"
+    assert captured["proxy_geo_operator_pinned"] is False
+    acct = captured["account"]
+    assert acct["registered_geo"] == "DE" and acct["fingerprint_hash"] == "abc123"
+    assert all(a["registered_geo"] == "DE" for a in captured["accounts"])
+
+
+def test_an_account_with_no_recorded_country_keeps_the_booking_geos(client, monkeypatch):
+    h = _operate_headers(client)
+    _iid, _bid, w = _geo_booking(client, h, "NoGeo")
+    captured = _spy_launch(monkeypatch)
+    assert client.post(f"/workers/{w['id']}/launch", headers=h).status_code == 200
+    assert captured["proxy_geos"] == ["IT", "PT"]
+    assert captured["account"]["registered_geo"] is None and captured["account"]["fingerprint_hash"] is None
+
+
+def test_the_operators_worker_pin_outranks_the_account_country(client, monkeypatch):
+    h = _operate_headers(client)
+    iid, _bid, w = _geo_booking(client, h, "OpPin")
+    _set_registered_geo(client, iid, "DE")
+    assert client.patch(f"/workers/{w['id']}/geo", json={"geo": "es"}, headers=h).status_code == 200
+    captured = _spy_launch(monkeypatch)
+    assert client.post(f"/workers/{w['id']}/launch", headers=h).status_code == 200
+    assert "-country-es-" in captured["warm_proxy"]
+    assert captured["proxy_geo_operator_pinned"] is True
+
+
+def test_account_geo_pin_can_be_switched_off_per_booking(client, monkeypatch):
+    h = _operate_headers(client)
+    iid, _bid, w = _geo_booking(client, h, "PinOff", {"ACCOUNT_GEO_PIN": False})
+    _set_registered_geo(client, iid, "DE")
+    captured = _spy_launch(monkeypatch)
+    assert client.post(f"/workers/{w['id']}/launch", headers=h).status_code == 200
+    assert captured["proxy_geos"] == ["IT", "PT"]
+
+
+def test_account_geo_pin_helper_ignores_junk():
+    import apps.hub.main as hub_main
+    from types import SimpleNamespace as NS
+    assert hub_main._account_geo_pin({}, NS(registered_geo="de")) == "DE"
+    assert hub_main._account_geo_pin({"ACCOUNT_GEO_PIN": False}, NS(registered_geo="DE")) is None
+    assert hub_main._account_geo_pin({}, NS(registered_geo=None)) is None
+    assert hub_main._account_geo_pin({}, NS(registered_geo="D3")) is None
+    assert hub_main._account_geo_pin({}, None) is None

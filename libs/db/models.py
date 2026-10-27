@@ -117,6 +117,16 @@ class SubAccount(Base, PKMixin, TimestampMixin):
     )
     last_login_ok_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     notes: Mapped[str | None] = mapped_column(Text)
+    # Where this account was last REGISTERED successfully (written from the registrar's result): the
+    # browser backend, the Donut profile it ran on (derived from the username, stored so a profile
+    # deleted behind our back is visible), a hash of the device it presented, and the exit country.
+    # Booking pins the account to that country (ACCOUNT_GEO_PIN) and compares the device hash at login.
+    # NULL = registered before this was recorded; such accounts keep the booking's PROXY_GEOS behaviour.
+    browser_backend: Mapped[str | None] = mapped_column(String(16))
+    donut_profile: Mapped[str | None] = mapped_column(String(32))
+    fingerprint_hash: Mapped[str | None] = mapped_column(String(32))
+    registered_geo: Mapped[str | None] = mapped_column(String(2))
+    fingerprint_recorded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class IdentityAllocation(Base, PKMixin, TimestampMixin):

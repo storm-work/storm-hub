@@ -76,6 +76,20 @@ def _headless() -> bool:
     return os.environ.get("DONUT_HEADLESS", "1").strip() != "0"
 
 
+def _keep_state() -> bool:
+    """DONUT_PROFILE_KEEP_STATE: an account's profile keeps its cookies, storage and history between
+    sessions (Donut's clear_on_close off). The session clears the PORTAL's cookies on attach, so a stale
+    portal session can never leak into a fresh login -- everything else (e.g. reCAPTCHA's own cookies)
+    persists and ages with the account."""
+    return os.environ.get("DONUT_PROFILE_KEEP_STATE", "0").strip() == "1"
+
+
+def profile_name(fp_seed: str | None) -> str | None:
+    """The Donut profile a sub-account runs on (account scope), derived from its fp_seed -- the same
+    name _launch_once computes. None when there is no seed (a session-scope throwaway has no stable name)."""
+    return _PREFIX + hashlib.sha1(fp_seed.encode()).hexdigest()[:12] if fp_seed else None
+
+
 def _profile_os() -> str:
     return os.environ.get("DONUT_PROFILE_OS", "").strip().lower() or "windows"
 
@@ -211,7 +225,7 @@ def _ensure_profile(api: _Api, name: str, proxy_id: str | None, scope: str) -> s
         if pid:
             try:
                 api.call("PUT", f"/v1/profiles/{pid}",
-                         {"proxy_id": proxy_id or "", "clear_on_close": True})
+                         {"proxy_id": proxy_id or "", "clear_on_close": not _keep_state()})
                 return pid
             except DonutError:
                 with _cache_lock:
@@ -225,8 +239,9 @@ def _ensure_profile(api: _Api, name: str, proxy_id: str | None, scope: str) -> s
         raise DonutError("Donut POST /v1/profiles returned no id")
     if scope == "account":
         # The cookie jar must not outlive the session -- every session starts from an empty jar, as
-        # a fresh Chromium context does. Engine and fingerprint OS are fixed at creation.
-        api.call("PUT", f"/v1/profiles/{pid}", {"clear_on_close": True})
+        # a fresh Chromium context does (unless DONUT_PROFILE_KEEP_STATE, which keeps the profile's
+        # state and has the session clear only the portal's cookies on attach). Engine and fingerprint OS are fixed at creation.
+        api.call("PUT", f"/v1/profiles/{pid}", {"clear_on_close": not _keep_state()})
         with _cache_lock:
             _profile_ids[name] = pid
     return pid
@@ -256,7 +271,7 @@ def _launch_once(proxy_url: str | None, fp_seed: str | None) -> Lease:
     api = _Api()
     scope = _scope() if fp_seed else "session"
     if scope == "account":
-        name = _PREFIX + hashlib.sha1(fp_seed.encode()).hexdigest()[:12]
+        name = profile_name(fp_seed)
     else:
         name = f"{_PREFIX}tmp-{uuid.uuid4().hex[:12]}"
     proxy_id = _ensure_proxy(api, name, proxy_url, reuse=scope == "account")

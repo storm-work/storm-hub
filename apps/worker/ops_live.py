@@ -636,6 +636,7 @@ class LiveEngineOps(EngineOps):
         schedule_capsolver_keys: list[str] | None = None,
         schedule_anticaptcha_keys: list[str] | None = None,
         proxy_geos: list[str] | None = None,
+        proxy_geo_operator_pinned: bool = False,
         headless: bool = True,
         sub_account_id: str,
         accounts: list[dict] | None = None,
@@ -675,6 +676,10 @@ class LiveEngineOps(EngineOps):
         # one possibly-throttled geo for the whole run (2026-10-01). {pin} if the operator pinned a
         # single geo, else the booking's whole PROXY_GEOS set; None/empty = no geo constraint.
         self._proxy_geos = [g.strip().upper() for g in (proxy_geos or []) if g and g.strip()]
+        # True when the OPERATOR pinned this worker to one country (per-worker geo endpoint). That pin
+        # outranks the per-account country (ACCOUNT_GEO_PIN), exactly as it outranks PROXY_GEOS.
+        self._geo_operator_pinned = bool(proxy_geo_operator_pinned)
+        self._geo_pin_warned: set = set()
         # phase-2 (hold/apply/discovery) proxy -- only used when HOLD_SWAP_AFTER_LOGIN is on
         # (do_swap() below). None is the correct/expected value when swap is off; the Hub only
         # leases and passes this when the setting is actually enabled (apps/hub/main.py).
@@ -1016,6 +1021,73 @@ class LiveEngineOps(EngineOps):
             return "none"
         return f"{self._anchor_src}/{age:.0f}s" if age is not None else f"{self._anchor_src}/age-unknown"
 
+    def _account_geo(self, account: dict | None = None) -> str | None:
+        """The exit country `account` (default: the current one) is pinned to -- where its registration
+        last succeeded (ACCOUNT_GEO_PIN) -- or None: pinning off, no recorded country (an account
+        registered before it was recorded), or the operator pinned this worker to a country, which wins."""
+        if getattr(self, "_geo_operator_pinned", False):
+            return None
+        raw = getattr(getattr(self, "cfg", None), "raw", None) or {}
+        if not raw.get("ACCOUNT_GEO_PIN", True):
+            return None
+        acct = account if account is not None else (getattr(self, "account", None) or {})
+        cc = str(acct.get("registered_geo") or "").strip().upper()
+        return cc if len(cc) == 2 and cc.isalpha() else None
+
+    def _pin_exit_to_account(self) -> None:
+        """Before a session opens for the CURRENT account: put the exit in that account's country.
+
+        A rotating credential names its country, so it is reseated onto a FRESH sticky session (never a
+        country change mid-session -- that reads as an exit move). A static/ISP exit is a leased IP whose
+        country cannot be rewritten here; that case is logged once, not silently ignored."""
+        geo = self._account_geo()
+        if not geo or not self.warm_proxy:
+            return
+        try:
+            from libs.proxies.lease import roll_sticky_session
+            from libs.proxies.rotating import pin_geo, url_country
+        except Exception:
+            return
+        cur = url_country(self.warm_proxy)
+        if cur == geo:
+            return
+        moved = pin_geo(self.warm_proxy, geo)
+        if moved != self.warm_proxy:
+            self.warm_proxy = roll_sticky_session(moved)
+            self._exit_ip = None
+            self._portal_down_since = None
+            self._log(f"proxy: exit pinned to {geo} for account {self.account.get('username')} "
+                      f"(registered from there; was {cur or 'unconstrained'}) [{_proxy_label(self.warm_proxy)}]")
+            return
+        key = (self.account.get("username"), geo)
+        if key not in self._geo_pin_warned:
+            self._geo_pin_warned.add(key)
+            self._log(f"proxy: account {self.account.get('username')} is pinned to {geo} but this exit "
+                      f"is {cur or 'of unknown country'} and cannot be reseated (static exit or an "
+                      f"unsupported provider) -- continuing on it")
+
+    def _check_fingerprint_drift(self) -> None:
+        """After a session attaches for the CURRENT account: is this the device it registered from?
+        Warn-only -- a drift (profile deleted in the Donut panel, backend switched, OS changed) is made
+        visible, never a reason to refuse a login. One evaluate; silent when nothing was recorded."""
+        want = (getattr(self, "account", None) or {}).get("fingerprint_hash")
+        if not want or self.session is None or not hasattr(self.session, "identity_fingerprint"):
+            return
+        try:
+            got = (self.session.identity_fingerprint() or {}).get("hash")
+        except Exception:
+            return
+        if not got:
+            return
+        user = self.account.get("username")
+        if got == want:
+            self._log(f"device: {user} presents the fingerprint it registered with ({got})")
+            return
+        self._log(f"device: DRIFT for {user} -- registered as {want}, presenting {got} "
+                  f"(profile recreated, backend or OS setting changed?)")
+        if self._emit is not None:
+            self._emit("fingerprint_drift", username=user, expected=want, got=got)
+
     def _roll_exit(self, why: str) -> bool:
         """Move THIS worker onto a fresh sticky exit without asking the Hub for another lease.
 
@@ -1041,7 +1113,14 @@ class LiveEngineOps(EngineOps):
         # to also change the exit COUNTRY (no mid-session geo change that would trip a 'confirma o
         # reCAPTCHA' exit-moved verdict). Pick a fresh random country from the booking's set so the
         # worker samples all allowed geos over its retries instead of dying on one throttled country.
-        if self._proxy_geos:
+        _pinned = self._account_geo()
+        if _pinned:
+            try:
+                from libs.proxies.rotating import pin_geo
+                rolled = pin_geo(rolled, _pinned)       # the account's registration country, every roll
+            except Exception:
+                pass
+        elif self._proxy_geos:
             try:
                 from libs.proxies.rotating import reseat_geo
                 rolled = reseat_geo(rolled, random.choice(self._proxy_geos))
@@ -1630,9 +1709,11 @@ class LiveEngineOps(EngineOps):
                 except Exception:
                     pass   # pool is an optimisation; a failure must never block a login
                 self._close_session_quietly()
+                self._pin_exit_to_account()    # this account's registration country (ACCOUNT_GEO_PIN)
                 self.session = get_session(proxy=self.warm_proxy, headless=self.headless,
                                            fp_seed=self.account.get("username"))
                 self._browser_closed = False   # fresh live browser (Phase C invariant)
+                self._check_fingerprint_drift()
                 # Baseline the exit before the CAPTCHA is solved, so a rejection can be attributed
                 # (or not) to the address moving underneath the solve.
                 self._note_exit_ip("before login attempt")
@@ -1997,7 +2078,8 @@ class LiveEngineOps(EngineOps):
         if self._emit is None or self._signals is None or not hasattr(self._signals, "wait_proxy"):
             return None
         resolved_phase = phase or self._current_phase
-        self._emit("proxy_request", phase=resolved_phase)
+        _pin = self._account_geo()
+        self._emit("proxy_request", phase=resolved_phase, **({"geo": _pin} if _pin else {}))
         result = self._signals.wait_proxy(timeout=30)
         if not isinstance(result, dict) or not result.get("ok"):
             # Phase 5 (Phase-4-identified gap): this reason used to be generated by the Hub and then

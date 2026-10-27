@@ -2615,6 +2615,13 @@ def run_registration(body: RegistrationRunRequest, db: Session = Depends(get_db)
             "traveldoc": (ident.passport_no if ident else None) or "",
         })
 
+    # The vendored engine reads its browser settings (BROWSER_BACKEND, DONUT_*, STEALTH, ...) from the
+    # environment of the process that imports it. A worker gets them in its launch payload; the
+    # registrar never did, so a global BROWSER_BACKEND=donut was silently ignored by registration --
+    # accounts were registered from a different device than the one they would later book from.
+    _eff = resolve({L.GLOBAL: g})
+    vendor_settings = {k: _eff[k] for k in vendor_env.VENDOR_ENV_KNOBS if k in _eff}
+
     run_id = f"reg-{uuid.uuid4().hex[:12]}"
     supervisor.spawn_registrar(run_id)
     _bus.ensure_command_group(run_id)
@@ -2624,7 +2631,7 @@ def run_registration(body: RegistrationRunRequest, db: Session = Depends(get_db)
         lang="PT", email_provider=email_provider,
         email_cfg=email_cfg, concurrency=body.concurrency,
         browser_concurrency=body.browser_concurrency or body.concurrency,
-        captcha_solve_proxy=captcha_solve_proxy,
+        captcha_solve_proxy=captcha_solve_proxy, vendor_settings=vendor_settings,
     )
     return {"run_id": run_id, "queued": len(accounts)}
 
@@ -3364,6 +3371,10 @@ def _live_account(identity: M.Identity, sub_account: M.SubAccount) -> dict:
         "birthdate": identity.birthdate or "",
         "gender_expanded": "MALE" if gender_raw in ("M", "MALE") else "FEMALE",
         "traveldoc": identity.passport_no or "",
+        # Where this account's registration last succeeded (None = not recorded). The worker pins the
+        # exit country to it (ACCOUNT_GEO_PIN) and compares the device hash after attach.
+        "registered_geo": sub_account.registered_geo or None,
+        "fingerprint_hash": sub_account.fingerprint_hash or None,
     }
 
 
@@ -3489,6 +3500,17 @@ def _pick_geo(geos: set[str] | None) -> str | None:
     return random.choice(sorted(geos)) if geos else None
 
 
+def _account_geo_pin(eff: dict, sub_account) -> str | None:
+    """The exit country a sub-account is pinned to (ACCOUNT_GEO_PIN): where its registration last
+    succeeded. None when pinning is off or the account has no recorded country (registered before it was
+    recorded) -- those keep the booking's PROXY_GEOS behaviour. The operator's per-worker pin is applied
+    by the caller and always wins."""
+    if sub_account is None or not eff.get("ACCOUNT_GEO_PIN", True):
+        return None
+    cc = str(getattr(sub_account, "registered_geo", None) or "").strip().upper()
+    return cc if len(cc) == 2 and cc.isalpha() else None
+
+
 def _resolve_and_freeze_worker_geo(db: Session, w: M.Worker, allowed: set[str] | None) -> str | None:
     """The exit country to PIN this worker to, or None to let it vary across the booking's geo set.
 
@@ -3594,7 +3616,11 @@ def _do_launch_worker(db: Session, w: M.Worker) -> None:
         # the choice is durable. Empty set -> None -> no geo restriction (unchanged). The worker
         # self-rolls without changing the country segment, so this holds across every exit rotation.
         _bound_geo = _resolve_and_freeze_worker_geo(db, w, _geos(eff.get("PROXY_GEOS")))
-        _geo_set = {_bound_geo} if _bound_geo else _geos(eff.get("PROXY_GEOS"))
+        _acct_geo = None if _bound_geo else _account_geo_pin(eff, sub_account)
+        if _acct_geo:
+            logger.info("worker %s: exit country pinned to %s (sub-account %s registered from there)",
+                        w.id, _acct_geo, sub_account.username)
+        _geo_set = {_bound_geo} if _bound_geo else ({_acct_geo} if _acct_geo else _geos(eff.get("PROXY_GEOS")))
         # The geo set the ROTATING worker varies across on each exit roll ({pin} if pinned, else the
         # whole PROXY_GEOS set). None for static/ISP (those IPs don't roll geo). Set in the rotating
         # branch below; reseat_geo no-ops on a non-soax URL so it is harmless even if it leaks.
@@ -3755,6 +3781,7 @@ def _do_launch_worker(db: Session, w: M.Worker) -> None:
             schedule_anticaptcha_keys=schedule_anticaptcha_keys,
             warm_proxy=warm_proxy,
             proxy_geos=_worker_proxy_geos,   # rotating: the geo set the worker varies across per roll
+            proxy_geo_operator_pinned=bool(_bound_geo),   # the operator's per-worker pin outranks the account's
             hold_proxy=hold_proxy,
             # Phase 5: a hold_proxy is only ever leased inside the HOLD_SWAP_AFTER_LOGIN branch above,
             # and (as of this phase) is now always resource_type='static' when it is. Carrying this

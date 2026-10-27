@@ -723,3 +723,58 @@ def test_a_booked_slot_still_becomes_taken_once_capacity_is_exhausted(client, tm
             "cap=1 and 1/1 capacity used -- the slot must still transition to TAKEN")
     finally:
         db.close()
+
+
+def _geo_rotation_reply(client, geo, pin_setting=True, booking_geos="DE,IT"):
+    """A static rotation request where the worker names `geo` (its current sub-account's country).
+    One proxy per country, so the reply says exactly which country the Hub drew from."""
+    c, TestSession = client
+    h = _op_headers(c)
+    iid = c.post("/identities", json={"full_name": "X", "type": "test"}, headers=h).json()["id"]
+    bid = c.post("/bookings", json={"name": "b", "type": "test", "posto_id": "2032"}, headers=h).json()["id"]
+    wid = c.post(f"/bookings/{bid}/identities",
+                 json={"identity_id": iid, "assigned_role": "apply"}, headers=h).json()["id"]
+    from libs.db import models as M
+    db = TestSession()
+    try:
+        bk = db.get(M.Booking, bid)
+        bk.settings_json = {**bk.settings_json, "PROXY_PROVIDER": "soax", "PROXY_KIND": "isp",
+                            "PROXY_GEOS": booking_geos, "ACCOUNT_GEO_PIN": pin_setting}
+        for pid, ep, g in (("px-de", "h:1", "DE"), ("px-it", "h:2", "IT")):
+            db.add(M.Proxy(id=pid, provider="soax", kind="isp", endpoint=ep, credentials_ref="u:p",
+                           max_sessions=5, resource_type="static", geo=g))
+        db.commit()
+    finally:
+        db.close()
+
+    class _FakeBus:
+        def __init__(self):
+            self.sent = []
+
+        def send_command(self, worker_id, type, **payload):
+            self.sent.append((worker_id, type, payload))
+
+    import apps.hub.db as hub_db
+    import apps.hub.events as events_mod
+    orig = hub_db.SessionLocal
+    hub_db.SessionLocal = TestSession
+    events_mod.SessionLocal = TestSession
+    bus = _FakeBus()
+    try:
+        hub = events_mod.EventHub.__new__(events_mod.EventHub)
+        hub._handle_proxy_request(wid, "warmup", bus, health_check=lambda url: (True, "ok"), geo=geo)
+    finally:
+        hub_db.SessionLocal = orig
+        events_mod.SessionLocal = orig
+    return bus.sent[0][1], bus.sent[0][2]
+
+
+def test_a_rotation_request_that_names_the_accounts_country_stays_inside_it(client):
+    typ, payload = _geo_rotation_reply(client, "IT", booking_geos="DE")    # booking alone would say DE
+    assert typ == "proxy_assigned" and payload["proxy"].endswith("h:2"), \
+        "the account's country (IT) must outrank the booking's PROXY_GEOS (DE)"
+
+
+def test_the_account_country_in_a_rotation_request_is_ignored_when_pinning_is_off(client):
+    typ, payload = _geo_rotation_reply(client, "IT", pin_setting=False, booking_geos="DE")
+    assert typ == "proxy_assigned" and payload["proxy"].endswith("h:1"), "pinning off: the booking's DE stands"

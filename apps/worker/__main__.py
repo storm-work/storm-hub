@@ -123,6 +123,7 @@ def _build_ops(engine_kind: str, cfg: EngineConfig, payload: dict, bus: Bus, wor
             schedule_anticaptcha_keys=payload.get("schedule_anticaptcha_keys"),
             warm_proxy=payload["warm_proxy"],
             proxy_geos=payload.get("proxy_geos"),
+            proxy_geo_operator_pinned=bool(payload.get("proxy_geo_operator_pinned", False)),
             hold_proxy=payload.get("hold_proxy"),
             hold_proxy_static=bool(payload.get("hold_proxy_static", False)),
             sub_account_id=payload["sub_account_id"],

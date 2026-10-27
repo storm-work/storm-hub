@@ -6321,3 +6321,164 @@ def test_account_rest_does_not_count_the_maintenance_page(monkeypatch):
 
 def test_account_rest_does_not_count_an_empty_answer(monkeypatch):
     assert _shots_after(monkeypatch, {"status": 200, "body": ""}) == 0
+
+
+# ── ACCOUNT_GEO_PIN + device drift: a sub-account runs from where it registered ─────────────────────
+_SOAX_PT = "http://package-352438-country-pt-sessionid-abc123def456ghij-sessionlength-3600:pw@proxy.soax.com:5000"
+_STATIC = "http://user:pw@203.0.113.7:8080"
+
+
+def _pin_ops(proxy=_SOAX_PT, geo="DE", fp="want123", operator_pinned=False, **settings):
+    ops = _make_ops(cfg=_cfg(**settings), warm_proxy=proxy,
+                    account={"username": "alice", "password": "p", "registered_geo": geo,
+                             "fingerprint_hash": fp},
+                    proxy_geo_operator_pinned=operator_pinned, proxy_geos=["PT", "IT"])
+    ops.logs = []
+    ops._log = lambda msg, *a, **k: ops.logs.append(msg)
+    return ops
+
+
+def test_account_geo_is_the_recorded_registration_country():
+    assert _pin_ops(geo="de")._account_geo() == "DE"
+    assert _pin_ops(geo=None)._account_geo() is None
+    assert _pin_ops(geo="D3")._account_geo() is None
+    assert _pin_ops(geo="DE", operator_pinned=True)._account_geo() is None, "the operator's pin outranks it"
+
+
+def test_account_geo_pin_can_be_switched_off():
+    ops = _make_ops(cfg=_cfg(), account={"username": "a", "password": "p", "registered_geo": "DE"})
+    ops.cfg.raw["ACCOUNT_GEO_PIN"] = False
+    assert ops._account_geo() is None
+
+
+def test_pin_reseats_a_rotating_exit_onto_a_fresh_session_in_the_account_country():
+    from libs.proxies.rotating import rotating_session_id, url_country
+    ops = _pin_ops(geo="DE")
+    before = ops.warm_proxy
+    ops._pin_exit_to_account()
+    assert url_country(ops.warm_proxy) == "DE"
+    assert rotating_session_id(ops.warm_proxy) != rotating_session_id(before), \
+        "a country change must start a FRESH sticky session, never move one mid-session"
+    assert any("exit pinned to DE" in m for m in ops.logs)
+
+
+def test_pin_is_a_noop_when_the_exit_is_already_in_the_country():
+    ops = _pin_ops(geo="PT")
+    before = ops.warm_proxy
+    ops._pin_exit_to_account()
+    assert ops.warm_proxy == before and not ops.logs
+
+
+def test_pin_on_a_static_exit_is_reported_once_and_changes_nothing():
+    ops = _pin_ops(proxy=_STATIC, geo="DE")
+    ops._pin_exit_to_account()
+    ops._pin_exit_to_account()
+    assert ops.warm_proxy == _STATIC
+    assert len([m for m in ops.logs if "cannot be reseated" in m]) == 1
+
+
+def test_a_roll_stays_in_the_accounts_country_not_the_bookings_set():
+    from libs.proxies.rotating import url_country
+    ops = _pin_ops(geo="DE")
+    ops._pin_exit_to_account()
+    for _ in range(8):                                   # booking set is PT,IT -- must never be drawn
+        assert ops._roll_exit("test")
+        assert url_country(ops.warm_proxy) == "DE"
+
+
+def test_an_account_with_no_recorded_country_still_varies_across_the_booking_geos():
+    from libs.proxies.rotating import url_country
+    ops = _pin_ops(geo=None)
+    seen = set()
+    for _ in range(40):
+        ops._roll_exit("test")
+        seen.add(url_country(ops.warm_proxy))
+    assert seen == {"PT", "IT"}
+
+
+class _DeviceSession(_FakeSession):
+    def __init__(self, fp_hash="want123"):
+        super().__init__()
+        self._fp = fp_hash
+
+    def identity_fingerprint(self):
+        return {"hash": self._fp} if self._fp else None
+
+
+def _login_once(monkeypatch, ops, session):
+    import apps.worker.ops_live as ops_live_mod
+    opened = []
+
+    def _get_session(**kw):
+        opened.append(kw)
+        return session
+
+    monkeypatch.setattr(ops_live_mod, "get_session", _get_session)
+    ops._backoff = lambda n: None
+    ops._backoff_seconds = lambda s: None
+    ops._request_proxy_rotation = lambda phase=None: None
+    ops._liveness = _RecordingLiveness()
+    ops._verify_logged_in = lambda: "logged_in"
+    ops._emit = lambda type, **kw: ops.events.append((type, kw))
+    ops.events = []
+    session.browser_login = lambda *a, **k: {"status": 200, "body": '{"type":"success"}'}
+    ops._sticky_login_attempts(1)
+    return opened
+
+
+def test_the_login_loop_opens_the_browser_in_the_accounts_country(monkeypatch):
+    from libs.proxies.rotating import url_country
+    ops = _pin_ops(geo="DE", STICKY_RETRY_MAX=1, LOGIN_ACCOUNT_HOURLY_CAP=50)
+    opened = _login_once(monkeypatch, ops, _DeviceSession())
+    assert url_country(opened[0]["proxy"]) == "DE", "the pin must be applied BEFORE the session is opened"
+    assert opened[0]["fp_seed"] == "alice"
+
+
+def test_a_matching_device_is_logged_and_no_drift_event_is_emitted(monkeypatch):
+    ops = _pin_ops(STICKY_RETRY_MAX=1, LOGIN_ACCOUNT_HOURLY_CAP=50)
+    _login_once(monkeypatch, ops, _DeviceSession("want123"))
+    assert any("presents the fingerprint it registered with" in m for m in ops.logs)
+    assert not [e for e in ops.events if e[0] == "fingerprint_drift"]
+
+
+def test_a_changed_device_emits_a_drift_event_but_the_login_proceeds(monkeypatch):
+    ops = _pin_ops(STICKY_RETRY_MAX=1, LOGIN_ACCOUNT_HOURLY_CAP=50)
+    _login_once(monkeypatch, ops, _DeviceSession("other999"))
+    drift = [e for e in ops.events if e[0] == "fingerprint_drift"]
+    assert drift and drift[0][1] == {"username": "alice", "expected": "want123", "got": "other999"}
+    assert any("DRIFT" in m for m in ops.logs)
+
+
+def test_no_recorded_device_means_no_check_and_no_noise(monkeypatch):
+    ops = _pin_ops(fp=None, STICKY_RETRY_MAX=1, LOGIN_ACCOUNT_HOURLY_CAP=50)
+    session = _DeviceSession("anything")
+    called = []
+    session.identity_fingerprint = lambda: called.append(1) or {"hash": "x"}
+    _login_once(monkeypatch, ops, session)
+    assert not called and not ops.events
+
+
+def test_an_unreadable_device_is_never_a_reason_to_fail_a_login(monkeypatch):
+    ops = _pin_ops(STICKY_RETRY_MAX=1, LOGIN_ACCOUNT_HOURLY_CAP=50)
+    session = _DeviceSession()
+
+    def _boom():
+        raise RuntimeError("page gone")
+    session.identity_fingerprint = _boom
+    _login_once(monkeypatch, ops, session)
+    assert not [e for e in ops.events if e[0] == "fingerprint_drift"]
+
+
+def test_a_hub_rotation_request_names_the_accounts_country():
+    ops = _pin_ops(proxy=_STATIC, geo="IT")
+    sent = []
+    ops._emit = lambda type, **kw: sent.append((type, kw))
+    ops._signals = type("S", (), {"wait_proxy": lambda self, timeout=30: {"ok": True, "proxy": "http://n"}})()
+    ops._request_proxy_rotation("warmup")
+    assert sent == [("proxy_request", {"phase": "warmup", "geo": "IT"})]
+    pinned_off = _pin_ops(proxy=_STATIC, geo=None)
+    sent2 = []
+    pinned_off._emit = lambda type, **kw: sent2.append((type, kw))
+    pinned_off._signals = ops._signals
+    pinned_off._request_proxy_rotation("warmup")
+    assert sent2 == [("proxy_request", {"phase": "warmup"})], "no geo key at all when there is no pin"

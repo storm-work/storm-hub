@@ -33,6 +33,7 @@ import random
 import threading
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 import donut as _donut
 
@@ -1428,6 +1429,14 @@ class PlaywrightSession:
         # No engine fingerprint in this mode (Wayfern's is the only one), so SAVE_STATE writes no
         # companion fingerprint profile and a restore cannot force one onto the profile.
         self._fp = None
+        if _donut._keep_state():
+            # A kept profile carries last session's cookies. The portal's must not survive into a fresh
+            # login (a stale Vistos_sid / cookiesession1 is exactly the state a new login must not see);
+            # everything else the profile accumulated stays.
+            try:
+                ctx.clear_cookies(domain=urlparse(BASE).hostname or "")
+            except Exception as _ke:
+                print(f"[session] kept-profile portal-cookie clear failed: {_ke}")
         if self._storage_state:
             # A Donut profile's context already exists, so storage_state cannot be passed at
             # creation; the jar is what a restore needs (the portal keeps no state in localStorage).
@@ -1450,6 +1459,30 @@ class PlaywrightSession:
             print(f"[session] donut fingerprint: {fp}")
         except Exception as _fe:
             print(f"[session] donut fingerprint read failed: {_fe}")
+
+    _FP_ID_JS = """() => { let gl = '';
+        try { const c = document.createElement('canvas'); const g = c.getContext('webgl');
+              const e = g && g.getExtension('WEBGL_debug_renderer_info');
+              gl = e ? g.getParameter(e.UNMASKED_RENDERER_WEBGL) : ''; } catch (_) {}
+        return {ua: navigator.userAgent, platform: navigator.platform, webgl: gl,
+                screen: screen.width + 'x' + screen.height, cores: navigator.hardwareConcurrency,
+                mem: navigator.deviceMemory || 0, langs: (navigator.languages || []).join(',')}; }"""
+
+    def identity_fingerprint(self) -> dict | None:
+        """The device this session presents, as {hash, ...fields}: what registration records for a
+        sub-account and a later login compares against, so "same device" is a fact, not an assumption.
+        Exit-dependent fields (timezone, locale-by-geo) are deliberately NOT in the hash. One evaluate;
+        None on any failure -- it must never be the reason a session fails."""
+        try:
+            fp = self.browser_eval(self._FP_ID_JS, timeout=20)
+            if not isinstance(fp, dict) or not fp.get("ua"):
+                return None
+            key = _json.dumps({k: fp.get(k) for k in sorted(fp)}, sort_keys=True)
+            fp["hash"] = hashlib.sha1(key.encode()).hexdigest()[:16]
+            return fp
+        except Exception as _fe:
+            print(f"[session] identity fingerprint read failed: {_fe}")
+            return None
 
     def _take_screenshot(self, page, username: str, stage: str) -> None:
         """Save a screenshot from within the browser worker thread (no queue)."""

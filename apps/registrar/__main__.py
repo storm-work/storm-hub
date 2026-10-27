@@ -102,6 +102,34 @@ def _portal_origin_live(s) -> bool:
     return str(st.get("o") or "") == PORTAL_ORIGIN and str(st.get("h") or "").startswith(BASE)
 
 
+async def _record_device(loop, executor, session, proxy: str | None, username: str) -> dict:
+    """{browser_backend, donut_profile, fingerprint_hash, registered_geo} for a registration that just
+    succeeded -- every key present only when it could be determined. The country comes from the
+    credential when it names one, else from a geolocation lookup through the same exit (not the portal)."""
+    import donut as _donut
+
+    from libs.proxies.exit_ip import lookup_exit_country
+    from libs.proxies.rotating import url_country
+
+    out: dict = {}
+    try:
+        backend = "donut" if _donut.enabled() else "chromium"
+        out["browser_backend"] = backend
+        if backend == "donut" and _donut._scope() == "account":
+            out["donut_profile"] = _donut.profile_name(username)
+        fp = await loop.run_in_executor(executor, session.identity_fingerprint)
+        if fp and fp.get("hash"):
+            out["fingerprint_hash"] = fp["hash"]
+        cc = url_country(proxy)
+        if not cc and proxy:
+            cc = await loop.run_in_executor(executor, lookup_exit_country, proxy)
+        if cc:
+            out["registered_geo"] = cc
+    except Exception:
+        pass            # a missing device record costs nothing now; a failed registration costs an account
+    return out
+
+
 async def _register_one(acct: dict, proxies_cycle, capsolver_keys: list[str], lang: str,
                         email_provider: str, email_cfg: dict, executor: ThreadPoolExecutor,
                         bus: Bus, run_id: str, browser_sem: asyncio.Semaphore,
@@ -148,6 +176,7 @@ async def _register_one(acct: dict, proxies_cycle, capsolver_keys: list[str], la
     saved_cookies_full: list = []
     reg_token_raw = ""
     proxy_success = False
+    reg_device: dict = {}
     reg_result_detail = ""
     recaptcha_fails = 0        # reCAPTCHA REJECTIONS so far -- capped at RECAPTCHA_FAIL_BUDGET
 
@@ -158,7 +187,8 @@ async def _register_one(acct: dict, proxies_cycle, capsolver_keys: list[str], la
         async with browser_sem:
             progress(f"loading registration page (attempt {attempt + 1}/{MAX_PROXY_RETRIES})")
             try:
-                s = await loop.run_in_executor(executor, lambda p=proxy: get_session(p, headless=True))
+                s = await loop.run_in_executor(
+                    executor, lambda p=proxy: get_session(p, headless=True, fp_seed=username))
             except Exception as e:
                 progress(f"FAIL get_session ({proxy}): {e}")
                 continue
@@ -279,6 +309,10 @@ async def _register_one(acct: dict, proxies_cycle, capsolver_keys: list[str], la
                     saved_cookies_full = s.get_all_cookies()
                 except Exception:
                     saved_cookies_full = []
+                # Where this account was registered FROM: the device the session presented and the exit
+                # country. Booking pins the account to that country and checks the device hash at login.
+                # Read while the session is still open; never a reason to fail a registration.
+                reg_device = await _record_device(loop, executor, s, proxy, username)
                 try: s.close()
                 except Exception: pass
                 proxy_success = True
@@ -344,7 +378,7 @@ async def _register_one(acct: dict, proxies_cycle, capsolver_keys: list[str], la
     _solver_used = ("race" if (capsolver_keys and anticaptcha_keys)
                     else "anticaptcha" if anticaptcha_keys else "capsolver")
     result("registered", email=email_addr, email_pass=email_pass,
-           proxy_id=used_proxy_id, solver_used=_solver_used)
+           proxy_id=used_proxy_id, solver_used=_solver_used, **reg_device)
 
     # ── poll inbox, then verify ──────────────────────────────────────────────
     # async_poll_for_tokens can legitimately run for up to EMAIL_POLL_TIMEOUT (240s) with nothing to
@@ -382,7 +416,8 @@ async def _register_one(acct: dict, proxies_cycle, capsolver_keys: list[str], la
             sv = None
             try:
                 def _open(p=verify_proxy, ck=cookies, ckf=cookies_full):
-                    return get_session(p, inject_cookies=ck, inject_cookies_full=ckf, headless=True)
+                    return get_session(p, inject_cookies=ck, inject_cookies_full=ckf, headless=True,
+                                       fp_seed=username)
                 sv = await loop.run_in_executor(executor, _open)
 
                 def _verify(sv=sv):
@@ -483,6 +518,14 @@ def main() -> int:
     if not accounts:
         bus.emit_event(run_id, "job_terminal", counts={})
         return 0
+
+    # Browser settings for the vendored engine (BROWSER_BACKEND, DONUT_*, ...), applied BEFORE the vendor
+    # is first imported (it reads them at import) -- _register_one imports it lazily for that reason.
+    vendor_settings = payload.get("vendor_settings") or {}
+    if vendor_settings:
+        from libs.engine import vendor_env
+        exported = vendor_env.apply(vendor_settings)
+        print(f"[registrar] vendor env applied: {exported}", flush=True)
 
     asyncio.run(_run_all(bus, run_id, accounts, proxies, capsolver_keys, lang,
                          email_provider, email_cfg, concurrency, browser_concurrency,

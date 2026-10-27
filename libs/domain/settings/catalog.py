@@ -262,6 +262,14 @@ _GLOBAL = [
        "cleared on close, and created once -- so it stays under Donut's hourly new-fingerprint limit. "
        "'session' = a throwaway profile per session (new device every time; every launch counts "
        "against that limit)."),
+    _s("DONUT_PROFILE_KEEP_STATE", L.GLOBAL, bool, False, _TPL, "browser",
+       note=
+       "BROWSER_BACKEND=donut, DONUT_PROFILE_SCOPE=account only. Off (default) = a profile's cookies are "
+       "cleared when it closes, so every session starts clean. On = the profile keeps its cookies, "
+       "storage and history between sessions (reCAPTCHA's own cookies age with the account); the "
+       "session still clears the PORTAL's cookies on attach, so a stale portal session never leaks "
+       "into a fresh login. Whether kept state helps the reCAPTCHA score is unmeasured -- opt in "
+       "deliberately. Persistent cookies and localStorage survive a restart; session-only cookies do not."),
     _s("DETERMINISTIC_FP", L.GLOBAL, bool, True, _TPL, "browser",
        note=
        "Derive a STABLE browser fingerprint per sub-account, so the same account presents the same "
@@ -467,6 +475,16 @@ _BOOKING = [
     # worker and have no rows to belong to a pool (D39/D40). Mirrors PROXY_GEOS/HOLD_PROXY_GEOS
     # deliberately -- same comma-separated shape, same blank-means-all rule, same per-phase pair --
     # so there is one filter idiom to learn rather than two.
+    _s("ACCOUNT_GEO_PIN", L.BOOKING, bool, True, _TPL, group="mode",
+       note=
+       "Pin each sub-account to the exit COUNTRY its registration succeeded from (recorded at "
+       "registration). A device that registered from DE and then logs in from CZ -- with a timezone and "
+       "locale that follow the exit -- is two stories for one account. Applies to accounts that HAVE a "
+       "recorded country; older accounts keep the booking's PROXY_GEOS behaviour. The operator's "
+       "per-worker geo pin still wins. Honoured on soax, capsolver and webshare rotating exits "
+       "(country reseated on each roll / account switch) and, for static pools, at launch and on "
+       "Hub rotation -- a static exit cannot change country when the worker switches to another "
+       "sub-account (logged). Off = ignore the recorded country. Template-overridable."),
     _s("PROXY_POOLS", L.BOOKING, str, "", _TPL, group="mode",
        note="Comma-separated NAMED ISP pools the phase-1 (login/warmup) static pool may draw from, "
             "e.g. 'thordata-oct,iproyal-a'. Blank = any pool. A booking may name several because one "
