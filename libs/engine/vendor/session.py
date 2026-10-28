@@ -2835,6 +2835,17 @@ class PlaywrightSession:
             _kill_proc_tree(self._driver_pid)
             _donut.release(self._donut_lease)
             print("[session] browser close hung — force-killed driver tree (primp session active)")
+        else:
+            # The ack goes out BEFORE the browser thread's teardown (browser.close, pw.stop, then the Donut
+            # release), so returning on it let a worker that was about to exit take the process down
+            # mid-teardown: the daemon thread died before stopping the Donut profile, which -- unlike a
+            # Chromium child -- is not our child and runs on. The three apply workers of "Test 2032 Donut"
+            # left three Wayfern profiles running for hours after they booked. Wait for the teardown,
+            # then make sure the profile is stopped whatever the thread managed (release is idempotent).
+            self._thread.join(timeout=15)
+            if self._thread.is_alive():
+                _kill_proc_tree(self._driver_pid)
+            _donut.release(self._donut_lease)
 
     def save_state(self, path) -> None:
         """Export cookies + localStorage to a JSON file via Playwright storage_state."""
