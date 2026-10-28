@@ -1012,7 +1012,8 @@ _TEMPLATE = [
        "auto abc5 showed re-warm is unreliable on a long-held session (852 'Session lost' in one "
        "run) and only a fresh login rebuilds the anchor. Raising this mostly buys failed re-warms."),
     # Keepalive
-    # 600, not 900. MEASURED 2026-08-20 across 28 keepalive cycles on booking "Test 3018": the
+    # 360 (+0..120 jitter = 6-8 min) since 2026-10-28, because the portal SESSION idles out at ~10.4 min
+    # and 600+30 sat on that line. History: 600, not 900. MEASURED 2026-08-20 across 28 keepalive cycles on booking "Test 3018": the
     # portal's scheduling form state dies on a 16.1-minute median clock (min 15.8, max 33.6). A
     # 900s interval left a 60-second margin against a 15.8-minute worst case -- and the re-warm
     # itself takes longer exactly when the portal is slow, so the margin closes from both ends.
@@ -1021,13 +1022,15 @@ _TEMPLATE = [
     # fired, and it spent the next eight minutes recovering while a worker whose form state happened
     # to be fresh booked in 47 seconds. 600s leaves ~6 minutes of headroom and costs one extra
     # lightweight probe per worker per hour.
-    _s("KEEPALIVE_INTERVAL", L.TEMPLATE, float, 600.0, _WRK, "keepalive", min_value=1.0,
+    _s("KEEPALIVE_INTERVAL", L.TEMPLATE, float, 360.0, _WRK, "keepalive", min_value=1.0,
        note=
-       "Seconds between keepalive probes on a holding worker. CONTESTED: the catalog rationale "
-       "measured form state dying on a 16.1-min median (2026-08-20, 28 cycles) while CONFIRMED_FACTS "
-       "§30 measured 4-6 min (2026-08-27). 600 is defensible under the first and too slow under the "
-       "second. LEAVE AT 600 until that is reconciled -- both bookings of 2026-08-27 booked at "
-       "exactly this value."),
+       "Seconds between keepalive probes on a holding worker; the actual wait is this plus a random "
+       "0..KEEPALIVE_JITTER (default 360 + 0..120 = every 6-8 minutes). Sized to the PORTAL SESSION's "
+       "idle timeout, which measured ~10.4 min (3 of 4 held sessions were found expired 10.3-10.5 min "
+       "after login, 2026-10-28; the old 600s + 30s landed right on that line, so sessions died "
+       "between probes). Must also stay under the proxy exit's idlettl. FORM STATE is a different, "
+       "shorter clock (CONTESTED: 16.1-min median on 2026-08-20 vs 4-6 min in CONFIRMED_FACTS §30) -- "
+       "KEEPALIVE_MODE=schedule caps the cadence under FORM_STATE_TTL itself."),
     # Discovery back-off on a BLOCKED gettime (the portal's "try again later" / WAF page, not an
     # empty calendar). MEASURED live 2026-08-27 on "Test 2032": one worker went `-> discovering`
     # twenty times in ~10 minutes, every one answered portal_try_again_later (28,499B), five workers
@@ -1133,8 +1136,10 @@ _TEMPLATE = [
        note=
        "Disable keepalive entirely. Diagnostic only: a holding worker then has NO portal traffic and "
        "its session can silently die without anyone noticing until the next real signal."),
-    _s("KEEPALIVE_JITTER", L.TEMPLATE, float, 30.0, _WRK, "keepalive",
-       note="anti-herd: randomize keepalive timing so many workers don't probe in the same instant"),
+    _s("KEEPALIVE_JITTER", L.TEMPLATE, float, 120.0, _WRK, "keepalive",
+       note="Random 0..N seconds ADDED to KEEPALIVE_INTERVAL on every wait (default 120: with the 360s "
+            "interval, probes land every 6-8 minutes). Anti-herd -- many workers must not probe in the "
+            "same instant -- and it keeps the cadence from being an exact grid."),
     _s("CHECKPOINT_RESTORE_BUDGET", L.TEMPLATE, float, 90.0, _WRK, "keepalive",
        note="wall-clock seconds the checkpoint restore chain (rebuild -> health probe -> re-warm) "
             "may spend before abandoning and going straight to a full login. Every tier is a real "

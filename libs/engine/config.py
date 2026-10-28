@@ -132,7 +132,7 @@ class EngineConfig:
                 partial_render_retries=int(g("PARTIAL_RENDER_RETRIES", 3)),
             ),
             keepalive=KeepaliveConfig(
-                interval=float(g("KEEPALIVE_INTERVAL", 900.0)),
+                interval=float(g("KEEPALIVE_INTERVAL", 360.0)),
                 decay_min=float(g("KEEPALIVE_DECAY_MIN", 30.0)),
                 decay_max=float(g("KEEPALIVE_DECAY_MAX", 60.0)),
                 no_restore=bool(g("KEEPALIVE_NO_RESTORE", False)),
@@ -141,7 +141,7 @@ class EngineConfig:
                 off=bool(g("KEEPALIVE_OFF", False)),
                 dead_trip=int(g("KEEPALIVE_DEAD_TRIP", 3)),
                 probe=str(g("KEEPALIVE_PROBE", "home") or "home"),
-                jitter=float(g("KEEPALIVE_JITTER", 30.0)),
+                jitter=float(g("KEEPALIVE_JITTER", 120.0)),
                 mode=str(g("KEEPALIVE_MODE", "schedule") or "schedule").strip().lower(),
             ),
             hold_swap=HoldSwapConfig(

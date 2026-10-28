@@ -90,9 +90,20 @@ _SLOTS_PATH_MARK = "/slots"
 # limit comes back as application/json, and a real array arrives with no content-type at all.
 SLOTS_OK = "ok"
 SLOTS_RATE_LIMITED = "rate_limited"    # token refused; wait, do NOT touch the session
-SLOTS_SESSION_BURNED = "session_burned"  # 200 + {"data":{}}; only a fresh LOGIN clears it
+SLOTS_SESSION_BURNED = "session_burned"  # an unrecognised {"data":...} wrapper, or a stub streak; a fresh LOGIN clears it
+SLOTS_TOKEN_REJECTED = "token_rejected"  # 200 + an EMPTY {"data":{}} / {"data":[]} stub: THIS token was refused
 SLOTS_BLOCKED = "blocked"              # 4xx/HTML; this exit is done
 SLOTS_UNKNOWN = "unknown"
+
+
+def _is_empty_data_stub(body: str) -> bool:
+    """True for exactly the portal's stub: a JSON object whose only key is "data" and whose value is
+    empty ({} or [] or null). A wrapper that carries dates is not a stub."""
+    try:
+        parsed = json.loads(body)
+    except (TypeError, ValueError):
+        return False
+    return isinstance(parsed, dict) and set(parsed) == {"data"} and not parsed["data"]
 
 
 def _classify_slots_response(res: dict) -> str:
@@ -117,8 +128,16 @@ def _classify_slots_response(res: dict) -> str:
         pass
     if "ReCaptchaError" in body or "recaptcha" in body.lower():
         return SLOTS_RATE_LIMITED
+    if _is_empty_data_stub(body):
+        # {"data":{}} / {"data":[]} -- the portal's canned 12-byte answer to a token it will not honour
+        # (invalid, spent, or minted in a context it does not trust). NOT an empty calendar -- the real
+        # answer is a bare ARRAY -- and NOT a statement about the SESSION: a reference bot that books on
+        # this portal re-solves and asks again on the same session, and gets the dates (2026-10-26:
+        # 288-290 open dates on the first poll in three runs, ~1 in 3 asks answered by this stub).
+        # Treating it as a burned session cost a full re-login on every stub.
+        return SLOTS_TOKEN_REJECTED
     if '"data"' in body.replace(" ", ""):
-        # {"data":{}} -- a 200 whose body announces no payload at all.
+        # Any other {"data": ...} wrapper is not a shape we have a verdict for; keep the old reading.
         return SLOTS_SESSION_BURNED
     if res.get("ok"):
         return SLOTS_OK
@@ -801,6 +820,10 @@ class LiveEngineOps(EngineOps):
         # grant, a fresh login, or any exit roll resets the streaks.
         self._slots_interstitial_streak: int = 0
         self._slots_recaptcha_streak: int = 0
+        # Consecutive empty-stub answers (token refused). A stub is ONE token's verdict, so the session is
+        # kept and the next round re-solves; only a run of them escalates to a re-login (see
+        # _SLOTS_STUB_ESCALATE_AFTER).
+        self._slots_stub_streak: int = 0
         # getTables handshake state (2026-09-23, ref-confirmed). getTables is a page-fired POST on
         # Schedule.jsp that the WAF wants confirmed ("success":"true") before it serves /slots -- but
         # it is POSTO-OPTIONAL (posto 5084 has none yet serves slots). _posto_gettables: None=unknown,
@@ -4041,6 +4064,10 @@ class LiveEngineOps(EngineOps):
     # flagged exit never un-flags itself, so grinding it is wasted rounds (login rolls on the same
     # reCAPTCHA verdict). Reset by a real grant, a fresh login, or any roll.
     _SLOTS_ROLL_AFTER = 2
+    # How many empty-stub answers IN A ROW (each on a freshly solved token) before the session itself is
+    # suspected and a re-login is asked for. One stub is a refused token; the reference bot sees it on
+    # roughly 1 ask in 3, so three in a row (~4%) is evidence of something the session carries.
+    _SLOTS_STUB_ESCALATE_AFTER = 3
     # How long the keepalive probe waits for the home page to SETTLE before reading it. The home
     # page runs reCAPTCHA + async JS and keeps navigating for a beat after load, so an immediate
     # read races it: "Execution context was destroyed" (the outer handler counted this as a dead
@@ -4515,11 +4542,30 @@ class LiveEngineOps(EngineOps):
             return self._no_report(
                 f"the endpoint refused the token (rate limit); next attempt in "
                 f"{self._SLOTS_MIN_INTERVAL:.0f}s")
+        if kind == SLOTS_TOKEN_REJECTED:
+            # This token was refused; the SESSION is not implicated. Keep it, drop any cached token, and
+            # let the next round solve a fresh one -- no pacing back-off (a stub is not a grant, so the
+            # ~100s grant meter has not moved) and no re-login (which costs a login shot and a minute or
+            # two of blindness, and was the previous reading of this exact reply).
+            self._presolved_slots = None
+            self._slots_interstitial_streak = self._slots_recaptcha_streak = 0
+            self._slots_stub_streak += 1
+            if self._slots_stub_streak >= self._SLOTS_STUB_ESCALATE_AFTER:
+                self._slots_stub_streak = 0
+                self._slots_needs_relogin = True
+                self._log(f"do_discover[slots]: {self._SLOTS_STUB_ESCALATE_AFTER} empty-stub answers in a "
+                          "row on fresh tokens -- suspecting the session; asking for a fresh login")
+                return [{"date": d, "outcome": "failed"} for d in dates]
+            self._log(f"do_discover[slots]: the endpoint refused this token (empty stub "
+                      f"{self._slots_stub_streak}/{self._SLOTS_STUB_ESCALATE_AFTER}) -- session kept, "
+                      f"re-solving next round")
+            return self._no_report("the endpoint refused the token (empty stub)")
         if kind == SLOTS_SESSION_BURNED:
             # Only a fresh LOGIN clears this. Flagged for phases.py so the rebuild ladder skips
             # straight past the re-warm rung, which is measured to never help here.
             self._slots_needs_relogin = True
             self._slots_interstitial_streak = self._slots_recaptcha_streak = 0   # relogin resets
+            self._slots_stub_streak = 0
             self._log("do_discover[slots]: the endpoint returned an empty object -- this SESSION is "
                       "burned for /slots; a re-warm cannot fix it, only a fresh login")
             return [{"date": d, "outcome": "failed"} for d in dates]
@@ -4528,6 +4574,7 @@ class LiveEngineOps(EngineOps):
             self._log("do_discover[slots]: the endpoint blocked this exit -- rolling off it")
             self._roll_exit("slots blocked")
             self._slots_interstitial_streak = self._slots_recaptcha_streak = 0   # fresh exit
+            self._slots_stub_streak = 0
             return self._no_report("the endpoint blocked this exit")
         if res.get("err"):
             self._log(f"do_discover[slots]: {res['err']}")
@@ -4543,6 +4590,7 @@ class LiveEngineOps(EngineOps):
         self._slots_last_grant_at = time.time()
         self._slots_needs_relogin = False
         self._slots_interstitial_streak = self._slots_recaptcha_streak = 0   # this exit works
+        self._slots_stub_streak = 0
         found, capacity = {}, {}
         for entry in (res.get("data") or []):
             if not isinstance(entry, dict):
