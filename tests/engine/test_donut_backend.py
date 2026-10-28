@@ -233,3 +233,73 @@ def test_donut_infrastructure_failures_are_never_charged_to_the_account():
                 "could not attach to Donut profile storm-abc at http://127.0.0.1:9301: timeout",
                 "Donut run returned no remote_debugging_port: {}"):
         assert LiveEngineOps._is_transient_login_failure(msg), msg
+
+
+# ── close_browser waits for the teardown that stops the profile ──────────────────────────────────
+def _closing_session(teardown):
+    """A bare session whose browser thread acks CLOSE_BROWSER, then runs `teardown` -- the real thread's
+    order: ack first, browser.close / pw.stop / Donut release after."""
+    import queue
+    import threading
+
+    from libs.engine.vendor.session import PlaywrightSession, _StampedResultQueue
+
+    class _S(PlaywrightSession):
+        def __init__(self):
+            self._cmd_q = queue.Queue()
+            self._seq_lock = threading.Lock()
+            self._next_seq = 0
+            self._current_seq = 0
+            self._res_q = _StampedResultQueue(self)
+            self._driver_pid = None
+            self._donut_lease = object()
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+
+        def _run(self):
+            cmd = self._cmd_q.get(timeout=5)
+            self._current_seq = cmd["_seq"]
+            self._res_q.put(("ok", None))
+            teardown()
+
+    return _S()
+
+
+def test_close_browser_does_not_return_before_the_profile_is_stopped(monkeypatch):
+    import time
+
+    from libs.engine.vendor import session as sess_mod
+
+    stopped = []
+    monkeypatch.setattr(sess_mod._donut, "release", lambda lease: stopped.append("release"))
+
+    def slow_teardown():
+        time.sleep(0.4)
+        stopped.append("thread-teardown")
+
+    s = _closing_session(slow_teardown)
+    s.close_browser()
+    assert stopped[0] == "thread-teardown", (
+        "close_browser returned on the ack, before the browser thread finished tearing down -- a worker "
+        f"exiting right after would kill the thread mid-teardown; got {stopped}")
+    assert "release" in stopped
+
+
+def test_close_browser_stops_the_profile_even_if_the_teardown_never_finishes(monkeypatch):
+    import threading
+
+    from libs.engine.vendor import session as sess_mod
+
+    released, killed = [], []
+    monkeypatch.setattr(sess_mod._donut, "release", lambda lease: released.append(lease))
+    monkeypatch.setattr(sess_mod, "_kill_proc_tree", lambda pid: killed.append(pid))
+    gate = threading.Event()
+    s = _closing_session(lambda: gate.wait(timeout=30))
+    real_join = s._thread.join
+    monkeypatch.setattr(s._thread, "join", lambda timeout=None: real_join(0.2))   # don't sit out 15s
+    try:
+        s.close_browser()
+        assert released, "a wedged teardown must not leave the Donut profile running"
+        assert killed, "and the driver tree is killed rather than left to leak"
+    finally:
+        gate.set()

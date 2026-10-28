@@ -109,6 +109,27 @@ def _find_pid_by_cmdline(module: str, key: str) -> int | None:
     return None
 
 
+def live_keys(module: str) -> set[str]:
+    """Keys of every live `python -m <module> <key>` process on this host, whoever spawned it
+    (/proc scan, same signature as _find_pid_by_cmdline)."""
+    out: set[str] = set()
+    try:
+        pids = os.listdir("/proc")
+    except FileNotFoundError:
+        return out
+    for entry in pids:
+        if not entry.isdigit():
+            continue
+        try:
+            raw = Path(f"/proc/{entry}/cmdline").read_bytes()
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
+            continue
+        parts = [p.decode(errors="replace") for p in raw.split(b"\x00") if p]
+        if len(parts) >= 3 and parts[-3:-1] == ["-m", module]:
+            out.add(parts[-1])
+    return out
+
+
 class Supervisor:
     """Authoritative process tracking is by PID (`self._pids`), not by `subprocess.Popen` object --
     `Popen` can only ever represent a process THIS Python process actually started, which breaks the
