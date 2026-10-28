@@ -52,6 +52,15 @@ def _no_account_rest(request, monkeypatch):
     monkeypatch.setattr(LiveEngineOps, "_account_cap", lambda self: (0, 3600.0))
 
 
+@pytest.fixture(autouse=True)
+def _no_slots_rewarm(request, monkeypatch):
+    """The per-round /slots re-warm needs a real warm-up chain; the page fakes below only model the
+    schedule page. Off by default here; the `test_slots_rewarm_*` tests exercise it."""
+    if request.node.name.startswith("test_slots_rewarm_"):
+        return
+    monkeypatch.setattr(LiveEngineOps, "_SLOTS_REWARM_EACH_ROUND", False)
+
+
 _REAL_SAVE_SUBMIT_BODY = LiveEngineOps._save_submit_body
 
 
@@ -6532,3 +6541,76 @@ def test_keepalive_defaults_land_every_six_to_eight_minutes():
     from libs.domain.enums import SettingsLayer as L
     eff = resolve({L.GLOBAL: {}})
     assert eff["KEEPALIVE_INTERVAL"] == 360.0 and eff["KEEPALIVE_JITTER"] == 120.0
+
+
+class _CountingSlotsSession(_SlotsPageSession):
+    def __init__(self, payload):
+        super().__init__(payload)
+        self.navs = 0
+
+    def browser_nav(self, url, *a, **k):
+        self.navs += 1
+        return super().browser_nav(url, *a, **k)
+
+
+def _rewarm_ops(monkeypatch):
+    monkeypatch.setattr("libs.engine.vendor.race_all", lambda *a, **k: "T" * 2617)
+    ops = _make_ops(emit=lambda t, **p: None)
+    ops.session = _CountingSlotsSession({"ok": True, "data": [{"date": "2026-09-14", "periods": [5]}]})
+    ops._log = lambda *a, **k: None
+    ops.posto_pdf = "3059"
+    ops._SLOTS_MIN_INTERVAL = 0.0
+    warms = []
+
+    def _warm():
+        warms.append(1)
+        ops._set_anchor("chain")
+        return True
+
+    ops._run_warmup_steps = _warm
+    return ops, warms
+
+
+def test_slots_rewarm_runs_when_the_cursor_was_spent_by_the_last_nav(monkeypatch):
+    ops, warms = _rewarm_ops(monkeypatch)
+    ops._set_anchor("chain")
+    ops._slots_nav_at = time.time() + 1.0         # a Schedule.jsp nav newer than the warm-up
+    out = ops._discover_via_slots(["2026-09-14"])
+    assert warms == [1], "a round after a spent cursor must re-warm first"
+    assert out[0]["outcome"] == "found"
+
+
+def test_slots_rewarm_is_skipped_right_after_a_warm_up(monkeypatch):
+    ops, warms = _rewarm_ops(monkeypatch)
+    ops._slots_nav_at = time.time() - 5.0
+    ops._set_anchor("chain")                       # warm-up newer than the last nav
+    ops._discover_via_slots(["2026-09-14"])
+    assert warms == [], "the signal's own warm-up already left a live cursor"
+
+
+def test_slots_rewarm_runs_for_a_checkpoint_anchor(monkeypatch):
+    ops, warms = _rewarm_ops(monkeypatch)
+    ops._set_anchor("checkpoint")                  # as old as a file, never verified
+    ops._discover_via_slots(["2026-09-14"])
+    assert warms == [1]
+
+
+def test_slots_rewarm_each_round_spends_the_cursor_once(monkeypatch):
+    ops, warms = _rewarm_ops(monkeypatch)
+    ops._set_anchor("chain")
+    ops._discover_via_slots(["2026-09-14"])
+    ops._discover_via_slots(["2026-09-14"])
+    ops._discover_via_slots(["2026-09-14"])
+    assert warms == [1, 1], "round 1 uses the signal's warm-up; rounds 2 and 3 each re-warm"
+
+
+def test_slots_rewarm_failure_spends_no_solve_and_reports_failed(monkeypatch):
+    ops, warms = _rewarm_ops(monkeypatch)
+    solves = []
+    monkeypatch.setattr("libs.engine.vendor.race_all",
+                        lambda *a, **k: solves.append(1) or "T" * 2617)
+    ops._run_warmup_steps = lambda: False
+    ops._warmup_last_error = "quest step 3/7 never returned 200"
+    out = ops._discover_via_slots(["2026-09-14", "2026-09-15"])
+    assert [r["outcome"] for r in out] == ["failed", "failed"]
+    assert solves == [] and ops.session.navs == 0

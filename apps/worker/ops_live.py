@@ -820,6 +820,10 @@ class LiveEngineOps(EngineOps):
         # grant, a fresh login, or any exit roll resets the streaks.
         self._slots_interstitial_streak: int = 0
         self._slots_recaptcha_streak: int = 0
+        # When this session last navigated to Schedule.jsp for /slots. The form cursor is NAV-BOUND:
+        # a chain warm-up (_set_anchor("chain")) newer than this stamp means the next nav lands on a
+        # live schedule page; an older one means the last nav already spent it.
+        self._slots_nav_at: float = 0.0
         # Consecutive empty-stub answers (token refused). A stub is ONE token's verdict, so the session is
         # kept and the next round re-solves; only a run of them escalates to a re-login (see
         # _SLOTS_STUB_ESCALATE_AFTER).
@@ -4091,6 +4095,12 @@ class LiveEngineOps(EngineOps):
     # buys a CAPTCHA token and trades it for {"error": ReCaptchaError"}. Gated on the last GRANT,
     # because that is what the limit keys on.
     _SLOTS_MIN_INTERVAL = 100.0
+    # Re-run the warm-up chain before any /slots round whose last Schedule.jsp nav already spent the
+    # cursor. MEASURED 2026-10-28 (scout a7afc415, 9 rounds): the first discover after a warm-up
+    # reached the schedule page 3/3; the 6 rounds with no warm-up since the previous nav got the
+    # marker-less interstitial 6/6 -- and the exit rolls those streaks triggered moved the IP under
+    # a live session. See memory rewarm_every_round_is_mandatory.
+    _SLOTS_REWARM_EACH_ROUND = True
     # Longest a single paced-out round will sleep before giving up and reporting nothing. Bounded
     # because an APPLY worker that is self-scouting runs this same path and must stay able to act
     # on an assignment.
@@ -4256,6 +4266,11 @@ class LiveEngineOps(EngineOps):
                 self._posto_gettables = False   # first miss -- assume this posto doesn't use it
             self._log("do_discover[slots]: getTables not seen (posto may not use it) -- proceeding to /slots")
 
+    def _slots_cursor_fresh(self) -> bool:
+        """True when a verified chain warm-up is newer than the last /slots Schedule.jsp nav."""
+        return (self._anchor_src == "chain" and self._anchor_at is not None
+                and self._anchor_at > self._slots_nav_at)
+
     def _discover_via_slots(self, dates: list[str]) -> list[dict]:
         """Solve SCHEDULE_EVISA, hand the token to window.onCaptchaSuccess, read window.data."""
         from libs.engine.vendor import race_all
@@ -4289,6 +4304,15 @@ class LiveEngineOps(EngineOps):
             return self._no_report(
                 f"/slots grants about one response per {self._SLOTS_MIN_INTERVAL:.0f}s and the last "
                 f"one was too recent ({_wait:.0f}s to go) -- not spending a solve")
+        if self._SLOTS_REWARM_EACH_ROUND and not self._slots_cursor_fresh():
+            self._log("do_discover[slots]: the last Schedule.jsp nav spent the form cursor -- "
+                      "re-warming before this round")
+            if not self._run_warmup_steps():
+                # A failed warm-up is evidence about the session, so it is `failed` (feeds the
+                # rebuild counter in phases.py), not _no_report -- and nothing was spent.
+                self._log(f"do_discover[slots]: re-warm failed ({self._warmup_last_error[:90] or 'no detail'})"
+                          " -- no solve spent")
+                return [{"date": d, "outcome": "failed"} for d in dates]
         # WAIT FOR THE CALLBACK TO EXIST BEFORE SPENDING A SOLVE.
         #
         # browser_nav returns when the document loads, but window.onCaptchaSuccess is registered by
@@ -4317,6 +4341,7 @@ class LiveEngineOps(EngineOps):
             # Install the getTables capture hook BEFORE navigating -- getTables fires during the page
             # load, so the fetch/XHR wrapper must already be registered as an init script.
             self._ensure_gettables_hook()
+            self._slots_nav_at = time.time()
             try:
                 self.session.browser_nav(
                     SCHED_JSP + "?posto_id=" + str(self.posto_pdf or self.posto_id), timeout=30)
