@@ -29,6 +29,18 @@ def test_live_keys_are_used_in_even_rotation():
     assert firsts == {"a": 10, "b": 10, "c": 10}, "30 solves over 3 keys: 10 each, not 30 on key #1"
 
 
+def test_the_callers_list_order_does_not_change_the_spread():
+    """Registration/booking consumers rotate their key list per account; the book's counter must not be
+    cancelled by that. Two consecutive solves from two differently-rotated lists must use DIFFERENT keys."""
+    book = KeyBook()
+    first = book.order("anticaptcha", ["a", "b"])[0]      # account 0's rotation
+    second = book.order("anticaptcha", ["b", "a"])[0]     # account 1's rotation
+    assert first != second
+    firsts = collections.Counter(
+        book.order("anticaptcha", ["a", "b", "c"][i % 3:] + ["a", "b", "c"][:i % 3])[0] for i in range(30))
+    assert firsts == {"a": 10, "b": 10, "c": 10}
+
+
 def test_a_single_key_or_none_is_returned_as_is():
     book = KeyBook()
     assert book.order("anticaptcha", ["only"]) == ["only"] and book.order("anticaptcha", []) == []

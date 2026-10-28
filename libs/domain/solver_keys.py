@@ -115,6 +115,10 @@ class KeyBook:
         keys = [k for k in (keys or []) if k]
         if len(keys) <= 1:
             return keys
+        # CANONICAL order, whatever order the caller handed over: consumers rotate their list (per account,
+        # per worker) so list[0] differs, and rotating that again by the shared counter lets the two rotations
+        # cancel -- 2026-10-28, two accounts both landed on the same key while the other sat unused.
+        keys = sorted(dict.fromkeys(keys), key=fingerprint)
         live, dead = [], []
         for k in keys:
             until = self.dead_until(solver, k)
