@@ -84,6 +84,7 @@ from .events import EventHub
 from .genaccounts import gen_fake_identities, gen_subaccounts
 from . import dedup
 from .importers import parse_geo, parse_identities, parse_proxies
+from .donut_sweep import sweep_donut_profiles
 from .settings_store import get_global, set_layer
 from .scheduler import (LAUNCH_FAILED_PREFIX, _LAUNCH_BLOCKED_BOOKING_STATUSES, _aware,
                         Scheduler)
@@ -581,6 +582,21 @@ def _stop_portal_pulse() -> None:
     _pulse_stop.set()
 
 
+def _start_donut_sweep() -> None:
+    """Stop Donut profiles no live worker owns (a Donut profile outlives the process that launched it).
+    Background thread: the Donut API can be slow or down, and boot must not wait on it."""
+    def _run() -> None:
+        try:
+            db = SessionLocal()
+            try:
+                sweep_donut_profiles(db)
+            finally:
+                db.close()
+        except Exception:
+            logger.exception("donut sweep: could not start")
+    threading.Thread(target=_run, name="donut-sweep", daemon=True).start()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
@@ -623,6 +639,7 @@ async def lifespan(app: FastAPI):
     scheduler.start()          # auto-ops: scheduled start + slot-open + slot assignment
     _start_token_factory()     # shared pre-solved login-token pool (OFF unless LOGIN_TOKEN_POOL_TARGET>0)
     _start_portal_pulse()      # real-time portal liveness prober (only probes while a booking is live)
+    _start_donut_sweep()       # stop Donut profiles orphaned by workers that exited without stopping them
     yield
     # Release open dashboard sockets FIRST: uvicorn will not complete shutdown while one is still
     # being served, and ws_events blocks forever on its queue by construction.

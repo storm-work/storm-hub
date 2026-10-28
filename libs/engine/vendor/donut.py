@@ -111,9 +111,12 @@ def _scope() -> str:
 
 
 class _Api:
-    def __init__(self):
-        self.base = (os.environ.get("DONUT_API_URL", "").strip() or DEFAULT_API_URL).rstrip("/")
-        token = os.environ.get("DONUT_API_TOKEN", "").strip()
+    def __init__(self, url: str | None = None, token: str | None = None):
+        # url/token are for callers that do not run with the Donut env (the Hub's startup sweep reads them
+        # from the Global settings); workers pass nothing and get the env, as before.
+        self.base = ((url if url is not None else os.environ.get("DONUT_API_URL", "")).strip()
+                     or DEFAULT_API_URL).rstrip("/")
+        token = (token if token is not None else os.environ.get("DONUT_API_TOKEN", "")).strip()
         if not token:
             raise DonutError("BROWSER_BACKEND=donut but DONUT_API_TOKEN is not set "
                              "(Global settings; copy it from Donut > Integrations > Local API)")
