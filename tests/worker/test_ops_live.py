@@ -4446,10 +4446,14 @@ def test_the_maintenance_page_marks_the_portal_down_and_does_NOT_roll(monkeypatc
 
 def test_the_four_responses_are_classified_apart():
     from apps.worker.ops_live import (_classify_slots_response, SLOTS_OK, SLOTS_RATE_LIMITED,
-                                      SLOTS_SESSION_BURNED, SLOTS_BLOCKED)
+                                      SLOTS_SESSION_BURNED, SLOTS_BLOCKED, SLOTS_TOKEN_REJECTED)
     P = lambda st, b: {"probe": {"status": st, "body": b}}
     assert _classify_slots_response(P(200, '{"error": ReCaptchaError"}')) == SLOTS_RATE_LIMITED
-    assert _classify_slots_response(P(200, '{"data":{}}\n')) == SLOTS_SESSION_BURNED
+    # The portal's 12-byte stub, in both shapes seen: a refused TOKEN, not a burned session (2026-10-28).
+    assert _classify_slots_response(P(200, '{"data":{}}\n')) == SLOTS_TOKEN_REJECTED
+    assert _classify_slots_response(P(200, '{"data":[]}\n')) == SLOTS_TOKEN_REJECTED
+    # Any other {"data": ...} wrapper keeps the old reading -- we have no verdict for a shape we never saw.
+    assert _classify_slots_response(P(200, '{"data":{"x":1}}')) == SLOTS_SESSION_BURNED
     assert _classify_slots_response(P(403, "<!DOCTYPE html>")) == SLOTS_BLOCKED
     out = dict(P(200, '[{"date":"2026-09-08"}]')); out["ok"] = True
     assert _classify_slots_response(out) == SLOTS_OK
@@ -4464,8 +4468,8 @@ def test_a_403_is_blocked_whatever_body_it_carries():
 def test_the_residue_is_used_when_nothing_was_captured():
     """The interceptor can miss (cache, or a request issued before the hook existed) -- the old
     page residue must still classify rather than silently becoming 'unknown'."""
-    from apps.worker.ops_live import _classify_slots_response, SLOTS_SESSION_BURNED
-    assert _classify_slots_response({"coerced": True, "raw": '{"data":{}}'}) == SLOTS_SESSION_BURNED
+    from apps.worker.ops_live import _classify_slots_response, SLOTS_TOKEN_REJECTED
+    assert _classify_slots_response({"coerced": True, "raw": '{"data":{}}'}) == SLOTS_TOKEN_REJECTED
 
 
 def _slots_kind_ops(monkeypatch, payload):
@@ -4486,14 +4490,48 @@ def test_a_rate_limit_reports_nothing_and_does_not_touch_the_session(monkeypatch
     assert ops._slots_backoff_until > 0, "no back-off was armed, so the next round refuses again"
 
 
-def test_a_burned_session_asks_for_a_re_login_not_a_re_warm(monkeypatch):
-    ops = _slots_kind_ops(monkeypatch, {"coerced": True, "raw": '{"data":{}}',
-                                        "probe": {"status": 200, "body": '{"data":{}}\n'}})
+def test_a_refused_token_keeps_the_session_and_reports_nothing(monkeypatch):
+    """The empty stub is ONE token's verdict. It used to be read as 'session burned' and cost a full
+    re-login each time (2026-10-28: a good scout was torn down four times in 11 minutes)."""
+    ops = _slots_kind_ops(monkeypatch, {"coerced": True, "raw": '{"data":[]}',
+                                        "probe": {"status": 200, "body": '{"data":[]}\n'}})
+    ops._presolved_slots = ("T" * 2000, __import__("time").time())
     out = ops._discover_via_slots(["2026-09-14"])
 
-    assert [r["outcome"] for r in out] == ["failed"], "the ladder must still engage"
-    assert ops.discovery_needs_relogin() is True, \
-        "without this the ladder re-warms, which is measured never to clear {\"data\":{}}"
+    assert out == [], "a refused token says nothing about the dates and must not feed the rebuild counter"
+    assert ops.discovery_needs_relogin() is False, "one refused token is not a session fault"
+    assert ops._slots_backoff_until == 0.0, "a stub is not a grant; the next round must be able to go at once"
+    assert ops._presolved_slots is None, "a cached token must not be replayed after a refusal"
+    assert ops._slots_stub_streak == 1
+
+
+def test_a_run_of_refused_tokens_finally_asks_for_a_re_login(monkeypatch):
+    """Three stubs in a row on freshly solved tokens (~4% by chance) is no longer a token's bad luck."""
+    ops = _slots_kind_ops(monkeypatch, {"coerced": True, "raw": '{"data":{}}',
+                                        "probe": {"status": 200, "body": '{"data":{}}\n'}})
+    first = ops._discover_via_slots(["2026-09-14"])
+    second = ops._discover_via_slots(["2026-09-14"])
+    assert first == [] and second == [] and ops.discovery_needs_relogin() is False
+    third = ops._discover_via_slots(["2026-09-14"])
+
+    assert [r["outcome"] for r in third] == ["failed"], "the ladder must engage on the escalation"
+    assert ops.discovery_needs_relogin() is True
+    assert ops._slots_stub_streak == 0, "the streak restarts after it escalates"
+
+
+def test_a_real_grant_resets_the_stub_streak(monkeypatch):
+    ops = _slots_kind_ops(monkeypatch, {"ok": True, "data": [{"date": "2026-09-14", "periods": [5]}],
+                                        "probe": {"status": 200, "body": "[...]"}})
+    ops._slots_stub_streak = 2
+    ops._discover_via_slots(["2026-09-14"])
+    assert ops._slots_stub_streak == 0
+
+
+def test_an_unrecognised_data_wrapper_still_asks_for_a_re_login(monkeypatch):
+    ops = _slots_kind_ops(monkeypatch, {"coerced": True, "raw": '{"data":{"x":1}}',
+                                        "probe": {"status": 200, "body": '{"data":{"x":1}}\n'}})
+    out = ops._discover_via_slots(["2026-09-14"])
+    assert [r["outcome"] for r in out] == ["failed"] and ops.discovery_needs_relogin() is True
 
 
 def test_a_block_rolls_the_exit(monkeypatch):
@@ -6482,3 +6520,15 @@ def test_a_hub_rotation_request_names_the_accounts_country():
     pinned_off._signals = ops._signals
     pinned_off._request_proxy_rotation("warmup")
     assert sent2 == [("proxy_request", {"phase": "warmup"})], "no geo key at all when there is no pin"
+
+
+def test_keepalive_defaults_land_every_six_to_eight_minutes():
+    """The portal session idles out at ~10.4 min (measured 2026-10-28); 600+30 sat on that line."""
+    ops = _make_ops(cfg=_cfg(KEEPALIVE_INTERVAL=360.0, KEEPALIVE_JITTER=120.0))
+    waits = [ops._keepalive_window() for _ in range(300)]
+    assert min(waits) >= 360.0 and max(waits) <= 480.0 + 1e-9
+    assert max(waits) - min(waits) > 60.0, "jittered, not an exact grid"
+    from libs.domain.settings import resolve
+    from libs.domain.enums import SettingsLayer as L
+    eff = resolve({L.GLOBAL: {}})
+    assert eff["KEEPALIVE_INTERVAL"] == 360.0 and eff["KEEPALIVE_JITTER"] == 120.0
