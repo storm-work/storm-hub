@@ -1,8 +1,8 @@
 # Hot-window experiment plan — booking day 2026-10-30
 
 Everything below is decided BEFORE the window. The window is the only time the portal is in its stress
-posture, so an experiment that is not set up in advance is lost. Times are UTC and assume slot-open ≈ **T0 =
-10:45** (past openings: 09:45–10:47; set the real T0 when the booking exists and shift the table).
+posture, so an experiment that is not set up in advance is lost. Times are UTC and assume slot-open **T0 =
+10:00 UTC** (confirmed by the operator 2026-10-30).
 
 **Rule zero: the real booking comes first.** Experiments ride on it; none may reduce its chance of booking by
 more than the share of workers it uses (≤ 30 % in total), and nothing is changed after T0−10 min.
@@ -70,18 +70,18 @@ verdict, so a failure has a timestamp that can be matched to the pulse.
 * Save at T0+120: `/portal/pulse?n=1000`, each booking's worker and appointment counts (dashboard), the soak probe's jsonl.
 * Preflight at T0−150 and again at T0−30: `python -m scripts.window_preflight` (add `--create-test` once).
 
-## 5. Timeline (T0 = 10:45)
+## 5. Timeline (T0 = 10:00 UTC)
 
 | Time | Action |
 |---|---|
-| 07:45 (T0−180) | Preflight (`--create-test`). Start the recorder. Create the arm bookings (identical times), attach identity pools, set the overrides. Reserve the 6 `EXP` spares. |
-| 08:15 (T0−150) | Warm-up starts (`warmup_start_at`). Start the soak probe. Preflight again. |
-| 08:15–09:15 | Everyone logs in and parks on the Questionario hold. X7 probes on spares (T0−120, T0−60). Watch login success per geo — expect the wall to rise from ≈ T0−90. |
-| 09:05 (T0−100) | X6 round 1, then every 20 min. |
-| 09:30 (T0−75) | **Strict flip expected.** X5 primp A/B every 10 min from here. |
-| 10:35 (T0−10) | **Freeze.** No setting changes, no restarts, no new workers. |
-| 10:45 (T0) | Signal. Do nothing by hand. Watch the recorder only. |
-| T0+120 | Stop the recorder, save the artifacts above, then analyse. |
+| before 07:00 | Arm bookings created, identities attached, 6+ `EXP` spares registered (§9). `window_link_arms` run. |
+| 07:00 (T0−180) | Preflight (`--create-test`). Start the recorder. Start `window_probes` (it sleeps until 07:30). |
+| 07:30 (T0−150) | `warmup_start_at`: the fleet logs in and parks on the Questionario hold. Soak probe starts. Preflight again. |
+| 08:00–09:00 | Login wall expected from ≈ 08:30 (T0−90). Formstate probe 08:00 and 09:00; wall probes 08:20 → |
+| 08:44 (T0−76) | **Strict flip expected.** Primp A/B 08:50, 09:05, 09:20, 09:35. |
+| 09:50 (T0−10) | **Freeze.** No setting changes, no restarts, no new workers. Start `W-blind` here (§9). |
+| 10:00 (T0) | Signal. Do nothing by hand. Watch the recorder only. |
+| 12:00 (T0+120) | Stop the recorder, save the artifacts above, then analyse. |
 
 ## 6. What each result decides (pre-registered)
 
@@ -116,3 +116,41 @@ verdict, so a failure has a timestamp that can be matched to the pulse.
 * The login throttle (3 shots/account/h) shapes how many workers are logged in at T0−90, whatever the arm.
 * The resume path has run only against fakes. It falls back to the full chain, so a failure costs ≈ 40 s,
   not the session.
+
+## 9. Operator runbook (dashboard) -- exact settings
+
+Identity budget: 80 real (apply) + test identities (scout). **Real identities** are split by shuffling them
+first (so no arm gets the better accounts), **test identities** all go into `W-main`.
+
+| Booking | type | real (apply) identities | test (scout) identities | Settings (BOOKING layer) |
+|---|---|---|---|---|
+| `W-main` | real | 50 | all (scouts) | *(none -- defaults: `KEEPALIVE_MODE=quest_hold`, 60-300 s)* |
+| `W-sched` | real | 7 | none | `KEEPALIVE_MODE=schedule` |
+| `W-short` | real | 7 | none | `QUEST_HOLD_MIN_S=60`, `QUEST_HOLD_MAX_S=120` |
+| `W-long` | real | 7 | none | `QUEST_HOLD_MIN_S=240`, `QUEST_HOLD_MAX_S=420` |
+| `W-blind` | real | 7 | none | `BLIND_APPLY_MODE=true`, `BLIND_MAX_BOUNCES=0` |
+
+2 real identities stay unassigned as reserve. Every booking: **posto 5084**, same nationality/residence,
+`warmup_start_at` = **07:30 UTC**, `slot_open_at` = **10:00 UTC** (identical on all four timed bookings).
+`HYBRID_MODE` stays off. Do not copy any setting that is not in the table.
+
+Steps (dashboard, Bookings page):
+1. Create `W-main` (type real, posto 5084, times above, no settings). Attach the 50 real + all test identities.
+2. For each arm: **Duplicate** `W-main` (copies posto/nationality/residence/settings, not identities or times),
+   rename, then set the arm's settings in the booking's settings editor and the two times. Attach its identities.
+   Check the booking's *effective settings* show the arm's keys and nothing else different.
+3. `W-blind`: create the same way, then seed the 5084 periods (`POST /bookings/{id}/blind-apply`).
+   **Do not Start it** -- see below.
+4. Link the arms to the control (the dashboard has no field for it):
+   `.venv/bin/python -m scripts.window_link_arms` then `--check`. `W-blind` stays unlinked.
+5. Schedule `W-main`, `W-sched`, `W-short`, `W-long` (they warm up by themselves at 07:30).
+6. **`W-blind` is started by hand at 09:50 (T0-10)**: blind mode fires slot-open the moment it starts, so
+   its workers log in, warm and go straight to applying the seeded grid. Starting it earlier would hammer
+   the portal against a closed grid. `BLIND_MAX_BOUNCES=0` keeps pre-open bounces from retiring the grid.
+7. Test identities for the spares: register at least 6, set their **group to `EXP`**, leave them unattached to
+   any booking. They need an ACTIVE identity, a VERIFIED sub-account and (donut backend) a profile.
+
+Probes (automatic): `.venv/bin/python -m scripts.window_probes --t0 10:00 --booking W-main`
+(`--dry-run` prints the plan and the spares it found). Output: `var/window/probes/`. Stop everything with
+`touch var/window/ABORT`. Not automated: the exit-change probe (`session_ip_migration_probe.py`, X7/Q28), which
+does not take the EXP scope -- run it by hand in a quiet period if wanted.

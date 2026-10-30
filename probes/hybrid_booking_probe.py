@@ -128,6 +128,20 @@ def _mint_proxy(pool, settings, geo):
     return conn_url(random.choice(rows), geo=geo) if rows else None
 
 
+def scope_identities(stmt):
+    """Narrow an Identity select to the probe's sandbox: `--group G` (batch label, e.g. EXP) and/or
+    `--identity-id ID`. Without it a probe may pick ANY active identity, including a real applier
+    that a booking is about to launch (burning its login shots) -- so the hot-window scheduler
+    always passes --group EXP."""
+    from libs.db import models as M
+    g, iid = _arg("--group"), _arg("--identity-id")
+    if g:
+        stmt = stmt.where(M.Identity.group_name == g)
+    if iid:
+        stmt = stmt.where(M.Identity.id == iid)
+    return stmt
+
+
 def _warm(pool, geo, posto, nat, res, log, headless=True, tries=8, exit_tries=4, login_only=False):
     """Login + warmup via the production LiveEngineOps, retrying identities/exits. Returns ops|None.
 
@@ -161,12 +175,15 @@ def _warm(pool, geo, posto, nat, res, log, headless=True, tries=8, exit_tries=4,
         log(f"excluding {len(probe_booked)} identity(ies) this probe already booked (local ledger)")
     booked |= probe_booked
     running = {r[0] for r in db.execute(select(M.Worker.identity_id).where(M.Worker.status == "RUNNING")).all()}
-    cands = db.scalars(select(M.Identity).where(M.Identity.status == "ACTIVE").limit(400)).all()
+    cands = db.scalars(scope_identities(
+        select(M.Identity).where(M.Identity.status == "ACTIVE")).limit(400)).all()
     random.shuffle(cands)
     # SESSION CACHE: prefer the last identity we warmed, so do_login restores ITS fresh checkpoint
     # (skip the whole login lottery) when re-run within the Vistos_sid TTL. First run fights login
     # once; re-runs ride the banked session.
     _cache = _ROOT / "var" / "probe_session_identity.txt"
+    if _arg("--group") or _arg("--identity-id"):
+        _cache = _ROOT / "var" / f"probe_session_identity_{_arg('--group') or _arg('--identity-id')}.txt"
     _pref = _cache.read_text().strip() if _cache.exists() else ""
     if _pref and _pref in booked:
         # The banked identity is now spent (booked by the probe or for real) -- never prefer it, or
@@ -199,6 +216,8 @@ def _warm(pool, geo, posto, nat, res, log, headless=True, tries=8, exit_tries=4,
         os.environ["HUMAN_BEHAVIOR"] = "0"
     from apps.worker.ops_live import LiveEngineOps
 
+    tries = int(_arg("--tries", tries))
+    exit_tries = int(_arg("--exit-tries", exit_tries))
     tried = 0
     for ident in cands:
         if tried >= tries:

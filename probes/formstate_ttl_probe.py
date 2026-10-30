@@ -107,7 +107,12 @@ def warm_one(arm: str, geo: str, log, booking_name: str = "Test2",
     from apps.worker.ops_live import LiveEngineOps
 
     appt = {r[0] for r in db.execute(select(M.BookedAppointment.identity_id)).all() if r[0]}
-    cands = db.scalars(select(M.Identity).where(M.Identity.status == "ACTIVE").limit(300)).all()
+    _stmt = select(M.Identity).where(M.Identity.status == "ACTIVE")
+    if _GROUP:
+        _stmt = _stmt.where(M.Identity.group_name == _GROUP)
+    if _IDENT:
+        _stmt = _stmt.where(M.Identity.id == _IDENT)
+    cands = db.scalars(_stmt.limit(300)).all()
     _r.shuffle(cands)
     pool = db.scalars(select(M.Proxy).where(M.Proxy.provider == provider,
                                             M.Proxy.active.is_(True)).limit(1500)).all()
@@ -263,6 +268,9 @@ def report(path):
     return 0
 
 
+_GROUP = _IDENT = None
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--minutes", type=float, default=20.0)
@@ -272,8 +280,12 @@ def main():
     ap.add_argument("--booking", default="Test2",
                     help="booking to source posto/nationality/residence from")
     ap.add_argument("--out", default="var/formstate_ttl.jsonl")
+    ap.add_argument("--group", help="only identities with this group_name (e.g. EXP)")
+    ap.add_argument("--identity-id", help="only this identity")
     ap.add_argument("--report")
     a = ap.parse_args()
+    global _GROUP, _IDENT
+    _GROUP, _IDENT = a.group, a.identity_id
     if a.report: return report(a.report)
     def log(t): print(f"  {time.strftime('%H:%M:%S')} {t}", flush=True)
     out = pathlib.Path(a.out); out.parent.mkdir(parents=True, exist_ok=True)

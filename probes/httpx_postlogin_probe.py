@@ -94,9 +94,11 @@ def _pick_accounts(db, limit):
         where sa.status = 'VERIFIED'
           and sa.password is not null and sa.password <> ''
           and sa.identity_id not in (select identity_id from workers where status = 'RUNNING')
+          and (cast(:g as text) is null or sa.identity_id in (select id from identities where group_name = :g))
+          and (cast(:iid as text) is null or sa.identity_id = :iid)
         order by (sa.last_login_ok_at is not null) desc, random()
         limit :n
-    """), {"n": limit}).all()
+    """), {"n": limit, "g": _arg("--group"), "iid": _arg("--identity-id")}).all()
     return [(r.username, r.password) for r in rows]
 
 
