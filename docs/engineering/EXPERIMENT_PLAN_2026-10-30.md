@@ -1,0 +1,118 @@
+# Hot-window experiment plan — booking day 2026-10-30
+
+Everything below is decided BEFORE the window. The window is the only time the portal is in its stress
+posture, so an experiment that is not set up in advance is lost. Times are UTC and assume slot-open ≈ **T0 =
+10:45** (past openings: 09:45–10:47; set the real T0 when the booking exists and shift the table).
+
+**Rule zero: the real booking comes first.** Experiments ride on it; none may reduce its chance of booking by
+more than the share of workers it uses (≤ 30 % in total), and nothing is changed after T0−10 min.
+
+## 1. What we do not know yet (the questions)
+
+| # | Question | Why it matters |
+|---|---|---|
+| X1 | Does the `quest_hold` hold survive the strict window and the stress cycle better than the `schedule` re-warm (what booked 12 on 1002)? | It is the new default. Probes only ran outside the window. |
+| X2 | Which hold interval is best: 60–120 s, 60–300 s (default) or 240–420 s? | Less traffic vs. margin to the ~10.4 min idle expiry. |
+| X3 | Does the resume at the signal work live, and how much time does it save? | Unit-tested only. Full chain ≈ 40 s. |
+| X4 | Where do the minutes go between slot-open and the first submit? (open → first `/slots` answer → found → warm → submit) | Last run: slot-open → found took 3.5 min. The re-warm-each-round fix is untested live. |
+| X5 | Does `PRIMP_IMPERSONATE=chrome_148` get detached primp through the strict window? | Decides whether a primp/hybrid arm is ever viable. Needs a strict window. |
+| X6 | When exactly does the login wall rise, and does it hit held sessions? | Sets how early everyone must be logged in. |
+| X7 | How long does a warmed cursor stay bookable (Q29), and does an exit change under a held login matter (Q28)? | Gates pre-warm timing; decides whether rolling a dead exit is cheap. |
+| X8 | What does ~60+ concurrent Donut profiles cost the host (CDP throttle, load, "context destroyed")? | Scale limit for the fleet size. |
+| X9 | Blind apply (periods seeded by the operator) vs discovery-driven apply. | Only if a blind booking is created. |
+| X10 | What is the real portal up/down cycle? | PortalPulse records it passively. |
+
+## 2. Layout: bookings are the arms
+
+Settings are frozen into each worker at launch, so an arm is a **booking** with its own overrides, all on the
+same posto. The identity pools must not overlap (an identity belongs to one active booking). Use the identity
+**group** label to keep pools apart and to avoid mixing quality between arms (shuffle, then split).
+
+| Booking name | Share | Overrides | Answers |
+|---|---|---|---|
+| `W-main` (control) | ~70 % | none (defaults: `quest_hold`, 60–300 s) | the real run; baseline for X1–X4 |
+| `W-sched` | ~10 % | `KEEPALIVE_MODE=schedule` | X1 (old default) |
+| `W-short` | ~10 % | `QUEST_HOLD_MIN_S=60`, `QUEST_HOLD_MAX_S=120` | X2 |
+| `W-long` | ~10 % | `QUEST_HOLD_MIN_S=240`, `QUEST_HOLD_MAX_S=420` | X2 |
+| `W-blind` (optional) | 5–10 % | `BLIND_APPLY_MODE=on`, periods seeded by you | X9 |
+
+Slots found by any arm feed the others through the existing cross-booking feed (`discovery_feeder_booking_ids`
+on the apply bookings), so the arms cooperate on discovery and compete only for the same slots. Keep every
+booking's `slot_open_at` / `warmup_start_at` identical. Keep `HYBRID_MODE` off everywhere (browser path).
+
+Minimum sample: an arm under ~15 workers can only be read as "no disaster / clear disaster", not as a rate.
+If the pool is small, run **only** `W-main` + `W-sched` + one interval arm and skip the rest.
+
+## 3. Side probes (spare identities, never part of a booking)
+
+Reserve **6 spare ACTIVE identities with a Donut profile** and label their group `EXP`. They are touched only
+by these probes, one login shot per account per hour at most (the per-account cap is 3/h). Each probe runs its own login, so give each probe its own spare and do not reuse one inside the hour.
+
+| Probe | When | How | Reads |
+|---|---|---|---|
+| X6 login wall | T0−100, −80, −60, −40, −20, 0, +15 | one `probes/quest_hold_probe.py ... --login-only --tag wall-HHMM` per spare (login attempt, then exit) | login success/"try again later" vs. time to open |
+| X5 primp A/B | from T0−70 (strict flips ≈ T0−76) every 10 min until T0+30 | `probes/primp_impersonate_probe.py <posto>` on a logged-in spare | interstitial (44 KB) vs real form, default vs `chrome_148`, same exit/cookies |
+| X7 cursor life (Q29) | T0−120 and T0−60 | `probes/formstate_ttl_probe.py` (usage in its header) on a spare | cursor still bookable after Δ without navigating |
+| X7 exit change (Q28) | any quiet 20 min before T0−90 | `probes/session_ip_migration_probe.py` (usage in its header) | auth survives an exit roll |
+| X1/X2 long soak | T0−150 → T0+60 | `probes/quest_hold_probe.py --min-s 60 --max-s 300 --minutes 200 --tag window-soak` on one spare | uninterrupted hold through the whole window, event by event |
+
+The soak probe is the cleanest single measurement of the hold: it books nothing and logs every event with its
+verdict, so a failure has a timestamp that can be matched to the pulse.
+
+## 4. Instrumentation (all passive, start before anything else)
+
+* `python -m scripts.window_recorder` in its own terminal from T0−180 until T0+120: pulse state and counts,
+  fleet by booking/role/substate, appointments per booking, load, browser processes, running Donut
+  profiles → `var/window/<date>.jsonl` (every 10 s).
+* PortalPulse (`PORTAL_PULSE=true`): the closed up/down windows → `GET /portal/pulse?n=1000` saved at T0+120.
+* Hub event stream and worker logs (`var/worker-logs`) stay as they are. **Do not run
+  `scripts/cleanup_worker_logs.py` or `cleanup_checkpoints.py` today.**
+* Save at T0+120: `/portal/pulse?n=1000`, each booking's worker and appointment counts (dashboard), the soak probe's jsonl.
+* Preflight at T0−150 and again at T0−30: `python -m scripts.window_preflight` (add `--create-test` once).
+
+## 5. Timeline (T0 = 10:45)
+
+| Time | Action |
+|---|---|
+| 07:45 (T0−180) | Preflight (`--create-test`). Start the recorder. Create the arm bookings (identical times), attach identity pools, set the overrides. Reserve the 6 `EXP` spares. |
+| 08:15 (T0−150) | Warm-up starts (`warmup_start_at`). Start the soak probe. Preflight again. |
+| 08:15–09:15 | Everyone logs in and parks on the Questionario hold. X7 probes on spares (T0−120, T0−60). Watch login success per geo — expect the wall to rise from ≈ T0−90. |
+| 09:05 (T0−100) | X6 round 1, then every 20 min. |
+| 09:30 (T0−75) | **Strict flip expected.** X5 primp A/B every 10 min from here. |
+| 10:35 (T0−10) | **Freeze.** No setting changes, no restarts, no new workers. |
+| 10:45 (T0) | Signal. Do nothing by hand. Watch the recorder only. |
+| T0+120 | Stop the recorder, save the artifacts above, then analyse. |
+
+## 6. What each result decides (pre-registered)
+
+* **X1:** *alive-at-signal* = logged in, last hold/keepalive `ok` within 2 × the arm's max interval of the
+  signal, no re-login since. If `W-main` < `W-sched` by more than 15 points, set `KEEPALIVE_MODE=schedule` as
+  the default before the next window; if equal or better, keep `quest_hold`.
+* **X2:** the longest interval whose alive-at-signal is not worse than the default's becomes the default.
+  If `W-long` loses sessions to idle expiry, cap `QUEST_HOLD_MAX_S` at 300 for good.
+* **X3:** log lines `RESUMING the held questionnaire` vs full chain, with the warm-up duration and outcome.
+  Resume failing more than the full chain → turn the resume off (`_qh_take` returns None) and keep the hold.
+* **X4:** per signal round: open → first `/slots` answer → found → warm start → submit → answer. The biggest gap
+  is the next thing to fix.
+* **X5:** `chrome_148` passes where the default is challenged ≥ 80 % of the time → a primp arm is worth
+  building; both challenged → primp stays out of the strict window for good.
+* **X6:** the time at which new-login success falls under 5 % is "everyone logged in by" next time.
+* **X7:** cursor still bookable at Δ → the longest safe pre-warm lead; auth survives a roll in ≥ 8 of 10 →
+  rolling a dead exit under a held login is cheap and F41's hold matters less.
+* **X8:** peak concurrent profiles, load1, CDP "context destroyed" count by minute → the fleet size ceiling.
+
+## 7. Abort rules (protect the real run)
+
+* A probe or arm that is damaging the control (load1 > 15, > 5 % of workers in a restart loop) is stopped
+  immediately; the control is never touched.
+* If Donut starts answering 429 on creation, stop creating anything new; existing profiles keep working.
+* If the Hub stops answering, do not restart it during the window unless workers have already lost their
+  signal path; restarting re-clears the slot-open latch by design (fresh-run semantics).
+
+## 8. Known unknowns and how they are handled
+
+* Settings are frozen at worker launch: an arm cannot be switched mid-window. That is why §2 is fixed up front.
+* `QUEST_HOLD_*` and `KEEPALIVE_MODE` live at the booking layer; a template cannot override them.
+* The login throttle (3 shots/account/h) shapes how many workers are logged in at T0−90, whatever the arm.
+* The resume path has run only against fakes. It falls back to the full chain, so a failure costs ≈ 40 s,
+  not the session.

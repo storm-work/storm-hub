@@ -23,6 +23,7 @@ Usage:
   cd /srv/projects/storm-hub
   .venv/bin/python probes/quest_hold_probe.py --booking "Test 2032 Donut" --pool soax --geo DE \
       --min-s 60 --max-s 300 --minutes 40 --tag jit60-300
+  ... --login-only --tag wall-0905     # login attempt only (login-wall mapping), then exit
 """
 from __future__ import annotations
 
@@ -93,6 +94,12 @@ def main() -> int:
     if ops is None:
         log("could not LOG IN any identity -- re-run (login is a lottery)")
         return 1
+    if "--login-only" in sys.argv:
+        # login-wall mapping: one login attempt and out -- no hold, no warm-up chain
+        log("LOGIN-ONLY: logged in; closing")
+        rec(ev="login_only", ok=True)
+        ops._close_session_quietly()
+        return 0
     from apps.worker.ops_live import HOME_URL, QUEST_NEXT, QUEST_URL
     steps = quest_steps.get(res if res != nat else nat, [])
     if not steps:
