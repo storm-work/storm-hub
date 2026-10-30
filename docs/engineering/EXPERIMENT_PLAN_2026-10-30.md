@@ -79,8 +79,9 @@ verdict, so a failure has a timestamp that can be matched to the pulse.
 | 07:30 (T0−150) | `warmup_start_at`: the fleet logs in and parks on the Questionario hold. Soak probe starts. Preflight again. |
 | 08:00–09:00 | Login wall expected from ≈ 08:30 (T0−90). Formstate probe 08:00 and 09:00; wall probes 08:20 → |
 | 08:44 (T0−76) | **Strict flip expected.** Primp A/B 08:50, 09:05, 09:20, 09:35. |
-| 09:50 (T0−10) | **Freeze.** No setting changes, no restarts, no new workers. Start `W-blind` here (§9). |
-| 10:00 (T0) | Signal. Do nothing by hand. Watch the recorder only. |
+| 09:20 | **Freeze.** No setting changes, no restarts, no new workers. |
+| 09:30 | Scheduled slot-open fires on all five bookings (the portal's claimed 10:00 is the late bound). |
+| 10:00 (T0) | Claimed open. Do nothing by hand. Watch the recorder only. |
 | 12:00 (T0+120) | Stop the recorder, save the artifacts above, then analyse. |
 
 ## 6. What each result decides (pre-registered)
@@ -131,7 +132,10 @@ first (so no arm gets the better accounts), **test identities** all go into `W-m
 | `W-blind` | real | 7 | none | `BLIND_APPLY_MODE=true`, `BLIND_MAX_BOUNCES=0` |
 
 2 real identities stay unassigned as reserve. Every booking: **posto 5084**, same nationality/residence,
-`warmup_start_at` = **07:30 UTC**, `slot_open_at` = **10:00 UTC** (identical on all four timed bookings).
+`warmup_start_at` = **07:30 UTC**, `slot_open_at` = **09:30 UTC** (identical on all five bookings). The portal
+claims 10:00 but has opened up to ~15 min early before; discovery only runs once slot-open has fired, so
+`slot_open_at` is set 30 min ahead of the claimed time (scouts then poll from 09:30; the apply workers
+re-warm each round anyway).
 `HYBRID_MODE` stays off. Do not copy any setting that is not in the table.
 
 Steps (dashboard, Bookings page):
@@ -139,14 +143,14 @@ Steps (dashboard, Bookings page):
 2. For each arm: **Duplicate** `W-main` (copies posto/nationality/residence/settings, not identities or times),
    rename, then set the arm's settings in the booking's settings editor and the two times. Attach its identities.
    Check the booking's *effective settings* show the arm's keys and nothing else different.
-3. `W-blind`: create the same way, then seed the 5084 periods (`POST /bookings/{id}/blind-apply`).
-   **Do not Start it** -- see below.
+3. `W-blind`: create the same way (identical times), then seed the 5084 periods (`POST /bookings/{id}/blind-apply`).
 4. Link the arms to the control (the dashboard has no field for it):
    `.venv/bin/python -m scripts.window_link_arms` then `--check`. `W-blind` stays unlinked.
-5. Schedule `W-main`, `W-sched`, `W-short`, `W-long` (they warm up by themselves at 07:30).
-6. **`W-blind` is started by hand at 09:50 (T0-10)**: blind mode fires slot-open the moment it starts, so
-   its workers log in, warm and go straight to applying the seeded grid. Starting it earlier would hammer
-   the portal against a closed grid. `BLIND_MAX_BOUNCES=0` keeps pre-open bounces from retiring the grid.
+5. Schedule all five bookings (they warm up by themselves at 07:30). Blind mode with a `slot_open_at` set HOLDS
+   the seeded pool until that instant (scheduler `_drive_booking`: the immediate blind fire only applies when
+   no `slot_open_at` is set), so `W-blind` is scheduled exactly like the others and warms up before the login
+   wall. `BLIND_MAX_BOUNCES=0` keeps the 09:30-10:00 bounces from retiring the grid.
+6. Nothing is started by hand. Freeze at 09:20 (T0_sched-10): no setting changes or restarts after that.
 7. Test identities for the spares: register at least 6, set their **group to `EXP`**, leave them unattached to
    any booking. They need an ACTIVE identity, a VERIFIED sub-account and (donut backend) a profile.
 
