@@ -753,6 +753,9 @@ class LiveEngineOps(EngineOps):
         # The ScheduleController form state has a ~90-120s TTL (measured; see do_apply), so "is it
         # set" was never the right question -- "how old, and did we build it" is.
         self._anchor_src: str | None = None      # "chain" | "checkpoint" | None
+        # KEEPALIVE_MODE=quest_hold: questionnaire steps answered on the server by the hold (None =
+        # not parked on Questionario). Consumed by the next warm-up (_qh_take).
+        self._qh_pos: int | None = None
         self._anchor_at: float | None = None     # monotonic stamp; None = age unknown
         self._restore_stage: str | None = None   # "alive" | "rewarmed" | "none", set by do_login
         # Rolling view of how the portal is behaving FOR THIS WORKER: per-phase durations plus
@@ -2808,6 +2811,8 @@ class LiveEngineOps(EngineOps):
         # (anchor on success, _warmup_last_error taxonomy, already-booked detection), so every caller
         # -- do_warmup, do_apply's round-start re-warm, _do_keepalive, _rebuild_session -- is unchanged.
         self._last_warm_kind = "unknown"
+        # QUEST_HOLD: the questionnaire position the hold had reached (consumed here, always).
+        _resume = self._qh_take()
         if self._hybrid("WARMUP"):
             # The primp chain never reported to _note_portal, so a hybrid worker's warm-up failures
             # were always kind "unknown": no slow-portal hold, no portal-down check, every stressed
@@ -2870,7 +2875,10 @@ class LiveEngineOps(EngineOps):
             # live run, 370 of them from just two workers stuck in a hot retry loop, none of which
             # ever reached ScheduleController. "TypeError: Failed to fetch" is a transient network
             # failure inside the page (dead proxy, dropped tunnel), exactly what a retry is for.
-            for attempt in range(1, _retries + 1):
+            if _resume:
+                self._log(f"warm-up: RESUMING the held questionnaire at step {_resume + 1}/"
+                          f"{len(self._quest_hold_steps())} (no home-lang POST / Questionario nav)")
+            for attempt in (range(1, _retries + 1) if not _resume else ()):
                 try:
                     self.session.browser_eval(
                         "(async()=>{const r=await fetch('%s',{method:'POST',credentials:'include',"
@@ -2886,9 +2894,10 @@ class LiveEngineOps(EngineOps):
             # Same pacing before the Questionario nav: storm-auto paces the whole early burst
             # (HOME -> lang POST -> Questionario), not just the steps.
             _gap0 = max(0.0, float(self.cfg.raw.get("QUEST_STEP_GAP", 1.0)))
-            if _gap0 > 0:
+            if _gap0 > 0 and not _resume:
                 time.sleep(_gap0 * random.uniform(0.7, 1.3))
-            self.session.browser_nav(QUEST_URL, timeout=35, skip_cookie_sync=True)
+            if not _resume:
+                self.session.browser_nav(QUEST_URL, timeout=35, skip_cookie_sync=True)
 
             quest_key = self.residence if self.residence != self.nationality else self.nationality
             steps = self.quest_steps.get(quest_key, [])
@@ -2899,6 +2908,8 @@ class LiveEngineOps(EngineOps):
             base_qs = {"lang": "PT", "nacionalidade": self.nationality}
             gap = max(0.0, float(self.cfg.raw.get("QUEST_STEP_GAP", 1.0)))
             for i, step in enumerate(steps):
+                if i < (_resume or 0):
+                    continue            # already answered by the hold
                 is_last = i == len(steps) - 1
                 # PACE into each step (±30% jitter). storm-auto added this knob for exactly the
                 # failure we are seeing: "the quest-step-1 403s were observed clustering on exactly
@@ -3353,6 +3364,11 @@ class LiveEngineOps(EngineOps):
         interval = max(float(self.cfg.keepalive.interval), 30.0)
         jitter = max(0.0, float(self.cfg.keepalive.jitter))
         mode = (getattr(self.cfg.keepalive, "mode", "auth_only") or "auth_only").strip().lower()
+        if mode == "quest_hold" and not self.is_warmed():
+            # The hold event is one tiny quest step: wait a jittered QUEST_HOLD_MIN_S..MAX_S between
+            # them (measured 60-300s survives; the portal's idle expiry is ~10.4 min).
+            lo, hi = self._quest_hold_bounds()
+            return random.uniform(lo, hi)
         if mode == "schedule":
             # ACTIVE cursor-keeping: a warmed Schedule.jsp cursor lapses after FORM_STATE_TTL, so the
             # ping cadence MUST stay under it or the "kept" cursor is already stale by the next cycle.
@@ -3540,14 +3556,123 @@ class LiveEngineOps(EngineOps):
         is NOT lost -- the Hub's signal latch re-sends to a not-yet-notified worker -- so warming
         before the first listen is safe."""
         mode = (getattr(self.cfg.keepalive, "mode", "auth_only") or "auth_only").strip().lower()
-        if mode != "schedule" or self.cfg.keepalive.off:
+        if mode not in ("schedule", "quest_hold") or self.cfg.keepalive.off:
             return
         try:
             if self.is_warmed():
                 return
         except Exception:
             pass
+        if mode == "quest_hold" and getattr(self, "_qh_pos", None) is not None:
+            return          # already parked on the questionnaire; the next window continues the hold
         self._do_keepalive(context + "/initial")
+
+    # ── KEEPALIVE_MODE='quest_hold' ──────────────────────────────────────────────────────────────
+    def _quest_hold_bounds(self) -> tuple[float, float]:
+        try:
+            lo = max(15.0, float(self.cfg.raw.get("QUEST_HOLD_MIN_S", 60.0)))
+            hi = max(lo, float(self.cfg.raw.get("QUEST_HOLD_MAX_S", 300.0)))
+        except (TypeError, ValueError):
+            lo, hi = 60.0, 300.0
+        return lo, hi
+
+    def _quest_hold_steps(self) -> list:
+        quest_key = self.residence if self.residence != self.nationality else self.nationality
+        return list(self.quest_steps.get(quest_key, []))
+
+    def _qh_take(self) -> int | None:
+        """Hand the warm-up the questionnaire position the hold had reached, and forget it. Returns
+        the number of steps already answered on the server (1..len-1) when the next warm-up can RESUME
+        the stateful questionnaire there, else None (full chain from home-lang). Always consumed: the
+        warm-up navigates on, so the position is stale the moment it runs, success or not."""
+        pos = getattr(self, "_qh_pos", None)
+        self._qh_pos = None
+        if pos is None:
+            return None
+        n = len(self._quest_hold_steps())
+        return pos if 0 < pos < n else None
+
+    def _quest_hold_event(self, context: str) -> None:
+        """ONE hold event, always through the real browser (the strict anti-bot window challenges
+        detached primp, not the browser): reload Questionario (home-lang POST + nav) when entering or
+        after the last step, else the next QuestNextQuestion step as the same in-page fetch the
+        warm-up chain uses. Measured by probes/quest_hold_probe.py. Raises on transport failure so the
+        caller's existing dead-trip / portal-down ladder in _do_keepalive owns it."""
+        steps = self._quest_hold_steps()
+        pos = getattr(self, "_qh_pos", None)
+        reload_ = pos is None or pos >= len(steps) or not steps
+        status = 200
+        if reload_:
+            self.session.browser_eval(
+                "(async()=>{const r=await fetch('%s',{method:'POST',credentials:'include',"
+                "headers:{'Content-Type':'application/x-www-form-urlencoded'},"
+                "body:'lang=PT'});return r.status;})()" % HOME_URL)
+            final_url = self.session.browser_nav(QUEST_URL, timeout=35, skip_cookie_sync=True)
+            page = self._keepalive_read_page()
+            kind = "reload"
+        else:
+            base_qs = {"lang": "PT", "nacionalidade": self.nationality}
+            url = f"{QUEST_NEXT}?{urlencode({**base_qs, **steps[pos]})}"
+            res = self.session.browser_eval(
+                "(async()=>{const r=await fetch(%r,{method:'GET',credentials:'include',"
+                "headers:{'Accept':'text/plain, */*; q=0.01','X-Requested-With':'XMLHttpRequest',"
+                "'Sec-Fetch-Mode':'cors','Sec-Fetch-Dest':'empty','Sec-Fetch-Site':'same-origin',"
+                "'Referer':%r}});const b=await r.text();return {status:r.status,"
+                "body:b.substring(0,4000)};})()" % (url, QUEST_URL))
+            final_url = ""
+            status = res.get("status") if isinstance(res, dict) else None
+            page = (res.get("body") if isinstance(res, dict) else str(res)) or ""
+            kind = f"step{pos + 1}"
+        low = (page or "").lower()
+        n = len(page or "")
+        if "authentication.jsp" in (final_url or "").lower() or "sessionlost" in (final_url or "").lower() \
+                or (kind != "reload" and "perdeu a sess" in low):
+            self._qh_pos = None
+            self._log(f"keepalive[quest_hold]: session expired at {kind} ({n}B, {context}) -- "
+                      f"re-authenticating")
+            self._slog("keepalive", result="expired", mode="quest_hold", ev=kind, ctx=context)
+            self._attempt_keepalive_restore(context)
+            return
+        if self._is_dead_exit_response(page, final_url):
+            self._qh_pos = None
+            if self._portal_down_not_exit("keepalive[quest_hold]"):
+                self._slog("keepalive", result="portal_down_hold", mode="quest_hold", ctx=context)
+                return
+            self._log(f"keepalive[quest_hold]: DEAD EXIT ({n}B, {context}) -- rolling + restoring")
+            self._slog("keepalive", result="dead_exit", mode="quest_hold", ctx=context)
+            self._roll_exit("keepalive: dead exit (quest hold)")
+            self._attempt_keepalive_restore(context)
+            return
+        self._keepalive_dead_streak = 0
+        self._portal_down_streak = 0
+        if _is_challenge_body(page) or _is_portal_refusal(page):
+            # The portal declining us is not a dead session: back off, do not re-login. The server-side
+            # questionnaire position is unknown now, so the next event starts the pass over.
+            self._qh_pos = None
+            self._log(f"keepalive[quest_hold]: portal refused/challenged {kind} ({n}B, {context}) -- "
+                      f"backing off")
+            self._slog("keepalive", result="portal_refused", mode="quest_hold", ev=kind, ctx=context)
+            return
+        positive = (low.find("questnextquestion") >= 0 or low.find("cb_question") >= 0) if reload_ \
+            else status == 200
+        if not positive:
+            self._qh_pos = None
+            self._keepalive_unknown_streak = getattr(self, "_keepalive_unknown_streak", 0) + 1
+            self._log(f"keepalive[quest_hold]: {kind} not confirmed (status={status}, {n}B, {context}) "
+                      f"-- inconclusive (streak={self._keepalive_unknown_streak}/{_KEEPALIVE_UNKNOWN_TRIP})")
+            self._slog("keepalive", result="inconclusive", mode="quest_hold", ev=kind, status=status,
+                       ctx=context)
+            if self._keepalive_unknown_streak >= _KEEPALIVE_UNKNOWN_TRIP:
+                self._prove_or_restore_inconclusive(context)
+            return
+        self._keepalive_unknown_streak = 0
+        self._qh_pos = 0 if reload_ else pos + 1
+        if getattr(self, "_keep_unbookable", False):
+            self._mark_keep_bookable(True)
+        if self._emit is not None:
+            self._emit("log_line", text=f"keepalive[quest_hold]: {kind} ok -> step {self._qh_pos}/"
+                                        f"{len(steps)} ({context})")
+        self._slog("keepalive", result="ok", mode="quest_hold", ev=kind, pos=self._qh_pos, ctx=context)
 
     def _do_keepalive_primp(self, context: str) -> bool:
         """HYBRID keepalive via primp (no browser nav -- the browser is parked). schedule mode holds a
@@ -3673,7 +3798,9 @@ class LiveEngineOps(EngineOps):
         # navs can't stale the cursor). schedule mode re-warms the cursor on primp; auth_only just
         # confirms the session is still authed. Falls through to the browser path on anything it
         # cannot resolve detached (e.g. a re-auth, which needs the reCAPTCHA browser login).
-        if self._hybrid("KEEPALIVE") and self._do_keepalive_primp(context):
+        if (self._hybrid("KEEPALIVE")
+                and (getattr(self.cfg.keepalive, "mode", "") or "").strip().lower() != "quest_hold"
+                and self._do_keepalive_primp(context)):
             return
         # AUTH-ONLY (2026-09-09, consolidated from the HOLD_AUTHED_ONLY A/B -- Test 0907 vs
         # Test 0907-auth matched on outcome, 2/2 booked each, ~same apply latency, while the
@@ -3704,6 +3831,12 @@ class LiveEngineOps(EngineOps):
             probe = SCHED_JSP + "?posto_id=" + str(self.posto_pdf or self.posto_id)
         url = HOME_URL if probe == "home" else probe
         try:
+            if mode == "quest_hold" and probe == "home" and not self.is_warmed():
+                # Not holding a fresh bookable cursor: hold on Questionario instead of probing HOME
+                # (home navs the session off the questionnaire). A warmed worker falls through to the
+                # plain authed-home probe below, which does not disturb its kept cursor.
+                self._quest_hold_event(context)
+                return
             final_url = self.session.browser_nav(url, timeout=30)
             if mode == "schedule" and probe != "home":
                 # Schedule.jsp carries DIFFERENT markers than home, so classify it on its own terms:

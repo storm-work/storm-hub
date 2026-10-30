@@ -218,10 +218,22 @@ def _warm(pool, geo, posto, nat, res, log, headless=True, tries=8, exit_tries=4,
                 capsolver_keys=caps, warm_proxy=proxy, headless=headless, sub_account_id=subs[0].id,
                 accounts=[dict(_live_account(ident, s), sub_account_id=s.id) for s in subs],
                 identity_id=ident.id)
-            ops._log = lambda t: log("  " + str(t)[:140])
+            capped = []
+
+            def _ops_log(t, _capped=capped):
+                # The engine rests an over-tried username for an hour; retrying THAT identity on a new
+                # exit just waits the hour out (run C sat 6h on one). Remember the cap so we move on.
+                if "shot cap" in str(t) or "3-shots/60min" in str(t):
+                    _capped.append(1)
+                log("  " + str(t)[:140])
+            ops._log = _ops_log
             try:
                 if not ops.do_login():
-                    ops._close_session_quietly(); proxy = roll_rotating_url(proxy); continue
+                    ops._close_session_quietly()
+                    if capped:
+                        log("  identity is at its login shot cap -- rolling to the next identity")
+                        break
+                    proxy = roll_rotating_url(proxy); continue
                 if login_only:
                     db.close()
                     log(f"LOGGED IN ✓ (login-only, warm-up deferred to primp) ({ident.full_name[:22]!r})")

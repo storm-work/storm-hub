@@ -45,6 +45,8 @@ class KeepaliveConfig:
     # every round) | "schedule" (EAGER model, 2026-10-02 -- warm BEFORE keeping; keepalive probes
     # Schedule.jsp and re-warms the cursor before FORM_STATE_TTL, paced under the TTL; the worker
     # applies/discovers DIRECTLY on the signal, do_apply skips its round-start re-warm when warmed).
+    # | "quest_hold" (DEFAULT, 2026-10-29 -- park on Questionario, one quest step per jittered
+    # QUEST_HOLD_MIN_S..MAX_S, resume the questionnaire at the signal; see ops_live._quest_hold_event).
     # See phases._warmup/_keepalive_mode, ops_live._do_keepalive/_keepalive_window/do_apply.
     mode: str = "auth_only"
 
@@ -142,7 +144,7 @@ class EngineConfig:
                 dead_trip=int(g("KEEPALIVE_DEAD_TRIP", 3)),
                 probe=str(g("KEEPALIVE_PROBE", "home") or "home"),
                 jitter=float(g("KEEPALIVE_JITTER", 120.0)),
-                mode=str(g("KEEPALIVE_MODE", "schedule") or "schedule").strip().lower(),
+                mode=str(g("KEEPALIVE_MODE", "quest_hold") or "quest_hold").strip().lower(),
             ),
             hold_swap=HoldSwapConfig(
                 swap_after_login=bool(g("HOLD_SWAP_AFTER_LOGIN", False)),

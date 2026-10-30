@@ -244,6 +244,15 @@ _GLOBAL = [
        "engine's fingerprint pool, version alignment, stealth script and HEADLESS_MODE do not apply. "
        "Needs the Donut app running on this host, signed in to a plan with automation, Local API "
        "on, and DONUT_API_TOKEN set. Login/warm-up/apply flows are unchanged."),
+    _s("REGISTRAR_BROWSER_BACKEND", L.GLOBAL, str, "", _TPL, "browser",
+       choices=("", "chromium", "donut"),
+       note=
+       "Browser the ACCOUNT REGISTRAR uses, independent of BROWSER_BACKEND (workers keep following "
+       "that). Blank = follow BROWSER_BACKEND. Set 'chromium' to register accounts while Donut refuses "
+       "new profiles (HTTP 429 WAYFERN_GENERATION_LIMIT_REACHED): registration then creates no Donut "
+       "profile. Accounts registered before 2026-10-27 were all registered on Chromium and later booked "
+       "on Donut profiles, so this works; each such account gets its profile on its first Donut "
+       "login. Takes effect on the next registration run."),
     _s("DONUT_HEADLESS", L.GLOBAL, bool, True, _TPL, "browser",
        note=
        "BROWSER_BACKEND=donut only: start Donut profiles headless. Off = a real window, which needs "
@@ -262,6 +271,14 @@ _GLOBAL = [
        "cleared on close, and created once -- so it stays under Donut's hourly new-fingerprint limit. "
        "'session' = a throwaway profile per session (new device every time; every launch counts "
        "against that limit)."),
+    _s("DONUT_EXISTING_PROFILES_ONLY", L.GLOBAL, bool, True, _TPL, "browser",
+       note=
+       "BROWSER_BACKEND=donut only. Offer a live worker only the sub-accounts whose Donut profile ALREADY "
+       "EXISTS. Donut blocks an account for 24 hours after it creates too many profiles in one hour "
+       "(registrar, 2026-10-29: ~236 profiles, then HTTP 429 WAYFERN_GENERATION_LIMIT_REACHED for the "
+       "rest of the day), and a sub-account without a profile cannot launch a browser while that block "
+       "is on. Turn OFF once the block has lifted. Fails open: if Donut cannot be asked, nothing is "
+       "filtered."),
     _s("DONUT_CDP_THROTTLE", L.GLOBAL, bool, True, _TPL, "browser",
        note=
        "BROWSER_BACKEND=donut only. Route the session's CDP socket through a local relay that paces "
@@ -1090,10 +1107,19 @@ _TEMPLATE = [
        "2026-09-09 (consolidated after the Test 0907/0907-auth A/B) -- keepalive only ever "
        "verifies the AUTH session is alive, never the booking form-state, which do_apply/"
        "do_discover establish fresh on demand instead of keepalive trying to keep it warm."),
-    _s("KEEPALIVE_MODE", L.BOOKING, str, "schedule", _WRK, "keepalive",
-       choices=("auth_only", "schedule"),
+    _s("KEEPALIVE_MODE", L.BOOKING, str, "quest_hold", _WRK, "keepalive",
+       choices=("auth_only", "schedule", "quest_hold"),
        note=
-       "DEFAULT REVISED 2026-10-26 -> schedule: auth_only DEFERS the multi-request warm-up to the signal, i.e. INTO the portal's stress window -- run 1023 warmed 0 of ~260 between 10:30 and 11:10 after a healthy 08:45-10:00 hold. schedule warms during the hold and keeps the cursor fresh, so the signal-time action is (when the cursor is still within FORM_STATE_TTL) a direct submit; it booked 12 on 1002. Cost: a re-warm per worker every ~0.75 x FORM_STATE_TTL. Mixed counter-evidence: 1016 (calm window, hybrid) booked 2 in schedule vs 3 in auth_only. Original note: "
+       "DEFAULT REVISED 2026-10-29 -> quest_hold: park the logged-in browser on Questionario and keep "
+       "the session alive with ONE quest step (QuestNextQuestion) every QUEST_HOLD_MIN_S..QUEST_HOLD_MAX_S "
+       "(jittered), reloading Questionario once every step is answered. No Schedule.jsp cursor is "
+       "spent, so there is no 35-45s re-warm exposure to the portal's stress window and the traffic is "
+       "a handful of tiny requests; on the signal the first warm-up RESUMES the questionnaire at the "
+       "step the hold had reached (ops_live._qh_take) instead of starting over. MEASURED "
+       "(probes/quest_hold_probe.py, 60-300s jitter, 40 min): 13/13 events clean, session alive, and "
+       "the full warm-up chain still reached the bookable cursor. Once the worker holds a FRESH "
+       "bookable cursor (is_warmed) the hold falls back to the auth_only home probe. "
+       "Earlier note, 2026-10-26: schedule -> schedule: auth_only DEFERS the multi-request warm-up to the signal, i.e. INTO the portal's stress window -- run 1023 warmed 0 of ~260 between 10:30 and 11:10 after a healthy 08:45-10:00 hold. schedule warms during the hold and keeps the cursor fresh, so the signal-time action is (when the cursor is still within FORM_STATE_TTL) a direct submit; it booked 12 on 1002. Cost: a re-warm per worker every ~0.75 x FORM_STATE_TTL. Mixed counter-evidence: 1016 (calm window, hybrid) booked 2 in schedule vs 3 in auth_only. Original note: "
        "Keepalive strategy for a holding worker. 'auth_only' (DEFAULT, the proven model): probe the "
        "authenticated HOME page; booking form-state is NEVER kept warm (do_apply re-warms every round "
        "regardless; warmup is deferred to the signal). 'schedule' (EAGER-warmup model, operator "
@@ -1107,6 +1133,13 @@ _TEMPLATE = [
        "MEASUREMENT only (the 147-vs-42 nav-verifies-but-does-not-renew finding). Deliberately at the "
        "BOOKING layer (not TEMPLATE) so a template cannot silently override the operator's per-booking "
        "choice. See docs/engineering/REPORT_2026-10-01_hot_period_reliability.md."),
+    _s("QUEST_HOLD_MIN_S", L.BOOKING, float, 60.0, _WRK, "keepalive", min_value=15.0,
+       note="KEEPALIVE_MODE=quest_hold: shortest wait (seconds) between hold events (one quest step, or "
+            "the Questionario reload after the last step). The wait is uniform in [MIN, MAX]. The "
+            "portal's idle expiry was measured at ~10.4 min; 60-300s survived a 40 min hold."),
+    _s("QUEST_HOLD_MAX_S", L.BOOKING, float, 300.0, _WRK, "keepalive", min_value=15.0,
+       note="KEEPALIVE_MODE=quest_hold: longest wait (seconds) between hold events. Keep it well under "
+            "the ~10.4 min idle expiry."),
     _s("SCHEDULE_KEEPALIVE_TTL_FRACTION", L.BOOKING, float, 0.75, _WRK, "keepalive",
        min_value=0.2,
        note=
