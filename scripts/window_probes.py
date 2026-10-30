@@ -64,9 +64,11 @@ def _spares(group: str) -> list[tuple[str, str]]:
         db.close()
 
 
-def build_plan(t0: datetime) -> list[tuple[datetime, str]]:
+def build_plan(t0: datetime, headed_soak: bool = False) -> list[tuple[datetime, str]]:
     at = lambda off: t0 + timedelta(minutes=off)  # noqa: E731
     plan = [(at(SOAK_START), "soak")]
+    if headed_soak:
+        plan.append((at(SOAK_START), "soak-headed"))
     plan += [(at(o), "wall") for o in WALL]
     plan += [(at(o), "primp") for o in PRIMP]
     plan += [(at(o), "formstate") for o in FORMSTATE]
@@ -77,10 +79,11 @@ def command(kind: str, when: datetime, ident: str, a) -> tuple[list[str], str]:
     hhmm = when.strftime("%H%M")
     scope = ["--group", a.group, "--identity-id", ident]
     common = ["--pool", a.pool, "--geo", a.geo]
-    if kind == "soak":
-        tag = "window-soak"
+    if kind in ("soak", "soak-headed"):
+        tag = "window-soak" + ("-headed" if kind == "soak-headed" else "")
         return [PY, "probes/quest_hold_probe.py", "--booking", a.booking, *common, "--min-s", "60",
-                "--max-s", "300", "--minutes", str(SOAK_MIN), "--tag", tag, *scope], tag
+                "--max-s", "300", "--minutes", str(SOAK_MIN), "--tag", tag, *scope,
+                *(["--headed"] if kind == "soak-headed" else [])], tag
     if kind == "wall":
         tag = f"wall-{hhmm}"
         return [PY, "probes/quest_hold_probe.py", "--booking", a.booking, *common, "--login-only",
@@ -103,11 +106,14 @@ def main() -> int:
     ap.add_argument("--pool", default="soax")
     ap.add_argument("--geo", default="DE", help="best measured login rate (DE/IT ~23%%)")
     ap.add_argument("--max-load", type=float, default=15.0)
+    ap.add_argument("--headed-soak", action="store_true",
+                    help="also run a second soak with a REAL window (DONUT_HEADLESS=0) on its own spare "
+                         "(needs >= 7 spares; the headless soak keeps the first)")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
 
     t0 = _t0(a.t0)
-    plan = build_plan(t0)
+    plan = build_plan(t0, a.headed_soak)
     try:
         spares = _spares(a.group)
     except Exception as e:                                           # noqa: BLE001
@@ -130,7 +136,12 @@ def main() -> int:
 
     OUT.mkdir(parents=True, exist_ok=True)
     abort = ROOT / "var" / "window" / "ABORT"
-    soak_id, pool = spares[0][0], [s[0] for s in spares[1:]] or [spares[0][0]]
+    if a.headed_soak and len(spares) < 7:
+        print("--headed-soak needs >= 7 spares; dropping it"); a.headed_soak = False
+        plan = [p for p in plan if p[1] != "soak-headed"]
+    reserved = 2 if a.headed_soak else 1
+    soak_id, pool = spares[0][0], [s[0] for s in spares[reserved:]] or [spares[0][0]]
+    headed_id = spares[1][0] if a.headed_soak else None
     shots: dict[str, list[float]] = {}
     last_used: dict[str, float] = {}
     procs: list[tuple[str, subprocess.Popen]] = []
@@ -154,6 +165,8 @@ def main() -> int:
         now = time.time()
         if kind == "soak":
             ident = soak_id
+        elif kind == "soak-headed":
+            ident = headed_id
         else:
             ok = [i for i in pool if len([t for t in shots.get(i, []) if now - t < 3600]) < 2]
             if not ok:

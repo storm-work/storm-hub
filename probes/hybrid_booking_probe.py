@@ -208,6 +208,10 @@ def _warm(pool, geo, posto, nat, res, log, headless=True, tries=8, exit_tries=4,
     cfg = EngineConfig.from_settings(resolve({L.GLOBAL: g, L.BOOKING: {
         "DISCOVERY_SOURCE": disc_source, "KEEPALIVE_MODE": "schedule"}}))
     vendor_env.apply(resolve({L.GLOBAL: g}))
+    if "--headed" in sys.argv:
+        # AFTER the settings export (which writes DONUT_HEADLESS from the global setting): a real
+        # window on the Donut app's display, for this probe only.
+        os.environ["DONUT_HEADLESS"] = "0"
     # Faster login for the experiment: HUMAN_BEHAVIOR pacing lengthens the login, widening the window
     # in which a rotating exit can move mid-solve ('confirma o reCAPTCHA'). The warmup/submit do not
     # depend on it. Set --human to keep the production pacing. (Must precede the ops_live import --
