@@ -60,7 +60,7 @@ def main() -> int:
         except Exception as e:
             say("FAIL", f"Hub not answering: {e}")
         started = _run(["systemctl", "show", "storm-hub", "-p", "ActiveEnterTimestamp", "--value"])
-        head = _run(["git", "log", "-1", "--format=%ct"])
+        head = _run(["git", "log", "-1", "--format=%ct", "--", "apps", "libs", "alembic"])
         try:
             st = datetime.strptime(started.replace(" UTC", ""), "%a %Y-%m-%d %H:%M:%S").replace(
                 tzinfo=timezone.utc).timestamp()
