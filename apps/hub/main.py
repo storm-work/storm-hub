@@ -84,7 +84,8 @@ from .events import EventHub
 from .genaccounts import gen_fake_identities, gen_subaccounts
 from . import dedup
 from .importers import parse_geo, parse_identities, parse_proxies
-from .donut_sweep import sweep_donut_profiles
+from .donut_sweep import cleanup_junk_profiles, cleanup_stray_proxies, sweep_donut_profiles
+from .donut_profiles import keep_with_profile
 from .settings_store import get_global, set_layer
 from .scheduler import (LAUNCH_FAILED_PREFIX, _LAUNCH_BLOCKED_BOOKING_STATUSES, _aware,
                         Scheduler)
@@ -582,18 +583,27 @@ def _stop_portal_pulse() -> None:
     _pulse_stop.set()
 
 
+_DONUT_SWEEP_EVERY_S = 1800.0
+
+
 def _start_donut_sweep() -> None:
-    """Stop Donut profiles no live worker owns (a Donut profile outlives the process that launched it).
-    Background thread: the Donut API can be slow or down, and boot must not wait on it."""
+    """Keep Donut tidy: stop profiles no live worker owns (a Donut profile outlives the process that
+    launched it) and DELETE junk ones -- orphans, finished accounts, abandoned signups -- at boot and
+    every 30 minutes, so junk cannot build up between restarts. Background thread: the Donut API can be
+    slow or down, and boot must not wait on it."""
     def _run() -> None:
-        try:
-            db = SessionLocal()
+        while True:
             try:
-                sweep_donut_profiles(db)
-            finally:
-                db.close()
-        except Exception:
-            logger.exception("donut sweep: could not start")
+                db = SessionLocal()
+                try:
+                    sweep_donut_profiles(db)
+                    cleanup_junk_profiles(db)
+                    cleanup_stray_proxies(db)
+                finally:
+                    db.close()
+            except Exception:
+                logger.exception("donut sweep: pass failed")
+            time.sleep(_DONUT_SWEEP_EVERY_S)
     threading.Thread(target=_run, name="donut-sweep", daemon=True).start()
 
 
@@ -2501,6 +2511,16 @@ def retire_sub_accounts(body: SubAccountResetRequest, db: Session = Depends(get_
     return ImportResult(created=updated, errors=errors)
 
 
+def registrar_vendor_settings(eff: dict) -> dict:
+    """Browser settings handed to the registrar. REGISTRAR_BROWSER_BACKEND, when set, replaces
+    BROWSER_BACKEND for registration only (e.g. 'chromium' while Donut refuses new profiles)."""
+    out = {k: eff[k] for k in vendor_env.VENDOR_ENV_KNOBS if k in eff}
+    override = str(eff.get("REGISTRAR_BROWSER_BACKEND") or "").strip().lower()
+    if override in ("chromium", "donut"):
+        out["BROWSER_BACKEND"] = override
+    return out
+
+
 @app.post("/registration/run")
 def run_registration(body: RegistrationRunRequest, db: Session = Depends(get_db),
                      _op: Principal = Depends(require_operator)) -> dict:
@@ -2639,7 +2659,7 @@ def run_registration(body: RegistrationRunRequest, db: Session = Depends(get_db)
     # registrar never did, so a global BROWSER_BACKEND=donut was silently ignored by registration --
     # accounts were registered from a different device than the one they would later book from.
     _eff = resolve({L.GLOBAL: g})
-    vendor_settings = {k: _eff[k] for k in vendor_env.VENDOR_ENV_KNOBS if k in _eff}
+    vendor_settings = registrar_vendor_settings(_eff)
 
     run_id = f"reg-{uuid.uuid4().hex[:12]}"
     supervisor.spawn_registrar(run_id)
@@ -3424,7 +3444,8 @@ def _rank_live_sub_accounts(db: Session, identity_id: str) -> list[M.SubAccount]
                                    M.SubAccount.status.in_(list(READY_SUB_ACCOUNT_STATUSES)))
     ).all())
     candidates.sort(key=lambda s: rank.get(s.status, 99))
-    return candidates
+    # Donut's 24h new-profile block: a sub-account with no profile yet cannot launch (see donut_profiles).
+    return keep_with_profile(candidates, get_global(db))
 
 
 def _resolve_rotating_pool(db: Session, provider: str, kind: str | None):

@@ -185,3 +185,109 @@ def test_live_keys_finds_a_real_foreign_process():
     finally:
         proc.terminate()
         proc.wait(timeout=5)
+
+
+# ── junk profiles: what is DELETED, and the guards ───────────────────────────────────────────────
+JUNK_OLD = NOW - 3 * 3600
+
+
+def _stopped(name, *, launched=JUNK_OLD, proxy_id=None):
+    return {"id": f"id-{name}", "name": name, "is_running": False, "last_launch": launched,
+            "proxy_id": proxy_id}
+
+
+def test_plan_junk_picks_orphans_finished_accounts_and_abandoned_signups_only():
+    known = {
+        "storm-keep": ("verified", "active"), "storm-held": ("held", "active"),
+        "storm-login": ("login_ok", "active"),
+        "storm-booked": ("booked", "booked"), "storm-ident": ("verified", "booked"),
+        "storm-burned": ("burned", "active"), "storm-new": ("new", "active"),
+    }
+    profiles = [_stopped(n) for n in ("storm-keep", "storm-held", "storm-login", "storm-booked",
+                                      "storm-ident", "storm-burned", "storm-new", "storm-ghost")]
+    got = {p["name"]: why for p, why in sweep.plan_junk(profiles, known, set(), NOW)}
+    assert set(got) == {"storm-booked", "storm-ident", "storm-burned", "storm-new", "storm-ghost"}
+    assert got["storm-ghost"].startswith("orphan")
+
+
+def test_plan_junk_never_touches_running_recent_protected_or_foreign_profiles():
+    profiles = [
+        {**_stopped("storm-run"), "is_running": True},
+        _stopped("storm-recent", launched=NOW - 60),
+        _stopped("storm-protected"),
+        _stopped("someone-elses"),
+    ]
+    assert sweep.plan_junk(profiles, {}, {"storm-protected"}, NOW) == []
+
+
+def test_plan_stray_proxies_only_unreferenced_storm_entries():
+    proxies = [{"id": "1", "name": "storm-used"}, {"id": "2", "name": "storm-stray"},
+               {"id": "3", "name": "my-own-proxy"}]
+    profiles = [{"name": "storm-used", "proxy_id": "1"}]
+    assert [x["id"] for x in sweep.plan_stray_proxies(proxies, profiles)] == ["2"]
+
+
+def test_known_profile_index_and_pending_signups(db):
+    bk = M.Booking(name="b", type="test", posto_id="2032", status=BookingStatus.RUNNING)
+    i1, i2 = M.Identity(full_name="A", type="test"), M.Identity(full_name="B", type="test")
+    db.add_all([bk, i1, i2]); db.commit()
+    s1 = M.SubAccount(identity_id=i1.id, username="u1", password="x")
+    s2 = M.SubAccount(identity_id=i2.id, username="u2", password="x")
+    db.add_all([s1, s2]); db.commit()
+    db.add(M.RegistrationJob(sub_account_id=s2.id, status=RegistrationStatus.QUEUED)); db.commit()
+    known, pending = sweep.known_profile_index(db, _name)
+    assert set(known) == {"storm-u1", "storm-u2"} and pending == {"storm-u2"}
+    assert known["storm-u1"][0] == "new"
+
+
+class _CleanApi:
+    profiles: list = []
+    deleted: list = []
+
+    def __init__(self, url=None, token=None):
+        pass
+
+    def call(self, method, path, body=None, timeout=30.0):
+        if method == "GET" and path == "/v1/profiles":
+            return {"profiles": list(self.profiles)}
+        if method == "DELETE":
+            self.deleted.append(path)
+        return {}
+
+
+def _install_donut(monkeypatch, profiles):
+    import libs.engine.vendor  # noqa: F401
+    import donut
+    _CleanApi.profiles, _CleanApi.deleted = profiles, []
+    monkeypatch.setattr(donut, "_Api", _CleanApi)
+    monkeypatch.setattr(sweep, "get_global", lambda db: {"BROWSER_BACKEND": "donut"})
+    monkeypatch.setattr(sweep, "live_keys", lambda module: set())
+    return donut
+
+
+def test_cleanup_refuses_when_the_sub_account_table_is_empty(db, monkeypatch):
+    _install_donut(monkeypatch, [_stopped("storm-a"), _stopped("storm-b")])
+    assert sweep.cleanup_junk_profiles(db, now=time.time()) == [] and _CleanApi.deleted == []
+
+
+def test_cleanup_refuses_a_pass_that_would_delete_most_profiles(db, monkeypatch):
+    donut = _install_donut(monkeypatch, [])
+    _world(db)
+    names = [donut.profile_name(u) for u in ("live1", "dead1")]
+    _CleanApi.profiles = [_stopped(n) for n in names] + [_stopped("storm-g1"), _stopped("storm-g2")]
+    assert sweep.cleanup_junk_profiles(db, now=time.time()) == []   # 3 of 4 look like junk
+    assert _CleanApi.deleted == []
+
+
+def test_cleanup_deletes_the_profile_and_its_proxy_entry(db, monkeypatch):
+    donut = _install_donut(monkeypatch, [])
+    _world(db)
+    from libs.domain.enums import SubAccountStatus
+    for sa in db.query(M.SubAccount).all():
+        sa.status = SubAccountStatus.VERIFIED
+    db.commit()
+    keep = [_stopped(donut.profile_name(u)) for u in ("live1", "live2", "dead1", "reg1")]
+    _CleanApi.profiles = keep + [_stopped("storm-ghost", proxy_id="px1")]
+    out = sweep.cleanup_junk_profiles(db, now=time.time())
+    assert [n for n, _ in out] == ["storm-ghost"]
+    assert _CleanApi.deleted == ["/v1/profiles/id-storm-ghost", "/v1/proxies/px1"]

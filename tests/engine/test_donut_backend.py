@@ -303,3 +303,27 @@ def test_close_browser_stops_the_profile_even_if_the_teardown_never_finishes(mon
         assert killed, "and the driver tree is killed rather than left to leak"
     finally:
         gate.set()
+
+
+def test_a_rejected_profile_create_does_not_leave_its_proxy_entry_behind(monkeypatch):
+    """Donut answered 429 on POST /v1/profiles AFTER the proxy entry was created; every retry left one
+    more stray entry (132 found on 2026-10-30)."""
+    calls = []
+
+    class _Api:
+        host = "h"
+
+        def call(self, method, path, body=None, timeout=30.0):
+            calls.append((method, path))
+            if method == "GET":
+                return {"profiles": [], "proxies": []}
+            if (method, path) == ("POST", "/v1/proxies"):
+                return {"proxy": {"id": "px9"}}
+            raise donut.DonutRateLimited("429", 60.0)
+
+    monkeypatch.setattr(donut, "_Api", _Api)
+    monkeypatch.setattr(donut, "_profile_ids", {})
+    monkeypatch.setattr(donut, "_proxy_ids", {})
+    with pytest.raises(donut.DonutRateLimited):
+        donut._launch_once("http://u:p@h:1", "someuser")
+    assert ("DELETE", "/v1/proxies/px9") in calls

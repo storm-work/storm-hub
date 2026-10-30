@@ -282,6 +282,21 @@ def launch(proxy_url: str | None, fp_seed: str | None) -> Lease:
     return _rate_limited(_launch_once, proxy_url, fp_seed)
 
 
+def _drop_unused_proxy(api: _Api, name: str, proxy_id: str | None) -> None:
+    """Delete the Donut proxy entry `proxy_id` when no profile named `name` exists. Never raises."""
+    if not proxy_id:
+        return
+    try:
+        if any(isinstance(it, dict) and it.get("name") == name
+               for it in _items(api.call("GET", "/v1/profiles"), "profiles")):
+            return                              # the profile exists; the entry is its proxy
+        api.call("DELETE", f"/v1/proxies/{proxy_id}", timeout=15)
+        with _cache_lock:
+            _proxy_ids.pop(name, None)
+    except Exception as e:
+        print(f"[donut] could not drop unused proxy entry for {name}: {str(e)[:100]}")
+
+
 def _launch_once(proxy_url: str | None, fp_seed: str | None) -> Lease:
     api = _Api()
     scope = _scope() if fp_seed else "session"
@@ -290,7 +305,14 @@ def _launch_once(proxy_url: str | None, fp_seed: str | None) -> Lease:
     else:
         name = f"{_PREFIX}tmp-{uuid.uuid4().hex[:12]}"
     proxy_id = _ensure_proxy(api, name, proxy_url, reuse=scope == "account")
-    profile_id = _ensure_profile(api, name, proxy_id, scope)
+    try:
+        profile_id = _ensure_profile(api, name, proxy_id, scope)
+    except Exception:
+        # The proxy entry was created for a profile that does not exist (Donut answered 429 on
+        # POST /v1/profiles, ...). Every retry used to leave another one behind -- 132 stray entries
+        # were found on 2026-10-30. Drop it, then let the failure through.
+        _drop_unused_proxy(api, name, proxy_id)
+        raise
     lease = Lease(profile_id, proxy_id, 0, api.host, scope, name)
     try:
         run = api.call("POST", f"/v1/profiles/{profile_id}/run",

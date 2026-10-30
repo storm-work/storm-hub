@@ -29,7 +29,12 @@ from .supervisor import live_keys
 logger = logging.getLogger("storm.hub.donut_sweep")
 
 GRACE_S = 600.0
+JUNK_GRACE_S = 7200.0        # a profile must have sat unused this long before it may be DELETED
+MAX_JUNK_FRACTION = 0.5      # refuse a pass that would delete more than this share of the profiles
 _PREFIX = "storm-"
+_DEAD_SUB = {"booked", "burned", "retired"}
+_DEAD_IDENT = {"booked", "retired", "archived"}
+_PENDING_SUB = {"new", "registered"}
 
 
 def plan_sweep(profiles: list[dict], protected: set[str], now: float,
@@ -68,6 +73,147 @@ def protected_profile_names(db: Session, profile_name) -> set[str]:
     return names
 
 
+def plan_junk(profiles: list[dict], known: dict[str, tuple[str, str]], protected: set[str],
+              now: float, grace_s: float = JUNK_GRACE_S) -> list[tuple[dict, str]]:
+    """Pure: (profile, reason) for every stopped `storm-*` profile that is not worth keeping.
+
+    Every profile counts toward Donut's 24h new-profile block when it is CREATED and clutters the host
+    afterwards, so a profile no future login can use should not outlive its purpose:
+      * orphan            -- no sub-account has this name (its account was deleted or regenerated);
+      * finished account  -- the sub-account is booked/burned/retired, or its identity is booked/retired;
+      * abandoned signup  -- the account never got past new/registered and no registration job is
+                             pending for it.
+    `known` maps profile name -> (sub-account status, identity status). Running, recently used or
+    protected profiles are never planned."""
+    out = []
+    for p in profiles:
+        name = str(p.get("name") or "")
+        if not name.startswith(_PREFIX) or p.get("is_running") or name in protected:
+            continue
+        launched = p.get("last_launch")
+        if isinstance(launched, (int, float)) and now - launched < grace_s:
+            continue
+        st = known.get(name)
+        if st is None:
+            out.append((p, "orphan: no sub-account has this profile"))
+        elif st[0] in _DEAD_SUB or st[1] in _DEAD_IDENT:
+            out.append((p, f"finished account (sub-account {st[0]}, identity {st[1]})"))
+        elif st[0] in _PENDING_SUB:
+            out.append((p, f"abandoned signup (sub-account {st[0]}, no pending registration)"))
+    return out
+
+
+def known_profile_index(db: Session, profile_name) -> tuple[dict[str, tuple[str, str]], set[str]]:
+    """({profile name: (sub-account status, identity status)}, names with a queued/running signup)."""
+    known: dict[str, tuple[str, str]] = {}
+    rows = db.execute(select(M.SubAccount.username, M.SubAccount.status, M.Identity.status)
+                      .join(M.Identity, M.Identity.id == M.SubAccount.identity_id)).all()
+    for username, st, ist in rows:
+        n = profile_name(username)
+        if n:
+            known[n] = (str(getattr(st, "value", st)), str(getattr(ist, "value", ist)))
+    pending: set[str] = set()
+    for u in db.scalars(
+            select(M.SubAccount.username)
+            .join(M.RegistrationJob, M.RegistrationJob.sub_account_id == M.SubAccount.id)
+            .where(M.RegistrationJob.status.in_(
+                [RegistrationStatus.QUEUED, RegistrationStatus.RUNNING]))).all():
+        n = profile_name(u)
+        if n:
+            pending.add(n)
+    return known, pending
+
+
+def cleanup_junk_profiles(db: Session, *, dry_run: bool = False, now: float | None = None) -> list[tuple[str, str]]:
+    """Delete the junk profiles (and their Donut proxy entry); returns (name, reason). Never raises.
+
+    Fails SAFE: an empty sub-account table (wrong database, mid-restore) would make every profile an
+    orphan, so nothing is deleted then, nor when a pass would delete over MAX_JUNK_FRACTION of them."""
+    try:
+        g = get_global(db)
+        if str(g.get("BROWSER_BACKEND") or "chromium").strip().lower() != "donut":
+            return []
+        import libs.engine.vendor  # noqa: F401
+        import donut
+        api = donut._Api(url=g.get("DONUT_API_URL") or "", token=g.get("DONUT_API_TOKEN") or "")
+        profiles = donut._items(api.call("GET", "/v1/profiles", timeout=15), "profiles")
+        known, pending = known_profile_index(db, donut.profile_name)
+        if not known:
+            logger.warning("donut cleanup: no sub-accounts in the database -- deleting nothing")
+            return []
+        protected = protected_profile_names(db, donut.profile_name) | pending
+        victims = plan_junk(profiles, known, protected, time.time() if now is None else now)
+        mine = [p for p in profiles if str(p.get("name") or "").startswith(_PREFIX)]
+        if mine and len(victims) > MAX_JUNK_FRACTION * len(mine):
+            logger.warning("donut cleanup: %d of %d profiles look like junk -- more than %d%%, refusing "
+                           "to delete anything", len(victims), len(mine), int(MAX_JUNK_FRACTION * 100))
+            return []
+        done = []
+        for p, why in victims:
+            if not dry_run:
+                try:
+                    api.call("DELETE", f"/v1/profiles/{p['id']}", timeout=15)
+                except Exception as e:
+                    logger.warning("donut cleanup: could not delete %s: %s", p.get("name"), str(e)[:120])
+                    continue
+                if p.get("proxy_id"):
+                    try:
+                        api.call("DELETE", f"/v1/proxies/{p['proxy_id']}", timeout=15)
+                    except Exception:
+                        pass
+            done.append((p["name"], why))
+        if done:
+            logger.info("donut cleanup: %s %d junk profile(s): %s", "would delete" if dry_run else "deleted",
+                        len(done), "; ".join(f"{n} [{w}]" for n, w in done))
+        return done
+    except Exception:
+        logger.exception("donut cleanup failed -- leaving profiles as they are")
+        return []
+
+
+def plan_stray_proxies(proxies: list[dict], profiles: list[dict]) -> list[dict]:
+    """Pure: `storm-*` Donut proxy entries no profile points at. Entries the bot did not name are the
+    operator's and are never planned."""
+    used = {p.get("proxy_id") for p in profiles if p.get("proxy_id")}
+    return [x for x in proxies if str(x.get("name") or "").startswith(_PREFIX) and x.get("id") not in used]
+
+
+def cleanup_stray_proxies(db: Session, *, dry_run: bool = False, settle_s: float = 15.0) -> list[str]:
+    """Delete `storm-*` proxy entries no profile uses. A launch creates the proxy entry a moment before
+    its profile, so an entry is only deleted if it is STILL unreferenced after `settle_s` seconds.
+    Never raises."""
+    try:
+        g = get_global(db)
+        if str(g.get("BROWSER_BACKEND") or "chromium").strip().lower() != "donut":
+            return []
+        import libs.engine.vendor  # noqa: F401
+        import donut
+        api = donut._Api(url=g.get("DONUT_API_URL") or "", token=g.get("DONUT_API_TOKEN") or "")
+
+        def _lists():
+            return (donut._items(api.call("GET", "/v1/proxies", timeout=15), "proxies"),
+                    donut._items(api.call("GET", "/v1/profiles", timeout=15), "profiles"))
+        first = {x["id"] for x in plan_stray_proxies(*_lists())}
+        if not first:
+            return []
+        time.sleep(settle_s)
+        proxies, profiles = _lists()
+        victims = [x for x in plan_stray_proxies(proxies, profiles) if x["id"] in first]
+        for x in victims:
+            if not dry_run:
+                try:
+                    api.call("DELETE", f"/v1/proxies/{x['id']}", timeout=15)
+                except Exception as e:
+                    logger.warning("donut cleanup: could not delete proxy %s: %s", x.get("name"), str(e)[:100])
+        if victims:
+            logger.info("donut cleanup: %s %d stray proxy entr(ies)",
+                        "would delete" if dry_run else "deleted", len(victims))
+        return [x["name"] for x in victims]
+    except Exception:
+        logger.exception("donut proxy cleanup failed -- leaving them")
+        return []
+
+
 def sweep_donut_profiles(db: Session, *, dry_run: bool = False, now: float | None = None) -> list[str]:
     """Stop the unowned running profiles; returns their names. Never raises: it runs at boot."""
     try:
@@ -100,4 +246,9 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     with SessionLocal() as _db:
         names = sweep_donut_profiles(_db, dry_run="--dry-run" in sys.argv)
+        junk = cleanup_junk_profiles(_db, dry_run="--dry-run" in sys.argv)
+        strays = cleanup_stray_proxies(_db, dry_run="--dry-run" in sys.argv)
     print(("would stop: " if "--dry-run" in sys.argv else "stopped: ") + (", ".join(names) or "nothing"))
+    print(("would delete: " if "--dry-run" in sys.argv else "deleted: ")
+          + ("; ".join(f"{n} [{w}]" for n, w in junk) or "nothing"))
+    print(("would delete proxies: " if "--dry-run" in sys.argv else "deleted proxies: ") + str(len(strays)))
