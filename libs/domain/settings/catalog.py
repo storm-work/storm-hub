@@ -244,6 +244,13 @@ _GLOBAL = [
        "engine's fingerprint pool, version alignment, stealth script and HEADLESS_MODE do not apply. "
        "Needs the Donut app running on this host, signed in to a plan with automation, Local API "
        "on, and DONUT_API_TOKEN set. Login/warm-up/apply flows are unchanged."),
+    _s("DONUT_PROFILES_PER_HOUR", L.GLOBAL, int, 80, _TPL, "browser", min_value=0,
+       note=
+       "BROWSER_BACKEND=donut. The registrar starts at most this many accounts per rolling hour (each "
+       "creates one Donut profile on its first launch), shared across registrar runs through Redis. "
+       "Donut's Pro plan allows 100 new profiles per hour and blocks the account for 24h above that "
+       "(2026-10-29: ~236 profiles in two hours). 80 leaves headroom for workers' first launches. "
+       "0 disables the budget."),
     _s("REGISTRAR_BROWSER_BACKEND", L.GLOBAL, str, "", _TPL, "browser",
        choices=("", "chromium", "donut"),
        note=

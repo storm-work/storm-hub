@@ -71,6 +71,10 @@ The Hub's own proxy-screening probes always stay on Chromium.
   does not say whether that is per profile or per account. One login is far more than 100 CDP
   messages. If this limit is enforced, the mode cannot work. `probes/donut_probe.py` step 5
   measures it.
+- **New profiles: 100 per hour on Pro** (Donut support, 2026-10-30), no daily/weekly limit. Over it the
+  account is blocked for 24h (`WAYFERN_GENERATION_LIMIT_REACHED`, no Retry-After); support lifts it on
+  request, and the Donut app must be RESTARTED afterwards before the API honours the lift. The registrar
+  stays under it with `DONUT_PROFILES_PER_HOUR` (default 80, Redis rolling window).
 - **Hourly automation limit** on profile runs (HTTP 429 with `Retry-After`). The numbers depend on
   the plan and are not published. Every exit roll is a new run.
 - **Scale.** Nothing is documented for about 100 concurrent profiles on one host.

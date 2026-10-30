@@ -2671,6 +2671,7 @@ def run_registration(body: RegistrationRunRequest, db: Session = Depends(get_db)
         email_cfg=email_cfg, concurrency=body.concurrency,
         browser_concurrency=body.browser_concurrency or body.concurrency,
         captcha_solve_proxy=captcha_solve_proxy, vendor_settings=vendor_settings,
+        donut_profiles_per_hour=int(_eff.get("DONUT_PROFILES_PER_HOUR") or 0),
     )
     return {"run_id": run_id, "queued": len(accounts)}
 

@@ -28,6 +28,7 @@ from concurrent.futures import ThreadPoolExecutor
 from libs.bus import Bus, connect
 
 from apps.worker.bus_signals import BusSignals
+from apps.registrar import profile_budget
 
 BASE = "https://pedidodevistos.mne.gov.pt"
 PORTAL_ORIGIN = "https://pedidodevistos.mne.gov.pt"
@@ -465,7 +466,7 @@ async def _run_all(bus: Bus, run_id: str, accounts: list[dict], proxies: list[di
                    capsolver_keys: list[str], lang: str, email_provider: str, email_cfg: dict,
                    concurrency: int, browser_concurrency: int,
                    captcha_solve_proxy: bool = False,
-                   anticaptcha_keys: list[str] | None = None) -> None:
+                   anticaptcha_keys: list[str] | None = None, profile_cap: int = 0) -> None:
     proxies_cycle = itertools.cycle(proxies or [{"id": None, "url": None}])
     sem = asyncio.Semaphore(max(1, concurrency))
     browser_sem = asyncio.Semaphore(max(1, browser_concurrency))
@@ -473,6 +474,8 @@ async def _run_all(bus: Bus, run_id: str, accounts: list[dict], proxies: list[di
 
     async def bounded(acct: dict, idx: int) -> str:
         async with sem:
+            if profile_cap > 0 and os.environ.get("BROWSER_BACKEND", "chromium").strip().lower() == "donut":
+                await profile_budget.reserve(getattr(bus, "r", None), profile_cap)
             return await _register_one(acct, proxies_cycle, capsolver_keys, lang, email_provider,
                                        email_cfg, executor, bus, run_id, browser_sem,
                                        captcha_solve_proxy, anticaptcha_keys=anticaptcha_keys,
@@ -533,7 +536,8 @@ def main() -> int:
 
     asyncio.run(_run_all(bus, run_id, accounts, proxies, capsolver_keys, lang,
                          email_provider, email_cfg, concurrency, browser_concurrency,
-                         captcha_solve_proxy, anticaptcha_keys=anticaptcha_keys))
+                         captcha_solve_proxy, anticaptcha_keys=anticaptcha_keys,
+                         profile_cap=int(payload.get("donut_profiles_per_hour") or 0)))
     return 0
 
 
