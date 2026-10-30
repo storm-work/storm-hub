@@ -105,7 +105,7 @@ def main() -> int:
     ap.add_argument("--group", default="EXP")
     ap.add_argument("--pool", default="soax")
     ap.add_argument("--geo", default="DE", help="best measured login rate (DE/IT ~23%%)")
-    ap.add_argument("--max-load", type=float, default=15.0)
+    ap.add_argument("--max-load", type=float, default=56.0, help="skip a probe above this load1 (host has 56 cores)")
     ap.add_argument("--headed-soak", action="store_true",
                     help="also run a second soak with a REAL window (DONUT_HEADLESS=0) on its own spare "
                          "(needs >= 7 spares; the headless soak keeps the first)")
