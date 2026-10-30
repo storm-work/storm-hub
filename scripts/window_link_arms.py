@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
-"""Link the experiment arms to the control: every arm booking gets `W-main` as its slot feeder.
+"""Full-mesh slot feed between the four non-blind experiment bookings: each one lists the other three as
+feeders, so a slot found by ANY booking's scouts reaches all the others (W-blind stays out: its seeded grid
+is never copied out and it takes nothing in).
 
-The dashboard has no field for discovery_feeder_booking_ids, so this sets it (names -> ids) directly:
-
-    .venv/bin/python -m scripts.window_link_arms                # W-sched, W-short, W-long <- W-main
+    .venv/bin/python -m scripts.window_link_arms                # link
     .venv/bin/python -m scripts.window_link_arms --check        # print what is linked, change nothing
 
-Arms never feed W-main (one direction; a slot found by W-main's scouts is mirrored into each arm's pool
-every scheduler tick -- see Scheduler._mirror_feeder_slots). W-blind is NOT linked: it runs off the
-seeded pool and must stay independent.
+The dashboard has no field for discovery_feeder_booking_ids, so this sets it (names -> ids) directly.
+See Scheduler._mirror_feeder_slots (one-directional per link; the mesh is 12 links).
 """
 import argparse
 
@@ -17,8 +16,8 @@ from sqlalchemy import select
 from apps.hub.db import SessionLocal
 from libs.db import models as M
 
-CONTROL = "W-main"
-ARMS = ("W-sched", "W-short", "W-long")
+MESH = ("W-main", "W-sched", "W-short", "W-long")
+OUT = ("W-blind",)
 
 
 def main() -> int:
@@ -28,19 +27,20 @@ def main() -> int:
     db = SessionLocal()
     try:
         by_name = {b.name: b for b in db.scalars(select(M.Booking).where(
-            M.Booking.name.in_((CONTROL, *ARMS, "W-blind")), M.Booking.archived_at.is_(None)))}
-        ctl = by_name.get(CONTROL)
-        if ctl is None:
-            print(f"ERROR: no booking named {CONTROL!r}"); return 1
-        for name in (*ARMS, "W-blind"):
+            M.Booking.name.in_((*MESH, *OUT)), M.Booking.archived_at.is_(None)))}
+        missing = [n for n in MESH if n not in by_name]
+        if missing:
+            print(f"ERROR: no booking named {missing}"); return 1
+        for name in (*MESH, *OUT):
             b = by_name.get(name)
             if b is None:
                 print(f"  {name:8} missing"); continue
-            want = [ctl.id] if name in ARMS else []
-            have = list(b.discovery_feeder_booking_ids or [])
+            want = sorted(by_name[o].id for o in MESH if o != name) if name in MESH else []
+            have = sorted(b.discovery_feeder_booking_ids or [])
             if not a.check and have != want:
                 b.discovery_feeder_booking_ids = want
-            print(f"  {name:8} posto={b.posto_id} status={b.status} feeders: {have} -> {want}"
+            names = [n for n, x in by_name.items() if x.id in want]
+            print(f"  {name:8} posto={b.posto_id} status={b.status} feeders <- {sorted(names)}"
                   f"{'' if have == want else ('  (would change)' if a.check else '  (set)')}")
         if not a.check:
             db.commit()

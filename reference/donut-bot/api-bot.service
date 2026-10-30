@@ -1,0 +1,19 @@
+[Unit]
+Description=ptbot pure-API booking bot v3 (dashboard-integrated)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust User + paths to the target VPS:
+User=USER
+WorkingDirectory=/home/USER/visa-dashboard/api-bot
+EnvironmentFile=/home/USER/visa-dashboard/api-bot/.env
+ExecStart=/usr/bin/python3 /home/USER/visa-dashboard/api-bot/api_bot.py
+Restart=always
+RestartSec=3
+# never let it die for good:
+StartLimitIntervalSec=0
+
+[Install]
+WantedBy=multi-user.target

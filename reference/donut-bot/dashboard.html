@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="pt">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Visa Bot Monitor</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --bg-panel: #161b22;
+    --bg-hover: #1c2128;
+    --border: #30363d;
+    --text: #e6edf3;
+    --text-dim: #8b949e;
+    --green: #3fb950;
+    --yellow: #d29922;
+    --red: #f85149;
+    --blue: #58a6ff;
+    --purple: #bc8cff;
+    --orange: #db6d28;
+    --cyan: #39c5cf;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+  }
+  /* Header */
+  header {
+    background: var(--bg-panel);
+    border-bottom: 1px solid var(--border);
+    padding: 12px 24px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    position: sticky;
+    top: 0;
+    z-index: 100;
+  }
+  .logo { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 18px; }
+  .logo-icon { color: var(--blue); }
+  .header-right { display: flex; align-items: center; gap: 16px; font-size: 12px; color: var(--text-dim); }
+  .live-dot {
+    display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+    background: var(--green); animation: pulse 2s infinite;
+  }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+  /* Counters bar */
+  .counters {
+    display: flex;
+    gap: 1px;
+    background: var(--border);
+    border-bottom: 1px solid var(--border);
+    overflow-x: auto;
+  }
+  .counter {
+    background: var(--bg-panel);
+    padding: 14px 20px;
+    min-width: 110px;
+    text-align: center;
+  }
+  .counter .num { font-size: 28px; font-weight: 700; line-height: 1.2; }
+  .counter .lbl { font-size: 11px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.5px; margin-top: 2px; }
+  .counter.total .num { color: var(--text); }
+  .counter.logging_in .num { color: var(--blue); }
+  .counter.warming .num { color: var(--yellow); }
+  .counter.sentinel .num { color: var(--purple); }
+  .counter.followers .num { color: var(--cyan); }
+  .counter.polling .num { color: var(--orange); }
+  .counter.booked .num { color: var(--green); }
+  .counter.failed .num { color: var(--red); }
+  .counter.slots_found .num { color: var(--green); }
+
+  /* Layout */
+  .main { display: flex; gap: 1px; background: var(--border); min-height: calc(100vh - 130px); }
+  .accounts-panel { flex: 1; background: var(--bg); overflow: auto; }
+  .events-panel { width: 360px; background: var(--bg); overflow: auto; }
+
+  /* Sentinel banner */
+  .sentinel-banner {
+    background: var(--bg-panel);
+    border-bottom: 1px solid var(--border);
+    padding: 12px 24px;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+  }
+  .sentinel-banner.found { background: #1a3a2a; border-bottom-color: var(--green); }
+  .sentinel-banner .label { font-size: 11px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.5px; }
+  .sentinel-banner .value { font-weight: 600; }
+  .sentinel-banner .found-badge {
+    background: var(--green); color: #000; padding: 4px 12px; border-radius: 4px;
+    font-weight: 700; font-size: 12px; animation: pulse 1s infinite;
+  }
+
+  /* Accounts table */
+  .panel-header {
+    padding: 12px 24px;
+    background: var(--bg-panel);
+    border-bottom: 1px solid var(--border);
+    font-weight: 600;
+    font-size: 13px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    position: sticky;
+    top: 0;
+    z-index: 10;
+  }
+  table { width: 100%; border-collapse: collapse; }
+  th {
+    text-align: left;
+    padding: 10px 16px;
+    font-size: 11px;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-panel);
+    position: sticky;
+    top: 41px;
+    z-index: 5;
+  }
+  td { padding: 10px 16px; border-bottom: 1px solid #21262d; font-size: 13px; }
+  tr:hover td { background: var(--bg-hover); }
+  .username { font-family: 'SF Mono', Monaco, Consolas, monospace; font-weight: 600; }
+  .badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 3px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+  }
+  .badge-LOGGING_IN { background: #1a3a5a; color: var(--blue); }
+  .badge-LOGGED_IN { background: #1a3a5a; color: var(--blue); }
+  .badge-warming { background: #3a2f1a; color: var(--yellow); }
+  .badge-sentinel { background: #2d1a3a; color: var(--purple); }
+  .badge-follower { background: #1a3033; color: var(--cyan); }
+  .badge-polling { background: #3a2a1a; color: var(--orange); }
+  .badge-COMPLETED { background: #1a3a2a; color: var(--green); }
+  .badge-booked { background: #1a3a2a; color: var(--green); }
+  .badge-FAILED { background: #3a1a1a; color: var(--red); }
+  .badge-STOPPED { background: #3a1a1a; color: var(--red); }
+  .badge-failed { background: #3a1a1a; color: var(--red); }
+  .badge-IDLE { background: #2a2a2a; color: var(--text-dim); }
+  .ago { color: var(--text-dim); font-size: 12px; font-family: monospace; }
+  .detail { color: var(--text-dim); font-size: 12px; max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  /* Events feed */
+  .event-item {
+    padding: 10px 16px;
+    border-bottom: 1px solid #21262d;
+    font-size: 12px;
+  }
+  .event-item .ev-time { color: var(--text-dim); font-family: monospace; font-size: 11px; }
+  .event-item .ev-text { margin-top: 2px; }
+  .event-item.slots_found { background: #1a3a2a; }
+  .event-item.slots_found .ev-text { color: var(--green); font-weight: 600; }
+  .event-item.signal { background: #2d1a3a; }
+  .event-item.signal .ev-text { color: var(--purple); font-weight: 600; }
+  .event-item.booked { background: #1a3a2a; }
+  .event-item.booked .ev-text { color: var(--green); font-weight: 600; }
+  .event-item.failed .ev-text { color: var(--red); }
+
+  /* Empty state */
+  .empty { padding: 40px; text-align: center; color: var(--text-dim); }
+
+  /* Scrollbar */
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-track { background: var(--bg); }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+  ::-webkit-scrollbar-thumb:hover { background: #484f58; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">
+    <span class="logo-icon">&#9889;</span>
+    Visa Bot Monitor
+  </div>
+  <div class="header-right">
+    <span><span class="live-dot"></span> LIVE</span>
+    <span id="updated">-</span>
+    <span id="portugal-time">-</span>
+  </div>
+</header>
+
+<!-- Counters -->
+<div class="counters" id="counters">
+  <div class="counter total"><div class="num" id="c-total">0</div><div class="lbl">Total Contas</div></div>
+  <div class="counter logging_in"><div class="num" id="c-logging_in">0</div><div class="lbl">A Logar</div></div>
+  <div class="counter warming"><div class="num" id="c-warming">0</div><div class="lbl">A Aquecer</div></div>
+  <div class="counter sentinel"><div class="num" id="c-sentinel">0</div><div class="lbl">Sentinela</div></div>
+  <div class="counter followers"><div class="num" id="c-followers">0</div><div class="lbl">Followers</div></div>
+  <div class="counter polling"><div class="num" id="c-polling">0</div><div class="lbl">A Sondar</div></div>
+  <div class="counter booked"><div class="num" id="c-booked">0</div><div class="lbl">Agendadas</div></div>
+  <div class="counter failed"><div class="num" id="c-failed">0</div><div class="lbl">Falharam</div></div>
+  <div class="counter slots_found"><div class="num" id="c-slots_found">0</div><div class="lbl">Vagas Encontradas</div></div>
+</div>
+
+<!-- Sentinel banner -->
+<div class="sentinel-banner" id="sentinel-banner">
+  <div>
+    <div class="label">Sentinela Atual</div>
+    <div class="value" id="sentinel-name">Aguardando...</div>
+  </div>
+  <div>
+    <div class="label">Geração</div>
+    <div class="value" id="sentinel-gen">-</div>
+  </div>
+  <div id="sentinel-status"></div>
+</div>
+
+<!-- Main layout -->
+<div class="main">
+  <div class="accounts-panel">
+    <div class="panel-header">
+      <span>Contas (<span id="acc-count">0</span>)</span>
+      <input type="text" id="search" placeholder="filtrar..." style="background:var(--bg);border:1px solid var(--border);color:var(--text);padding:4px 10px;border-radius:4px;font-size:12px;width:180px;">
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th>Username</th>
+          <th>Estado</th>
+          <th>Papel</th>
+          <th>Evento</th>
+          <th>Detalhe</th>
+          <th>Visto há</th>
+        </tr>
+      </thead>
+      <tbody id="accounts-body">
+        <tr><td colspan="6" class="empty">A carregar contas...</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="events-panel">
+    <div class="panel-header">
+      <span>Eventos Recentes</span>
+      <span style="color:var(--text-dim);font-size:11px;">&uacute;ltimos 50</span>
+    </div>
+    <div id="events-list">
+      <div class="empty">Sem eventos</div>
+    </div>
+  </div>
+</div>
+
+<script>
+const REFRESH_MS = 3000;
+let lastData = null;
+
+function fmtAgo(seconds) {
+  if (seconds < 5) return 'agora';
+  if (seconds < 60) return Math.round(seconds) + 's';
+  if (seconds < 3600) return Math.round(seconds/60) + 'm';
+  return Math.round(seconds/3600) + 'h';
+}
+
+function fmtTime(ts) {
+  if (!ts) return '-';
+  const d = new Date(ts * 1000);
+  return d.toLocaleTimeString('pt-PT');
+}
+
+function roleBadge(role, stage) {
+  const r = role || stage || 'IDLE';
+  return '<span class="badge badge-' + r + '">' + r + '</span>';
+}
+
+async function refresh() {
+  try {
+    const resp = await fetch('/api/status');
+    const data = await resp.json();
+    lastData = data;
+    render(data);
+  } catch (e) {
+    document.getElementById('updated').textContent = 'ERRO: ' + e.message;
+  }
+}
+
+function render(data) {
+  const c = data.counters || {};
+  document.getElementById('c-total').textContent = c.total || 0;
+  document.getElementById('c-logging_in').textContent = c.logging_in || 0;
+  document.getElementById('c-warming').textContent = c.warming || 0;
+  document.getElementById('c-sentinel').textContent = c.sentinel || 0;
+  document.getElementById('c-followers').textContent = c.followers || 0;
+  document.getElementById('c-polling').textContent = c.polling || 0;
+  document.getElementById('c-booked').textContent = c.booked || 0;
+  document.getElementById('c-failed').textContent = c.failed || 0;
+  document.getElementById('c-slots_found').textContent = c.slots_found || 0;
+
+  // Updated time
+  document.getElementById('updated').textContent = 'Atualizado: ' + new Date().toLocaleTimeString('pt-PT');
+
+  // Portugal time
+  const ptTime = new Date().toLocaleTimeString('pt-PT', { timeZone: 'Europe/Lisbon' });
+  document.getElementById('portugal-time').textContent = 'PT: ' + ptTime;
+
+  // Sentinel banner
+  const banner = document.getElementById('sentinel-banner');
+  const sName = document.getElementById('sentinel-name');
+  const sGen = document.getElementById('sentinel-gen');
+  const sStatus = document.getElementById('sentinel-status');
+  if (data.sentinel) {
+    sName.textContent = data.sentinel.username;
+    sGen.textContent = 'gen ' + data.sentinel.generation;
+  } else {
+    sName.textContent = 'Nenhuma (a aguardar)';
+    sGen.textContent = '-';
+  }
+  if (data.counters && data.counters.slots_found) {
+    banner.classList.add('found');
+    sStatus.innerHTML = '<span class="found-badge">VAGAS ENCONTRADAS!</span>';
+  } else {
+    banner.classList.remove('found');
+    sStatus.innerHTML = '';
+  }
+
+  // Accounts table
+  const filter = document.getElementById('search').value.toLowerCase();
+  const accounts = (data.accounts || []).filter(a =>
+    !filter || (a.username || '').toLowerCase().includes(filter)
+  );
+  accounts.sort((a, b) => (a.username || '').localeCompare(b.username || ''));
+  document.getElementById('acc-count').textContent = accounts.length;
+
+  const tbody = document.getElementById('accounts-body');
+  if (accounts.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="6" class="empty">Nenhuma conta encontrada. O bot est&aacute; a correr? Verifica logs/api_bot.log</td></tr>';
+  } else {
+    tbody.innerHTML = accounts.map(a => {
+      const ago = a.last_seen_ago != null ? fmtAgo(a.last_seen_ago) : '-';
+      return '<tr>' +
+        '<td class="username">' + (a.username || '?') + '</td>' +
+        '<td>' + roleBadge(a.role, a.stage) + '</td>' +
+        '<td style="color:var(--text-dim);font-size:12px;">' + (a.role || '-') + '</td>' +
+        '<td style="font-size:12px;">' + (a.event || '-') + '</td>' +
+        '<td class="detail">' + (a.detail || '') + '</td>' +
+        '<td class="ago">' + ago + '</td>' +
+        '</tr>';
+    }).join('');
+  }
+
+  // Events feed
+  const eventsList = document.getElementById('events-list');
+  const events = data.events || [];
+  if (events.length === 0) {
+    eventsList.innerHTML = '<div class="empty">Sem eventos</div>';
+  } else {
+    eventsList.innerHTML = events.map(e => {
+      const cls = 'event-item ' + (e.type || '');
+      return '<div class="' + cls + '">' +
+        '<div class="ev-time">' + fmtTime(e.ts) + ' &middot; ' + fmtAgo(e.ago) + ' atr&aacute;s</div>' +
+        '<div class="ev-text">' + (e.text || '') + '</div>' +
+        '</div>';
+    }).join('');
+  }
+}
+
+document.getElementById('search').addEventListener('input', () => { if (lastData) render(lastData); });
+refresh();
+setInterval(refresh, REFRESH_MS);
+</script>
+</body>
+</html>

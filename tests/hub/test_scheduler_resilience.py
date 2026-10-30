@@ -2635,3 +2635,53 @@ def test_a_feeder_detector_stuck_at_the_login_wall_does_not(db):
     sched._maybe_self_scout(db, bk, NOW)
 
     assert any(t == "assign" and p.get("scouts_invalid") for _w, t, p in bus.sent)
+
+
+def _mesh(db, n=4):
+    """n RUNNING bookings on one posto, each fed by every OTHER one (full mesh)."""
+    bks = [_mk_booking(db, status=BookingStatus.RUNNING) for _ in range(n)]
+    for b in bks:
+        b.discovery_feeder_booking_ids = [o.id for o in bks if o.id != b.id]
+    db.commit()
+    return bks
+
+
+def _pool(db, bk):
+    return sorted((r.date, r.period, r.source) for r in db.scalars(
+        select(M.Slot).where(M.Slot.booking_id == bk.id)).all())
+
+
+def test_full_mesh_one_find_reaches_all_others_once_and_settles(db):
+    a, b, c, d = _mesh(db)
+    _add_slot(db, c, "2026-10-20", 3)             # only C's scouts found it
+    sch = _scheduler()
+
+    for _ in range(3):                             # several ticks, every booking mirrors each tick
+        for bk in (a, b, c, d):
+            sch._mirror_feeder_slots(db, bk, _utcnow())
+
+    assert _pool(db, c) == [("2026-10-20", 3, "scout")]           # finder keeps its own, no echo copy
+    for bk in (a, b, d):
+        assert _pool(db, bk) == [("2026-10-20", 3, "feeder")]      # exactly one copy each
+
+
+def test_full_mesh_two_finders_do_not_duplicate_and_a_closed_slot_is_not_resurrected(db):
+    a, b, c, d = _mesh(db)
+    _add_slot(db, a, "2026-10-20", 3)
+    _add_slot(db, d, "2026-10-20", 3)             # same slot found independently by A and D
+    _add_slot(db, d, "2026-10-21", 4)
+    sch = _scheduler()
+    for _ in range(2):
+        for bk in (a, b, c, d):
+            sch._mirror_feeder_slots(db, bk, _utcnow())
+    assert [(r[0], r[1]) for r in _pool(db, b)] == [("2026-10-20", 3), ("2026-10-21", 4)]
+    assert [(r[0], r[1]) for r in _pool(db, a)] == [("2026-10-20", 3), ("2026-10-21", 4)]
+
+    # B bounces 10-20 (slot taken) and closes it; A still holds it AVAILABLE and feeds B every tick
+    for r in db.scalars(select(M.Slot).where(M.Slot.booking_id == b.id, M.Slot.date == "2026-10-20")):
+        r.status = SlotStatus.CLOSED
+    db.commit()
+    for bk in (a, b, c, d):
+        sch._mirror_feeder_slots(db, bk, _utcnow())
+    closed = db.scalars(select(M.Slot).where(M.Slot.booking_id == b.id, M.Slot.date == "2026-10-20")).all()
+    assert len(closed) == 1 and closed[0].status == SlotStatus.CLOSED

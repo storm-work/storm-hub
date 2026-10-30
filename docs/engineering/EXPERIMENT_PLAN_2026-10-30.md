@@ -144,8 +144,9 @@ Steps (dashboard, Bookings page):
    rename, then set the arm's settings in the booking's settings editor and the two times. Attach its identities.
    Check the booking's *effective settings* show the arm's keys and nothing else different.
 3. `W-blind`: create the same way (identical times), then seed the 5084 periods (`POST /bookings/{id}/blind-apply`).
-4. Link the arms to the control (the dashboard has no field for it):
-   `.venv/bin/python -m scripts.window_link_arms` then `--check`. `W-blind` stays unlinked.
+4. Full-mesh slot feed between the four non-blind bookings (each lists the other three; the dashboard has no
+   field for it): `.venv/bin/python -m scripts.window_link_arms` then `--check`. `W-blind` stays unlinked.
+   Every booking carries its own scouts, so a find by any of them reaches all.
 5. Schedule all five bookings (they warm up by themselves at 07:30). Blind mode with a `slot_open_at` set HOLDS
    the seeded pool until that instant (scheduler `_drive_booking`: the immediate blind fire only applies when
    no `slot_open_at` is set), so `W-blind` is scheduled exactly like the others and warms up before the login

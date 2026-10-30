@@ -1055,9 +1055,13 @@ class Scheduler:
             # (or_ keeps a source-less row) so a future discovered source can't silently be dropped.
             or_(M.Slot.source.is_(None), M.Slot.source != "blind"))).all()
         injected = 0
+        seen: set[tuple] = set()   # several feeders can hold the SAME slot (full mesh): insert it once
         for s in feeder_rows:
             if s.posto_id and bk.posto_id and s.posto_id != bk.posto_id:
                 continue   # different consulate -- not bookable by this booking's sessions
+            if (s.date, s.period) in seen:
+                continue
+            seen.add((s.date, s.period))
             exists = db.scalar(select(M.Slot).where(
                 M.Slot.booking_id == bk.id, M.Slot.date == s.date, M.Slot.period == s.period))
             if exists is not None:
