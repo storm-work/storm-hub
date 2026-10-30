@@ -131,7 +131,7 @@ first (so no arm gets the better accounts), **test identities** all go into `W-m
 | `W-long` | real | 7 | none | `QUEST_HOLD_MIN_S=240`, `QUEST_HOLD_MAX_S=420` |
 | `W-blind` | real | 7 | none | `BLIND_APPLY_MODE=true`, `BLIND_MAX_BOUNCES=0` |
 
-2 real identities stay unassigned as reserve. Every booking: **posto 5084**, same nationality/residence,
+The 78 real identities labelled `+` are split by `scripts.window_split_identities` into groups `ARM-main`/`ARM-sched`/...; the 11 ungrouped real identities stay as reserve. Every booking: **posto 5084**, same nationality/residence,
 `warmup_start_at` = **07:30 UTC**, `slot_open_at` = **09:30 UTC** (identical on all five bookings). The portal
 claims 10:00 but has opened up to ~15 min early before; discovery only runs once slot-open has fired, so
 `slot_open_at` is set 30 min ahead of the claimed time (scouts then poll from 09:30; the apply workers
