@@ -94,7 +94,7 @@ def command(kind: str, when: datetime, ident: str, a) -> tuple[list[str], str]:
                 "--accounts", "1", "--exit-tries", "1", *scope], tag
     tag = f"formstate-{hhmm}"
     return [PY, "probes/formstate_ttl_probe.py", "--booking", a.booking, "--minutes", "20",
-            "--interval", "120", "--silent-at", "480", "--out", f"var/window/probes/{tag}.jsonl", *scope], tag
+            *common, "--interval", "120", "--silent-at", "480", "--out", f"var/window/probes/{tag}.jsonl", *scope], tag
 
 
 def main() -> int:

@@ -44,7 +44,8 @@ def keep_with_profile(subs: list, g: dict) -> list:
     backend is not donut, or Donut cannot be asked."""
     if str(g.get("BROWSER_BACKEND", "") or "").lower() != "donut":
         return subs
-    if not g.get("DONUT_EXISTING_PROFILES_ONLY", True):
+    # `g` is the raw settings map (every value a string): "false" is truthy, so parse it.
+    if str(g.get("DONUT_EXISTING_PROFILES_ONLY", "true")).strip().lower() in ("false", "0", "no", "off", ""):
         return subs
     names = existing_profile_names(g)
     if names is None:

@@ -132,7 +132,13 @@ def warm_one(arm: str, geo: str, log, booking_name: str = "Test2",
         if not subs:
             continue
         tried += 1
-        url = conn_url(pool[tried], geo=geo)
+        if _POOL in ("soax", "rotating"):
+            from libs.proxies.rotating import mint_rotating_url
+            url = mint_rotating_url("soax", "rotating", settings=get_global(db), geo=geo or None)
+        elif pool:
+            url = conn_url(pool[tried % len(pool)], geo=geo)
+        else:
+            log(f"[{arm}] no active {provider!r} proxies -- cannot log in"); break
         log(f"[{arm}] login try {tried} {ident.full_name[:22]!r} {provider}#{session_id(url)}")
         ops = LiveEngineOps(
             cfg, account=_live_account(ident, subs[0]), posto_id=str(bk.posto_id),
@@ -269,6 +275,7 @@ def report(path):
 
 
 _GROUP = _IDENT = None
+_POOL = "soax"
 
 
 def main():
@@ -277,6 +284,7 @@ def main():
     ap.add_argument("--interval", type=float, default=120.0, help="poll arm: seconds between GETs")
     ap.add_argument("--silent-at", type=float, default=480.0, help="silent arm: seconds before its ONE GET")
     ap.add_argument("--geo", default="it")
+    ap.add_argument("--pool", default="soax", help="soax|rotating mint a fresh exit per try; else a DB provider")
     ap.add_argument("--booking", default="Test2",
                     help="booking to source posto/nationality/residence from")
     ap.add_argument("--out", default="var/formstate_ttl.jsonl")
@@ -284,8 +292,8 @@ def main():
     ap.add_argument("--identity-id", help="only this identity")
     ap.add_argument("--report")
     a = ap.parse_args()
-    global _GROUP, _IDENT
-    _GROUP, _IDENT = a.group, a.identity_id
+    global _GROUP, _IDENT, _POOL
+    _GROUP, _IDENT, _POOL = a.group, a.identity_id, a.pool.lower()
     if a.report: return report(a.report)
     def log(t): print(f"  {time.strftime('%H:%M:%S')} {t}", flush=True)
     out = pathlib.Path(a.out); out.parent.mkdir(parents=True, exist_ok=True)

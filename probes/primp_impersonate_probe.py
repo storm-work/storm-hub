@@ -135,9 +135,18 @@ def main() -> int:
         print(f"[probe] logged in as {user}; FULL jar carried to primp: {sorted(jar)}")
         print(f"[probe] exit={proxy}\n")
         print(f"{'variant':34} {'Questionario':34} {'Schedule.jsp'}")
+        cells = []
         for label, imp in VARIANTS:
             res = _probe_variant(proxy, jar, ua, imp)
+            cells += [res['Questionario'].split()[0], res['Schedule.jsp'].split()[0]]
             print(f"{label:34} {res['Questionario']:34} {res['Schedule.jsp']}")
+        if all(c == "auth-redirect" for c in cells):
+            # 'login OK' can be a lie ('confirma o reCAPTCHA': the exit moved between solve and submit):
+            # a session that is not authenticated sees the login page on BOTH variants, which says
+            # nothing about the WAF. Fail loudly instead of printing an interpretable-looking table.
+            print("\nINVALID: every cell is the login page -- the session was NOT authenticated "
+                  "(token/IP mismatch). No A/B conclusion can be drawn; re-run.")
+            return 3
         print("\nINTERPRETATION: if 'default' shows CHALLENGE and 'chrome_148' shows form, the WAF is "
               "fingerprint-gated and the impersonation fix defeats it. If BOTH pass, you're in the "
               "permissive window (re-run closer to slot-open). If BOTH show CHALLENGE, the fingerprint "
