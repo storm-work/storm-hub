@@ -663,6 +663,12 @@ _BOOKING = [
             "slots are unaffected; they retire via the scouts' miss count. 0 = never."),
     _s("PREWARM_BEFORE_SLOT_OPEN", L.BOOKING, float, 120.0, group="discovery",
        note="re-warm holding workers this many seconds before the scheduled slot-open"),
+    _s("PREWARM_APPLIERS", L.BOOKING, bool, False, group="discovery",
+       note="also pre-warm APPLY workers PREWARM_BEFORE_SLOT_OPEN seconds before the scheduled "
+            "slot-open. Off by default: only scouts warm at the open, an applier warms when a slot is "
+            "assigned to it (do_apply re-warms right before the submit regardless). On = the old "
+            "whole-fleet pre-warm, which on 2026-10-30 sent every holding applier into a warm-up "
+            "two minutes early and lost their sessions."),
     _s("SLOT_LEASE_TTL", L.BOOKING, float, 180.0, group="discovery",
        note="seconds a worker may hold a slot lease without converting it into an apply before the "
             "scheduler reclaims it and returns the slot to the pool. A lease is a promise to attempt "

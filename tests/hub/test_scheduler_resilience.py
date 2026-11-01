@@ -1737,7 +1737,7 @@ def test_prewarm_fires_inside_the_lead_window_only():
     bk = _make_booking(db)
     bk.slot_open_at = NOW + timedelta(seconds=600)     # well outside a 120s lead
     bk.settings_json = {"PREWARM_BEFORE_SLOT_OPEN": 120.0}
-    w = _make_worker(db, bk, _make_identity(db), status=WorkerStatus.RUNNING)
+    w = _make_worker(db, bk, _make_identity(db), status=WorkerStatus.RUNNING, role=WorkerRole.SCOUT)
     w.substate = WorkerSubstate.KEEPING
     db.commit()
 
@@ -1762,7 +1762,7 @@ def test_prewarm_is_sent_once_per_worker():
     db = _launch_failed_db()
     bk = _make_booking(db)
     bk.slot_open_at = NOW + timedelta(seconds=60)
-    w = _make_worker(db, bk, _make_identity(db), status=WorkerStatus.RUNNING)
+    w = _make_worker(db, bk, _make_identity(db), status=WorkerStatus.RUNNING, role=WorkerRole.SCOUT)
     w.substate = WorkerSubstate.KEEPING
     db.commit()
 
@@ -1784,7 +1784,7 @@ def test_prewarm_skips_a_booking_whose_slot_open_already_fired():
     bk = _make_booking(db)
     bk.slot_open_at = NOW + timedelta(seconds=60)
     bk.slot_open_fired_at = NOW
-    w = _make_worker(db, bk, _make_identity(db), status=WorkerStatus.RUNNING)
+    w = _make_worker(db, bk, _make_identity(db), status=WorkerStatus.RUNNING, role=WorkerRole.SCOUT)
     w.substate = WorkerSubstate.KEEPING
     db.commit()
 
@@ -2685,3 +2685,35 @@ def test_full_mesh_two_finders_do_not_duplicate_and_a_closed_slot_is_not_resurre
         sch._mirror_feeder_slots(db, bk, _utcnow())
     closed = db.scalars(select(M.Slot).where(M.Slot.booking_id == b.id, M.Slot.date == "2026-10-20")).all()
     assert len(closed) == 1 and closed[0].status == SlotStatus.CLOSED
+
+
+def _prewarm_targets(settings, roles):
+    import fakeredis
+    from libs.bus.bus import Bus
+    r = fakeredis.FakeStrictRedis(decode_responses=True)
+    sent = []
+    bus = Bus(r); orig = bus.send_command
+    bus.send_command = lambda wid, t, **p: (sent.append(wid), orig(wid, t, **p))[1]
+    db = _launch_failed_db()
+    bk = _make_booking(db)
+    bk.slot_open_at = NOW + timedelta(seconds=60)
+    bk.settings_json = settings
+    ids = {}
+    for role in roles:
+        w = _make_worker(db, bk, _make_identity(db), status=WorkerStatus.RUNNING, role=role)
+        w.substate = WorkerSubstate.KEEPING
+        ids[role] = w.id
+    db.commit()
+    _prewarm_sched(r, bus)._maybe_prewarm(db, bk, NOW)
+    return sent, ids
+
+
+def test_prewarm_reaches_scouts_not_appliers_by_default():
+    """2026-10-30: the whole-fleet pre-warm sent 55 holding appliers into a warm-up at T-2min."""
+    sent, ids = _prewarm_targets({}, [WorkerRole.SCOUT, WorkerRole.APPLY])
+    assert sent == [ids[WorkerRole.SCOUT]]
+
+
+def test_prewarm_appliers_is_an_explicit_opt_in():
+    sent, ids = _prewarm_targets({"PREWARM_APPLIERS": "true"}, [WorkerRole.SCOUT, WorkerRole.APPLY])
+    assert sorted(sent) == sorted(ids.values())

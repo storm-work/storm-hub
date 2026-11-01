@@ -1204,9 +1204,18 @@ class Scheduler:
         if lead <= 0 or now < slot_open_at - timedelta(seconds=lead):
             return
         key = notified_key(bk.id, "prewarm")
+        # SCOUTS ONLY by default. The workflow is: at slot-open the scouts warm up and find slots;
+        # an applier warms only once a slot is assigned to it (do_apply re-warms unconditionally right
+        # before the submit, and a pre-warmed Schedule cursor is dead by then anyway). Pre-warming the
+        # whole fleet did the opposite: run 2026-10-30 sent it to all 55 holding appliers at 09:38:07,
+        # two minutes before the open, and 94 of their quest-resume steps came back "User not found
+        # in session", which started the re-login cascade that emptied the fleet.
+        roles = [WorkerRole.SCOUT]
+        if self._effective_booking_setting(db, bk, "PREWARM_APPLIERS", False):
+            roles.append(WorkerRole.APPLY)
         holding = db.scalars(select(M.Worker).where(
             M.Worker.booking_id == bk.id, M.Worker.status == WorkerStatus.RUNNING,
-            M.Worker.substate == WorkerSubstate.KEEPING)).all()
+            M.Worker.substate == WorkerSubstate.KEEPING, M.Worker.role.in_(roles))).all()
         sent = 0
         for w in holding:
             if self._redis is not None and self._redis.sismember(key, w.id):
