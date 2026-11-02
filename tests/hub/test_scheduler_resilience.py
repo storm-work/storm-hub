@@ -2849,3 +2849,52 @@ def test_burst_can_be_switched_off():
     sched._posto_watch_at = time.time() - 10
     sched._posto_auto(db, near)
     assert len([1 for _, _, p in sent if p.get("name") == "posto_watch"]) == 1
+
+
+def test_scouts_get_slot_open_one_stagger_apart_and_appliers_at_once():
+    """SCOUT_OPEN_STAGGER_S: a portal failing at the open costs one scout's warm-up at a time."""
+    import fakeredis
+    from libs.bus.bus import Bus
+    r = fakeredis.FakeStrictRedis(decode_responses=True)
+    sent = []
+    bus = Bus(r); orig = bus.send_command
+    bus.send_command = lambda wid, t, **p: (sent.append((wid, p.get("name"))), orig(wid, t, **p))[1]
+    db = _launch_failed_db()
+    bk = _make_booking(db, settings_json={"SCOUT_OPEN_STAGGER_S": 10.0})
+    bk.slot_open_fired_at = NOW
+    scouts = [_make_worker(db, bk, _make_identity(db), status=WorkerStatus.RUNNING, role=WorkerRole.SCOUT)
+              for _ in range(3)]
+    applier = _make_worker(db, bk, _make_identity(db), status=WorkerStatus.RUNNING, role=WorkerRole.APPLY)
+    db.commit()
+    sched = _scheduler(redis_client=r, bus=bus)
+    opened = lambda: [wid for wid, name in sent if name == "slot_open"]
+
+    sched._latch_signals(db, bk, NOW)
+    assert applier.id in opened() and len([w for w in scouts if w.id in opened()]) == 1
+    sched._latch_signals(db, bk, NOW)                      # same instant: no further scout
+    assert len(opened()) == 2
+    sched._scout_open_last[bk.id] -= 11                    # one stagger later: the next scout
+    sched._latch_signals(db, bk, NOW)
+    assert len(opened()) == 3
+    sched._scout_open_last[bk.id] -= 11
+    sched._latch_signals(db, bk, NOW)
+    assert sorted(opened()) == sorted(w.id for w in scouts + [applier])
+    sched._scout_open_last[bk.id] -= 11
+    sched._latch_signals(db, bk, NOW)
+    assert len(opened()) == 4, "nobody is told twice"
+
+
+def test_without_a_stagger_every_scout_gets_slot_open_in_one_tick():
+    import fakeredis
+    from libs.bus.bus import Bus
+    r = fakeredis.FakeStrictRedis(decode_responses=True)
+    sent = []
+    bus = Bus(r); orig = bus.send_command
+    bus.send_command = lambda wid, t, **p: (sent.append(wid), orig(wid, t, **p))[1]
+    db = _launch_failed_db()
+    bk = _make_booking(db)
+    bk.slot_open_fired_at = NOW
+    for _ in range(3):
+        _make_worker(db, bk, _make_identity(db), status=WorkerStatus.RUNNING, role=WorkerRole.SCOUT)
+    _scheduler(redis_client=r, bus=bus)._latch_signals(db, bk, NOW)
+    assert len(sent) == 3

@@ -683,6 +683,11 @@ _BOOKING = [
     _s("POSTO_WATCH_INTERVAL_S", L.BOOKING, float, 20.0, group="discovery", min_value=5,
        note="seconds between posto-dropdown reads while watching: one KEEPING scout is asked to "
             "re-warm (which reads the dropdown) per interval, rotating through the scouts."),
+    _s("SCOUT_OPEN_STAGGER_S", L.BOOKING, float, 0.0, group="discovery", min_value=0,
+       note="seconds between releasing the slot-open signal to one scout and the next (0 = all at once, "
+            "the old behaviour). A portal that is failing at the open then costs one scout's warm-up "
+            "at a time, not the whole scouting fleet's. Applier workers get the signal immediately "
+            "(they only hold). The scheduler ticks every ~5s, so values under 5 behave as 5."),
     _s("POSTO_WATCH_BURST_S", L.BOOKING, float, 8.0, group="discovery", min_value=0,
        note="posto-dropdown read interval (POSTO_AUTO) while within POSTO_WATCH_BURST_WINDOW_S of "
             "slot_open_at, before or after. 0 = no burst (POSTO_WATCH_INTERVAL_S throughout)."),

@@ -47,3 +47,9 @@ Manual override, the same code path: `POST /bookings/{id}/set-posto {"posto_id":
 - Slots already in a booking's pool belong to the old posto; clear them if any exist.
 - A sighting is only reported when a worker's dropdown CHANGED; a Hub restart forgets which bookings it
   resolved (the new posto is then the current one, so it is not re-picked, but watching resumes).
+
+## SCOUT_OPEN_STAGGER_S (the cheap version of "test the portal with one scout first")
+`Scheduler._latch_signals` releases the slot-open signal to ONE scout per `SCOUT_OPEN_STAGGER_S` (booking
+setting, default 0 = all at once). Appliers get it immediately (they only hold). A portal that fails at the open
+then costs one scout's warm-up at a time. It does NOT gate on the first scout succeeding -- that is the full
+canary, not built. Today: set it to 8-10. The scheduler tick is ~5s, so values under 5 behave as 5.

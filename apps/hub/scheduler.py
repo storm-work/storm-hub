@@ -160,6 +160,7 @@ class Scheduler:
         # the last "cannot choose" option set already logged; rotating watch bookkeeping.
         self._posto_resolved: dict[str, str] = {}
         self._posto_unclear: dict[str, tuple] = {}
+        self._scout_open_last: dict[str, float] = {}     # booking_id -> when a scout last got slot_open
         self._posto_watch_at = 0.0
         self._posto_watch_last: dict[str, float] = {}
         self._stop = threading.Event()
@@ -785,13 +786,20 @@ class Scheduler:
                 continue
             key = notified_key(bk.id, signal_name)
             already = self._redis.smembers(key) if self._redis is not None else set()
-            for w in running:
+            stagger = float(self._effective_booking_setting(db, bk, "SCOUT_OPEN_STAGGER_S", 0.0) or 0.0) \
+                if signal_name == "slot_open" else 0.0
+            for w in sorted(running, key=lambda x: x.id):
                 if w.id in already:
                     continue
+                staggered = stagger > 0 and w.role == WorkerRole.SCOUT
+                if staggered and time.time() - self._scout_open_last.get(bk.id, 0.0) < stagger:
+                    continue          # not this tick: the next scout is released one stagger later
                 try:
                     self._bus.send_command(w.id, "signal", name=signal_name)
                 except Exception:
                     continue   # NOT marked notified -- retried next tick, exactly the confirmed fix
+                if staggered:
+                    self._scout_open_last[bk.id] = time.time()
                 if self._redis is not None:
                     self._redis.sadd(key, w.id)
                     self._redis.expire(key, 86400)
