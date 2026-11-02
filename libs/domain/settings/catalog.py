@@ -683,6 +683,11 @@ _BOOKING = [
     _s("POSTO_WATCH_INTERVAL_S", L.BOOKING, float, 20.0, group="discovery", min_value=5,
        note="seconds between posto-dropdown reads while watching: one KEEPING scout is asked to "
             "re-warm (which reads the dropdown) per interval, rotating through the scouts."),
+    _s("POSTO_WATCH_BURST_S", L.BOOKING, float, 8.0, group="discovery", min_value=0,
+       note="posto-dropdown read interval (POSTO_AUTO) while within POSTO_WATCH_BURST_WINDOW_S of "
+            "slot_open_at, before or after. 0 = no burst (POSTO_WATCH_INTERVAL_S throughout)."),
+    _s("POSTO_WATCH_BURST_WINDOW_S", L.BOOKING, float, 600.0, group="discovery", min_value=0,
+       note="seconds either side of slot_open_at in which POSTO_WATCH_BURST_S applies."),
     _s("PREWARM_APPLIERS", L.BOOKING, bool, False, group="discovery",
        note="also pre-warm APPLY workers PREWARM_BEFORE_SLOT_OPEN seconds before the scheduled "
             "slot-open. Off by default: only scouts warm at the open, an applier warms when a slot is "

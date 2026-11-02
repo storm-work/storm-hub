@@ -1283,8 +1283,15 @@ class Scheduler:
             watching.append(b)
         if not watching:
             return
-        interval = min(float(self._effective_booking_setting(db, b, "POSTO_WATCH_INTERVAL_S", 20.0))
-                       for b in watching)
+        def _interval(b) -> float:
+            base = float(self._effective_booking_setting(db, b, "POSTO_WATCH_INTERVAL_S", 20.0))
+            burst = float(self._effective_booking_setting(db, b, "POSTO_WATCH_BURST_S", 8.0))
+            window = float(self._effective_booking_setting(db, b, "POSTO_WATCH_BURST_WINDOW_S", 600.0))
+            so = _aware(b.slot_open_at)
+            if burst > 0 and so is not None and abs((now - so).total_seconds()) <= window:
+                return min(base, burst)      # the posto most likely shows around the open: look harder
+            return base
+        interval = min(_interval(b) for b in watching)
         if time.time() - self._posto_watch_at < interval:
             return
         scouts = db.scalars(select(M.Worker).where(

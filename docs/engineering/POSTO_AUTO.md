@@ -10,6 +10,8 @@ Cape Verde time = **10:00 UTC**, Cape Verde is UTC-1 all year). Off by default.
    CHANGED. A worker never picks a posto.
 3. From `POSTO_WATCH_LEAD_S` before `slot_open_at`, the Hub asks ONE holding scout per
    `POSTO_WATCH_INTERVAL_S` (fleet-wide, rotating) to re-warm (`posto_watch` signal) so the dropdown is read.
+   Within `POSTO_WATCH_BURST_WINDOW_S` (600s) either side of `slot_open_at` the pace is `POSTO_WATCH_BURST_S` (8s),
+   because the list changes with time and the posto most likely shows at the open.
    After slot-open the scouts' own warm-ups keep reading it.
 4. `Scheduler._posto_auto` picks the new posto: an option not in `POSTO_KNOWN` and not the booking's current
    posto. A `POSTO_HINT` match wins; a single new option is taken; several new options with no hint match are

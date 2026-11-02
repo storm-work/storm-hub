@@ -2826,3 +2826,26 @@ def test_watch_stops_once_the_posto_is_resolved():
     sent.clear(); sched._posto_watch_at = 0.0
     sched._posto_auto(db, NOW + timedelta(seconds=2100))
     assert [1 for _, _, p in sent if p.get("name") == "posto_watch"] == []
+
+
+def test_watch_reads_faster_around_the_open_and_at_the_normal_pace_outside_it():
+    db, sched, hub, bks, scouts, sent, opened = _posto_world()
+    asks = lambda: len([1 for _, _, p in sent if p.get("name") == "posto_watch"])
+    far = NOW + timedelta(seconds=1900)                      # 1700s before the open: normal 20s pace
+    sched._posto_auto(db, far); assert asks() == 1
+    sched._posto_watch_at = time.time() - 10                 # 10s later: still throttled
+    sched._posto_auto(db, far); assert asks() == 1
+    near = NOW + timedelta(seconds=3300)                     # 300s before the open: burst, 8s pace
+    sched._posto_watch_at = time.time() - 10                 # 10s later: now due
+    sched._posto_auto(db, near); assert asks() == 2
+    sched._posto_watch_at = time.time() - 5                  # 5s later: not yet
+    sched._posto_auto(db, near); assert asks() == 2
+
+
+def test_burst_can_be_switched_off():
+    db, sched, hub, bks, scouts, sent, opened = _posto_world(POSTO_WATCH_BURST_S=0)
+    near = NOW + timedelta(seconds=3300)
+    sched._posto_auto(db, near)
+    sched._posto_watch_at = time.time() - 10
+    sched._posto_auto(db, near)
+    assert len([1 for _, _, p in sent if p.get("name") == "posto_watch"]) == 1
