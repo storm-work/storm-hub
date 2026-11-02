@@ -72,6 +72,16 @@ def is_recaptcha_rejection(reg_type: str, reg_desc: str) -> bool:
     return "recaptcha" in blob
 
 
+def _describe_non_json(body: str) -> str:
+    """What a non-JSON register answer IS: the page <title> plus the first visible text. The old
+    body[:80] cut every HTML page at '<meta name="robots"', so 287 failures were unreadable."""
+    import re
+    body = body or ""
+    m = re.search(r"<title[^>]*>(.*?)</title>", body, re.S | re.I)
+    text = re.sub(r"\s+", " ", re.sub(r"<(script|style)[^>]*>.*?</\1>|<[^>]+>", " ", body, flags=re.S | re.I)).strip()
+    return f"[html {len(body)}B title={re.sub(chr(32)+'+', ' ', m.group(1)).strip()[:80] if m else '-'!r}] {text[:300]}"
+
+
 def _mk_mail(email_provider: str, email_cfg: dict, proxy: str | None = None):
     """`proxy` is for mail.tm only: it rate-limits per IP, and every mailbox in a run was being
     created from the server's single address. 87 of ~170 registration outcomes on 2026-08-23 were
@@ -293,7 +303,7 @@ async def _register_one(acct: dict, proxies_cycle, capsolver_keys: list[str], la
                 reg_type = reg_json.get("type", "")
                 reg_desc = reg_json.get("description", "")
             except Exception:
-                reg_type, reg_desc = "", reg_resp["body"][:80]
+                reg_type, reg_desc = "", _describe_non_json(reg_resp["body"])
 
             if "already_exists" in reg_type or "already_exists" in reg_desc.lower():
                 progress("account already exists on server")
