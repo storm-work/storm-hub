@@ -427,6 +427,8 @@ _MAX_KEEPALIVE_RESTORE_ATTEMPTS = 3
 # Measured 2026-10-27 (Test 1026): an apply worker answered "unrecognised pre-warm response (1920B)"
 # on 11 consecutive cycles (~105 min) after an exit-IP change and stayed KEEPING the whole time --
 # "no evidence" had been promoted to "healthy" by simply doing nothing.
+# Bodies of a QuestNextQuestion step that mean the portal has lost the session (answered with 200).
+_QUEST_SESSION_GONE = ("perdeu a sess", "user not found in session")
 _KEEPALIVE_UNKNOWN_TRIP = 2
 
 # storm-auto's QUEST_STEP_RETRIES (default 3): re-attempt a questionnaire step that doesn't return
@@ -3625,8 +3627,12 @@ class LiveEngineOps(EngineOps):
             kind = f"step{pos + 1}"
         low = (page or "").lower()
         n = len(page or "")
+        # A step answers HTTP 200 even when the portal no longer knows the session: the body then reads
+        # "(QuestNextQuestion) ERROR: User not found in session". Judging a step by status alone made the
+        # hold report `ok` on a dead session for ~100 minutes (run 2026-10-30: 51 workers found out at
+        # 09:38, when the pre-warm resumed them, with no time left to re-login ahead of the wall).
         if "authentication.jsp" in (final_url or "").lower() or "sessionlost" in (final_url or "").lower() \
-                or (kind != "reload" and "perdeu a sess" in low):
+                or (kind != "reload" and any(m in low for m in _QUEST_SESSION_GONE)):
             self._qh_pos = None
             self._log(f"keepalive[quest_hold]: session expired at {kind} ({n}B, {context}) -- "
                       f"re-authenticating")

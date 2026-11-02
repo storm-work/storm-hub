@@ -47,6 +47,8 @@ def _verdict(ops, status, body_or_url: str, final_url: str = "") -> str:
         return "dead_exit"
     if _is_challenge_body(body_or_url):
         return "challenge"
+    if any(m in (body_or_url or "").lower() for m in ("user not found in session", "perdeu a sess")):
+        return "session_expired"       # a step answers 200 with this body when the session is gone
     if isinstance(status, int) and status != 200:
         return f"http_{status}"
     st = classify_session_state(body_or_url, final_url, warmed=False)

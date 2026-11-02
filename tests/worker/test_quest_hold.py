@@ -71,6 +71,17 @@ def test_hold_session_expired_restores_and_forgets_the_position():
     assert restored and ops._qh_pos is None
 
 
+def test_hold_step_answering_user_not_found_in_session_is_an_expired_session():
+    """HTTP 200 with 'User not found in session' is a lost session, not a healthy step (2026-10-30:
+    the hold counted these ok for ~100 min and the fleet found out at the pre-warm)."""
+    ops = _hold_ops(_QSession(step={"status": 200, "body": "(QuestNextQuestion) ERROR: User not found in session"}))
+    restored = []
+    ops._attempt_keepalive_restore = lambda ctx: restored.append(ctx)
+    ops._qh_pos = 1
+    ops._do_keepalive("t")
+    assert restored and ops._qh_pos is None
+
+
 def test_hold_challenge_backs_off_without_relogin():
     ops = _hold_ops(_QSession(page="<html>/ch/bd.js captcha-delivery</html>"))
     restored = []
