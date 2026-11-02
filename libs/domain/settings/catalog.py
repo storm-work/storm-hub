@@ -693,6 +693,17 @@ _BOOKING = [
             "slot_open_at, before or after. 0 = no burst (POSTO_WATCH_INTERVAL_S throughout)."),
     _s("POSTO_WATCH_BURST_WINDOW_S", L.BOOKING, float, 600.0, group="discovery", min_value=0,
        note="seconds either side of slot_open_at in which POSTO_WATCH_BURST_S applies."),
+    _s("POSTO_WATCH_GIVEUP_AFTER", L.BOOKING, int, 0, group="discovery", min_value=0,
+       note="posto-watch circuit-breaker: suspend the watch after this many re-warms in a row that "
+            "never reached the Formulario dropdown (every chain died pre-dropdown, e.g. on the "
+            "bot-check shell) -- 1 full warm-up chain every POSTO_WATCH_BURST_S that cannot succeed is "
+            "pure load on an already-refusing portal. A later sighting (any scout's own warm-up) "
+            "resets it and resumes the watch. 0 = never give up (watch every interval as before)."),
+    _s("PREWARM_SKIP_WHEN_DOWN", L.BOOKING, bool, True, group="discovery",
+       note="skip the pre-warm when the fleet-wide PortalPulse shows the portal serving nothing (0 "
+            "'up' while refusals/maintenance are seen). Pre-warming into a wall sends holding scouts "
+            "into a chain that fails on the shell and can start a re-login cascade (2026-10-30); the "
+            "worker's own keepalive keeps the session meanwhile. Off = always pre-warm at the lead."),
     _s("PREWARM_APPLIERS", L.BOOKING, bool, False, group="discovery",
        note="also pre-warm APPLY workers PREWARM_BEFORE_SLOT_OPEN seconds before the scheduled "
             "slot-open. Off by default: only scouts warm at the open, an applier warms when a slot is "

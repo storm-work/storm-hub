@@ -2898,3 +2898,64 @@ def test_without_a_stagger_every_scout_gets_slot_open_in_one_tick():
         _make_worker(db, bk, _make_identity(db), status=WorkerStatus.RUNNING, role=WorkerRole.SCOUT)
     _scheduler(redis_client=r, bus=bus)._latch_signals(db, bk, NOW)
     assert len(sent) == 3
+
+
+# ── #1 reduce footprint: posto-watch circuit-breaker + prewarm gate + hold backoff ────────────
+def test_posto_watch_suspends_after_dry_rewarms_and_resumes_on_a_sighting():
+    db, sched, hub, bks, scouts, sent, opened = _posto_world(1, POSTO_WATCH_GIVEUP_AFTER=3)
+    t = NOW + timedelta(seconds=2000)            # inside the 1800s lead of a 3600s open
+    watches = lambda: len([1 for _, _, p in sent if p.get("name") == "posto_watch"])
+    for _ in range(5):
+        sched._posto_watch_at = 0.0              # clear the per-interval throttle
+        sched._posto_auto(db, t)
+    assert watches() == 3                        # 3 dry re-warms, then the breaker tripped
+    assert bks[0].id in sched._posto_watch_suspended
+    # a sighting (the chain reached the dropdown -- known postos only, so no switch) resets + resumes
+    hub.postos.append((scouts[0].id, [_PRAIA, ["5086", "MINDELO"]]))
+    sched._posto_watch_at = 0.0
+    sched._posto_auto(db, t)
+    assert bks[0].id not in sched._posto_watch_suspended and watches() == 4
+
+
+def test_posto_watch_giveup_zero_never_suspends():
+    db, sched, hub, bks, scouts, sent, opened = _posto_world(1)       # default GIVEUP_AFTER=0
+    t = NOW + timedelta(seconds=2000)
+    for _ in range(6):
+        sched._posto_watch_at = 0.0
+        sched._posto_auto(db, t)
+    assert len([1 for _, _, p in sent if p.get("name") == "posto_watch"]) == 6
+    assert not sched._posto_watch_suspended
+
+
+def _prewarm_with_pulse(observe):
+    import fakeredis
+    from libs.bus.bus import Bus
+    from libs.bus.portal_pulse import PortalPulse
+    r = fakeredis.FakeStrictRedis(decode_responses=True)
+    sent = []
+    bus = Bus(r); orig = bus.send_command
+    bus.send_command = lambda wid, t, **p: (sent.append((wid, t, p)), orig(wid, t, **p))[1]
+    db = _launch_failed_db()
+    bk = _make_booking(db)
+    bk.slot_open_at = NOW + timedelta(seconds=60)
+    w = _make_worker(db, bk, _make_identity(db), status=WorkerStatus.RUNNING, role=WorkerRole.SCOUT)
+    w.substate = WorkerSubstate.KEEPING
+    db.commit()
+    observe(PortalPulse(r))
+    _prewarm_sched(r, bus)._maybe_prewarm(db, bk, NOW)
+    return [wid for wid, t, p in sent if p.get("name") == "prewarm"]
+
+
+def test_prewarm_skipped_when_the_portal_serves_nothing():
+    sent = _prewarm_with_pulse(lambda p: [p.observe("refused", reason="shell") for _ in range(3)])
+    assert sent == []                            # 0 up + refusals seen -> suppressed
+
+
+def test_prewarm_fires_when_the_portal_is_answering():
+    def obs(p):
+        p.observe("refused", reason="shell"); p.observe("up")
+    assert len(_prewarm_with_pulse(obs)) == 1    # at least one 'up' -> not suppressed
+
+
+def test_prewarm_fires_when_the_pulse_is_empty():
+    assert len(_prewarm_with_pulse(lambda p: None)) == 1   # no information -> never suppress

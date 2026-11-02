@@ -163,6 +163,9 @@ class Scheduler:
         self._scout_open_last: dict[str, float] = {}     # booking_id -> when a scout last got slot_open
         self._posto_watch_at = 0.0
         self._posto_watch_last: dict[str, float] = {}
+        self._posto_watch_dry: dict[str, int] = {}       # booking_id -> consecutive re-warms with no dropdown
+        self._posto_watch_suspended: set[str] = set()    # bookings whose watch gave up (logged once)
+        self._prewarm_skipped: set[str] = set()          # bookings whose prewarm was suppressed (logged once)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._last_self_scout: dict[str, float] = {}   # booking_id -> last self-scout trigger time
@@ -1216,7 +1219,13 @@ class Scheduler:
         for wid, options in seen:
             w = db.get(M.Worker, wid)
             bk = by_id.get(w.booking_id) if w is not None else None
-            if bk is None or self._posto_is_resolved(bk):
+            if bk is None:
+                continue
+            # A sighting means the chain reached the dropdown: the watch is productive again, so
+            # clear any give-up state for this booking (even if we cannot pick a posto from it yet).
+            self._posto_watch_dry[bk.id] = 0
+            self._posto_watch_suspended.discard(bk.id)
+            if self._posto_is_resolved(bk):
                 continue
             known = parse_ids(self._effective_booking_setting(db, bk, "POSTO_KNOWN", ""))
             hint = str(self._effective_booking_setting(db, bk, "POSTO_HINT", "") or "")
@@ -1288,6 +1297,18 @@ class Scheduler:
             lead = float(self._effective_booking_setting(db, b, "POSTO_WATCH_LEAD_S", 1800.0))
             if so is not None and now < so - timedelta(seconds=lead):
                 continue
+            # Circuit-breaker: if the watch has asked for GIVEUP_AFTER re-warms in a row and not one
+            # reached the dropdown (every chain died pre-dropdown, e.g. on the bot-check shell), stop
+            # asking. ~1 full warm-up chain every POSTO_WATCH_BURST_S that cannot succeed is pure load
+            # on an already-refusing portal. A later sighting (any scout's own warm-up) resets it.
+            giveup = int(self._effective_booking_setting(db, b, "POSTO_WATCH_GIVEUP_AFTER", 0) or 0)
+            if giveup > 0 and self._posto_watch_dry.get(b.id, 0) >= giveup:
+                if b.id not in self._posto_watch_suspended:
+                    self._posto_watch_suspended.add(b.id)
+                    logger.warning("booking %s: posto-watch suspended after %d re-warms with no "
+                                   "dropdown (POSTO_WATCH_GIVEUP_AFTER=%d) -- resumes on a sighting",
+                                   b.id, self._posto_watch_dry.get(b.id, 0), giveup)
+                continue
             watching.append(b)
         if not watching:
             return
@@ -1315,6 +1336,23 @@ class Scheduler:
             return
         self._posto_watch_at = time.time()
         self._posto_watch_last[w.id] = self._posto_watch_at
+        # Count this re-warm as dry; a sighting (in _posto_auto) resets it to 0. The breaker trips
+        # when these outrun the sightings.
+        self._posto_watch_dry[w.booking_id] = self._posto_watch_dry.get(w.booking_id, 0) + 1
+
+    def _portal_not_serving(self) -> bool:
+        """True when the fleet-wide PortalPulse has seen the application answer 0 times in its window
+        while refusals or the maintenance page WERE seen -- i.e. the portal is reachable but serving
+        nobody. Unknown/empty pulse returns False (never suppress on no information)."""
+        r = self._redis if self._redis is not None else (self._bus.r if self._bus is not None else None)
+        if r is None:
+            return False
+        try:
+            from libs.bus.portal_pulse import PortalPulse
+            c = PortalPulse(r).counts()
+            return c["up"] == 0 and (c["degraded"] + c["refused"]) > 0
+        except Exception:
+            return False
 
     def _maybe_prewarm(self, db, bk: M.Booking, now: datetime) -> None:
         """Tell holding workers to re-warm shortly before a SCHEDULED slot-open.
@@ -1339,6 +1377,17 @@ class Scheduler:
         lead = float(self._effective_booking_setting(db, bk, "PREWARM_BEFORE_SLOT_OPEN", 120.0))
         if lead <= 0 or now < slot_open_at - timedelta(seconds=lead):
             return
+        # Don't pre-warm into a wall. If the fleet-wide pulse shows the portal serving NOTHING (0 up,
+        # with refusals/maintenance seen), a pre-warm just sends holding scouts into a chain that
+        # fails on the shell and starts a re-login cascade (run 2026-10-30). Skip until it serves
+        # again; the worker's own keepalive keeps the session. Opt out with PREWARM_SKIP_WHEN_DOWN.
+        if self._effective_booking_setting(db, bk, "PREWARM_SKIP_WHEN_DOWN", True) and self._portal_not_serving():
+            if bk.id not in self._prewarm_skipped:
+                self._prewarm_skipped.add(bk.id)
+                logger.warning("booking %s: prewarm skipped -- portal pulse shows 0 up (not serving); "
+                               "holding workers keep their session via keepalive", bk.id)
+            return
+        self._prewarm_skipped.discard(bk.id)
         key = notified_key(bk.id, "prewarm")
         # SCOUTS ONLY by default. The workflow is: at slot-open the scouts warm up and find slots;
         # an applier warms only once a slot is assigned to it (do_apply re-warms unconditionally right
