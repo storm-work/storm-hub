@@ -2469,6 +2469,21 @@ function Identities({ me, setLeftPanel, setRightPanel }) {
       { method: "POST", body: { identity_ids: selectedIds, group_name: bulkGroup.trim() || null } });
     setMsg(`Set group on ${r.updated.length}` + (r.group_name ? ` → "${r.group_name}".` : " (cleared)."));
   });
+  // Admin only: stored sub-account passwords leave the server here, same rule as the booked export.
+  const [credVerifiedOnly, setCredVerifiedOnly] = useState(true);
+  const downloadCredentials = () => act(async () => {
+    const r = await api("/identities/credentials",
+      { method: "POST", body: { identity_ids: selectedIds, verified_only: credVerifiedOnly } });
+    const head = ["full_name", "passport_no", "identity_group", "username", "password", "email", "email_pass", "status"];
+    const csv = [head.join(","), ...r.rows.map((x) => head.map((k) => `"${String(x[k] ?? "").replace(/"/g, '""')}"`).join(","))].join("\n");
+    const url = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `subaccount-credentials-${new Date().toISOString().slice(0, 10)}.csv`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    setMsg(`Downloaded ${r.count} sub-account credential row(s) for ${selectedIds.length} identit${selectedIds.length === 1 ? "y" : "ies"}.`);
+  });
   // Duplicate = clone each selected identity with a passport SUFFIX, no sub-accounts, into an
   // optional group. Reports per-id skips (e.g. passport already exists) rather than failing silently.
   const duplicateSelected = () => act(async () => {
@@ -2629,6 +2644,15 @@ function Identities({ me, setLeftPanel, setRightPanel }) {
                   title="Clone each selected identity with the passport suffix into 'Dup group'. No sub-accounts are copied — the duplicates start empty.">
             Duplicate
           </button>
+          {me.role === "admin" && (<>
+            <label style={{ margin: 0 }} title="only VERIFIED sub-accounts (the ones that can log in)">
+              <input type="checkbox" checked={credVerifiedOnly} onChange={(e) => setCredVerifiedOnly(e.target.checked)} /> verified
+            </label>
+            <button className="btn ghost" onClick={downloadCredentials}
+                    title="Download username/password/email of the selected identities' sub-accounts as CSV (admin only)">
+              ⬇ Credentials
+            </button>
+          </>)}
           <button className="btn ghost" disabled={!op} onClick={deleteSelectedIdentities}
                   title="Delete the selected identities. Anything attached to a booking, or holding a real booked appointment, is refused.">
             🗑 Delete selected

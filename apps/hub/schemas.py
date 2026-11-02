@@ -139,6 +139,11 @@ class BookedCredentialsRequest(BaseModel):
     identity_ids: list[str]
 
 
+class SubAccountCredentialsRequest(BaseModel):
+    identity_ids: list[str]
+    verified_only: bool = False
+
+
 # ── Bookings ──────────────────────────────────────────────────────────────────
 class BookingCreate(BaseModel):
     name: str

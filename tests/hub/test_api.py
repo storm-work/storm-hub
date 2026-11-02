@@ -1987,3 +1987,19 @@ def test_bulk_set_group_requires_operator(client):
     r = client.post("/identities/bulk-group", json={"identity_ids": [], "group_name": "x"},
                     headers={"Authorization": f"Bearer {tok}"})
     assert r.status_code == 423
+
+
+def test_subaccount_credentials_export_is_admin_only_and_scoped_to_selection(client):
+    """Passwords leave the server only for an admin, and only for the identities that were selected."""
+    h = _operate_headers(client)
+    a = client.post("/identities", json={"full_name": "CRED ONE", "type": "real"}, headers=h).json()["id"]
+    b = client.post("/identities", json={"full_name": "CRED TWO", "type": "real"}, headers=h).json()["id"]
+    client.post("/identities/gen-subaccounts", json={"identity_ids": [a, b], "count": 2}, headers=h)
+
+    r = client.post("/identities/credentials", json={"identity_ids": [a]}, headers=h)
+    assert r.status_code == 200 and r.json()["count"] == 2
+    row = r.json()["rows"][0]
+    assert row["full_name"] == "CRED ONE" and row["username"] and row["password"]
+    assert client.post("/identities/credentials", json={"identity_ids": []}, headers=h).json()["count"] == 0
+    assert client.post("/identities/credentials", json={"identity_ids": [a], "verified_only": True},
+                       headers=h).json()["count"] == 0      # freshly generated accounts are not VERIFIED

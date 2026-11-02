@@ -94,6 +94,7 @@ from .supervisor import Supervisor
 from .schemas import (
     BlindApplyRequest, ProxyBulkDelete, ProxyBulkUpdate, ProxyHealthCheck,
     BookedCredentialsRequest,
+    SubAccountCredentialsRequest,
     BookedIdentityOut,
     ArtifactOut,
     AttachIdentity,
@@ -1436,6 +1437,30 @@ def export_booked_credentials(body: BookedCredentialsRequest, db: Session = Depe
                     "booked_at": appt.booked_at.isoformat() if appt.booked_at else None})
     logger.warning("credentials export by admin %s: %d booked identity/identities",
                    me.user.username, len(out))
+    return {"rows": out, "count": len(out)}
+
+
+@app.post("/identities/credentials")
+def export_subaccount_credentials(body: SubAccountCredentialsRequest, db: Session = Depends(get_db),
+                                  me: Principal = Depends(require_admin)) -> dict:
+    """Sub-account logins (username, password, email + mailbox password) of the SELECTED identities.
+    ADMIN ONLY, and logged. Unlike /identities/booked/credentials this is not limited to identities
+    that booked: it is the working set the operator picked on the Identities page."""
+    if not body.identity_ids:
+        return {"rows": [], "count": 0}
+    q = (select(M.Identity, M.SubAccount)
+         .join(M.SubAccount, M.SubAccount.identity_id == M.Identity.id)
+         .where(M.Identity.id.in_(body.identity_ids))
+         .order_by(M.Identity.full_name, M.SubAccount.created_at))
+    if body.verified_only:
+        q = q.where(M.SubAccount.status == "VERIFIED")
+    out = [{"full_name": ident.full_name, "passport_no": ident.passport_no,
+            "identity_group": ident.group_name, "username": sub.username, "password": sub.password,
+            "email": sub.email, "email_pass": sub.email_pass,
+            "status": str(getattr(sub.status, "value", sub.status))}
+           for ident, sub in db.execute(q).all()]
+    logger.warning("sub-account credentials export by admin %s: %d account(s) of %d identit(ies)",
+                   me.user.username, len(out), len(body.identity_ids))
     return {"rows": out, "count": len(out)}
 
 
