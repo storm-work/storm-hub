@@ -19,6 +19,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from pydantic import BaseModel
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -4105,6 +4106,30 @@ def fire_slot_open(booking_id: str, db: Session = Depends(get_db),
     _sched_on_slot_open(db, bk)
     _cmd_log(booking_id, _op, "⚡ fire slot-open")
     return {"fired": True, "booking_status": str(bk.status)}
+
+
+class SetPostoBody(BaseModel):
+    posto_id: str
+
+
+@app.post("/bookings/{booking_id}/set-posto")
+def set_posto(booking_id: str, body: SetPostoBody, db: Session = Depends(get_db),
+              _op: Principal = Depends(require_operator)) -> dict:
+    """Manual override for POSTO_AUTO: make `posto_id` the booking's posto NOW -- and that of every other
+    POSTO_AUTO booking still on the same old posto -- tell their running workers, and fire slot-open.
+    The same code path the scheduler takes when a scout sees the new posto in the dropdown. Use it when
+    you see the posto yourself, or when the Hub logs that it cannot choose between several new ones."""
+    bk = db.get(M.Booking, booking_id)
+    if not bk:
+        raise HTTPException(404, "booking not found")
+    new = body.posto_id.strip()
+    if not new.isdigit():
+        raise HTTPException(400, "posto_id must be the numeric posto id")
+    if not (bk.settings_json or {}).get("POSTO_AUTO"):
+        raise HTTPException(409, "POSTO_AUTO is off on this booking -- change its posto_id with PUT /bookings/{id}")
+    switched = scheduler.switch_posto(db, bk, new, "operator set-posto")
+    _cmd_log(booking_id, _op, f"posto -> {new} ({len(switched)} booking(s))")
+    return {"posto_id": new, "switched_bookings": switched}
 
 
 @app.post("/bookings/{booking_id}/revert-slot-open")

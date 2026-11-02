@@ -6614,3 +6614,42 @@ def test_slots_rewarm_failure_spends_no_solve_and_reports_failed(monkeypatch):
     out = ops._discover_via_slots(["2026-09-14", "2026-09-15"])
     assert [r["outcome"] for r in out] == ["failed", "failed"]
     assert solves == [] and ops.session.navs == 0
+
+
+# ── POSTO_AUTO: the posto is a runtime value ─────────────────────────────────────────────────────
+def _posto_ops(auto=True):
+    from libs.domain.enums import SettingsLayer as L
+    from libs.domain.settings import resolve
+    from libs.engine.config import EngineConfig
+    cfg = EngineConfig.from_settings(resolve({L.TEMPLATE: {"ROLE": "scout"}, L.BOOKING: {
+        **_UNIT_MODE, "POSTO_AUTO": auto}}))
+    ops = _make_ops(cfg=cfg)
+    ops._log = lambda *a, **k: None
+    events = []
+    ops._emit = lambda t, **k: events.append((t, k))
+    return ops, events
+
+
+def test_set_posto_switches_the_posto_and_drops_the_old_anchor():
+    import types
+    ops, _ = _posto_ops()
+    ops.posto_pdf = "5084"
+    ops._signals = types.SimpleNamespace(posto_override=None)
+    assert ops.posto_id == "5084" and ops.posto_pdf == "5084"
+    ops._signals.posto_override = "5099"
+    assert ops.posto_id == "5099"
+    assert ops.posto_pdf is None, "the cursor belongs to the old posto"
+    assert ops.posto_id == "5099"          # stable on every later read
+
+
+def test_the_dropdown_is_reported_once_per_change_and_only_under_posto_auto():
+    ops, events = _posto_ops()
+    opts = [("5084", "PRAIA"), ("5099", "SAO NICOLAU")]
+    ops._observe_postos(opts, "t"); ops._observe_postos(opts, "t")
+    assert [e for e, _ in events] == ["posto_seen"]
+    assert events[0][1]["options"] == [["5084", "PRAIA"], ["5099", "SAO NICOLAU"]]
+    ops._observe_postos(opts + [("5100", "X")], "t")
+    assert len(events) == 2
+    off, off_events = _posto_ops(auto=False)
+    off._observe_postos(opts, "t")
+    assert off_events == []

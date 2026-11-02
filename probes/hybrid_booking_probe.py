@@ -118,6 +118,9 @@ def _mint_proxy(pool, settings, geo):
     if pool in ("soax", "rotating"):
         from libs.proxies.rotating import mint_rotating_url
         return mint_rotating_url("soax", "rotating", settings=settings, geo=geo or None)
+    if pool == "webshare":
+        from libs.proxies.rotating import mint_rotating_url
+        return mint_rotating_url("webshare", "rotating", settings=settings, geo=geo or None)
     from sqlalchemy import select
     from apps.hub.db import SessionLocal
     from libs.db import models as M

@@ -103,6 +103,10 @@ class EventHub:
         # _event_times' existing "EventHub owns process-local advisory state, Scheduler polls it"
         # pattern rather than giving EventHub a direct reference into Scheduler's internals.
         self.dates_reported: dict[str, list[list[dict]]] = {}
+        # POSTO_AUTO: a worker's `posto_seen` (the Formulario dropdown it just read) is buffered the same
+        # way for Scheduler._posto_auto to drain: (worker_id, [[value, label], ...]).
+        self._postos_seen: list[tuple[str, list]] = []
+        self._postos_lock = threading.Lock()
         # Shared gettime cache (storm-auto's proven app/core/slot_manager.py._gettime_cache pattern,
         # ported): booking_id -> (special_days JSON dict, cached_at). One scout's fresh gettime fetch
         # gets handed to the rest of the fleet by _drive_scouts so, within GETTIME_CACHE_SECS, only
@@ -113,6 +117,12 @@ class EventHub:
         """Return and clear this worker's buffered dates_reported outcome-lists (each element is
         one report's full outcomes list, oldest first)."""
         return self.dates_reported.pop(worker_id, [])
+
+    def pop_postos_seen(self) -> list[tuple[str, list]]:
+        """Return and clear every buffered posto_seen event (oldest first)."""
+        with self._postos_lock:
+            out, self._postos_seen = self._postos_seen, []
+        return out
 
     def get_gettime_cache(self, booking_id: str, max_age: float) -> dict | None:
         """Returns the cached special_days JSON dict if still within max_age (GETTIME_CACHE_SECS),
@@ -879,6 +889,9 @@ class EventHub:
                         self._proxy_executor.submit(
                             self._handle_proxy_request, wid, m.payload.get("phase", "warmup"), bus,
                             None, m.payload.get("geo"))
+                    if m.type == "posto_seen":
+                        with self._postos_lock:
+                            self._postos_seen.append((wid, m.payload.get("options") or []))
                     if m.type == "dates_reported":
                         self.dates_reported.setdefault(wid, []).append(m.payload.get("outcomes", []))
                     if m.type == "slot_released":

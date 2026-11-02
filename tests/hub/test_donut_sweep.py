@@ -291,3 +291,16 @@ def test_cleanup_deletes_the_profile_and_its_proxy_entry(db, monkeypatch):
     out = sweep.cleanup_junk_profiles(db, now=time.time())
     assert [n for n, _ in out] == ["storm-ghost"]
     assert _CleanApi.deleted == ["/v1/profiles/id-storm-ghost", "/v1/proxies/px1"]
+
+
+def test_a_probe_naming_its_identity_owns_that_identitys_profiles():
+    """2026-10-30 / 11-02: probe soaks died at ~20 min because the sweep stopped their profile as unowned."""
+    from apps.hub.donut_sweep import probe_identity_ids
+    cmds = [
+        [".venv/bin/python", "probes/quest_hold_probe.py", "--pool", "soax", "--group", "EXP",
+         "--identity-id", "abc-123"],
+        [".venv/bin/python", "-m", "scripts.window_probes", "--identity-id", "def-456"],
+        [".venv/bin/python", "-m", "apps.worker", "w1"],                 # a worker: owned another way
+        ["python", "unrelated.py", "--identity-id", "zzz"],              # not a probe/script path
+    ]
+    assert probe_identity_ids(cmds) == {"abc-123", "def-456"}

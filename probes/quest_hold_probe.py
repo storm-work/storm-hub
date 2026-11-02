@@ -107,7 +107,11 @@ def main() -> int:
     if not steps:
         log("no quest steps for this nationality/residence"); return 2
     base_qs = {"lang": "PT", "nacionalidade": nat}
-    rec(ev="start", steps=len(steps), lo=lo, hi=hi, minutes=minutes)
+    rec(ev="start", steps=len(steps), lo=lo, hi=hi, minutes=minutes, pool=pool)
+    try:
+        ops._note_exit_ip("probe-start")    # baseline, so the first move is a move
+    except Exception:
+        pass
 
     sess = ops.session
     survived = True
@@ -162,6 +166,13 @@ def main() -> int:
                 v = "dead_exit" if "Failed to fetch" in str(e) or "chrome-error" in str(e) else "exception"
                 rec(ev="error", verdict=v, err=str(e)[:200])
                 log(f"event raised {type(e).__name__}: {str(e)[:120]} -> {v}")
+            try:   # does the exit under this session move, and does the session die when it does?
+                moved = bool(ops._note_exit_ip("probe"))
+            except Exception:
+                moved = None
+            if moved:
+                rec(ev="exit_moved", after_min=round((time.time() - t0) / 60, 1))
+                log("EXIT IP MOVED under this session")
             if v in ("session_expired", "dead_exit", "exception"):
                 survived, fatal = False, v
                 break

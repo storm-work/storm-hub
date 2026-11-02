@@ -672,6 +672,7 @@ class LiveEngineOps(EngineOps):
         self.cfg = cfg
         self.account = account
         self.posto_id = posto_id
+        self._postos_sig: tuple | None = None
         self.nationality = nationality
         self.residence = residence
         self.quest_steps = quest_steps
@@ -1032,6 +1033,39 @@ class LiveEngineOps(EngineOps):
             pass
         self.session = None
         return False
+
+    # -- the posto is a RUNTIME value on an unknown-posto day (POSTO_AUTO): the Hub resolves it and sends
+    # `set_posto`; every use of self.posto_id then reads the new one, and the posto-bound state is dropped.
+    @property
+    def posto_id(self) -> str:
+        ov = getattr(getattr(self, "_signals", None), "posto_override", None)
+        if ov and ov != getattr(self, "_posto_base", None):
+            old = getattr(self, "_posto_base", None)
+            self._posto_base = ov
+            self._clear_anchor()               # posto_pdf / anchor belong to the OLD posto
+            try:
+                self._log(f"posto: switched {old} -> {ov} (Hub resolved the posto); anchor cleared")
+            except Exception:
+                pass
+        return self._posto_base
+
+    @posto_id.setter
+    def posto_id(self, value: str) -> None:
+        self._posto_base = value
+
+    def _observe_postos(self, postos: list[tuple[str, str]], where: str) -> None:
+        """Report the Formulario dropdown to the Hub when it CHANGED (POSTO_AUTO only). The Hub decides
+        whether any option is the new posto -- the worker never picks one itself."""
+        if not postos or not bool(self.cfg.raw.get("POSTO_AUTO", False)):
+            return
+        sig = tuple(sorted((str(v), str(lbl)) for v, lbl in postos))
+        if sig == self._postos_sig:
+            return
+        self._postos_sig = sig
+        self._log(f"posto-watch ({where}): the dropdown offers {len(postos)}: "
+                  + ", ".join(f"{v}({lbl[:28]})" for v, lbl in postos[:12]))
+        if self._emit is not None:
+            self._emit("posto_seen", options=[[v, lbl] for v, lbl in postos], posto_id=str(self.posto_id))
 
     def _set_anchor(self, src: str) -> None:
         """Record that the booking anchor was (re)established, and by which route."""
@@ -2666,6 +2700,7 @@ class LiveEngineOps(EngineOps):
                 self._log("hybrid-warm: csrf_missing after Formulario POST")
                 return False
             postos = _posto_options(form_html)
+            self._observe_postos(postos, "hybrid-warm")
             if postos and self.posto_id not in {v for v, _ in postos}:
                 self._log(f"hybrid-warm: posto_id={self.posto_id} NOT offered for residence "
                           f"{self.residence!r} -- ScheduleController will reject this")
@@ -3018,6 +3053,7 @@ class LiveEngineOps(EngineOps):
             # is not evidence of anything, and a portal that renders the field some other way must
             # not become a hard launch failure. Say it loudly and continue.
             postos = _posto_options(form_html)
+            self._observe_postos(postos, "do_warmup")
             if postos and self.posto_id not in {v for v, _ in postos}:
                 offered = ", ".join(f"{v}({lbl})" for v, lbl in postos[:12])
                 self._log(f"do_warmup: posto_id={self.posto_id} is NOT offered for residence "
@@ -3318,6 +3354,13 @@ class LiveEngineOps(EngineOps):
                 # booked in 47 seconds.
                 self._signals.prewarm_requested = False
                 self._log("prewarm: slot-open imminent -- re-warming now")
+                self._run_warmup_steps()
+                continue
+            if getattr(self._signals, "posto_watch_requested", False):
+                # POSTO_AUTO: the Hub wants the posto dropdown read. A warm-up chain passes through the
+                # Formulario page, whose dropdown _observe_postos reports.
+                self._signals.posto_watch_requested = False
+                self._log("posto-watch: re-warming to read the posto dropdown")
                 self._run_warmup_steps()
                 continue
             self._do_keepalive("await_slot_open")

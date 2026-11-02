@@ -356,3 +356,16 @@ def test_discover_command_carries_the_source_side_channel():
     bus.send_command("w1", "discover", dates=["2026-11-03"], source="slots")
     assert sig.wait_discover_task(timeout=2) == ["2026-11-03"]
     assert sig.last_discover_source == "slots"
+
+
+def test_posto_watch_wakes_a_holding_scout_early_and_set_posto_is_sticky():
+    """POSTO_AUTO: the Hub's posto_watch must not wait out the whole hold window, and set_posto must
+    survive whichever wait_* drained it."""
+    bus = _bus()
+    sig = BusSignals(bus, "w1", "c1")
+    bus.send_command("w1", "signal", name="posto_watch")
+    assert sig.wait_slot_open(timeout=30) == "timeout"      # returned early (well under 30s)
+    assert sig.posto_watch_requested is True
+    bus.send_command("w1", "signal", name="set_posto", posto_id="5099")
+    sig._drain(block_ms=100)
+    assert sig.posto_override == "5099"

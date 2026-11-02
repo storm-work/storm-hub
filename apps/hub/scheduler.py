@@ -30,6 +30,7 @@ from libs.domain.enums import (
     NOT_BOOKABLE_PREFIX, BookingStatus, SlotLeaseOutcome, SlotStatus, WorkerRole, WorkerStatus,
     WorkerSubstate)
 from libs.engine import orchestration, pool_manager
+from libs.engine.posto import parse_ids, pick_new_posto
 
 logger = logging.getLogger(__name__)
 
@@ -155,6 +156,12 @@ class Scheduler:
         self._redis = redis_client
         self._bus = bus
         self._tick = tick
+        # POSTO_AUTO state (process-local, advisory): booking_id -> the posto this Hub resolved it to;
+        # the last "cannot choose" option set already logged; rotating watch bookkeeping.
+        self._posto_resolved: dict[str, str] = {}
+        self._posto_unclear: dict[str, tuple] = {}
+        self._posto_watch_at = 0.0
+        self._posto_watch_last: dict[str, float] = {}
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._last_self_scout: dict[str, float] = {}   # booking_id -> last self-scout trigger time
@@ -223,7 +230,8 @@ class Scheduler:
             # scheduling itself. Non-critical work may be skipped for a tick; a scheduled event may not.
             for _phase in (self._reap_dead_workers, self._reap_stalled_workers,
                            self._reap_runaway_workers, self._sweep_orphan_streams,
-                           self._reprobe_static_proxies, self._reconcile_orphaned_leases):
+                           self._reprobe_static_proxies, self._reconcile_orphaned_leases,
+                           self._posto_auto):
                 try:
                     _phase(db, now)
                 except Exception:
@@ -1179,6 +1187,119 @@ class Scheduler:
                                    special_days=cached_special_days, source=source)
         else:
             self._bus.send_command(chosen, "discover", dates=dates, source=source)
+
+    # ── POSTO_AUTO: an unknown posto, resolved at run time ───────────────────────────────────────
+    # 2026-11-02: the posto of the day is not known in advance and shows up in the Formulario `f0sf1`
+    # dropdown, probably when the slots open. Scouts read that dropdown (every warm-up chain passes
+    # through it) and report it; this decides which option is the new posto, switches every POSTO_AUTO
+    # booking that shares the old one, tells their workers, and fires slot-open. The Hub decides --
+    # a worker never picks a posto itself, so the fleet cannot disagree.
+    def _posto_auto(self, db, now: datetime) -> None:
+        if self._event_hub is None:
+            return
+        seen = self._event_hub.pop_postos_seen()
+        live = db.scalars(select(M.Booking).where(
+            M.Booking.status.notin_([BookingStatus.COMPLETED, BookingStatus.ABORTED,
+                                     BookingStatus.DRAFT]))).all()
+        auto = [b for b in live if self._effective_booking_setting(db, b, "POSTO_AUTO", False)]
+        if not auto:
+            return
+        by_id = {b.id: b for b in auto}
+        for wid, options in seen:
+            w = db.get(M.Worker, wid)
+            bk = by_id.get(w.booking_id) if w is not None else None
+            if bk is None or self._posto_is_resolved(bk):
+                continue
+            known = parse_ids(self._effective_booking_setting(db, bk, "POSTO_KNOWN", ""))
+            hint = str(self._effective_booking_setting(db, bk, "POSTO_HINT", "") or "")
+            pick = pick_new_posto([tuple(o) for o in options], known, bk.posto_id, hint)
+            if pick is None:
+                fresh = [o for o in options if str(o[0]) not in known and str(o[0]) != str(bk.posto_id)]
+                sig = tuple(sorted(str(o[0]) for o in fresh))
+                if fresh and self._posto_unclear.get(bk.id) != sig:
+                    self._posto_unclear[bk.id] = sig
+                    logger.warning("booking %s: POSTO_AUTO sees %d new posto(s) %s but cannot choose "
+                                   "(set POSTO_HINT, or POST /bookings/{id}/set-posto)", bk.id,
+                                   len(fresh), [f"{o[0]}:{o[1]}" for o in fresh])
+                continue
+            self.switch_posto(db, bk, pick[0], f"dropdown shows new posto {pick[0]} ({pick[1]})", now)
+        self._watch_postos(db, auto, now)
+
+    def _posto_is_resolved(self, bk: M.Booking) -> bool:
+        return self._posto_resolved.get(bk.id) == str(bk.posto_id)
+
+    def switch_posto(self, db, bk: M.Booking, new: str, why: str, now: datetime | None = None) -> list[str]:
+        """Make `new` the posto of `bk` and of every other POSTO_AUTO booking still on the same old posto,
+        send `set_posto` to their running workers, and fire slot-open where it has not fired. Returns the
+        ids of the bookings switched. Idempotent: a booking already on `new` is left alone."""
+        now = now or datetime.now(timezone.utc)
+        old = str(bk.posto_id)
+        new = str(new)
+        if old == new:
+            return []
+        cohort = [b for b in db.scalars(select(M.Booking).where(
+            M.Booking.status.notin_([BookingStatus.COMPLETED, BookingStatus.ABORTED, BookingStatus.DRAFT]))).all()
+            if str(b.posto_id) == old and self._effective_booking_setting(db, b, "POSTO_AUTO", False)]
+        done = []
+        for b in cohort:
+            b.posto_id = new
+            db.commit()
+            self._posto_resolved[b.id] = new
+            n = 0
+            for w in db.scalars(select(M.Worker).where(
+                    M.Worker.booking_id == b.id, M.Worker.status == WorkerStatus.RUNNING)).all():
+                try:
+                    if self._bus is not None:
+                        self._bus.send_command(w.id, "signal", name="set_posto", posto_id=new)
+                        n += 1
+                except Exception:
+                    logger.warning("set_posto send failed for worker %s", w.id, exc_info=True)
+            logger.warning("booking %s: POSTO %s -> %s (%s); told %d worker(s)", b.id, old, new, why, n)
+            if b.slot_open_fired_at is None and b.status in (BookingStatus.WARMING, BookingStatus.ARMED):
+                # The posto appearing is the open: fire now, and mark it OPERATOR-grade so the false-open
+                # guard does not revert it when the first discovery rounds come back empty.
+                try:
+                    if self._redis is not None:
+                        self._redis.set(manual_open_key(b.id), "1", ex=86400)
+                except Exception:
+                    pass
+                self._fire_slot_open(db, b, now)
+            done.append(b.id)
+        return done
+
+    def _watch_postos(self, db, auto: list, now: datetime) -> None:
+        """While a POSTO_AUTO booking is inside its watch window and unresolved, ask ONE holding scout per
+        POSTO_WATCH_INTERVAL_S (fleet-wide, rotating) to re-warm -- the chain reads the dropdown."""
+        if self._bus is None:
+            return
+        watching = []
+        for b in auto:
+            if self._posto_is_resolved(b):
+                continue
+            so = _aware(b.slot_open_at)
+            lead = float(self._effective_booking_setting(db, b, "POSTO_WATCH_LEAD_S", 1800.0))
+            if so is not None and now < so - timedelta(seconds=lead):
+                continue
+            watching.append(b)
+        if not watching:
+            return
+        interval = min(float(self._effective_booking_setting(db, b, "POSTO_WATCH_INTERVAL_S", 20.0))
+                       for b in watching)
+        if time.time() - self._posto_watch_at < interval:
+            return
+        scouts = db.scalars(select(M.Worker).where(
+            M.Worker.booking_id.in_([b.id for b in watching]), M.Worker.role == WorkerRole.SCOUT,
+            M.Worker.status == WorkerStatus.RUNNING, M.Worker.substate == WorkerSubstate.KEEPING)).all()
+        if not scouts:
+            return
+        w = min(scouts, key=lambda x: self._posto_watch_last.get(x.id, 0.0))
+        try:
+            self._bus.send_command(w.id, "signal", name="posto_watch")
+        except Exception:
+            logger.warning("posto_watch send failed for worker %s", w.id, exc_info=True)
+            return
+        self._posto_watch_at = time.time()
+        self._posto_watch_last[w.id] = self._posto_watch_at
 
     def _maybe_prewarm(self, db, bk: M.Booking, now: datetime) -> None:
         """Tell holding workers to re-warm shortly before a SCHEDULED slot-open.

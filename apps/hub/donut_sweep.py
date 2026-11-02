@@ -16,7 +16,9 @@ running, so a profile is only stopped when ALL of these hold:
 from __future__ import annotations
 
 import logging
+import os
 import time
+from pathlib import Path
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -52,9 +54,45 @@ def plan_sweep(profiles: list[dict], protected: set[str], now: float,
     return out
 
 
+def probe_identity_ids(cmdlines: list[list[str]] | None = None) -> set[str]:
+    """Identity ids named by `--identity-id X` on a live probe/scripts process.
+
+    A probe (probes/*.py, scripts/window_*) runs OUTSIDE apps.worker, so the sweep saw its Donut profile
+    as unowned and stopped it ~10-30 min after launch: the 2026-10-30 manual soak died at 19.6 min and
+    the 2026-11-02 exit-stability test at 19.9 min, both `Target page, context or browser has been
+    closed`. A probe that names its identity owns that identity's profiles."""
+    if cmdlines is None:
+        cmdlines = []
+        try:
+            entries = os.listdir("/proc")
+        except FileNotFoundError:
+            entries = []
+        for e in entries:
+            if not e.isdigit():
+                continue
+            try:
+                raw = Path(f"/proc/{e}/cmdline").read_bytes()
+            except (FileNotFoundError, ProcessLookupError, PermissionError):
+                continue
+            cmdlines.append([x.decode(errors="replace") for x in raw.split(b"\x00") if x])
+    out: set[str] = set()
+    for parts in cmdlines:
+        if not any(("probes/" in x or "scripts/" in x or x.startswith("scripts.")) for x in parts):
+            continue
+        for i, x in enumerate(parts[:-1]):
+            if x == "--identity-id":
+                out.add(parts[i + 1])
+    return out
+
+
 def protected_profile_names(db: Session, profile_name) -> set[str]:
     """Profile names a live process may be using, from the DB plus a /proc scan."""
     names: set[str] = set()
+    probe_idents = probe_identity_ids()
+    if probe_idents:
+        for u in db.scalars(select(M.SubAccount.username).where(
+                M.SubAccount.identity_id.in_(probe_idents))).all():
+            names.add(profile_name(u))
     live_workers = live_keys("apps.worker")
     if live_workers:
         idents = {w.identity_id for w in db.scalars(

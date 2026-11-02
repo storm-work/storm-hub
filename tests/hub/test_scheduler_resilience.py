@@ -105,6 +105,11 @@ class _FakeEventHub:
         self._rates: dict[str, float] = {}
         self.dates_reported: dict[str, list[list[dict]]] = {}
         self.gettime_cache: dict[str, tuple[dict, float]] = {}
+        self.postos: list = []
+
+    def pop_postos_seen(self):
+        out, self.postos = self.postos, []
+        return out
 
     def event_rate(self, worker_id, window=10.0):
         return self._rates.get(worker_id, 0.0)
@@ -2717,3 +2722,107 @@ def test_prewarm_reaches_scouts_not_appliers_by_default():
 def test_prewarm_appliers_is_an_explicit_opt_in():
     sent, ids = _prewarm_targets({"PREWARM_APPLIERS": "true"}, [WorkerRole.SCOUT, WorkerRole.APPLY])
     assert sorted(sent) == sorted(ids.values())
+
+
+# ── POSTO_AUTO: the posto is unknown until it shows up in the Formulario dropdown ─────────────────
+_PRAIA = ["5084", "COMMON VISA APPLICATION CENTER IN PRAIA (CAPE VERDE)"]
+_NICOLAU = ["5099", "CCV PERMANENCIA SAO NICOLAU"]
+
+
+def _posto_world(n_bookings=2, **settings):
+    import fakeredis
+    from libs.bus.bus import Bus
+    r = fakeredis.FakeStrictRedis(decode_responses=True)
+    sent, opened = [], []
+    bus = Bus(r); orig = bus.send_command
+    bus.send_command = lambda wid, t, **p: (sent.append((wid, t, p)), orig(wid, t, **p))[1]
+    hub = _FakeEventHub()
+    db = _launch_failed_db()
+    base = {"POSTO_AUTO": True, "POSTO_KNOWN": "5084,5086,5087,5088", "POSTO_HINT": "nicolau", **settings}
+    bks, scouts = [], []
+    for _ in range(n_bookings):
+        bk = _make_booking(db, settings_json=dict(base))
+        bk.status = BookingStatus.WARMING
+        bk.slot_open_at = NOW + timedelta(seconds=3600)
+        w = _make_worker(db, bk, _make_identity(db), status=WorkerStatus.RUNNING, role=WorkerRole.SCOUT)
+        w.substate = WorkerSubstate.KEEPING
+        bks.append(bk); scouts.append(w)
+    db.commit()
+    sched = _scheduler(redis_client=r, bus=bus, event_hub=hub,
+                       on_slot_open=lambda d, b: opened.append(b.id))
+    return db, sched, hub, bks, scouts, sent, opened
+
+
+def test_a_new_posto_in_the_dropdown_switches_every_auto_booking_tells_the_workers_and_fires_slot_open():
+    db, sched, hub, bks, scouts, sent, opened = _posto_world()
+    hub.postos.append((scouts[0].id, [_PRAIA, ["5086", "MINDELO"], _NICOLAU]))
+    sched._posto_auto(db, NOW)
+    assert [b.posto_id for b in bks] == ["5099", "5099"]
+    told = {wid for wid, t, p in sent if t == "signal" and p.get("name") == "set_posto"}
+    assert told == {w.id for w in scouts}
+    assert all(p["posto_id"] == "5099" for _, t, p in sent if p.get("name") == "set_posto")
+    assert sorted(opened) == sorted(b.id for b in bks), "the posto appearing is the open"
+    assert all(b.slot_open_fired_at is not None for b in bks)
+
+
+def test_the_known_postos_and_the_current_one_are_never_picked():
+    db, sched, hub, bks, scouts, sent, opened = _posto_world()
+    hub.postos.append((scouts[0].id, [_PRAIA, ["5086", "MINDELO"], ["5087", "SAL"], ["5088", "BOAVISTA"]]))
+    sched._posto_auto(db, NOW)
+    assert [b.posto_id for b in bks] == ["5084", "5084"] and opened == []
+
+
+def test_several_new_postos_without_a_hint_match_are_not_guessed():
+    db, sched, hub, bks, scouts, sent, opened = _posto_world(POSTO_HINT="fogo")
+    hub.postos.append((scouts[0].id, [_PRAIA, _NICOLAU, ["5100", "OTHER"]]))
+    sched._posto_auto(db, NOW)
+    assert [b.posto_id for b in bks] == ["5084", "5084"]
+
+
+def test_a_hint_match_wins_over_other_new_postos():
+    db, sched, hub, bks, scouts, sent, opened = _posto_world()
+    hub.postos.append((scouts[0].id, [_PRAIA, ["5100", "OTHER"], _NICOLAU]))
+    sched._posto_auto(db, NOW)
+    assert [b.posto_id for b in bks] == ["5099", "5099"]
+
+
+def test_posto_auto_off_ignores_the_dropdown():
+    db, sched, hub, bks, scouts, sent, opened = _posto_world(POSTO_AUTO=False)
+    hub.postos.append((scouts[0].id, [_PRAIA, _NICOLAU]))
+    sched._posto_auto(db, NOW)
+    assert [b.posto_id for b in bks] == ["5084", "5084"] and sent == []
+
+
+def test_a_second_sighting_after_the_switch_is_a_no_op():
+    db, sched, hub, bks, scouts, sent, opened = _posto_world()
+    hub.postos.append((scouts[0].id, [_PRAIA, _NICOLAU]))
+    sched._posto_auto(db, NOW)
+    n = len(sent)
+    hub.postos.append((scouts[1].id, [_PRAIA, _NICOLAU]))
+    sched._posto_auto(db, NOW + timedelta(seconds=5))
+    assert len(sent) == n and [b.posto_id for b in bks] == ["5099", "5099"]
+
+
+def test_watch_asks_one_holding_scout_per_interval_and_only_inside_the_lead_window():
+    db, sched, hub, bks, scouts, sent, opened = _posto_world()
+    sched._posto_auto(db, NOW)                                   # slot-open is 3600s away, lead 1800s
+    assert [1 for _, t, p in sent if p.get("name") == "posto_watch"] == []
+    t = NOW + timedelta(seconds=2000)                            # inside the lead
+    sched._posto_auto(db, t)
+    asked = [wid for wid, _, p in sent if p.get("name") == "posto_watch"]
+    assert len(asked) == 1
+    sched._posto_auto(db, t)                                     # same instant: throttled
+    assert len([1 for _, _, p in sent if p.get("name") == "posto_watch"]) == 1
+    sched._posto_watch_at -= 25                                  # an interval later: the OTHER scout
+    sched._posto_auto(db, t)
+    asked = [wid for wid, _, p in sent if p.get("name") == "posto_watch"]
+    assert len(asked) == 2 and asked[0] != asked[1]
+
+
+def test_watch_stops_once_the_posto_is_resolved():
+    db, sched, hub, bks, scouts, sent, opened = _posto_world()
+    hub.postos.append((scouts[0].id, [_PRAIA, _NICOLAU]))
+    sched._posto_auto(db, NOW + timedelta(seconds=2000))
+    sent.clear(); sched._posto_watch_at = 0.0
+    sched._posto_auto(db, NOW + timedelta(seconds=2100))
+    assert [1 for _, _, p in sent if p.get("name") == "posto_watch"] == []

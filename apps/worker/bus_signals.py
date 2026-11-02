@@ -52,6 +52,11 @@ class BusSignals:
         # holding worker enters the window with fresh form state instead of wherever it happens to
         # sit in its own keepalive cycle. Consumed once by ops_live's await_slot_open loop.
         self.prewarm_requested = False
+        # POSTO_AUTO (unknown-posto day). `posto_watch`: the Hub asks this holding scout to re-warm now so
+        # the Formulario posto dropdown is read; consumed by ops_live's await_slot_open. `set_posto`: the
+        # Hub resolved the posto -- sticky, read by LiveEngineOps.posto_id on every use.
+        self.posto_watch_requested = False
+        self.posto_override: str | None = None
         # An `assign` that arrives while some OTHER wait_* is blocked. _drain acks the whole batch,
         # so a command not matched by the currently-running wait used to be acked and dropped on the
         # floor. Confirmed live 2026-08-14: the scheduler assigns a slot (creating a SlotLease) to
@@ -109,6 +114,10 @@ class BusSignals:
                 self.slot_open_seen = True
             if m.type == "signal" and m.payload.get("name") == "prewarm":
                 self.prewarm_requested = True
+            if m.type == "signal" and m.payload.get("name") == "posto_watch":
+                self.posto_watch_requested = True
+            if m.type == "signal" and m.payload.get("name") == "set_posto" and m.payload.get("posto_id"):
+                self.posto_override = str(m.payload["posto_id"])
             if m.type == "signal" and m.payload.get("name") == "slot_found":
                 self.slot_found_seen = True
             if m.type == "assign":
@@ -172,6 +181,8 @@ class BusSignals:
                     return "stop"
             if self.slot_open_seen:
                 return "slot_open"
+            if self.posto_watch_requested:
+                return "timeout"      # the caller acts on the flag now, not after the whole hold window
         return "timeout"
 
     def wait_assignment(self, timeout: float = 900):

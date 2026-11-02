@@ -663,6 +663,26 @@ _BOOKING = [
             "slots are unaffected; they retire via the scouts' miss count. 0 = never."),
     _s("PREWARM_BEFORE_SLOT_OPEN", L.BOOKING, float, 120.0, group="discovery",
        note="re-warm holding workers this many seconds before the scheduled slot-open"),
+    # Unknown-posto day (2026-11-02): the posto is not known in advance. It shows up in the Formulario
+    # `f0sf1` dropdown, probably when the slots open. Hub-resolved: scouts report what they see, the Hub
+    # picks the new posto, switches the booking, tells every worker, and fires slot-open.
+    _s("POSTO_AUTO", L.BOOKING, bool, False, group="discovery",
+       note="resolve the posto at run time: scouts watch the Formulario posto dropdown, and the first "
+            "posto that is not in POSTO_KNOWN (and matches POSTO_HINT) becomes the booking's posto -- "
+            "every worker is switched to it and slot-open fires. Off = the booking's posto_id is fixed. "
+            "Set it on every booking that should follow the same posto; the booking's posto_id must "
+            "start as a posto the portal offers for the residence (so the warm-up chain can run)."),
+    _s("POSTO_KNOWN", L.BOOKING, str, "", group="discovery",
+       note="comma-separated posto ids that are NOT the target (already seen), e.g. "
+            "'5084,5086,5087,5088'. The booking's current posto_id is always treated as known."),
+    _s("POSTO_HINT", L.BOOKING, str, "", group="discovery",
+       note="name fragment of the target posto, accent/case-insensitive (e.g. 'nicolau'). A match wins "
+            "over other new postos; with no match and several new postos nothing is picked."),
+    _s("POSTO_WATCH_LEAD_S", L.BOOKING, float, 1800.0, group="discovery", min_value=0,
+       note="start watching the posto dropdown this many seconds before slot_open_at (POSTO_AUTO)."),
+    _s("POSTO_WATCH_INTERVAL_S", L.BOOKING, float, 20.0, group="discovery", min_value=5,
+       note="seconds between posto-dropdown reads while watching: one KEEPING scout is asked to "
+            "re-warm (which reads the dropdown) per interval, rotating through the scouts."),
     _s("PREWARM_APPLIERS", L.BOOKING, bool, False, group="discovery",
        note="also pre-warm APPLY workers PREWARM_BEFORE_SLOT_OPEN seconds before the scheduled "
             "slot-open. Off by default: only scouts warm at the open, an applier warms when a slot is "
