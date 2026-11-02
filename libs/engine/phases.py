@@ -160,10 +160,13 @@ class PhaseMachine:
     # portal answers; the first answer decides (warmed -> carry on, logged out -> re-login at once),
     # which is right whether or not a login survives an outage (OPEN_QUESTIONS Q27).
     def _portal_stressed(self) -> bool:
-        """Did the last warm-up fail because the PORTAL was slow or down -- a 503, a slow accept, or
-        no answer to an exit that still reaches the internet (ops_live classifies that last case as
-        slow, F41) -- rather than because of our session or our exit?"""
-        return getattr(self.ops, "warmup_failure_kind", lambda: "unknown")() == "slow"
+        """Did the last warm-up fail because the PORTAL was slow, down, or GATING us -- a 503, a slow
+        accept, no answer to an exit that still reaches the internet (ops_live classes that case as
+        `slow`, F41), or the bot-check shell / maintenance page (`challenged`) -- rather than because
+        of our session or our exit? All of these are 'keep the login and re-warm, do not re-login or
+        roll the exit'; a challenge is not cleared by a fresh exit, and re-logging spends a scarce
+        sub-account login shot to meet the same gate."""
+        return getattr(self.ops, "warmup_failure_kind", lambda: "unknown")() in ("slow", "challenged")
 
     def _stress_hold_on(self) -> bool:
         return bool(self.cfg.raw.get("STRESS_HOLD", True))

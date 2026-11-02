@@ -346,6 +346,20 @@ def _is_challenge_body(html: str) -> bool:
     """True when a response is a bot-challenge interstitial rather than the requested page."""
     low = (html or "").lower()
     return any(m.lower() in low for m in _CHALLENGE_MARKERS)
+# QUEST_HOLD_VIA_PAGE: call the portal page's own goNext(id, value) and hand back the first reply the page's
+# XHR/fetch receives (status -1: the page has no goNext; 0: it issued nothing within 6 s).
+_QUEST_VIA_PAGE_JS = (
+    "new Promise(res=>{if(typeof goNext!=='function'){res({status:-1,body:'no goNext'});return;}"
+    "const seen=[];const ox=XMLHttpRequest.prototype.send;"
+    "XMLHttpRequest.prototype.send=function(){this.addEventListener('load',()=>{seen.push({status:this.status,"
+    "body:(this.responseText||'').substring(0,4000)});});return ox.apply(this,arguments);};"
+    "const of=window.fetch;window.fetch=function(){return of.apply(this,arguments).then(async r=>{"
+    "const c=r.clone();seen.push({status:r.status,body:(await c.text()).substring(0,4000)});return r;});};"
+    "const undo=()=>{XMLHttpRequest.prototype.send=ox;window.fetch=of;};"
+    "try{goNext(%s,%s);}catch(e){undo();res({status:-2,body:String(e)});return;}"
+    "const t0=Date.now();const tick=()=>{if(seen.length||Date.now()-t0>6000){undo();"
+    "res(seen[0]||{status:0,body:'no request seen'});}else setTimeout(tick,100);};tick();})"
+)
 _HOME_MARKERS = ("solicitar pedido de visto", "consultar pedidos")
 _SCHEDULE_MARKERS = ("getperiodosocupados", "cmbperiodo", "getslots")
 
@@ -2269,7 +2283,18 @@ class LiveEngineOps(EngineOps):
             return
 
         kind = classify_failure(error)
-        if self._is_transport_failure(error):
+        if _is_challenge_body(error) or "bot-challenge" in (error or "").lower():
+            # The portal ANSWERED with the bot-check shell. Rolling the exit does not clear it
+            # (MEASURED 2026-10-23: three fresh exits all got the same 44,699 B interstitial -- it is
+            # portal-wide and time-bound, not an exit fault), and re-logging spends a CAPTCHA + a
+            # sub-account login shot to meet the same gate. Class it `challenged`: hold the session
+            # and re-warm on the stress-hold cadence until the portal serves again.
+            kind = "challenged"
+            self._pulse_obs("refused", reason="shell")
+        elif _is_maintenance(error) or "portal maintenance" in (error or "").lower():
+            kind = "challenged"              # down for everyone -- wait it out, keep the session
+            self._pulse_obs("degraded")
+        elif self._is_transport_failure(error):
             # F41 (run 1023): the request got NO answer -- a dead exit OR a portal that is not
             # accepting connections, and the error text cannot tell them apart. Ask the exit: if it
             # still reaches the internet, the PORTAL is down, which is slowness to wait out (keep the
@@ -2307,15 +2332,17 @@ class LiveEngineOps(EngineOps):
                        **self._health.snapshot())
 
     def warmup_failure_kind(self) -> str:
-        """How the LAST warm-up failed -- "slow" | "unreachable" | "unknown".
+        """How the LAST warm-up failed -- "slow" | "challenged" | "unreachable" | "unknown".
 
-        The phase machine uses this to keep a SLOW window from escalating into a re-login. Per
-        attempt, not the health streak: a warm-up that failed for a non-portal reason (stale form,
-        login redirect, csrf) records nothing in the streak, so reading the streak let it inherit an
-        earlier attempt's "slow" -- and the stress hold (F40) would then hold a logged-out session.
+        The phase machine uses this to keep a SLOW or CHALLENGED window from escalating into a
+        re-login. Per attempt, not the health streak: a warm-up that failed for a non-portal reason
+        (stale form, login redirect, csrf) records nothing in the streak, so reading the streak let
+        it inherit an earlier attempt's "slow" -- and the stress hold (F40) would then hold a
+        logged-out session. "challenged" = the portal answered with the bot-check shell or the
+        maintenance page: hold and re-warm, do NOT roll the exit (rolling does not clear it).
         """
         kind = getattr(self, "_last_warm_kind", "unknown")
-        return kind if kind in ("slow", "unreachable") else "unknown"
+        return kind if kind in ("slow", "challenged", "unreachable") else "unknown"
 
     def _is_transport_failure(self, error: str) -> bool:
         """The request got no answer from the portal at all (tunnel/connect/timeout/failed fetch),
@@ -2346,11 +2373,13 @@ class LiveEngineOps(EngineOps):
         except Exception:
             return {}
 
-    def _pulse_obs(self, outcome: str, ms: float | None = None) -> None:
-        """Report one portal answer (or non-answer) to the fleet-wide PortalPulse. Never raises."""
+    def _pulse_obs(self, outcome: str, ms: float | None = None, reason: str | None = None) -> None:
+        """Report one portal answer (or non-answer) to the fleet-wide PortalPulse. Never raises.
+        `reason` tags a `refused` outcome (shell/busy/edge) for PortalPulse.breakdown()."""
         p = getattr(self, "_pulse", None)
         if p is not None:
-            p.observe(outcome, ms=ms, src=f"w:{str(getattr(self, 'identity_id', '') or '')[:8]}")
+            p.observe(outcome, ms=ms, reason=reason,
+                      src=f"w:{str(getattr(self, 'identity_id', '') or '')[:8]}")
 
     def _portal_down_not_exit(self, why: str) -> bool:
         """F41: True when the exit still reaches the internet while the portal gave no answer -- the
@@ -3027,6 +3056,20 @@ class LiveEngineOps(EngineOps):
                                   f"| len={res.get('len')} snippet={str(res.get('snippet',''))[:200]!r}")
 
             if not last_fields:
+                # When the "no fields" page is actually the bot-check shell or the maintenance page,
+                # name it AND route it through _note_portal so it is classed `challenged` (stress-hold,
+                # keep the session) instead of an unexplained stale form the ladder re-logs into. The
+                # plain-stale case keeps its old path (no _note_portal -> kind unknown -> rebuild).
+                _snip = str(res.get("snippet", "")) if isinstance(res, dict) else ""
+                if _is_challenge_body(_snip):
+                    self._warmup_last_error = (f"WAF bot-challenge on quest step (last, "
+                                               f"{res.get('len')}B interstitial, no form)")
+                    self._note_portal("warmup", time.time() - _t0, ok=False,
+                                      error=self._warmup_last_error)
+                elif _is_maintenance(_snip):
+                    self._warmup_last_error = "portal maintenance on quest step (last, no form)"
+                    self._note_portal("warmup", time.time() - _t0, ok=False,
+                                      error=self._warmup_last_error)
                 self._log("do_warmup: quest_state_stale (last step yielded no fields)")
                 return False
 
@@ -3413,7 +3456,18 @@ class LiveEngineOps(EngineOps):
             # The hold event is one tiny quest step: wait a jittered QUEST_HOLD_MIN_S..MAX_S between
             # them (measured 60-300s survives; the portal's idle expiry is ~10.4 min).
             lo, hi = self._quest_hold_bounds()
-            return random.uniform(lo, hi)
+            w = random.uniform(lo, hi)
+            # When the portal is refusing us (bot-check shell), each retry is wasted traffic. Stretch
+            # the next wait by QUEST_HOLD_REFUSED_BACKOFF per consecutive refusal (default 1.0 = off),
+            # but never past a hard ceiling under the ~10.4 min idle expiry, or the hold would lapse.
+            try:
+                k = float(self.cfg.raw.get("QUEST_HOLD_REFUSED_BACKOFF", 1.0) or 1.0)
+            except (TypeError, ValueError):
+                k = 1.0
+            streak = getattr(self, "_qh_refused_streak", 0)
+            if k > 1.0 and streak > 0:
+                w = min(w * (k ** streak), 480.0)
+            return w
         if mode == "schedule":
             # ACTIVE cursor-keeping: a warmed Schedule.jsp cursor lapses after FORM_STATE_TTL, so the
             # ping cadence MUST stay under it or the "kept" cursor is already stale by the next cycle.
@@ -3658,12 +3712,22 @@ class LiveEngineOps(EngineOps):
         else:
             base_qs = {"lang": "PT", "nacionalidade": self.nationality}
             url = f"{QUEST_NEXT}?{urlencode({**base_qs, **steps[pos]})}"
-            res = self.session.browser_eval(
-                "(async()=>{const r=await fetch(%r,{method:'GET',credentials:'include',"
-                "headers:{'Accept':'text/plain, */*; q=0.01','X-Requested-With':'XMLHttpRequest',"
-                "'Sec-Fetch-Mode':'cors','Sec-Fetch-Dest':'empty','Sec-Fetch-Site':'same-origin',"
-                "'Referer':%r}});const b=await r.text();return {status:r.status,"
-                "body:b.substring(0,4000)};})()" % (url, QUEST_URL))
+            if self.cfg.raw.get("QUEST_HOLD_VIA_PAGE"):
+                res = self.session.browser_eval(_QUEST_VIA_PAGE_JS % (
+                    json.dumps(steps[pos].get("id_pergunta")), json.dumps(steps[pos].get("valor"))))
+                if isinstance(res, dict) and res.get("status") in (-1, -2, 0):
+                    self._log(f"keepalive[quest_hold]: goNext() gave nothing ({res.get('body')!r}) -- "
+                              f"falling back to the plain fetch")
+                    res = None
+            else:
+                res = None
+            if res is None:
+                res = self.session.browser_eval(
+                    "(async()=>{const r=await fetch(%r,{method:'GET',credentials:'include',"
+                    "headers:{'Accept':'text/plain, */*; q=0.01','X-Requested-With':'XMLHttpRequest',"
+                    "'Sec-Fetch-Mode':'cors','Sec-Fetch-Dest':'empty','Sec-Fetch-Site':'same-origin',"
+                    "'Referer':%r}});const b=await r.text();return {status:r.status,"
+                    "body:b.substring(0,4000)};})()" % (url, QUEST_URL))
             final_url = ""
             status = res.get("status") if isinstance(res, dict) else None
             page = (res.get("body") if isinstance(res, dict) else str(res)) or ""
@@ -3698,9 +3762,19 @@ class LiveEngineOps(EngineOps):
             # The portal declining us is not a dead session: back off, do not re-login. The server-side
             # questionnaire position is unknown now, so the next event starts the pass over.
             self._qh_pos = None
-            self._log(f"keepalive[quest_hold]: portal refused/challenged {kind} ({n}B, {context}) -- "
-                      f"backing off")
+            why = ("bot-check shell" if _is_challenge_body(page) else
+                   "maintenance page" if _is_maintenance(page) else "busy/throttle page")
+            head = re.sub(r"\s+", " ", page or "")[:120]
+            self._log(f"keepalive[quest_hold]: portal refused/challenged {kind} ({n}B, {context}): {why} "
+                      f"[{head}] -- backing off")
             self._slog("keepalive", result="portal_refused", mode="quest_hold", ev=kind, ctx=context)
+            # Feed the fleet-wide diagnostic: a logged-in worker seeing the shell is the us-gated
+            # signal; the maintenance page is down-for-everyone (degraded).
+            if _is_maintenance(page):
+                self._pulse_obs("degraded")
+            else:
+                self._pulse_obs("refused", reason="shell" if _is_challenge_body(page) else "busy")
+            self._qh_refused_streak = getattr(self, "_qh_refused_streak", 0) + 1
             return
         positive = (low.find("questnextquestion") >= 0 or low.find("cb_question") >= 0) if reload_ \
             else status == 200
@@ -3715,6 +3789,7 @@ class LiveEngineOps(EngineOps):
                 self._prove_or_restore_inconclusive(context)
             return
         self._keepalive_unknown_streak = 0
+        self._qh_refused_streak = 0          # the portal served us -- drop any refusal backoff
         self._qh_pos = 0 if reload_ else pos + 1
         if getattr(self, "_keep_unbookable", False):
             self._mark_keep_bookable(True)

@@ -140,3 +140,95 @@ def test_warmup_without_a_held_position_runs_the_whole_chain():
     kinds = [c[0] for c in ops.session.calls]
     assert kinds.count("home_lang") == 1 and kinds.count("step") == 3
     assert ("nav", QUEST_URL) in ops.session.calls
+
+
+class _PageSession(_QSession):
+    """Also answers the page's own goNext() helper (QUEST_HOLD_VIA_PAGE)."""
+    def __init__(self, via_page, **kw):
+        super().__init__(**kw)
+        self.via_page = via_page
+
+    def browser_eval(self, js):
+        if "typeof goNext" in (js or ""):
+            self.calls.append(("gonext", js))
+            return self.via_page
+        return super().browser_eval(js)
+
+
+def _via_page_ops(session, steps=_STEPS):
+    cfg = EngineConfig.from_settings(resolve({
+        L.TEMPLATE: {"ROLE": "apply"},
+        L.BOOKING: {**_UNIT_MODE, "KEEPALIVE_MODE": "quest_hold", "QUEST_HOLD_VIA_PAGE": True}}))
+    ops = _make_ops(cfg=cfg, quest_steps={"IRL": steps})
+    ops.session, ops.logged = session, []
+    ops._log = lambda m, *a, **k: ops.logged.append(m)
+    ops._note_exit_ip = lambda *a, **k: None
+    return ops
+
+
+def test_via_page_sends_the_step_through_the_pages_own_gonext_not_our_fetch():
+    s = _PageSession({"status": 200, "body": "<input type=hidden id=cb_next_1 value=21>"})
+    ops = _via_page_ops(s)
+    ops._quest_hold_event("t"); ops._quest_hold_event("t")        # reload, then step 1
+    kinds = [c[0] for c in s.calls]
+    assert "gonext" in kinds and "step" not in kinds
+    assert '"1"' in dict(s.calls[-1:])["gonext"] and ops._qh_pos == 1
+
+
+def test_via_page_falls_back_to_the_fetch_when_the_page_has_no_gonext():
+    s = _PageSession({"status": -1, "body": "no goNext"})
+    ops = _via_page_ops(s)
+    ops._quest_hold_event("t"); ops._quest_hold_event("t")
+    assert "step" in [c[0] for c in s.calls] and ops._qh_pos == 1
+
+
+def test_default_keeps_using_the_plain_fetch():
+    s = _PageSession({"status": 200, "body": "x"})
+    ops = _hold_ops(s)
+    ops._quest_hold_event("t"); ops._quest_hold_event("t")
+    assert "gonext" not in [c[0] for c in s.calls]
+
+
+def test_a_refusal_log_names_which_check_fired():
+    shell = '<html><head><meta name="robots" content="noindex,nofollow"></head><script src="/ch/bd.js"></script>'
+    s = _PageSession({"status": 200, "body": shell})
+    ops = _via_page_ops(s)
+    ops._quest_hold_event("t"); ops._quest_hold_event("t")
+    msg = [m for m in ops.logged if "refused/challenged" in m][0]
+    assert "bot-check shell" in msg and "bd.js" in msg and ops._qh_pos is None
+
+
+# ── #1 reduce footprint: the hold backs off while the portal is refusing ──────────────────────
+def _backoff_ops(backoff):
+    cfg = EngineConfig.from_settings(resolve({
+        L.TEMPLATE: {"ROLE": "apply"},
+        L.BOOKING: {**_UNIT_MODE, "KEEPALIVE_MODE": "quest_hold", "QUEST_HOLD_MIN_S": 100,
+                    "QUEST_HOLD_MAX_S": 100, "QUEST_HOLD_REFUSED_BACKOFF": backoff}}))
+    ops = _make_ops(cfg=cfg, quest_steps={"IRL": _STEPS})
+    ops._log = lambda *a, **k: None
+    return ops
+
+
+def test_refused_streak_stretches_the_next_hold_window_capped():
+    ops = _backoff_ops(2.0)
+    assert abs(ops._keepalive_window() - 100.0) < 1e-6      # no refusals yet: base wait
+    ops._qh_refused_streak = 1
+    assert abs(ops._keepalive_window() - 200.0) < 1e-6      # x2
+    ops._qh_refused_streak = 2
+    assert abs(ops._keepalive_window() - 400.0) < 1e-6      # x4
+    ops._qh_refused_streak = 5
+    assert ops._keepalive_window() == 480.0                 # hard ceiling under the idle expiry
+
+
+def test_backoff_off_by_default_keeps_the_base_window():
+    ops = _backoff_ops(1.0)
+    ops._qh_refused_streak = 4
+    assert abs(ops._keepalive_window() - 100.0) < 1e-6      # 1.0 = off
+
+
+def test_a_served_step_resets_the_refused_streak():
+    s = _PageSession({"status": 200, "body": "x"})
+    ops = _hold_ops(s)
+    ops._qh_refused_streak = 3
+    ops._quest_hold_event("t")                              # reload ok
+    assert ops._qh_refused_streak == 0

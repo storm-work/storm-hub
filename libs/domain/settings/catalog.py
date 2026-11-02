@@ -1194,6 +1194,18 @@ _TEMPLATE = [
     _s("QUEST_HOLD_MAX_S", L.BOOKING, float, 300.0, _WRK, "keepalive", min_value=15.0,
        note="KEEPALIVE_MODE=quest_hold: longest wait (seconds) between hold events. Keep it well under "
             "the ~10.4 min idle expiry."),
+    _s("QUEST_HOLD_REFUSED_BACKOFF", L.BOOKING, float, 1.0, _WRK, "keepalive", min_value=1.0,
+       note="KEEPALIVE_MODE=quest_hold: multiply the next hold wait by this per CONSECUTIVE refusal "
+            "(bot-check shell) -- 2.0 doubles each time -- so a worker the portal is refusing stops "
+            "retrying at the full cadence. Reset the moment the portal serves a step again. Hard-capped "
+            "under the ~10.4 min idle expiry (480s) so the hold never lapses. 1.0 = off (default)."),
+    _s("QUEST_HOLD_VIA_PAGE", L.BOOKING, bool, False, _WRK, "keepalive",
+       note="KEEPALIVE_MODE=quest_hold: send each quest step by calling the portal page's OWN goNext(id, "
+            "value) instead of our own fetch(). The request, headers and initiator are then the page's "
+            "(the HARs in data/ref show: Accept */*, Content-Type text/plain, no X-Requested-With), not "
+            "ours. 2026-11-02: our fetch step 1 was refused (bd.js bot-check shell) 315/315 times; on "
+            "2026-10-30 the same fetch passed 508/512. UNTESTED against the live portal -- run "
+            "probes/quest_step_shell_probe.py first; keep OFF until a variant is shown to pass."),
     _s("SCHEDULE_KEEPALIVE_TTL_FRACTION", L.BOOKING, float, 0.75, _WRK, "keepalive",
        min_value=0.2,
        note=

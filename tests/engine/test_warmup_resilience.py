@@ -416,3 +416,26 @@ def test_invalid_blind_slots_never_park_a_worker():
 def test_real_slot_bounces_still_park():
     """The soak10 protection stays for discovered slots: one broken session must not bounce a pool."""
     assert _parks(_BlindStaleOps(blind=False)) != []
+
+
+# ── #2 book reliably: the bot-check shell is `challenged` -- held like `slow`, never re-logged ──
+def test_a_challenged_warmup_holds_the_login_like_a_slow_portal():
+    """The bot-check shell / maintenance page (warmup_failure_kind=='challenged') must take the SAME
+    hold-and-re-warm path as a slow portal: keep the login, never re-log in, ride it out."""
+    ops = _SlowPortalOps(kind="challenged")
+    res = _machine(ops, REWARM_MAX_ATTEMPTS=2).run()
+    assert res.outcome == "warmed" and ops.logins == 1 and ops.warmups == 100
+
+
+def test_a_challenged_window_is_capped_then_terminates_without_a_re_login():
+    ops = _SlowPortalOps(kind="challenged")
+    res = _machine(ops, REWARM_MAX_ATTEMPTS=2, STRESS_HOLD_MAX_S=30, STRESS_HOLD_GAP=10).run()
+    assert res.outcome == "failed" and ops.logins == 1
+    assert ops.warmups == 1 + 2 + 3
+
+
+def test_a_challenged_apply_round_holds_the_login_and_releases_every_slot():
+    ops = _StressedApplyOps(rounds=20, kind="challenged")
+    cfg = EngineConfig.from_settings({"ROLE": "apply", "APPLY_MAX_ATTEMPTS": 2})
+    res = PhaseMachine(cfg, ops).run()
+    assert res.outcome == "stopped" and ops.logins == 1 and ops.warmups == 0 and ops.waits == 20

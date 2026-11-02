@@ -5882,14 +5882,25 @@ def test_stress_hold_off_restores_the_old_roll_on_every_failure():
     assert ops.warmup_failure_kind() == "unreachable" and len(rolls) == 1
 
 
-def test_a_waf_answer_is_not_portal_down_and_still_rolls_once():
-    """The portal ANSWERED with a bot gate: that is a verdict on the exit, not an outage."""
+def test_a_bot_check_shell_answer_is_challenged_held_not_rolled():
+    """The portal ANSWERED with the bot-check shell: portal-WIDE gating (three fresh exits got the
+    same interstitial, 2026-10-23), not an exit fault. Class it `challenged` so the phase machine
+    holds the session and re-warms; do NOT roll the exit (a fresh exit meets the same gate) and do
+    NOT re-login (it spends a sub-account login shot for nothing)."""
     ops, rolls = _stress_ops(exit_ok=True)
     ops._warmup_last_error = "WAF bot-challenge on quest step 1/7 (44699B)"
     ops._note_portal("warmup", 5.0, ok=False, error=ops._warmup_last_error)
-    assert ops.warmup_failure_kind() == "unknown"
+    assert ops.warmup_failure_kind() == "challenged"
     ops._roll_after_failed_warm("apply: dead exit at round-start re-warm")
-    assert rolls == ["apply: dead exit at round-start re-warm"]
+    assert rolls == []     # challenged -> _roll_after_failed_warm's unknown-guard keeps the exit
+
+
+def test_the_maintenance_page_during_warmup_is_challenged_not_rolled():
+    """'Serviço Indisponível' is down-for-everyone: wait it out on the same session, never roll."""
+    ops, rolls = _stress_ops(exit_ok=True)
+    ops._warmup_last_error = "portal maintenance on quest step (last, no form)"
+    ops._note_portal("warmup", 5.0, ok=False, error=ops._warmup_last_error)
+    assert ops.warmup_failure_kind() == "challenged" and rolls == []
 
 
 def test_no_second_roll_after_a_portal_down_warm_failure():
