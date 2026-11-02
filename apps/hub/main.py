@@ -3097,7 +3097,8 @@ def get_portal_pulse(n: int = 100, _v: Principal = Depends(require_viewer)) -> d
     from libs.bus.portal_pulse import PortalPulse
     p = PortalPulse(_bus.r)
     n = max(1, min(int(n), 1000))
-    return {"now": time.time(), **p.state(), "transitions": p.history(n), "windows": p.windows(n)}
+    return {"now": time.time(), **p.state(), "breakdown": p.breakdown(),
+            "transitions": p.history(n), "windows": p.windows(n)}
 
 
 @app.post("/bookings/{booking_id}/duplicate", response_model=BookingOut, status_code=201)

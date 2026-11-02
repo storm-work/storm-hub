@@ -85,6 +85,26 @@ def classify_probe(status: int | None, body: str) -> str:
     return "refused"          # any other edge answer (403 etc.): reachable, application unknown
 
 
+REFUSAL_REASONS = ("shell", "busy", "edge")
+
+
+def refusal_reason(status: int | None, body: str) -> str:
+    """WHY a `refused` outcome was refused -- so the one bucket that collapsed the bd.js bot-check
+    (automation is being gated) with the edge's 'try again later' (per-client throttle) and a bare
+    403 can be told apart. 'down for everyone' is `degraded` (the maintenance page), already separate.
+
+      shell  the bd.js / noindex bot-check interstitial -- served to AUTOMATION. The us-gated signal.
+      busy   the edge's 'try again later' / 'we were unable to complete your request' throttle page.
+      edge   any other refusal (e.g. a bare 403 to a datacenter IP) -- reachable, reason unknown.
+    """
+    low = (body or "").lower()
+    if any(m in low for m in _CHALLENGE):
+        return "shell"
+    if any(m in low for m in _BUSY):
+        return "busy"
+    return "edge"
+
+
 class PortalPulse:
     def __init__(self, r, *, window: float = 20.0, keep: float = 900.0, key: str = _KEY):
         self.r = r
@@ -97,9 +117,13 @@ class PortalPulse:
         return f"{self.key}:{outcome}"
 
     # ── recording ─────────────────────────────────────────────────────────────────────────────
-    def observe(self, outcome: str, *, ms: float | None = None, src: str = "") -> None:
+    def observe(self, outcome: str, *, ms: float | None = None, src: str = "",
+                reason: str | None = None) -> None:
         """Record one observation. Cheap (a pipeline of O(log n) ops); never raises to the caller's
-        hot path -- liveness must not be able to break the work it measures."""
+        hot path -- liveness must not be able to break the work it measures.
+
+        `reason` (REFUSAL_REASONS) is kept alongside a `refused` outcome so breakdown() can split the
+        bot-check gate from the edge throttle; it never affects the up/flapping/down state math."""
         if outcome not in OUTCOMES:
             return
         now = time.time()
@@ -114,11 +138,31 @@ class PortalPulse:
                 fields[f"last_{outcome}_src"] = src
             if outcome == "up" and ms is not None:
                 fields["last_up_ms"] = round(float(ms))
+            if outcome == "refused" and reason in REFUSAL_REASONS:
+                zr = f"{self.key}:refused:{reason}"
+                p.zadd(zr, {f"{now:.3f}:{uuid.uuid4().hex[:6]}": now})
+                p.zremrangebyscore(zr, "-inf", now - self.keep)
+                p.expire(zr, int(self.keep) + 60)
+                fields["last_refused_reason"] = reason
+                fields["last_refused_reason_at"] = now
             p.hset(self.key, mapping=fields)
             p.expire(self.key, 86400)
             p.execute()
         except Exception:
             pass
+
+    def breakdown(self, window: float | None = None) -> dict:
+        """Split the `refused` count over `window` seconds into {shell, busy, edge} -- the us-gated
+        bot-check vs the edge throttle vs a bare 403 -- plus the raw outcome counts. The diagnostic
+        that answers 'down for everyone (degraded) or gating us (refused/shell)?'."""
+        w = self.window if window is None else float(window)
+        now = time.time()
+        try:
+            refused = {r: int(self.r.zcount(f"{self.key}:refused:{r}", now - w, "+inf") or 0)
+                       for r in REFUSAL_REASONS}
+        except Exception:
+            refused = {r: 0 for r in REFUSAL_REASONS}
+        return {"window_s": w, "counts": self.counts(w), "refused_by_reason": refused}
 
     # ── reading ───────────────────────────────────────────────────────────────────────────────
     def _h(self) -> dict:
@@ -268,8 +312,10 @@ def probe_once(v: Vantage, pulse: PortalPulse, *, connect_t: float = 30.0, read_
     t0 = time.time()
     try:
         r = _client(v.proxy, connect_t, read_t).get(PORTAL_HOME, timeout=connect_t + read_t)
-        out = classify_probe(getattr(r, "status_code", None), r.text or "")
-        pulse.observe(out, ms=(time.time() - t0) * 1000, src=f"probe:{v.name}")
+        _st, _body = getattr(r, "status_code", None), r.text or ""
+        out = classify_probe(_st, _body)
+        pulse.observe(out, ms=(time.time() - t0) * 1000, src=f"probe:{v.name}",
+                      reason=refusal_reason(_st, _body) if out == "refused" else None)
         # NOT re-minted on `refused`: MEASURED 2026-10-23 ~15:30 UTC, three fresh soax exits all got
         # the same 44,699 B bot-challenge in 0.9-1.9 s -- the anonymous gate is portal-wide, so a new
         # exit would see the same thing. A refusal still proves the edge is up and how fast.

@@ -153,3 +153,33 @@ def test_a_dead_exit_is_not_evidence_and_is_re_minted(r, monkeypatch):
     assert probe_once(v, p) is None
     assert p.state()["state"] == "unknown", "a dead exit must say nothing about the portal"
     assert v.proxy == "http://new:1" and minted
+
+
+# ── refusal sub-reason breakdown (diagnosing: us-gated vs down-for-all) ───────────────────────
+def test_refusal_reason_splits_shell_busy_edge():
+    from libs.bus.portal_pulse import refusal_reason
+    assert refusal_reason(200, '<script src="/ch/bd.js"></script>') == "shell"
+    assert refusal_reason(200, '<meta name="robots" content="noindex,nofollow">') == "shell"
+    assert refusal_reason(200, "Nao foi possivel de momento concretizar o seu pedido") == "busy"
+    assert refusal_reason(403, "Forbidden") == "edge"
+
+
+def test_breakdown_counts_refusals_by_reason(r):
+    p = PortalPulse(r, window=60.0)
+    p.observe("refused", reason="shell")
+    p.observe("refused", reason="shell")
+    p.observe("refused", reason="busy")
+    p.observe("refused")                     # no reason -> only in the raw refused count
+    p.observe("up")
+    b = p.breakdown()
+    assert b["refused_by_reason"] == {"shell": 2, "busy": 1, "edge": 0}
+    assert b["counts"]["refused"] == 4 and b["counts"]["up"] == 1
+
+
+def test_reason_does_not_change_the_state_math(r):
+    """A reason tag on a refusal must not move up/flapping/down -- it is diagnostic only."""
+    p = PortalPulse(r, window=60.0)
+    p.observe("refused", reason="shell")
+    assert p.state()["state"] == "reachable"      # edge up, app unknown -- unchanged by the reason
+    p.observe("up")
+    assert p.state()["state"] == "up"
