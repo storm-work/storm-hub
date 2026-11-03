@@ -630,6 +630,27 @@ _BOOKING = [
             "of grinding discovery (which risks portal rate-limiting/detection for nothing). "
             "Slot-open can then be re-fired, manually or on schedule. 0 disables the guard entirely; "
             "never fires once slot_found has fired (there ARE slots -- the open was real)."),
+    _s("SLOT_OPEN_RETRY_EVERY_S", L.BOOKING, float, 0.0, group="discovery", min_value=0.0,
+       note="RETRY-AFTER-INACTIVATION (2026-11-03): once SLOT_OPEN_INACTIVATE_AFTER has reverted this "
+            "booking to WARMING with nothing found, re-fire slot-open automatically so scouts re-run "
+            "discovery and apply workers get a fresh window -- instead of the whole fleet rotting in "
+            "KEEPING until a manual re-fire. Each retry clears the signal latch (every RUNNING worker "
+            "is re-signalled) and resets the scout pool to the cheap first-round ladder. This value is "
+            "the minimum gap before re-firing after an inactivation; the effective retry interval is "
+            "dominated by SLOT_OPEN_INACTIVATE_AFTER (the retry only arms when that reverts). 0 = OFF "
+            "(today's behaviour: manual re-fire only). Never retries once slot_found has fired. Paired "
+            "with POST /bookings/{id}/retry-discovery (manual) and POST /workers/{id}/retry."),
+    _s("SLOT_OPEN_RETRY_MAX", L.BOOKING, int, 0, group="discovery", min_value=0,
+       note="cap on how many times SLOT_OPEN_RETRY_EVERY_S auto-re-fires slot-open in one run. 0 = "
+            "unlimited (keep retrying while the booking is active and nothing is found). The count is "
+            "reset on a fresh /start (reset_scout_pool)."),
+    _s("RETRY_REACTIVATE_SLOTS", L.BOOKING, bool, False, group="discovery",
+       note="on a retry (scheduled OR manual), flip this booking's BLIND-seeded slots that were "
+            "retired (status CLOSED, e.g. after BLIND_MAX_BOUNCES) back to AVAILABLE and reset their "
+            "miss_count, so the operator's seeded grid becomes leasable again -- blind mode has no "
+            "scout to rediscover them. TAKEN slots (booked / taken by someone) are NEVER touched. "
+            "Scout-discovered CLOSED rows are left to genuine rediscovery (reopening them risks "
+            "re-injecting phantoms). OFF by default; intended for BLIND_APPLY_MODE bookings."),
     # Seconds BEFORE the scheduled slot_open_at to tell every holding worker to re-warm, so the
     # fleet enters the window with fresh form state rather than scattered across their own
     # ~16-minute keepalive cycles. 0 disables. Only meaningful when slot_open_at is set --

@@ -170,6 +170,9 @@ class Scheduler:
         self._thread: threading.Thread | None = None
         self._last_self_scout: dict[str, float] = {}   # booking_id -> last self-scout trigger time
         self._scout_pools: dict[str, orchestration.ScoutPoolState] = {}   # booking_id -> pool state
+        # Retry-after-inactivation state (process-local, advisory): booking_id -> {"count", "last",
+        # "armed"}. Only _maybe_inactivate_slot_open arms it; _maybe_retry_slot_open consumes it.
+        self._retry_state: dict[str, dict] = {}
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._run, name="scheduler", daemon=True)
@@ -289,6 +292,7 @@ class Scheduler:
         self._mirror_feeder_slots(db, bk, now)
         self._launch_fresh_when_ready(db, bk)
         self._maybe_prewarm(db, bk, now)
+        self._maybe_retry_slot_open(db, bk, now)
         if self._settings_timeout_hours(db, bk) and should_timeout_booking(
             bk.status, bk.started_at, self._settings_timeout_hours(db, bk), now
         ):
@@ -862,6 +866,8 @@ class Scheduler:
         with no carried-over slices/strike-counts/awakened set. Called by the Hub's start_booking
         (every start is a fresh run) and internally by the false-slot-open revert."""
         self._scout_pools.pop(booking_id, None)
+        # A fresh run clears the retry budget; retry_discovery re-sets it right after calling this.
+        self._retry_state.pop(booking_id, None)
 
     def _maybe_revert_false_slot_found(self, db, bk: M.Booking, now: datetime) -> bool:
         """False-slot-FOUND revert (operator spec 2026-08-14). The mirror of
@@ -1010,6 +1016,127 @@ class Scheduler:
                        "inactivate, scouts back to holding, booking -> WARMING", bk.id, len(running))
         return len(running)
 
+    # ── Retry discovery/apply: un-stick a fleet parked in KEEPING (2026-11-03) ──
+    # slot_open/slot_found are one-shot latches and _maybe_inactivate_slot_open reverts a fruitless
+    # window to WARMING, which stops the whole RUNNING-branch machinery (assign / self-scout / latch).
+    # Nothing re-fired it automatically, so the fleet held precious authed sessions and retried
+    # nothing. retry_discovery re-arms the EXISTING machinery; three callers drive it (the scheduled
+    # cadence below, the manual endpoint, and per-worker), all off by default.
+    def retry_discovery(self, db, bk: M.Booking, now: datetime, *,
+                        reactivate_slots: bool = False, nudge_apply: bool = False,
+                        source: str = "scheduled") -> dict:
+        """Re-arm discovery/apply for ONE booking. Clears the signal latch and re-fires slot_open so
+        _latch_signals re-sends to every RUNNING worker next tick; optionally reactivates retired
+        blind slots and nudges idle apply workers to self-scout. Returns counts for logging."""
+        counts = {"reactivated": 0, "nudged": 0, "refired": False}
+        # 1. Drop the notified-set so _latch_signals genuinely reaches everyone again (the same
+        #    mechanism inactivation/revert use).
+        if self._redis is not None:
+            for signal_name in ("slot_open", "slot_found"):
+                self._redis.delete(notified_key(bk.id, signal_name))
+        # 2. Re-fire slot_open if inactivation cleared it (booking is WARMING/ARMED); flipping back to
+        #    RUNNING resumes assign/self-scout/latch. Already-fired (e.g. blind, still RUNNING) -> no-op.
+        if bk.slot_open_fired_at is None and bk.status in (BookingStatus.WARMING, BookingStatus.ARMED):
+            self._fire_slot_open(db, bk, now)
+            counts["refired"] = True
+        # 3. Fresh discovery round from the cheap first-round ladder (also clears _retry_state, which
+        #    the scheduled caller re-sets right after).
+        self.reset_scout_pool(bk.id)
+        # 4. Reactivate retired BLIND slots (blind mode has no scout to reopen them).
+        if reactivate_slots:
+            counts["reactivated"] = self._reactivate_retired_slots(db, bk)
+        # 5. Nudge idle apply workers to self-scout when there is no live inventory to assign.
+        if nudge_apply:
+            counts["nudged"] = self._nudge_apply_self_scout(db, bk)
+        db.commit()
+        logger.info("booking %s: RETRY discovery (%s) -- refired=%s reactivated=%d nudged=%d",
+                    bk.id, source, counts["refired"], counts["reactivated"], counts["nudged"])
+        return counts
+
+    def _reactivate_retired_slots(self, db, bk: M.Booking) -> int:
+        """Flip BLIND-seeded CLOSED slots back to AVAILABLE (miss_count reset) so the seeded grid is
+        leasable again -- CLOSED is how a bounced-out blind slot is retired (past BLIND_MAX_BOUNCES).
+        Never touches TAKEN (booked / genuinely gone) or scout-source rows (left to real rediscovery
+        -- reopening them risks re-injecting phantoms). Same transition events._persist_slots applies
+        on a genuine rediscovery."""
+        rows = db.scalars(select(M.Slot).where(
+            M.Slot.booking_id == bk.id,
+            M.Slot.source == "blind",
+            M.Slot.status == SlotStatus.CLOSED,
+        )).all()
+        for s in rows:
+            s.status = SlotStatus.AVAILABLE
+            s.miss_count = 0
+        return len(rows)
+
+    def _nudge_apply_self_scout(self, db, bk: M.Booking) -> int:
+        """Tell RUNNING+KEEPING apply workers to self-scout (assign slot=None, scouts_invalid=True) --
+        the same command _maybe_self_scout sends, but to the whole held fleet at once and only when
+        there is no live (non-blind) inventory to lease. The worker's own SELF_SCOUT_FALLBACK gate
+        still applies in phases._run_apply, so this is a prompt, not an override."""
+        if self._bus is None:
+            return 0
+        live = db.scalar(select(func.count(M.Slot.id)).where(
+            M.Slot.booking_id == bk.id,
+            M.Slot.status.in_([SlotStatus.AVAILABLE, SlotStatus.LEASED]),
+            M.Slot.source != "blind",
+        )) or 0
+        if live:
+            return 0
+        held = db.scalars(select(M.Worker).where(
+            M.Worker.booking_id == bk.id, M.Worker.role == WorkerRole.APPLY,
+            M.Worker.status == WorkerStatus.RUNNING, M.Worker.substate == WorkerSubstate.KEEPING,
+        )).all()
+        n = 0
+        for w in held:
+            try:
+                self._bus.send_command(w.id, "assign", slot=None, scouts_invalid=True)
+                n += 1
+            except Exception:
+                pass
+        return n
+
+    def _maybe_retry_slot_open(self, db, bk: M.Booking, now: datetime) -> None:
+        """Scheduled auto-retry: once a booking has been inactivated (reverted to WARMING with nothing
+        found), re-fire slot-open on the SLOT_OPEN_RETRY_EVERY_S floor, capped by SLOT_OPEN_RETRY_MAX.
+        OFF at 0. Never while slot_found is set, and only from the inactivated limbo (slot_open NOT
+        currently fired) so an actively-discovering RUNNING window is never interrupted. Armed only by
+        _maybe_inactivate_slot_open, so a never-yet-opened booking is not force-fired early."""
+        every = float(self._effective_booking_setting(db, bk, "SLOT_OPEN_RETRY_EVERY_S", 0.0) or 0.0)
+        if every <= 0:
+            return
+        if (bk.slot_found_fired_at is not None or bk.slot_open_fired_at is not None
+                or bk.status not in _ACTIVE_BOOKING_STATUSES):
+            return
+        st = self._retry_state.get(bk.id)
+        if st is None or not st.get("armed"):
+            return                      # only an inactivation arms a retry
+        cap = int(self._effective_booking_setting(db, bk, "SLOT_OPEN_RETRY_MAX", 0) or 0)
+        if cap and st["count"] >= cap:
+            return
+        if time.time() - st["last"] < every:
+            return
+        react = bool(self._effective_booking_setting(db, bk, "RETRY_REACTIVATE_SLOTS", False))
+        nudge = bool(self._effective_booking_setting(db, bk, "SELF_SCOUT_FALLBACK", True))
+        count = st["count"]
+        self.retry_discovery(db, bk, now, reactivate_slots=react, nudge_apply=nudge,
+                             source="scheduled")   # calls reset_scout_pool -> pops _retry_state
+        # Re-set the budget AFTER retry_discovery cleared it; consume the arm (next inactivation re-arms).
+        self._retry_state[bk.id] = {"count": count + 1, "last": time.time(), "armed": False}
+
+    def retry_worker(self, db, w: M.Worker) -> bool:
+        """Per-worker retry: strip just this worker from the notified-sets so _latch_signals re-sends
+        its slot_open/slot_found next tick, re-engaging one stuck worker without a fleet-wide re-fire.
+        Only effective while the booking still has a fired signal to re-send (an inactivated booking
+        has none -- use the fleet retry there). Returns True if anything was stripped."""
+        if self._redis is None:
+            return False
+        stripped = False
+        for signal_name in ("slot_open", "slot_found"):
+            if self._redis.srem(notified_key(w.booking_id, signal_name), w.id):
+                stripped = True
+        return stripped
+
     def _maybe_inactivate_slot_open(self, db, bk: M.Booking, now: datetime) -> bool:
         """False-slot-open guard (operator spec 2026-08-14): "if there are no slots during slot-open
         phase for a long time (e.g. 20 mins) then acknowledge the slot-open is false, then revert to
@@ -1078,6 +1205,11 @@ class Scheduler:
         except IllegalTransition:
             pass
         db.commit()
+        # Arm a scheduled retry (SLOT_OPEN_RETRY_EVERY_S) WITHOUT resetting the per-run count, so
+        # SLOT_OPEN_RETRY_MAX bounds the whole run across repeated inactivations.
+        st = self._retry_state.get(bk.id, {"count": 0, "last": 0.0})
+        st["armed"] = True
+        self._retry_state[bk.id] = st
         return True
 
     def _mirror_feeder_slots(self, db, bk: M.Booking, now: datetime) -> int:

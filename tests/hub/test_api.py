@@ -349,6 +349,35 @@ def test_fire_slot_open_manually(client):
     assert r2.status_code == 200 and r2.json()["already_fired"] is True
 
 
+def test_retry_discovery_manual(client):
+    """Manual fleet retry: re-arms a booking whose fleet is parked in KEEPING. On a WARMING booking
+    (slot-open inactivated/not yet fired) it re-fires slot-open; the response carries the counts."""
+    h = _operate_headers(client)
+    bid = client.post("/bookings", json={"name": "b-retry", "type": "real", "posto_id": "5084"}, headers=h).json()["id"]
+    # too early: not warming/armed/running yet
+    r = client.post(f"/bookings/{bid}/retry-discovery", headers=h)
+    assert r.status_code == 409
+
+    client.post(f"/bookings/{bid}/start", headers=h)            # -> WARMING, slot-open NOT fired
+    r = client.post(f"/bookings/{bid}/retry-discovery", headers=h)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["refired"] is True and body["booking_status"] == "running"
+    assert client.get(f"/bookings/{bid}", headers=h).json()["slot_open_fired_at"] is not None
+
+
+def test_retry_worker_endpoint(client):
+    """Per-worker retry: 404 unknown; on a real worker it returns the worker row (no fired signal to
+    re-send yet -> still 200, a safe no-op)."""
+    h = _operate_headers(client)
+    assert client.post("/workers/does-not-exist/retry", headers=h).status_code == 404
+    iid = client.post("/identities", json={"full_name": "R", "type": "real"}, headers=h).json()["id"]
+    bid = client.post("/bookings", json={"name": "b-wr", "type": "real", "posto_id": "5084"}, headers=h).json()["id"]
+    wid = client.post(f"/bookings/{bid}/identities", json={"identity_id": iid}, headers=h).json()["id"]
+    r = client.post(f"/workers/{wid}/retry", headers=h)
+    assert r.status_code == 200 and r.json()["id"] == wid
+
+
 def test_fire_slot_found_manually(client):
     """Regression: unlike fire-slot-open, slot-found previously had NO manual override at all --
     it only ever fired automatically once a real AVAILABLE Slot row existed, so an operator testing

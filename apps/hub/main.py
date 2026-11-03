@@ -4285,6 +4285,39 @@ def fire_slot_found(booking_id: str, db: Session = Depends(get_db),
     return {"fired": True, "booking_status": str(bk.status)}
 
 
+class RetryDiscoveryBody(BaseModel):
+    reactivate_slots: bool | None = None   # None -> booking's RETRY_REACTIVATE_SLOTS
+    nudge_apply: bool | None = None        # None -> booking's SELF_SCOUT_FALLBACK
+
+
+@app.post("/bookings/{booking_id}/retry-discovery")
+def retry_discovery(booking_id: str, body: RetryDiscoveryBody = RetryDiscoveryBody(),
+                    db: Session = Depends(get_db),
+                    _op: Principal = Depends(require_operator)) -> dict:
+    """Manually re-arm a booking whose fleet is parked in KEEPING after a fruitless window: clear the
+    signal latch, re-fire slot-open (so every RUNNING worker is re-signalled and scouts re-discover),
+    optionally reactivate retired BLIND slots, and nudge idle apply workers to self-scout. The
+    operator-triggered sibling of the scheduled SLOT_OPEN_RETRY_EVERY_S. A RUNNING booking (slot-open
+    still fired, e.g. blind) is not re-fired -- it just gets the latch cleared, slots reactivated and
+    apply nudged. Flags default to the booking's settings (RETRY_REACTIVATE_SLOTS, SELF_SCOUT_FALLBACK)
+    when omitted. Does NOT set the manual-open flag, so the normal inactivate/retry cycle continues."""
+    bk = db.get(M.Booking, booking_id)
+    if not bk:
+        raise HTTPException(404, "booking not found")
+    if bk.status not in (BookingStatus.WARMING, BookingStatus.ARMED, BookingStatus.RUNNING):
+        raise HTTPException(409, f"cannot retry discovery from status {bk.status}")
+    react = (body.reactivate_slots if body.reactivate_slots is not None
+             else bool(_resolve_booking_setting(db, bk, "RETRY_REACTIVATE_SLOTS", False)))
+    nudge = (body.nudge_apply if body.nudge_apply is not None
+             else bool(_resolve_booking_setting(db, bk, "SELF_SCOUT_FALLBACK", True)))
+    counts = scheduler.retry_discovery(db, bk, _now(), reactivate_slots=react, nudge_apply=nudge,
+                                       source="manual")
+    db.refresh(bk)
+    _cmd_log(booking_id, _op, f"🔁 retry discovery (refired={counts['refired']} "
+                              f"reactivated={counts['reactivated']} nudged={counts['nudged']})")
+    return {"booking_status": str(bk.status), **counts}
+
+
 @app.post("/bookings/{booking_id}/blind-apply")
 def blind_apply(booking_id: str, body: BlindApplyRequest, db: Session = Depends(get_db),
                 _op: Principal = Depends(require_operator)) -> dict:
@@ -4728,6 +4761,23 @@ def restart_worker(worker_id: str, db: Session = Depends(get_db),
     _set_worker_status(w, WorkerStatus.READY)
     db.commit()
     _do_launch_worker(db, w)
+    db.refresh(w)
+    return w
+
+
+@app.post("/workers/{worker_id}/retry", response_model=WorkerOut)
+def retry_worker(worker_id: str, db: Session = Depends(get_db),
+                 _op: Principal = Depends(require_operator)) -> M.Worker:
+    """Re-engage ONE worker stuck in KEEPING: strip it from its booking's signal notified-set so the
+    scheduler re-sends slot_open/slot_found to it on the next tick, re-entering its discover/apply
+    attempt -- no fleet-wide re-fire. Only effective while the booking still has a fired signal (an
+    inactivated booking has none; use POST /bookings/{id}/retry-discovery there)."""
+    w = db.get(M.Worker, worker_id)
+    if not w:
+        raise HTTPException(404, "worker not found")
+    stripped = scheduler.retry_worker(db, w)
+    _cmd_log(worker_id, _op,
+             "🔁 retry worker" if stripped else "🔁 retry worker (no fired signal to re-send)")
     db.refresh(w)
     return w
 
