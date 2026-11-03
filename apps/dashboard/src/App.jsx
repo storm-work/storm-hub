@@ -745,6 +745,16 @@ function BookingOverview({ me, booking, events, workers, allBookings, onBookingC
     const r = await api(`/bookings/${booking.id}/self-scout`, { method: "POST" });
     if (r && r.commanded) setMsg(`${r.commanded} apply worker(s) told to discover slots themselves.`);
   }, "self-scouting");
+  // Retry discovery/apply (2026-11-03). Un-stick a fleet parked in KEEPING after a fruitless window:
+  // clears the signal latch and re-fires slot-open (so every RUNNING worker is re-signalled and
+  // scouts re-discover), reactivates retired BLIND slots per RETRY_REACTIVATE_SLOTS, and nudges idle
+  // apply workers to self-scout. The manual sibling of the scheduled SLOT_OPEN_RETRY_EVERY_S.
+  const retryDiscovery = () => act(async () => {
+    const r = await api(`/bookings/${booking.id}/retry-discovery`, { method: "POST" });
+    setMsg(`Retried discovery — ${r.refired ? "re-fired slot-open" : "latch cleared"}`
+      + `${r.reactivated ? `, reactivated ${r.reactivated} blind slot(s)` : ""}`
+      + `${r.nudged ? `, nudged ${r.nudged} apply worker(s) to self-scout` : ""}.`);
+  }, "retrying");
   // Blind apply (operator direction 2026-09-18). For the moment the operator has confirmed
   // availability BY EYE on the portal's calendar and the system has found nothing -- /slots is on
   // record as under-reporting, and the calendar path manufactures phantoms under load. Seeds the
@@ -862,6 +872,8 @@ function BookingOverview({ me, booking, events, workers, allBookings, onBookingC
   const canSeedBlind = booking.status === "running"
     ? !!booking.slot_open_fired_at
     : blindMode && ["draft", "scheduled", "stopped"].includes(booking.status);
+  // Retry is legal from any active status (the backend 409s from draft/stopped/completed/aborted).
+  const canRetry = ["warming", "armed", "running"].includes(booking.status);
 
   return (
     <div className="card">
@@ -958,6 +970,13 @@ function BookingOverview({ me, booking, events, workers, allBookings, onBookingC
                  ? `booking is ${booking.status} — self-scout needs a running booking (there is nothing to discover before slot-open)`
                  : "tell every HOLDING apply worker to discover slots itself — use when the scouts look busy but are finding nothing"}>
           {busy === "self-scouting" ? "Sending…" : "🔎 Self-scout now"}</button>
+        <button className="btn ghost" disabled={!op || !canRetry || !!busy} onClick={retryDiscovery}
+          title={!canRetry
+                 ? `booking is ${booking.status} — retry needs a warming/armed/running booking`
+                 : "re-arm a fleet parked in KEEPING: clear the signal latch and re-fire slot-open so "
+                   + "scouts re-discover and apply workers re-engage (reactivates retired blind slots "
+                   + "if RETRY_REACTIVATE_SLOTS is on, and nudges idle appliers to self-scout)"}>
+          {busy === "retrying" ? "Retrying…" : "🔁 Retry discovery"}</button>
         <button className="btn ghost" disabled={!op || !canSeedBlind || !!busy}
           onClick={blindApply}
           title={canSeedBlind
