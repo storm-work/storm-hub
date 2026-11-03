@@ -311,6 +311,11 @@ def _sched_on_start(db: Session, bk: M.Booking) -> None:
     except IllegalTransition:
         pass
     db.commit()
+    # FRESH_SUBACCOUNT_PER_RUN: mint + register a brand-new sub-account per identity now, and leave
+    # the launching to the scheduler's fresh-launch watchdog (each worker comes up as its own account
+    # verifies). Launching the fleet here would only 409 on 'no usable sub-account'.
+    if _fresh_subaccounts_on_start(db, bk):
+        return
     # After the commit, for the same reason as start_booking: the launch thread uses its own
     # session, so it must not be able to read the booking in its pre-start status.
     _begin_fleet_launch(bk.id, worker_ids, jitter_secs=jitter)
@@ -2559,7 +2564,21 @@ def run_registration(body: RegistrationRunRequest, db: Session = Depends(get_db)
     subs = [s for s in subs if s.status != SubAccountStatus.RETIRED]
     if not subs:
         raise HTTPException(400, "no valid sub_account_ids")
+    run_id, queued = _spawn_registration_run(
+        db, subs, provider=body.provider, kind=body.kind, geos_raw=body.geos,
+        concurrency=body.concurrency, browser_concurrency=body.browser_concurrency,
+        solver=getattr(body, "solver", None), mode=body.mode)
+    return {"run_id": run_id, "queued": queued}
 
+
+def _spawn_registration_run(db: Session, subs: list, *, provider: str, kind: str | None,
+                            geos_raw: str | None, concurrency: int,
+                            browser_concurrency: int | None, solver: str | None,
+                            mode: str) -> tuple[str, int]:
+    """Core of POST /registration/run, shared with the FRESH_SUBACCOUNT_PER_RUN start path
+    (_fresh_subaccounts_on_start). `subs` are already-resolved, non-retired SubAccount rows. Bumps
+    their registration_jobs, selects proxies + solver keys + email config from settings, builds the
+    registrar launch payload and spawns the registrar process. Returns (run_id, queued_count)."""
     # get-or-create + bump the RegistrationJob row for each selected sub-account (one row per
     # sub-account, mutated in place across retries -- the pre-existing schema's own design, see
     # RegistrationJob's attempts counter).
@@ -2569,7 +2588,7 @@ def run_registration(body: RegistrationRunRequest, db: Session = Depends(get_db)
         if job is None:
             job = M.RegistrationJob(sub_account_id=sa.id)
             db.add(job)
-        job.mode = body.mode
+        job.mode = mode
         job.status = RegistrationStatus.QUEUED
         job.attempts = (job.attempts or 0) + 1
     db.commit()
@@ -2584,10 +2603,10 @@ def run_registration(body: RegistrationRunRequest, db: Session = Depends(get_db)
     # codebase that still excluded on it -- the booking path stopped doing so when the 639-row
     # false-condemnation incident was fixed, but registration kept the old filter and so kept
     # shrinking its own pool permanently, one transient failure at a time.
-    geos = _geos(body.geos)
+    geos = _geos(geos_raw)
     # 'pool:<name>' selects a NAMED rotating pool (DB creds); resolve to the real provider/kind +
     # creds before the branch so the static/rotating decision reads the real kind.
-    _rprov, _rkind, _rcreds = _resolve_rotating_pool(db, body.provider, body.kind)
+    _rprov, _rkind, _rcreds = _resolve_rotating_pool(db, provider, kind)
     if not _static_pool(_rkind):
         # ROTATING: mint, don't query (D39/D40). This path was the last one still selecting rotating
         # proxies from DB rows, and ci000droprot deleted those rows -- so registration failed with
@@ -2604,7 +2623,7 @@ def run_registration(body: RegistrationRunRequest, db: Session = Depends(get_db)
         # `id` is None because there is no row: RegistrationJob.proxy_id is nullable and the
         # registrar already writes None when a proxy entry carries none.
         try:
-            n = max(1, int(body.concurrency or 1), len(subs))
+            n = max(1, int(concurrency or 1), len(subs))
             proxies = [{"id": None,
                         "url": mint_rotating_url(_rprov, _rkind,
                                                  settings=get_global(db),
@@ -2622,19 +2641,19 @@ def run_registration(body: RegistrationRunRequest, db: Session = Depends(get_db)
         # resource_type='rotating' -- a 409 that names the kind while a matching row sits in the
         # table. Rotating rows no longer exist (ci000droprot), so the extra filter excluded nothing
         # real and only created that inconsistency.
-        q = select(M.Proxy).where(M.Proxy.provider == body.provider,
+        q = select(M.Proxy).where(M.Proxy.provider == provider,
                                   M.Proxy.active.is_(True))
-        if body.kind:
-            q = q.where(M.Proxy.kind == body.kind)
+        if kind:
+            q = q.where(M.Proxy.kind == kind)
         if geos:
             # NULL geo is never excluded: a filter narrows the pool, it must not silently empty it.
             q = q.where(M.Proxy.geo.in_(geos) | M.Proxy.geo.is_(None))
         q = q.order_by(M.Proxy.last_used_at.asc().nullslast())
         proxy_rows = list(db.scalars(q).all())
         if not proxy_rows:
-            raise HTTPException(409, f"no active {body.provider} static proxies available"
-                                     + (f" (kind={body.kind})" if body.kind else "")
-                                     + (f" (geo={body.geos})" if body.geos else ""))
+            raise HTTPException(409, f"no active {provider} static proxies available"
+                                     + (f" (kind={kind})" if kind else "")
+                                     + (f" (geo={geos_raw})" if geos_raw else ""))
         proxies = [{"id": p.id, "url": conn_url(p)} for p in proxy_rows]
 
     g = get_global(db)
@@ -2643,7 +2662,7 @@ def run_registration(body: RegistrationRunRequest, db: Session = Depends(get_db)
     # then distributes ONE key per account across them. Keep capsolver_keys as the var name the launch
     # payload already uses; add anticaptcha_keys alongside.
     from libs.domain.solver_select import active_solver_lists, parse_keys
-    _reg_solver = str(getattr(body, "solver", None) or g.get("REGISTRATION_SOLVER", "capsolver"))
+    _reg_solver = str(solver or g.get("REGISTRATION_SOLVER", "capsolver"))
     capsolver_keys, anticaptcha_keys = active_solver_lists(
         _reg_solver, parse_keys(g.get("CAPSOLVER_KEYS", "")), parse_keys(g.get("ANTICAPTCHA_KEYS", "")))
     if not (capsolver_keys or anticaptcha_keys):
@@ -2694,12 +2713,71 @@ def run_registration(body: RegistrationRunRequest, db: Session = Depends(get_db)
         run_id, "launch", cfg={}, accounts=accounts, proxies=proxies,
         capsolver_keys=capsolver_keys, anticaptcha_keys=anticaptcha_keys,
         lang="PT", email_provider=email_provider,
-        email_cfg=email_cfg, concurrency=body.concurrency,
-        browser_concurrency=body.browser_concurrency or body.concurrency,
+        email_cfg=email_cfg, concurrency=concurrency,
+        browser_concurrency=browser_concurrency or concurrency,
         captcha_solve_proxy=captcha_solve_proxy, vendor_settings=vendor_settings,
         donut_profiles_per_hour=int(_eff.get("DONUT_PROFILES_PER_HOUR") or 0),
     )
-    return {"run_id": run_id, "queued": len(accounts)}
+    return run_id, len(accounts)
+
+
+def _fresh_subaccounts_on_start(db: Session, bk: M.Booking) -> int:
+    """FRESH_SUBACCOUNT_PER_RUN: mint ONE brand-new sub-account for every identity attached to this
+    booking and queue a registration run for them. Returns the number minted (0 when the setting is
+    off, or the booking has no identity-bound workers).
+
+    The workers are deliberately NOT launched here -- a worker launched now would only fail with 'no
+    usable sub-account'. The scheduler's fresh-launch watchdog (_launch_fresh_when_ready) brings each
+    worker up the instant its OWN fresh account reaches VERIFIED, so a slow verification on one
+    identity never holds back the others, and no worker burns a launch (and the respawn attempt cap)
+    409'ing while it waits. Every Start mints a fresh batch (the 'every Start is a fresh run' rule);
+    accounts from a prior run stay in the table and simply go unused by this run."""
+    if not _resolve_booking_setting(db, bk, "FRESH_SUBACCOUNT_PER_RUN", False):
+        return 0
+    from .genaccounts import make_password, make_username
+    identity_ids = [iid for (iid,) in db.execute(
+        select(M.Worker.identity_id).where(M.Worker.booking_id == bk.id,
+                                            M.Worker.identity_id.isnot(None)).distinct()).all()]
+    if not identity_ids:
+        logger.info("FRESH_SUBACCOUNT_PER_RUN: booking %s has no identity-bound workers -- nothing "
+                    "to register", bk.id)
+        return 0
+    existing = {u for (u,) in db.execute(select(M.SubAccount.username)).all()}
+    fresh: list[M.SubAccount] = []
+    for iid in identity_ids:
+        ident = db.get(M.Identity, iid)
+        if ident is None:
+            continue
+        first, _, last = (ident.full_name or "x x").partition(" ")
+        u = make_username(first or "x", last or "x", existing)
+        existing.add(u)
+        sa = M.SubAccount(identity_id=iid, username=u, password=make_password(),
+                          status="new", notes=f"fresh-per-run {bk.id}")
+        db.add(sa)
+        fresh.append(sa)
+    if not fresh:
+        return 0
+    db.flush()
+    db.commit()
+    # Register them through the same path POST /registration/run uses, with the booking's OWN proxy
+    # pool/geos so each account is registered from where this booking will later book it from (the
+    # device/geo pin ACCOUNT_GEO_PIN relies on). solver=None uses the global REGISTRATION_SOLVER.
+    provider = str(_resolve_booking_setting(db, bk, "PROXY_PROVIDER", "soax"))
+    kind = _resolve_booking_setting(db, bk, "PROXY_KIND", None) or None
+    geos_raw = _resolve_booking_setting(db, bk, "PROXY_GEOS", None) or None
+    conc = min(len(fresh), 10)
+    try:
+        run_id, _queued = _spawn_registration_run(
+            db, list(fresh), provider=provider, kind=kind, geos_raw=geos_raw,
+            concurrency=conc, browser_concurrency=conc, solver=None, mode="parallel")
+    except HTTPException as e:
+        logger.warning("FRESH_SUBACCOUNT_PER_RUN: booking %s minted %d fresh account(s) but the "
+                       "registration run could not start: %s", bk.id, len(fresh),
+                       getattr(e, "detail", e))
+        return len(fresh)
+    logger.info("FRESH_SUBACCOUNT_PER_RUN: booking %s minted %d fresh sub-account(s); registration "
+                "run %s queued -- workers launch as each verifies", bk.id, len(fresh), run_id)
+    return len(fresh)
 
 
 @app.get("/registration/jobs", response_model=list[RegistrationJobOut])
@@ -4089,6 +4167,15 @@ def start_booking(booking_id: str, db: Session = Depends(get_db),
         except IllegalTransition as e:
             raise HTTPException(409, str(e))
     db.commit()
+    # FRESH_SUBACCOUNT_PER_RUN: mint + register a brand-new sub-account per attached identity, and do
+    # NOT launch the fleet now -- the scheduler's fresh-launch watchdog (_launch_fresh_when_ready)
+    # brings each worker up the instant its own fresh account verifies. Launching now would only 409.
+    fresh = _fresh_subaccounts_on_start(db, bk)
+    if fresh:
+        _cmd_log(booking_id, _op, f"▶ start — registering {fresh} fresh sub-account(s); each worker "
+                                  f"launches as its account verifies")
+        return {"started": 0, "booking_status": str(bk.status), "registering_fresh": fresh,
+                "launching": False, "already_launching": False}
     # Launch only AFTER the transition above is COMMITTED. The fleet launch runs on its own thread
     # with its own DB session, so starting it earlier means that session reads the booking in its
     # PRE-start status -- confirmed live 2026-08-14: Start was clicked on a STOPPED booking, the

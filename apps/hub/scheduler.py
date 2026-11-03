@@ -27,8 +27,8 @@ from sqlalchemy import and_, func, or_, select, update
 from libs.db import models as M
 from libs.bus.names import manual_open_key, notified_key
 from libs.domain.enums import (
-    NOT_BOOKABLE_PREFIX, BookingStatus, SlotLeaseOutcome, SlotStatus, WorkerRole, WorkerStatus,
-    WorkerSubstate)
+    NOT_BOOKABLE_PREFIX, READY_SUB_ACCOUNT_STATUSES, BookingStatus, SlotLeaseOutcome, SlotStatus,
+    WorkerRole, WorkerStatus, WorkerSubstate)
 from libs.engine import orchestration, pool_manager
 from libs.engine.posto import parse_ids, pick_new_posto
 
@@ -287,6 +287,7 @@ class Scheduler:
         # Cross-booking feed: mirror a detector booking's finds into this pool (BEFORE the RUNNING
         # branch so injected slots are assignable the same tick). No-op without a feeder.
         self._mirror_feeder_slots(db, bk, now)
+        self._launch_fresh_when_ready(db, bk)
         self._maybe_prewarm(db, bk, now)
         if self._settings_timeout_hours(db, bk) and should_timeout_booking(
             bk.status, bk.started_at, self._settings_timeout_hours(db, bk), now
@@ -476,6 +477,47 @@ class Scheduler:
     def _effective_booking_setting(self, db, bk: M.Booking, key: str, default):
         """Booking-layer settings only (timeout/guards live there, not per-template)."""
         return (bk.settings_json or {}).get(key, default)
+
+    # ── FRESH_SUBACCOUNT_PER_RUN: launch each worker as its fresh account verifies ──
+    def _launch_fresh_when_ready(self, db, bk: M.Booking) -> None:
+        """Launch each READY worker the instant its identity has a verified sub-account.
+
+        In FRESH_SUBACCOUNT_PER_RUN mode the Hub (_fresh_subaccounts_on_start) mints a brand-new
+        sub-account per identity at Start and registers it, but launches NOBODY -- a worker launched
+        before its account verifies would only 409 on 'no usable sub-account' and burn the respawn
+        attempt cap. This watchdog does the launching instead, per worker, as registration completes:
+        a slow verify on one identity never holds back the rest.
+
+        Strictly gated on the setting AND an active booking. A plain READY worker on a normal booking
+        is one an operator armed but did not start, and must never be auto-launched -- that would
+        start a booking nobody asked to run (the same rule _hold_respawn scopes to its marker)."""
+        if self._on_relaunch is None or bk.status not in _ACTIVE_BOOKING_STATUSES:
+            return
+        if not self._effective_booking_setting(db, bk, "FRESH_SUBACCOUNT_PER_RUN", False):
+            return
+        # Never-attempted READY workers only. A READY worker already carrying the launch-failed
+        # marker had its account ready and failed to launch for some OTHER reason (e.g. no proxy);
+        # that one belongs to _hold_respawn, which retries it with a backoff and a hard attempt cap.
+        # This watchdog owns only the FIRST launch, so it never retries a failing launch uncapped.
+        # (substate_detail IS NULL must be kept explicitly: `NOT (NULL LIKE ...)` is NULL, not true.)
+        ready = list(db.scalars(select(M.Worker).where(
+            M.Worker.booking_id == bk.id, M.Worker.status == WorkerStatus.READY,
+            M.Worker.identity_id.isnot(None),
+            or_(M.Worker.substate_detail.is_(None),
+                ~M.Worker.substate_detail.like(f"{LAUNCH_FAILED_PREFIX}%")))).all())
+        if not ready:
+            return
+        due = [w for w in ready if db.scalar(select(func.count()).select_from(M.SubAccount).where(
+            M.SubAccount.identity_id == w.identity_id,
+            M.SubAccount.status.in_(list(READY_SUB_ACCOUNT_STATUSES))))]
+        if not due:
+            return
+        logger.info("booking %s: FRESH_SUBACCOUNT_PER_RUN launching %d worker(s) whose fresh account "
+                    "verified", bk.id, len(due))
+        # _on_relaunch (_sched_on_relaunch) resets bus state, marks READY and fleet-launches -- its
+        # per-booking in-flight guard makes repeated ticks safe, and a worker already RUNNING is not
+        # READY so it is never re-launched here.
+        self._on_relaunch(db, due)
 
     def _settings_timeout_hours(self, db, bk: M.Booking) -> float:
         return float(self._effective_booking_setting(db, bk, "BOOKING_TIMEOUT_HOURS", 48.0))

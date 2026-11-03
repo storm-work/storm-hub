@@ -2959,3 +2959,100 @@ def test_prewarm_fires_when_the_portal_is_answering():
 
 def test_prewarm_fires_when_the_pulse_is_empty():
     assert len(_prewarm_with_pulse(lambda p: None)) == 1   # no information -> never suppress
+
+
+# ── FRESH_SUBACCOUNT_PER_RUN: _launch_fresh_when_ready ──────────────────────────
+def _sub(db, ident, status):
+    import uuid
+    sa = M.SubAccount(identity_id=ident.id, username=f"u-{uuid.uuid4().hex[:10]}",
+                      password="p", status=status)
+    db.add(sa)
+    db.commit()
+    return sa
+
+
+def _fresh_booking(db, status=BookingStatus.WARMING, fresh=True):
+    bk = _make_booking(db, settings_json=({"FRESH_SUBACCOUNT_PER_RUN": True} if fresh else {}))
+    bk.status = status
+    db.commit()
+    return bk
+
+
+def test_fresh_launch_fires_for_a_worker_whose_account_verified(db):
+    from libs.domain.enums import SubAccountStatus
+    launched = []
+    sched = _scheduler(on_relaunch=lambda db, ws: launched.extend(w.id for w in ws))
+    bk = _fresh_booking(db)
+    ident = _make_identity(db)
+    w = _make_worker(db, bk, ident, status=WorkerStatus.READY)
+    _sub(db, ident, SubAccountStatus.VERIFIED)
+
+    sched._launch_fresh_when_ready(db, bk)
+    assert launched == [w.id]
+
+
+def test_fresh_launch_waits_while_the_account_is_still_registering(db):
+    from libs.domain.enums import SubAccountStatus
+    launched = []
+    sched = _scheduler(on_relaunch=lambda db, ws: launched.extend(w.id for w in ws))
+    bk = _fresh_booking(db)
+    ident = _make_identity(db)
+    _make_worker(db, bk, ident, status=WorkerStatus.READY)
+    _sub(db, ident, SubAccountStatus.NEW)          # minted, not yet verified
+
+    sched._launch_fresh_when_ready(db, bk)
+    assert launched == []
+
+
+def test_fresh_launch_is_off_without_the_setting(db):
+    from libs.domain.enums import SubAccountStatus
+    launched = []
+    sched = _scheduler(on_relaunch=lambda db, ws: launched.extend(w.id for w in ws))
+    bk = _fresh_booking(db, fresh=False)                    # no FRESH_SUBACCOUNT_PER_RUN
+    ident = _make_identity(db)
+    _make_worker(db, bk, ident, status=WorkerStatus.READY)
+    _sub(db, ident, SubAccountStatus.VERIFIED)
+
+    sched._launch_fresh_when_ready(db, bk)
+    assert launched == []
+
+
+def test_fresh_launch_skips_an_inactive_booking(db):
+    from libs.domain.enums import SubAccountStatus
+    launched = []
+    sched = _scheduler(on_relaunch=lambda db, ws: launched.extend(w.id for w in ws))
+    bk = _fresh_booking(db, status=BookingStatus.STOPPED)
+    ident = _make_identity(db)
+    _make_worker(db, bk, ident, status=WorkerStatus.READY)
+    _sub(db, ident, SubAccountStatus.VERIFIED)
+
+    sched._launch_fresh_when_ready(db, bk)
+    assert launched == []                          # never auto-launch a stopped booking
+
+
+def test_fresh_launch_leaves_a_launch_failed_worker_to_hold_respawn(db):
+    from apps.hub.scheduler import LAUNCH_FAILED_PREFIX
+    from libs.domain.enums import SubAccountStatus
+    launched = []
+    sched = _scheduler(on_relaunch=lambda db, ws: launched.extend(w.id for w in ws))
+    bk = _fresh_booking(db)
+    ident = _make_identity(db)
+    _make_worker(db, bk, ident, status=WorkerStatus.READY,
+                 substate_detail=f"{LAUNCH_FAILED_PREFIX} no proxy")
+    _sub(db, ident, SubAccountStatus.VERIFIED)
+
+    sched._launch_fresh_when_ready(db, bk)
+    assert launched == []       # the capped _hold_respawn owns retries of a failed launch
+
+
+def test_fresh_launch_ignores_already_running_workers(db):
+    from libs.domain.enums import SubAccountStatus
+    launched = []
+    sched = _scheduler(on_relaunch=lambda db, ws: launched.extend(w.id for w in ws))
+    bk = _fresh_booking(db)
+    ident = _make_identity(db)
+    _make_worker(db, bk, ident, status=WorkerStatus.RUNNING)   # already up
+    _sub(db, ident, SubAccountStatus.VERIFIED)
+
+    sched._launch_fresh_when_ready(db, bk)
+    assert launched == []

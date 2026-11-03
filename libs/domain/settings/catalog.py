@@ -468,6 +468,16 @@ _BOOKING = [
     # foot-gun: a booking created without touching this ran a full fleet that could never book.
     _s("ENGINE_MODE", L.BOOKING, str, "live", group="mode",
        note="'live' books real appointments; 'sim' drives the same flow against SimEngineOps"),
+    _s("FRESH_SUBACCOUNT_PER_RUN", L.BOOKING, bool, False, group="mode",
+       note="register-then-book: on every Start, mint ONE brand-new sub-account for each identity "
+            "attached to this booking and kick off a registration run for them, THEN let each worker "
+            "launch (login -> keeping -> discovery/apply) the moment its own fresh account verifies. "
+            "The workers are NOT launched up front (they would only fail 'no usable sub-account'); a "
+            "scheduler watchdog launches each one as its account reaches VERIFIED. Off by default: a "
+            "normal Start launches immediately against whatever sub-accounts the identities already "
+            "have. Use when you want a clean, never-before-used account per booking rather than "
+            "reusing (and re-detecting) accounts registered in an earlier window. Each Start mints a "
+            "fresh batch, matching the 'every Start is a fresh run' rule."),
     # Phase 3 (D32): all six proxy settings below take _WRK (worker override) -- a worker can
     # override its booking's proxy configuration. Previously override=frozenset() on every one of
     # them, meaning NO worker-level override existed for any proxy setting despite the resolver
