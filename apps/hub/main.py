@@ -86,7 +86,7 @@ from .genaccounts import gen_fake_identities, gen_subaccounts
 from . import dedup
 from .importers import parse_geo, parse_identities, parse_proxies
 from .donut_sweep import cleanup_junk_profiles, cleanup_stray_proxies, sweep_donut_profiles
-from .donut_profiles import keep_with_profile
+from .donut_profiles import create_profiles, keep_with_profile, profile_status
 from .settings_store import get_global, set_layer
 from .scheduler import (LAUNCH_FAILED_PREFIX, _LAUNCH_BLOCKED_BOOKING_STATUSES, _aware,
                         Scheduler)
@@ -2540,6 +2540,55 @@ def retire_sub_accounts(body: SubAccountResetRequest, db: Session = Depends(get_
         updated += 1
     db.commit()
     return ImportResult(created=updated, errors=errors)
+
+
+# ── Donut profiles (Identities page operator tools) ─────────────────────────────
+class DonutProfileCreate(BaseModel):
+    identity_ids: list[str] = []          # create profiles for these identities' verified sub-accounts
+    sub_account_ids: list[str] = []       # or target specific sub-accounts directly
+
+
+@app.get("/donut/profiles/status")
+def donut_profiles_status(db: Session = Depends(get_db),
+                          me: Principal = Depends(current_principal)) -> dict:
+    """Reconcile the live Donut profiles against the sub-account table: how many match a verified
+    account, how many are junk (orphan / finished / abandoned), and how many verified accounts still
+    have no profile. Read-only -- the Identities page's "Donut status" button."""
+    return profile_status(db, get_global(db))
+
+
+@app.post("/donut/profiles/create")
+def donut_profiles_create(body: DonutProfileCreate, db: Session = Depends(get_db),
+                          _op: Principal = Depends(require_operator)) -> dict:
+    """Create a Donut profile for each selected identity's VERIFIED sub-accounts that has none yet
+    (register+verify can run on the Chromium path; the booking path then needs the profile). Honours
+    Donut's hourly new-profile budget -- accounts that would exceed it come back as `deferred`."""
+    q = select(M.SubAccount).where(M.SubAccount.status.in_(list(READY_SUB_ACCOUNT_STATUSES)))
+    if body.sub_account_ids:
+        q = q.where(M.SubAccount.id.in_(body.sub_account_ids))
+    elif body.identity_ids:
+        q = q.where(M.SubAccount.identity_id.in_(body.identity_ids))
+    else:
+        raise HTTPException(400, "give identity_ids or sub_account_ids")
+    usernames = [u for (u,) in db.execute(q.with_only_columns(M.SubAccount.username)).all()]
+    if not usernames:
+        return {"created": [], "existed": [], "deferred": [], "errors": [], "unreachable": False,
+                "note": "no verified sub-accounts in the selection"}
+    return create_profiles(db, get_global(db), usernames, redis=_bus.r)
+
+
+@app.post("/donut/profiles/cleanup")
+def donut_profiles_cleanup(dry_run: bool = False, db: Session = Depends(get_db),
+                           _op: Principal = Depends(require_operator)) -> dict:
+    """Clean up Donut: stop orphaned running profiles, delete junk ones (orphan / finished / abandoned),
+    and drop stray proxy entries. Fails safe -- an empty sub-account table or a pass that would delete
+    over half the profiles deletes nothing. `dry_run` reports what WOULD go without touching Donut."""
+    stopped = sweep_donut_profiles(db, dry_run=dry_run)
+    junk = cleanup_junk_profiles(db, dry_run=dry_run)
+    proxies = cleanup_stray_proxies(db, dry_run=dry_run)
+    return {"dry_run": dry_run, "stopped": stopped,
+            "deleted": [{"name": n, "reason": w} for n, w in junk],
+            "stray_proxies": proxies}
 
 
 def registrar_vendor_settings(eff: dict) -> dict:

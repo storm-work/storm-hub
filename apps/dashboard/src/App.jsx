@@ -2527,6 +2527,49 @@ function Identities({ me, setLeftPanel, setRightPanel }) {
     } catch (e) { setMsg(e.message); }
   }
 
+  // Donut profiles: register+verify can run on the Chromium path (no profile); the booking path then
+  // needs a Donut profile per verified sub-account. Create them for the selected identities in a batch
+  // (honours Donut's hourly new-profile budget — over-budget accounts come back "deferred").
+  const createDonutProfiles = () => act(async () => {
+    const r = await api("/donut/profiles/create",
+      { method: "POST", body: { identity_ids: selectedIds } });
+    if (r.unreachable) { setMsg(`Donut unreachable: ${(r.errors || []).join("; ") || "no detail"}`); return; }
+    setMsg(`Donut profiles — created ${r.created.length}, already existed ${r.existed.length}`
+      + (r.deferred?.length ? `, deferred ${r.deferred.length} (hourly budget)` : "")
+      + (r.errors?.length ? `, ${r.errors.length} error(s): ${r.errors.slice(0, 2).join("; ")}` : "")
+      + (r.note ? ` — ${r.note}` : "") + ".");
+  });
+  // Status check: live Donut profiles vs the sub-account table.
+  async function donutStatus() {
+    setMsg("");
+    try {
+      const s = await api("/donut/profiles/status");
+      if (!s.reachable) { setMsg(`Donut status: ${s.note || "unreachable"}.`); return; }
+      setMsg(`Donut: ${s.profiles_total} profile(s) (${s.running} running) — `
+        + `${s.matched} matched, ${s.junk_total} junk `
+        + `(${s.junk.orphan} orphan, ${s.junk.finished} finished, ${s.junk.abandoned} abandoned); `
+        + `${s.missing_total} of ${s.ready_total} verified account(s) have NO profile.`);
+    } catch (e) { setMsg(e.message); }
+  }
+  // Cleanup: stop orphaned running profiles, delete junk ones, drop stray proxies. Fails safe on the
+  // server (empty table / >50% junk deletes nothing). Dry-run first so the operator sees the plan.
+  async function cleanupDonut() {
+    setMsg("");
+    try {
+      const dry = await api("/donut/profiles/cleanup?dry_run=true", { method: "POST" });
+      const n = dry.stopped.length + dry.deleted.length + dry.stray_proxies.length;
+      if (n === 0) { setMsg("Donut cleanup: nothing to stop, delete, or drop."); return; }
+      if (!window.confirm(
+        `Donut cleanup would:\n`
+        + `• stop ${dry.stopped.length} orphaned running profile(s)\n`
+        + `• delete ${dry.deleted.length} junk profile(s)\n`
+        + `• drop ${dry.stray_proxies.length} stray proxy entr(ies)\n\nProceed?`)) return;
+      const r = await api("/donut/profiles/cleanup", { method: "POST" });
+      setMsg(`Donut cleanup — stopped ${r.stopped.length}, deleted ${r.deleted.length} junk, `
+        + `dropped ${r.stray_proxies.length} stray proxy entr(ies).`);
+    } catch (e) { setMsg(e.message); }
+  }
+
   // Two-step, mirroring the single-identity Delete in the details panel. A plain delete refuses
   // while an identity still owns rows WE generated (sub-accounts, allocations, event history) --
   // which is the ordinary state of a stale identity, so a one-shot bulk delete would refuse almost
@@ -2589,6 +2632,14 @@ function Identities({ me, setLeftPanel, setRightPanel }) {
                 title="Remove all identities the portal flagged as already booked by others. Real appointments we made are kept.">
           🧹 Cleanup By Others
         </button>
+        <button className="btn ghost" onClick={donutStatus}
+                title="Reconcile live Donut profiles against the sub-account table: matched / junk / verified accounts with no profile.">
+          🩺 Donut status
+        </button>
+        <button className="btn ghost" disabled={!op} onClick={cleanupDonut}
+                title="Stop orphaned Donut profiles, delete junk ones (orphan / finished / abandoned), drop stray proxy entries. Shows the plan before deleting.">
+          🧹 Donut cleanup
+        </button>
         <SearchBox q={q} setQ={setQ} placeholder="search identities…" />
         <div className="field" style={{ margin: 0 }}><label>Filter</label>
           <select value={filter} onChange={(e) => setFilter(e.target.value)}>
@@ -2637,6 +2688,10 @@ function Identities({ me, setLeftPanel, setRightPanel }) {
           <label style={{ margin: 0 }}>Sub-accounts/id</label>
           <input type="number" value={subCount} onChange={(e) => setSubCount(e.target.value)} style={{ width: 60 }} />
           <button className="btn" disabled={!op} onClick={genSubs}>Gen sub-accounts</button>
+          <button className="btn" disabled={!op} onClick={createDonutProfiles}
+                  title="Create a Donut profile for each selected identity's VERIFIED sub-accounts that has none yet (needed for the booking path; honours Donut's hourly new-profile budget).">
+            🍩 Create profiles
+          </button>
           <span className="grow" />
           <label style={{ margin: 0 }}>Priority</label>
           <select value={bulkPriority} onChange={(e) => setBulkPriority(e.target.value)}>

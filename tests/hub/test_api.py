@@ -378,6 +378,34 @@ def test_retry_worker_endpoint(client):
     assert r.status_code == 200 and r.json()["id"] == wid
 
 
+def test_donut_profile_status_endpoint(client):
+    """Status reconciliation is read-only; with the test's default (non-donut) backend it reports
+    reachable=False with a plain note rather than erroring."""
+    h = _operate_headers(client)
+    r = client.get("/donut/profiles/status", headers=h)
+    assert r.status_code == 200
+    body = r.json()
+    assert set(body) >= {"reachable", "backend", "profiles_total", "junk_total", "missing_total"}
+    assert body["reachable"] is False and "not donut" in body["note"]
+
+
+def test_donut_profile_create_requires_ids(client):
+    """No identity_ids and no sub_account_ids -> 400, not a silent empty run."""
+    h = _operate_headers(client)
+    assert client.post("/donut/profiles/create", json={}, headers=h).status_code == 400
+
+
+def test_donut_profile_cleanup_dry_run(client):
+    """Cleanup is operator-only and fails safe; a dry run returns the three result lists."""
+    assert client.post("/donut/profiles/cleanup").status_code == 401       # no token
+    h = _operate_headers(client)
+    r = client.post("/donut/profiles/cleanup?dry_run=true", headers=h)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["dry_run"] is True
+    assert set(body) >= {"stopped", "deleted", "stray_proxies"}
+
+
 def test_fire_slot_found_manually(client):
     """Regression: unlike fire-slot-open, slot-found previously had NO manual override at all --
     it only ever fired automatically once a real AVAILABLE Slot row existed, so an operator testing
