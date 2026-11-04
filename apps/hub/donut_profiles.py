@@ -120,29 +120,30 @@ def create_profiles(db, g: dict, usernames: list[str], *, redis=None) -> dict:
     (DONUT_PROFILES_PER_HOUR) through the shared Redis window: a username that would exceed it is left
     `deferred` rather than created, so a batch never trips the 24h block. Backfills each created (or
     already-present) sub-account's donut_profile / browser_backend so the row reflects reality."""
+    global _cache
     out = {"created": [], "existed": [], "deferred": [], "errors": [], "unreachable": False}
     if str(g.get("BROWSER_BACKEND", "") or "chromium").strip().lower() != "donut":
         out["errors"].append("BROWSER_BACKEND is not donut -- profiles are only used on the Donut path")
         return out
     try:
         api = donut._Api(url=g.get("DONUT_API_URL") or "", token=g.get("DONUT_API_TOKEN") or "")
+        # List FRESH, not through the 60s existing_profile_names cache: a stale "absent" here would make
+        # us re-POST a profile that already exists -- double-spending the hourly quota, which is the very
+        # 24h block this budget exists to avoid (an operator clicking twice, or a concurrent registrar).
+        profs = donut._items(api.call("GET", "/v1/profiles", timeout=15), "profiles")
     except donut.DonutError as e:
         out["unreachable"] = True
         out["errors"].append(str(e)[:200])
         return out
-    present = existing_profile_names(g)
-    if present is None:
-        out["unreachable"] = True
-        out["errors"].append("Donut could not be reached to list profiles")
-        return out
+    present = frozenset(str(p.get("name")) for p in (profs or [])
+                        if str(p.get("name", "")).startswith(donut._PREFIX))
 
+    rows = db.scalars(select(M.SubAccount).where(M.SubAccount.username.in_(usernames))).all()
     subs_by_name: dict[str, M.SubAccount] = {}
-    for u in usernames:
-        n = donut.profile_name(u)
+    for sa in rows:
+        n = donut.profile_name(sa.username)
         if n:
-            sa = db.scalar(select(M.SubAccount).where(M.SubAccount.username == u))
-            if sa is not None:
-                subs_by_name[n] = sa
+            subs_by_name[n] = sa
 
     try:
         cap = int(g.get("DONUT_PROFILES_PER_HOUR") or 0)
@@ -173,6 +174,8 @@ def create_profiles(db, g: dict, usernames: list[str], *, redis=None) -> dict:
         sa.donut_profile, sa.browser_backend = name, "donut"
         out["created"].append(sa.username)
     db.commit()
+    if out["created"]:
+        _cache = None   # the shared 60s list would otherwise hide the new profiles from keep_with_profile
     if out["created"] or out["deferred"]:
         logger.info("donut profile create: %d made, %d existed, %d deferred (budget), %d errors",
                     len(out["created"]), len(out["existed"]), len(out["deferred"]), len(out["errors"]))

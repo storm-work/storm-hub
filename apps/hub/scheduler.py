@@ -1207,8 +1207,10 @@ class Scheduler:
         db.commit()
         # Arm a scheduled retry (SLOT_OPEN_RETRY_EVERY_S) WITHOUT resetting the per-run count, so
         # SLOT_OPEN_RETRY_MAX bounds the whole run across repeated inactivations.
-        st = self._retry_state.get(bk.id, {"count": 0, "last": 0.0})
-        st["armed"] = True
+        # `last` = NOW: SLOT_OPEN_RETRY_EVERY_S is the gap measured FROM this inactivation. Leaving the
+        # previous retry's stamp (or 0.0) let the next tick re-fire at once -- no rest between rounds.
+        st = self._retry_state.get(bk.id, {"count": 0})
+        st["armed"], st["last"] = True, time.time()
         self._retry_state[bk.id] = st
         return True
 

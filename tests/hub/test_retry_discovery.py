@@ -247,6 +247,28 @@ def test_inactivation_arms_retry_state(db):
     assert sched._retry_state[bk.id]["armed"] is True
 
 
+def test_retry_waits_full_gap_after_inactivation(db, monkeypatch):
+    """Regression: arming kept last=0.0, so the tick right after an inactivation re-fired at once and
+    SLOT_OPEN_RETRY_EVERY_S never gave the scouts a rest. The gap is measured FROM the inactivation."""
+    clock = [1_000_000.0]
+    monkeypatch.setattr("apps.hub.scheduler.time.time", lambda: clock[0])
+    flips = []
+    sched = _scheduler(bus=_FakeBus(), redis_client=fakeredis.FakeStrictRedis(decode_responses=True),
+                       on_slot_open=lambda db, bk: flips.append(1))
+    bk = _booking(db, status=BookingStatus.RUNNING, SLOT_OPEN_INACTIVATE_AFTER=1.0,
+                  SLOT_OPEN_RETRY_EVERY_S=300.0)
+    bk.slot_open_fired_at = NOW - timedelta(seconds=10)
+    db.commit()
+    assert sched._maybe_inactivate_slot_open(db, bk, NOW) is True
+
+    clock[0] += 5                                       # next tick: too soon
+    sched._maybe_retry_slot_open(db, bk, NOW)
+    assert flips == []
+    clock[0] += 300                                     # gap elapsed
+    sched._maybe_retry_slot_open(db, bk, NOW)
+    assert flips == [1]
+
+
 # ── retry_worker (per-worker strip) ─────────────────────────────────────────────
 def test_retry_worker_strips_from_notified_sets(db):
     r = fakeredis.FakeStrictRedis(decode_responses=True)

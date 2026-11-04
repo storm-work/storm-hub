@@ -2563,14 +2563,14 @@ def donut_profiles_create(body: DonutProfileCreate, db: Session = Depends(get_db
     """Create a Donut profile for each selected identity's VERIFIED sub-accounts that has none yet
     (register+verify can run on the Chromium path; the booking path then needs the profile). Honours
     Donut's hourly new-profile budget -- accounts that would exceed it come back as `deferred`."""
-    q = select(M.SubAccount).where(M.SubAccount.status.in_(list(READY_SUB_ACCOUNT_STATUSES)))
+    conds = [M.SubAccount.status.in_(list(READY_SUB_ACCOUNT_STATUSES))]
     if body.sub_account_ids:
-        q = q.where(M.SubAccount.id.in_(body.sub_account_ids))
+        conds.append(M.SubAccount.id.in_(body.sub_account_ids))
     elif body.identity_ids:
-        q = q.where(M.SubAccount.identity_id.in_(body.identity_ids))
+        conds.append(M.SubAccount.identity_id.in_(body.identity_ids))
     else:
         raise HTTPException(400, "give identity_ids or sub_account_ids")
-    usernames = [u for (u,) in db.execute(q.with_only_columns(M.SubAccount.username)).all()]
+    usernames = [u for (u,) in db.execute(select(M.SubAccount.username).where(*conds)).all()]
     if not usernames:
         return {"created": [], "existed": [], "deferred": [], "errors": [], "unreachable": False,
                 "note": "no verified sub-accounts in the selection"}

@@ -395,6 +395,29 @@ def test_donut_profile_create_requires_ids(client):
     assert client.post("/donut/profiles/create", json={}, headers=h).status_code == 400
 
 
+def test_donut_profile_create_picks_verified_subs_of_selected(client, monkeypatch):
+    """The endpoint hands create_profiles ONLY the selected identities' ready (verified+) sub-accounts:
+    not NEW ones, not other identities'."""
+    import apps.hub.main as hub_main
+    from libs.db import models as M
+    from libs.domain.enums import SubAccountStatus
+    h = _operate_headers(client)
+    a = client.post("/identities", json={"full_name": "A A", "type": "real"}, headers=h).json()["id"]
+    b = client.post("/identities", json={"full_name": "B B", "type": "real"}, headers=h).json()["id"]
+    db = next(app.dependency_overrides[get_db]())
+    for ident, user, st in [(a, "a_ver", SubAccountStatus.VERIFIED), (a, "a_new", SubAccountStatus.NEW),
+                            (a, "a_ok", SubAccountStatus.LOGIN_OK), (b, "b_ver", SubAccountStatus.VERIFIED)]:
+        db.add(M.SubAccount(identity_id=ident, username=user, password="x", status=st))
+    db.commit()
+    seen = {}
+    monkeypatch.setattr(hub_main, "create_profiles",
+                        lambda db, g, usernames, redis=None: seen.setdefault("u", sorted(usernames)) and
+                        {"created": usernames, "existed": [], "deferred": [], "errors": [], "unreachable": False})
+    r = client.post("/donut/profiles/create", json={"identity_ids": [a]}, headers=h)
+    assert r.status_code == 200
+    assert seen["u"] == ["a_ok", "a_ver"]
+
+
 def test_donut_profile_cleanup_dry_run(client):
     """Cleanup is operator-only and fails safe; a dry run returns the three result lists."""
     assert client.post("/donut/profiles/cleanup").status_code == 401       # no token

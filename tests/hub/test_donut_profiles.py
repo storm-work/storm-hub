@@ -123,6 +123,32 @@ def test_create_rate_limited_defers_rest(db, monkeypatch):
     assert out["created"] == [] and len(out["deferred"]) == 2
 
 
+def test_create_twice_never_double_creates(db, monkeypatch):
+    """Regression: the create decision used the 60s existing_profile_names cache, so a second click
+    within a minute re-POSTed every profile -- duplicates plus double-spent hourly quota."""
+    api = FakeApi()
+    _patch(monkeypatch, api)
+    r = fakeredis.FakeStrictRedis(decode_responses=True)
+    _, s = _ident(db)
+    DP.existing_profile_names(G)                       # warm the shared cache with the EMPTY list
+    first = DP.create_profiles(db, G, [s.username], redis=r)
+    second = DP.create_profiles(db, G, [s.username], redis=r)
+    assert first["created"] == [s.username]
+    assert second["created"] == [] and second["existed"] == [s.username]
+    assert len(api.profiles) == 1 and r.zcard(DP._BUDGET_KEY) == 1
+
+
+def test_create_invalidates_shared_cache(db, monkeypatch):
+    """Regression: after creating, keep_with_profile must see the new profile at once, not filter the
+    just-enabled account out for up to 60s from a stale cached list."""
+    api = FakeApi()
+    _patch(monkeypatch, api)
+    _, s = _ident(db)
+    assert donut.profile_name(s.username) not in DP.existing_profile_names(G)   # cached: absent
+    DP.create_profiles(db, G, [s.username], redis=fakeredis.FakeStrictRedis(decode_responses=True))
+    assert donut.profile_name(s.username) in DP.existing_profile_names(G)
+
+
 # ── profile_status ──────────────────────────────────────────────────────────────
 def test_status_classifies_matched_junk_and_missing(db, monkeypatch):
     i_ok, s_ok = _ident(db, status=SubAccountStatus.VERIFIED, username="matched1")
