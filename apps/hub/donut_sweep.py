@@ -222,6 +222,74 @@ def cleanup_junk_profiles(db: Session, *, dry_run: bool = False, now: float | No
         return []
 
 
+def _launch_ts(p: dict) -> float:
+    ll = p.get("last_launch")
+    return float(ll) if isinstance(ll, (int, float)) else 0.0
+
+
+def plan_duplicates(profiles: list[dict], names: set[str] | None = None) -> list[dict]:
+    """Pure: the extra copies of every `storm-*` profile name that appears more than once (limited to
+    `names` when given). One profile name = one account's device; a second copy is a second device
+    that launches pick at random (`_find_id` takes the first listed).
+
+    Keeps ONE per name: a running copy (in use) over a stopped one, then the most recently launched
+    (it carries the account's history), then the first listed. A running extra is never planned --
+    something is using it; it is left for a later pass."""
+    groups: dict[str, list[tuple[int, dict]]] = {}
+    for i, p in enumerate(profiles):
+        name = str(p.get("name") or "")
+        if name.startswith(_PREFIX) and (names is None or name in names):
+            groups.setdefault(name, []).append((i, p))
+    out = []
+    for copies in groups.values():
+        if len(copies) < 2:
+            continue
+        keep = max(copies, key=lambda ip: (bool(ip[1].get("is_running")), _launch_ts(ip[1]), -ip[0]))
+        out += [p for i, p in copies if i != keep[0] and not p.get("is_running")]
+    return out
+
+
+def delete_profiles(api, victims: list[dict]) -> list[str]:
+    """DELETE each profile and its proxy entry; returns the names actually deleted. Never raises."""
+    done = []
+    for p in victims:
+        try:
+            api.call("DELETE", f"/v1/profiles/{p['id']}", timeout=15)
+        except Exception as e:
+            logger.warning("donut: could not delete %s (%s): %s", p.get("name"), p.get("id"), str(e)[:120])
+            continue
+        if p.get("proxy_id"):
+            try:
+                api.call("DELETE", f"/v1/proxies/{p['proxy_id']}", timeout=15)
+            except Exception:
+                pass
+        done.append(str(p.get("name")))
+    return done
+
+
+def cleanup_duplicate_profiles(db: Session, *, dry_run: bool = False) -> list[str]:
+    """Delete extra copies of a duplicated profile name (see plan_duplicates). Returns their names
+    (one entry per deleted copy). No fraction guard: a duplicate is redundant by definition -- the
+    kept copy is the same account's device -- so removing it can never strand an account. Never raises."""
+    try:
+        g = get_global(db)
+        if str(g.get("BROWSER_BACKEND") or "chromium").strip().lower() != "donut":
+            return []
+        import libs.engine.vendor  # noqa: F401
+        import donut
+        api = donut._Api(url=g.get("DONUT_API_URL") or "", token=g.get("DONUT_API_TOKEN") or "")
+        victims = plan_duplicates(donut._items(api.call("GET", "/v1/profiles", timeout=15), "profiles"))
+        if not victims:
+            return []
+        done = [str(p.get("name")) for p in victims] if dry_run else delete_profiles(api, victims)
+        logger.info("donut cleanup: %s %d duplicate profile cop(ies): %s",
+                    "would delete" if dry_run else "deleted", len(done), ", ".join(done))
+        return done
+    except Exception:
+        logger.exception("donut duplicate cleanup failed -- leaving profiles")
+        return []
+
+
 def plan_stray_proxies(proxies: list[dict], profiles: list[dict]) -> list[dict]:
     """Pure: `storm-*` Donut proxy entries no profile points at. Entries the bot did not name are the
     operator's and are never planned."""

@@ -86,7 +86,8 @@ from .events import EventHub
 from .genaccounts import gen_fake_identities, gen_subaccounts
 from . import dedup
 from .importers import parse_geo, parse_identities, parse_proxies
-from .donut_sweep import cleanup_junk_profiles, cleanup_stray_proxies, sweep_donut_profiles
+from .donut_sweep import (cleanup_duplicate_profiles, cleanup_junk_profiles, cleanup_stray_proxies,
+                          sweep_donut_profiles)
 from .donut_profiles import create_profiles, delete_profiles_for, keep_with_profile, profile_status
 from .settings_store import get_global, set_layer
 from .scheduler import (LAUNCH_FAILED_PREFIX, _LAUNCH_BLOCKED_BOOKING_STATUSES, _aware,
@@ -606,6 +607,7 @@ def _start_donut_sweep() -> None:
                 try:
                     sweep_donut_profiles(db)
                     cleanup_junk_profiles(db)
+                    cleanup_duplicate_profiles(db)    # extra copies of one name: always redundant
                     cleanup_stray_proxies(db)
                 finally:
                     db.close()
@@ -2687,9 +2689,11 @@ def donut_profiles_cleanup(dry_run: bool = False, force: bool = False, db: Sessi
     stopped = sweep_donut_profiles(db, dry_run=dry_run)
     rep: dict = {}
     junk = cleanup_junk_profiles(db, dry_run=dry_run, force=force, report=rep)
+    dups = cleanup_duplicate_profiles(db, dry_run=dry_run)    # extra copies of one account's profile
     proxies = cleanup_stray_proxies(db, dry_run=dry_run)
     return {"dry_run": dry_run, "stopped": stopped,
             "deleted": [{"name": n, "reason": w} for n, w in junk],
+            "duplicates": dups,
             "stray_proxies": proxies,
             "refused": rep.get("refused"),
             "planned": [{"name": n, "reason": w} for n, w in rep.get("planned", [])]}

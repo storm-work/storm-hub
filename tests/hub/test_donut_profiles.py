@@ -31,23 +31,36 @@ class FakeApi:
     """A stand-in for donut._Api backed by an in-memory profile list. One instance is shared across
     every donut._Api(...) call in a test via the monkeypatched factory, so creates are visible to the
     listing that follows."""
-    def __init__(self, profiles=None, rate_limited=False):
+    def __init__(self, profiles=None, rate_limited=False, racer=False, fail=False):
         self.profiles = list(profiles or [])
         self.rate_limited = rate_limited
+        self.racer = racer          # a concurrent creator (registrar/worker) makes the same name too
+        self.fail = fail
+        self.posts = 0
         self._n = 0
+
+    def _add(self, name):
+        self._n += 1
+        pid = f"id{self._n}"
+        self.profiles.append({"id": pid, "name": name, "is_running": False, "last_launch": 0})
+        return pid
 
     def call(self, method, path, body=None, timeout=30.0):
         if method == "GET" and path == "/v1/profiles":
-            return {"profiles": self.profiles}
+            return {"profiles": list(self.profiles)}
         if method == "POST" and path == "/v1/profiles":
             if self.rate_limited:
                 raise donut.DonutRateLimited("429", 300.0)
-            self._n += 1
-            pid = f"id{self._n}"
-            self.profiles.append({"id": pid, "name": body["name"], "is_running": False, "last_launch": 0})
-            return {"profile": {"id": pid}}
-        if method == "PUT":
-            return {}
+            if self.fail:
+                raise donut.DonutError("boom")
+            self.posts += 1
+            if self.racer:
+                self._add(body["name"])
+            return {"profile": {"id": self._add(body["name"])}}
+        if method == "DELETE" and path.startswith("/v1/profiles/"):
+            pid = path.rsplit("/", 1)[1]
+            self.profiles = [p for p in self.profiles if p["id"] != pid]
+            return None
         return {}
 
 
@@ -147,6 +160,55 @@ def test_create_invalidates_shared_cache(db, monkeypatch):
     assert donut.profile_name(s.username) not in DP.existing_profile_names(G)   # cached: absent
     DP.create_profiles(db, G, [s.username], redis=fakeredis.FakeStrictRedis(decode_responses=True))
     assert donut.profile_name(s.username) in DP.existing_profile_names(G)
+
+
+# ── dedup guard ─────────────────────────────────────────────────────────────────
+def test_claim_held_by_another_request_skips_as_busy(db, monkeypatch):
+    """Two overlapping creates: the second must not POST a second profile with the same name."""
+    api = FakeApi()
+    _patch(monkeypatch, api)
+    r = fakeredis.FakeStrictRedis(decode_responses=True)
+    _, s = _ident(db)
+    r.set(DP._CLAIM_PREFIX + donut.profile_name(s.username), "1")      # the other request's claim
+    out = DP.create_profiles(db, G, [s.username], redis=r)
+    assert out["busy"] == [s.username] and out["created"] == [] and api.posts == 0
+
+
+def test_successful_create_keeps_its_claim_failed_one_releases_it(db, monkeypatch):
+    r = fakeredis.FakeStrictRedis(decode_responses=True)
+    _, ok = _ident(db, username="okuser")
+    _patch(monkeypatch, FakeApi())
+    DP.create_profiles(db, G, ["okuser"], redis=r)
+    assert r.exists(DP._CLAIM_PREFIX + donut.profile_name("okuser"))       # "just created" marker
+    _, bad = _ident(db, username="baduser")
+    _patch(monkeypatch, FakeApi(fail=True))
+    DP._cache = None
+    out = DP.create_profiles(db, G, ["baduser"], redis=r)
+    assert out["errors"] and not r.exists(DP._CLAIM_PREFIX + donut.profile_name("baduser"))
+
+
+def test_post_create_check_removes_a_racers_copy(db, monkeypatch):
+    """A creator that does not take the claim (registrar/worker first launch) made the same name in
+    the gap: the batch's post-create check leaves exactly one copy."""
+    api = FakeApi(racer=True)
+    _patch(monkeypatch, api)
+    _, s = _ident(db)
+    out = DP.create_profiles(db, G, [s.username], redis=fakeredis.FakeStrictRedis(decode_responses=True))
+    name = donut.profile_name(s.username)
+    assert out["created"] == [s.username] and out["duplicates_removed"] == [name]
+    assert [p["name"] for p in api.profiles] == [name]
+
+
+def test_status_counts_duplicates_including_running(db, monkeypatch):
+    _patch(monkeypatch, FakeApi(profiles=[
+        {"id": "1", "name": "storm-aaa", "is_running": True},
+        {"id": "2", "name": "storm-aaa", "is_running": True},
+        {"id": "3", "name": "storm-aaa", "is_running": False},
+        {"id": "4", "name": "storm-bbb", "is_running": False},
+    ]))
+    _ident(db)
+    st = DP.profile_status(db, G)
+    assert st["duplicates"] == 2 and st["duplicate_names"] == ["storm-aaa"]
 
 
 # ── profile_status ──────────────────────────────────────────────────────────────

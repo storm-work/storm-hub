@@ -2599,6 +2599,8 @@ function Identities({ me, setLeftPanel, setRightPanel }) {
     if (r.unreachable) { setMsg(`Donut unreachable: ${(r.errors || []).join("; ") || "no detail"}`); return; }
     setMsg(`Donut profiles — created ${r.created.length}, already existed ${r.existed.length}`
       + (r.deferred?.length ? `, deferred ${r.deferred.length} (hourly budget)` : "")
+      + (r.busy?.length ? `, skipped ${r.busy.length} (another request just created or is creating it)` : "")
+      + (r.duplicates_removed?.length ? `, removed ${r.duplicates_removed.length} duplicate cop(ies)` : "")
       + (r.errors?.length ? `, ${r.errors.length} error(s): ${r.errors.slice(0, 2).join("; ")}` : "")
       + (r.note ? ` — ${r.note}` : "") + ".");
   });
@@ -2611,7 +2613,9 @@ function Identities({ me, setLeftPanel, setRightPanel }) {
       setMsg(`Donut: ${s.profiles_total} profile(s) (${s.running} running) — `
         + `${s.matched} matched, ${s.junk_total} junk `
         + `(${s.junk.orphan} orphan, ${s.junk.finished} finished, ${s.junk.abandoned} abandoned); `
-        + `${s.missing_total} of ${s.ready_total} verified account(s) have NO profile.`);
+        + `${s.missing_total} of ${s.ready_total} verified account(s) have NO profile`
+        + (s.duplicates ? `; ⚠ ${s.duplicates} duplicate cop(ies) of ${s.duplicate_names.length} name(s) — run Donut cleanup` : "")
+        + ".");
     } catch (e) { setMsg(e.message); }
   }
   // Cleanup: stop orphaned running profiles, delete junk ones, drop stray proxies. Fails safe on the
@@ -2626,7 +2630,8 @@ function Identities({ me, setLeftPanel, setRightPanel }) {
       const planned = dry.planned || [];
       const force = !!dry.refused && planned.length > 0;
       const toDelete = force ? planned.length : dry.deleted.length;
-      const n = dry.stopped.length + toDelete + dry.stray_proxies.length;
+      const dups = (dry.duplicates || []).length;
+      const n = dry.stopped.length + toDelete + dups + dry.stray_proxies.length;
       if (n === 0) {
         setMsg(dry.refused ? `Donut cleanup refused: ${dry.refused}.` : "Donut cleanup: nothing to stop, delete, or drop.");
         return;
@@ -2639,9 +2644,11 @@ function Identities({ me, setLeftPanel, setRightPanel }) {
         + `Donut cleanup will:\n`
         + `• stop ${dry.stopped.length} orphaned running profile(s)\n`
         + `• delete ${toDelete} junk profile(s)\n`
+        + `• delete ${dups} duplicate cop(ies) (one copy of each name is kept)\n`
         + `• drop ${dry.stray_proxies.length} stray proxy entr(ies)\n\nProceed?`)) return;
       const r = await api(`/donut/profiles/cleanup${force ? "?force=true" : ""}`, { method: "POST" });
       setMsg(`Donut cleanup — stopped ${r.stopped.length}, deleted ${r.deleted.length} junk, `
+        + `${(r.duplicates || []).length} duplicate(s), `
         + `dropped ${r.stray_proxies.length} stray proxy entr(ies).`);
     } catch (e) { setMsg(e.message); }
   }

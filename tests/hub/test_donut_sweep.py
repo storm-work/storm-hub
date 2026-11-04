@@ -303,6 +303,26 @@ def test_force_never_lifts_the_empty_table_guard(db, monkeypatch):
     assert _CleanApi.deleted == [] and "no sub-accounts" in rep["refused"]
 
 
+def test_plan_duplicates_keep_rule():
+    """Keep ONE per name: running > most recently launched > first listed. Never plan a running copy."""
+    P = lambda i, name, run=False, ll=None: {"id": i, "name": name, "is_running": run, "last_launch": ll}
+    profs = [P("a1", "storm-a", ll=100), P("a2", "storm-a", ll=500), P("a3", "storm-a"),      # keep a2
+             P("b1", "storm-b", ll=900), P("b2", "storm-b", run=True),                       # keep b2
+             P("c1", "storm-c"), P("c2", "storm-c"),                                         # keep c1
+             P("d1", "storm-d", run=True), P("d2", "storm-d", run=True, ll=5),               # keep d2, d1 running
+             P("u1", "storm-u"), P("x1", "operator-x"), P("x2", "operator-x")]              # single / not ours
+    assert sorted(p["id"] for p in sweep.plan_duplicates(profs)) == ["a1", "a3", "b1", "c2"]
+    assert [p["id"] for p in sweep.plan_duplicates(profs, names={"storm-c"})] == ["c2"]
+
+
+def test_cleanup_duplicate_profiles_deletes_extras(db, monkeypatch):
+    _install_donut(monkeypatch, [_stopped("storm-a"), _stopped("storm-a", proxy_id="pxA"), _stopped("storm-b")])
+    _CleanApi.profiles[1]["id"] = "id-storm-a-2"
+    assert sweep.cleanup_duplicate_profiles(db, dry_run=True) == ["storm-a"] and _CleanApi.deleted == []
+    assert sweep.cleanup_duplicate_profiles(db) == ["storm-a"]
+    assert _CleanApi.deleted == ["/v1/profiles/id-storm-a-2", "/v1/proxies/pxA"]
+
+
 def test_cleanup_deletes_the_profile_and_its_proxy_entry(db, monkeypatch):
     donut = _install_donut(monkeypatch, [])
     _world(db)

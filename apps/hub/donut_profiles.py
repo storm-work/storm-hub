@@ -18,7 +18,8 @@ import libs.db.models as M
 from libs.domain.enums import READY_SUB_ACCOUNT_STATUSES
 from libs.engine.vendor import donut
 
-from .donut_sweep import _DEAD_IDENT, _DEAD_SUB, _PENDING_SUB, known_profile_index
+from .donut_sweep import (_DEAD_IDENT, _DEAD_SUB, _PENDING_SUB, delete_profiles, known_profile_index,
+                          plan_duplicates)
 
 logger = logging.getLogger("storm.hub.donut_profiles")
 
@@ -98,6 +99,33 @@ def _budget_take(r, now: float | None = None) -> None:
         pass
 
 
+_CLAIM_PREFIX = "donut:profile_create:"
+_CLAIM_TTL_S = 900      # outlives any one batch, so a claim doubles as a "just created" marker
+
+
+def _claim_name(r, name: str) -> bool:
+    """Take the cross-process create claim for one profile name (SET NX). Kept after a successful
+    create, so a second request inside the TTL sees it as busy instead of re-creating. No redis ->
+    no claim (single process, e.g. tests); a redis ERROR fails closed -- better skip than duplicate."""
+    if r is None:
+        return True
+    try:
+        return bool(r.set(_CLAIM_PREFIX + name, "1", nx=True, ex=int(_CLAIM_TTL_S)))
+    except Exception as e:
+        logger.warning("donut create claim failed for %s (%s) -- skipping it", name, str(e)[:100])
+        return False
+
+
+def _release_name(r, name: str) -> None:
+    """Drop the claim after a FAILED create so the name can be retried at once."""
+    if r is None:
+        return
+    try:
+        r.delete(_CLAIM_PREFIX + name)
+    except Exception:
+        pass
+
+
 def _create_one(api, name: str, g: dict) -> None:
     """POST a Donut account-scope Wayfern profile (fingerprint only, no proxy -- a launch sets the exit).
     Mirrors donut._ensure_profile's create body but reads OS / keep-state from the Global settings `g`
@@ -121,7 +149,8 @@ def create_profiles(db, g: dict, usernames: list[str], *, redis=None) -> dict:
     `deferred` rather than created, so a batch never trips the 24h block. Backfills each created (or
     already-present) sub-account's donut_profile / browser_backend so the row reflects reality."""
     global _cache
-    out = {"created": [], "existed": [], "deferred": [], "errors": [], "unreachable": False}
+    out = {"created": [], "existed": [], "deferred": [], "busy": [], "duplicates_removed": [],
+           "errors": [], "unreachable": False}
     if str(g.get("BROWSER_BACKEND", "") or "chromium").strip().lower() != "donut":
         out["errors"].append("BROWSER_BACKEND is not donut -- profiles are only used on the Donut path")
         return out
@@ -151,6 +180,7 @@ def create_profiles(db, g: dict, usernames: list[str], *, redis=None) -> dict:
         cap = 0
     left = _budget_slots_left(redis, cap)
 
+    created_names: set[str] = set()
     for name, sa in subs_by_name.items():
         if name in present:
             out["existed"].append(sa.username)
@@ -160,20 +190,41 @@ def create_profiles(db, g: dict, usernames: list[str], *, redis=None) -> dict:
         if left <= 0:
             out["deferred"].append(sa.username)
             continue
+        # DEDUP GUARD (1/2): claim the name across processes before creating. The listing above can
+        # be minutes old by now, and Donut does not refuse a second profile with the same name -- two
+        # overlapping creates (double submit, two operators) would each make one.
+        if not _claim_name(redis, name):
+            out["busy"].append(sa.username)
+            continue
         try:
             _create_one(api, name, g)
         except donut.DonutRateLimited:
+            _release_name(redis, name)
             out["deferred"].append(sa.username)       # budget already full on Donut's side -- stop asking
             left = 0
             continue
         except donut.DonutError as e:
+            _release_name(redis, name)
             out["errors"].append(f"{sa.username}: {str(e)[:120]}")
             continue
         _budget_take(redis)
         left -= 1
         sa.donut_profile, sa.browser_backend = name, "donut"
+        created_names.add(name)
         out["created"].append(sa.username)
     db.commit()
+    # DEDUP GUARD (2/2): the registrar and workers create profiles on first launch without the claim.
+    # Re-list once and drop any extra copy of a name this batch created (keep rule: plan_duplicates).
+    if created_names:
+        try:
+            after = donut._items(api.call("GET", "/v1/profiles", timeout=15), "profiles")
+            extra = plan_duplicates(after, names=created_names)
+            if extra:
+                out["duplicates_removed"] = delete_profiles(api, extra)
+                logger.warning("donut profile create: removed %d duplicate cop(ies) a concurrent creator "
+                               "made: %s", len(out["duplicates_removed"]), ", ".join(out["duplicates_removed"]))
+        except Exception as e:
+            out["errors"].append(f"post-create duplicate check failed: {str(e)[:120]}")
     if out["created"]:
         _cache = None   # the shared 60s list would otherwise hide the new profiles from keep_with_profile
     if out["created"] or out["deferred"]:
@@ -196,23 +247,12 @@ def delete_profiles_for(g: dict, usernames: list[str]) -> dict:
     except Exception as e:
         out["errors"].append(f"Donut unreachable: {str(e)[:120]}")
         return out
-    for p in profiles:
-        if p.get("name") not in wanted:
-            continue
-        if p.get("is_running"):
-            out["skipped_running"] += 1
-            continue
-        try:
-            api.call("DELETE", f"/v1/profiles/{p['id']}", timeout=15)
-            out["deleted"] += 1
-        except Exception as e:
-            out["errors"].append(f"{p.get('name')}: {str(e)[:100]}")
-            continue
-        if p.get("proxy_id"):
-            try:
-                api.call("DELETE", f"/v1/proxies/{p['proxy_id']}", timeout=15)
-            except Exception:
-                pass
+    mine = [p for p in profiles if p.get("name") in wanted]
+    out["skipped_running"] = sum(1 for p in mine if p.get("is_running"))
+    victims = [p for p in mine if not p.get("is_running")]
+    out["deleted"] = len(delete_profiles(api, victims))
+    if out["deleted"] < len(victims):
+        out["errors"].append(f"{len(victims) - out['deleted']} profile(s) could not be deleted (see Hub log)")
     return out
 
 
@@ -223,7 +263,8 @@ def profile_status(db, g: dict) -> dict:
     out = {"reachable": False, "backend": str(g.get("BROWSER_BACKEND") or "chromium").strip().lower(),
            "note": "", "profiles_total": 0, "running": 0, "matched": 0,
            "junk_total": 0, "junk": {"orphan": 0, "finished": 0, "abandoned": 0}, "junk_sample": [],
-           "missing_total": 0, "missing_sample": [], "ready_total": 0}
+           "missing_total": 0, "missing_sample": [], "ready_total": 0,
+           "duplicates": 0, "duplicate_names": []}
     if out["backend"] != "donut":
         out["note"] = "BROWSER_BACKEND is not donut; profiles are not in use"
         return out
@@ -267,6 +308,17 @@ def profile_status(db, g: dict) -> dict:
         out["junk"][cat] += 1
         if len(out["junk_sample"]) < 20:
             out["junk_sample"].append({"name": name, "reason": reason, "running": bool(p.get("is_running"))})
+
+    # Extra copies of one name, running ones included (each copy is also counted above under its
+    # name's class). plan_duplicates is the DELETE planner and skips running copies, so count here.
+    copies: dict[str, int] = {}
+    for p in profiles:
+        n = str(p.get("name") or "")
+        if n.startswith(donut._PREFIX):
+            copies[n] = copies.get(n, 0) + 1
+    dup = {n: c for n, c in copies.items() if c > 1}
+    out["duplicates"] = sum(c - 1 for c in dup.values())
+    out["duplicate_names"] = sorted(dup)[:20]
 
     missing = sorted(ready_names - have)
     out["missing_total"] = len(missing)
