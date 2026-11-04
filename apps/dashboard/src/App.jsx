@@ -2331,7 +2331,7 @@ function BookedIdentities({ me }) {
   if (posto) qs.set("posto_id", posto);
   if (from) qs.set("date_from", `${from}T00:00:00`);
   if (to) qs.set("date_to", `${to}T23:59:59`);
-  const { rows, err } = useList(`/identities/booked${qs.toString() ? "?" + qs : ""}`,
+  const { rows, err, reload } = useList(`/identities/booked${qs.toString() ? "?" + qs : ""}`,
                                 { pollMs: 15000 });
   const { q, setQ, sort, setSort, rows: shown } = useSortSearch(rows, { key: "booked_at", dir: "desc" });
   const selectedIds = Object.keys(sel).filter((k) => sel[k]);
@@ -2354,6 +2354,61 @@ function BookedIdentities({ me }) {
       a.click();
       setTimeout(() => URL.revokeObjectURL(url), 60_000);
       setMsg(`Downloaded ${r.count} credential row(s).`);
+    } catch (e) { setMsg(e.message); } finally { setBusy(false); }
+  }
+
+  // Cleanup. Selection is open to the operate seat (trim / delete TEST); the credentials export and
+  // deleting REAL appointments stay admin-only, enforced again on the server.
+  const op = me.is_operating;
+  const isAdmin = me.role === "admin";
+  const canSelect = isAdmin || op;
+  const selRows = rows.filter((r) => sel[r.identity_id]);
+  const selReal = selRows.filter((r) => r.type === "real").length;
+  function summarize(r, verb) {
+    const refused = Object.values(r.refused || {});
+    const d = r.donut || {};
+    return `${verb} ${r.done.length} identit${r.done.length === 1 ? "y" : "ies"}`
+      + ` (${r.sub_accounts_removed} sub-account(s) removed`
+      + (d.deleted ? `, ${d.deleted} Donut profile(s) deleted` : "")
+      + (d.skipped_running ? `, ${d.skipped_running} running profile(s) kept` : "") + ")."
+      + (refused.length ? ` Refused ${refused.length}: ${[...new Set(refused)].slice(0, 2).join("; ")}` : "");
+  }
+  async function trimBooked() {
+    if (!window.confirm(
+      `Trim ${selectedIds.length} booked identit${selectedIds.length === 1 ? "y" : "ies"}?\n\n`
+      + "Keeps each identity, its appointment/PDF and the sub-account that BOOKED (the login that manages "
+      + "the appointment). Deletes every other sub-account and its Donut profile. Cannot be undone.")) return;
+    setMsg(""); setBusy(true);
+    try {
+      const r = await api("/identities/booked/cleanup",
+        { method: "POST", body: { identity_ids: selectedIds, mode: "trim" } });
+      setMsg(summarize(r, "Trimmed")); setSel({}); reload();
+    } catch (e) { setMsg(e.message); } finally { setBusy(false); }
+  }
+  async function deleteBooked() {
+    const nTest = selRows.length - selReal;
+    let confirm_real = null;
+    if (selReal) {
+      if (!isAdmin) {
+        if (!nTest) { setMsg("Deleting REAL booked identities needs the admin role."); return; }
+        if (!window.confirm(`${selReal} of the selected are REAL appointments — only an admin can delete those; they will be kept.\n\nDelete the ${nTest} TEST one(s)?`)) return;
+      } else {
+        confirm_real = window.prompt(
+          `⚠ ${selReal} selected identit${selReal === 1 ? "y holds a REAL appointment" : "ies hold REAL appointments"}.\n\n`
+          + "Deleting removes the appointment record AND the login that manages it — the only record we have. "
+          + "Export their credentials first (⬇ Credentials) if anyone may still need them.\n\n"
+          + "Type DELETE REAL to delete them (anything else keeps the real ones and deletes only TEST):");
+        if (confirm_real === null) return;
+      }
+    }
+    if (!selReal && !window.confirm(
+      `Delete ${nTest} booked TEST identit${nTest === 1 ? "y" : "ies"}?\n\n`
+      + "Removes the identity, its sub-accounts, appointment rows and Donut profiles. Cannot be undone.")) return;
+    setMsg(""); setBusy(true);
+    try {
+      const r = await api("/identities/booked/cleanup",
+        { method: "POST", body: { identity_ids: selectedIds, mode: "delete", confirm_real } });
+      setMsg(summarize(r, "Deleted")); setSel({}); reload();
     } catch (e) { setMsg(e.message); } finally { setBusy(false); }
   }
 
@@ -2381,6 +2436,14 @@ function BookedIdentities({ me }) {
             {busy ? "Preparing…" : `⬇ Credentials (${selectedIds.length})`}
           </button>
         )}
+        <button className="btn ghost" disabled={!op || !selectedIds.length || busy} onClick={trimBooked}
+                title="Keep the identity, appointment/PDF and the sub-account that booked; delete the other sub-accounts and their Donut profiles">
+          ✂ Trim sub-accounts
+        </button>
+        <button className="btn ghost" disabled={!op || !selectedIds.length || busy} onClick={deleteBooked}
+                title="Delete the selected booked identities. TEST: operator. REAL: admin + typed confirmation.">
+          🗑 Delete booked
+        </button>
     </>
   );
 
@@ -2391,7 +2454,7 @@ function BookedIdentities({ me }) {
       {msg && <div className="banner">{msg}</div>}
       <table className="table-compact"><thead><tr>
         <th style={{ width: 36, whiteSpace: "nowrap" }}>#</th>
-        {me.role === "admin" && <th style={{ width: "3%" }}>
+        {canSelect && <th style={{ width: "3%" }}>
           <input type="checkbox"
                  checked={!!shown.length && shown.every((r) => sel[r.identity_id])}
                  onChange={(e) => setSel(e.target.checked
@@ -2406,7 +2469,7 @@ function BookedIdentities({ me }) {
         <tbody>{shown.map((r, i) => (
           <tr key={r.identity_id}>
             <td className="muted row-num">{i + 1}</td>
-            {me.role === "admin" && <td><input type="checkbox" checked={!!sel[r.identity_id]}
+            {canSelect && <td><input type="checkbox" checked={!!sel[r.identity_id]}
               onChange={(e) => setSel({ ...sel, [r.identity_id]: e.target.checked })} /></td>}
             <td>{r.full_name}</td>
             <td><span className="pill">{r.type}</span></td>

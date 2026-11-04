@@ -418,6 +418,85 @@ def test_donut_profile_create_picks_verified_subs_of_selected(client, monkeypatc
     assert seen["u"] == ["a_ok", "a_ver"]
 
 
+def _booked_world(client, h):
+    """A real and a test booked identity, each with the booking sub-account + 2 unused siblings, a
+    finished worker on the sibling, and an event pointing at a sibling. Returns (db, ids)."""
+    from libs.db import models as M
+    from libs.domain.enums import SubAccountStatus, WorkerStatus
+    db = next(app.dependency_overrides[get_db]())
+    bid = client.post("/bookings", json={"name": "b-bk", "type": "real", "posto_id": "5084"}, headers=h).json()["id"]
+    out = {}
+    for kind in ("real", "test"):
+        iid = client.post("/identities", json={"full_name": f"{kind} P", "type": kind}, headers=h).json()["id"]
+        subs = [M.SubAccount(identity_id=iid, username=f"{kind}_{n}", password="x",
+                             status=SubAccountStatus.BOOKED if n == 0 else SubAccountStatus.VERIFIED)
+                for n in range(3)]
+        db.add_all(subs); db.commit()
+        db.add(M.BookedAppointment(booking_id=bid, identity_id=iid, sub_account_id=subs[0].id))
+        db.add(M.Worker(booking_id=bid, identity_id=iid, sub_account_id=subs[1].id, role="apply",
+                        status=WorkerStatus.COMPLETED))
+        db.add(M.IdentityEvent(identity_id=iid, sub_account_id=subs[2].id, event="failed", step="x"))
+        db.add(M.RegistrationJob(sub_account_id=subs[2].id))
+        db.commit()
+        out[kind] = (iid, [s.id for s in subs])
+    return db, out
+
+
+def test_booked_trim_keeps_the_booking_sub_account(client):
+    from libs.db import models as M
+    h = _operate_headers(client)
+    db, ids = _booked_world(client, h)
+    r = client.post("/identities/booked/cleanup", headers=h,
+                    json={"identity_ids": [ids["real"][0], ids["test"][0]], "mode": "trim"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert sorted(body["done"]) == sorted([ids["real"][0], ids["test"][0]]) and body["sub_accounts_removed"] == 4
+    db.expire_all()
+    for kind in ("real", "test"):
+        iid, (booked, *spare) = ids[kind]
+        left = {s.id for s in db.query(M.SubAccount).filter_by(identity_id=iid)}
+        assert left == {booked}                                    # only the booking login survives
+        assert db.query(M.BookedAppointment).filter_by(identity_id=iid).count() == 1
+        assert db.query(M.Worker).filter_by(identity_id=iid).one().sub_account_id is None   # history kept
+        assert db.query(M.IdentityEvent).filter_by(identity_id=iid).count() == 1
+
+
+def test_booked_delete_test_ok_real_needs_admin_confirmation(client):
+    from libs.db import models as M
+    h = _operate_headers(client)
+    db, ids = _booked_world(client, h)
+    both = [ids["real"][0], ids["test"][0]]
+    r = client.post("/identities/booked/cleanup", headers=h,
+                    json={"identity_ids": both, "mode": "delete", "confirm_real": "yes"}).json()
+    assert r["done"] == [ids["test"][0]] and "DELETE REAL" in r["refused"][ids["real"][0]]
+    db.expire_all()
+    assert db.get(M.Identity, ids["test"][0]) is None
+    assert db.get(M.Identity, ids["real"][0]) is not None          # wrong text -> real kept intact
+    assert db.query(M.BookedAppointment).filter_by(identity_id=ids["real"][0]).count() == 1
+    r = client.post("/identities/booked/cleanup", headers=h,
+                    json={"identity_ids": [ids["real"][0]], "mode": "delete", "confirm_real": "DELETE REAL"}).json()
+    assert r["done"] == [ids["real"][0]]
+    db.expire_all()
+    assert db.get(M.Identity, ids["real"][0]) is None
+    assert db.query(M.SubAccount).filter_by(identity_id=ids["real"][0]).count() == 0
+
+
+def test_booked_cleanup_refuses_unbooked_and_running(client):
+    from libs.db import models as M
+    from libs.domain.enums import WorkerStatus
+    h = _operate_headers(client)
+    db, ids = _booked_world(client, h)
+    plain = client.post("/identities", json={"full_name": "N", "type": "test"}, headers=h).json()["id"]
+    w = db.query(M.Worker).filter_by(identity_id=ids["test"][0]).one()
+    w.status = WorkerStatus.RUNNING
+    db.commit()
+    r = client.post("/identities/booked/cleanup", headers=h,
+                    json={"identity_ids": [plain, ids["test"][0]], "mode": "delete"}).json()
+    assert r["done"] == []
+    assert "not a booked identity" in r["refused"][plain]
+    assert "running worker" in r["refused"][ids["test"][0]]
+
+
 def test_donut_profile_cleanup_dry_run(client):
     """Cleanup is operator-only and fails safe; a dry run returns the three result lists."""
     assert client.post("/donut/profiles/cleanup").status_code == 401       # no token

@@ -15,6 +15,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Literal
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -86,7 +87,7 @@ from .genaccounts import gen_fake_identities, gen_subaccounts
 from . import dedup
 from .importers import parse_geo, parse_identities, parse_proxies
 from .donut_sweep import cleanup_junk_profiles, cleanup_stray_proxies, sweep_donut_profiles
-from .donut_profiles import create_profiles, keep_with_profile, profile_status
+from .donut_profiles import create_profiles, delete_profiles_for, keep_with_profile, profile_status
 from .settings_store import get_global, set_layer
 from .scheduler import (LAUNCH_FAILED_PREFIX, _LAUNCH_BLOCKED_BOOKING_STATUSES, _aware,
                         Scheduler)
@@ -1605,6 +1606,114 @@ def bulk_delete_identities(body: IdentityBulkDelete, db: Session = Depends(get_d
 _BY_OTHERS_STEP = "already_booked_at_portal"
 
 
+def _has_running_worker(db: Session, identity_id: str) -> bool:
+    return bool(db.scalar(select(func.count()).select_from(M.Worker).where(
+        M.Worker.identity_id == identity_id, M.Worker.status == WorkerStatus.RUNNING)))
+
+
+def _clear_finished_workers(db: Session, identity_id: str) -> None:
+    """Remove an identity's terminal worker rows (caller has checked none is RUNNING) -- they would
+    otherwise block delete_identity's "detach first" guard. Same lease/run cascade detach_identity
+    uses; artifacts are kept, unlinked from the worker."""
+    for w in db.scalars(select(M.Worker).where(M.Worker.identity_id == identity_id)).all():
+        db.execute(delete(M.ProxyLease).where(M.ProxyLease.worker_id == w.id))
+        db.execute(delete(M.SlotLease).where(M.SlotLease.worker_id == w.id))
+        db.execute(delete(M.WorkerRun).where(M.WorkerRun.worker_id == w.id))
+        db.execute(update(M.Artifact).where(M.Artifact.worker_id == w.id).values(worker_id=None))
+        _reset_worker_bus_state(w.booking_id, w.id)
+        db.delete(w)
+    db.flush()
+
+
+_REAL_DELETE_CONFIRM = "DELETE REAL"
+
+
+class BookedCleanup(BaseModel):
+    identity_ids: list[str]
+    mode: Literal["trim", "delete"]
+    confirm_real: str | None = None       # must equal _REAL_DELETE_CONFIRM to delete REAL ones (admin)
+
+
+@app.post("/identities/booked/cleanup")
+def cleanup_booked_identities(body: BookedCleanup, db: Session = Depends(get_db),
+                              me: Principal = Depends(require_operator)) -> dict:
+    """Clean up BOOKED identities (operator request 2026-11-04). Per-id outcomes, never all-or-nothing.
+
+    mode="trim": keep the identity, its appointment(s)/PDF and the sub-account(s) that BOOKED -- the
+    login needed to manage the appointment -- and delete every sibling sub-account that never booked
+    (registration jobs deleted; worker/event history kept at identity level with the sub-account link
+    nulled). Real and test alike: nothing that records an appointment is touched.
+
+    mode="delete": remove the identity entirely -- appointment rows, sub-accounts, allocations, events.
+    TEST identities: operator. REAL identities destroy the only record of a real person's appointment
+    and its login, so they additionally need the ADMIN role AND confirm_real == "DELETE REAL"; without
+    both, each real id is refused (the test ids in the same batch still go). A running worker refuses.
+
+    Both modes then delete the removed sub-accounts' Donut profiles (best effort; running ones kept)."""
+    from libs.domain.enums import UserRole
+    real_ok = (me.user.role == UserRole.ADMIN
+               and (body.confirm_real or "").strip() == _REAL_DELETE_CONFIRM)
+    done: list[str] = []
+    refused: dict[str, str] = {}
+    removed_usernames: list[str] = []
+    trimmed = 0
+    for iid in dict.fromkeys(body.identity_ids):
+        ident = db.get(M.Identity, iid)
+        if ident is None:
+            refused[iid] = "not found"
+            continue
+        booked_subs = {s for (s,) in db.execute(select(M.BookedAppointment.sub_account_id)
+                                                .where(M.BookedAppointment.identity_id == iid)).all()}
+        if not booked_subs:
+            refused[iid] = "not a booked identity -- use the normal delete"
+            continue
+        if _has_running_worker(db, iid):
+            refused[iid] = "has a running worker -- stop it first"
+            continue
+        try:
+            if body.mode == "trim":
+                spare = db.scalars(select(M.SubAccount).where(
+                    M.SubAccount.identity_id == iid, M.SubAccount.id.notin_(booked_subs))).all()
+                ids = [s.id for s in spare]
+                if ids:
+                    db.execute(delete(M.RegistrationJob).where(M.RegistrationJob.sub_account_id.in_(ids)))
+                    db.execute(update(M.Worker).where(M.Worker.sub_account_id.in_(ids)).values(sub_account_id=None))
+                    db.execute(update(M.IdentityEvent).where(M.IdentityEvent.sub_account_id.in_(ids))
+                               .values(sub_account_id=None))
+                    db.execute(delete(M.SubAccount).where(M.SubAccount.id.in_(ids)))
+                db.commit()
+                removed_usernames += [s.username for s in spare]
+                trimmed += len(ids)
+                done.append(iid)
+                continue
+            # mode == "delete". Read what we report BEFORE delete_identity commits the row away.
+            is_real, name = str(ident.type) == "real", ident.full_name
+            if is_real and not real_ok:
+                refused[iid] = ("REAL booked appointment -- deleting it needs the admin role and the "
+                                f"confirmation text {_REAL_DELETE_CONFIRM!r}")
+                continue
+            usernames = [u for (u,) in db.execute(select(M.SubAccount.username)
+                                                  .where(M.SubAccount.identity_id == iid)).all()]
+            _clear_finished_workers(db, iid)
+            db.execute(delete(M.BookedAppointment).where(M.BookedAppointment.identity_id == iid))
+            db.flush()
+            delete_identity(iid, force=True, db=db, _op=me)      # cascades subs/allocs/events + commits
+            if is_real:
+                logger.warning("REAL booked identity deleted by %s: %s (%s)", me.user.username, name, iid)
+            removed_usernames += usernames
+            done.append(iid)
+        except HTTPException as e:
+            db.rollback()
+            refused[iid] = str(e.detail)
+        except SQLAlchemyError as e:
+            db.rollback()
+            refused[iid] = f"{e.__class__.__name__}: {str(getattr(e, 'orig', e))}"[:200]
+    donut_out = delete_profiles_for(get_global(db), removed_usernames)
+    return {"mode": body.mode, "done": done, "refused": refused,
+            "sub_accounts_removed": trimmed if body.mode == "trim" else len(removed_usernames),
+            "donut": donut_out}
+
+
 @app.post("/identities/cleanup-booked-by-others", response_model=IdentityBulkDeleteResult)
 def cleanup_booked_by_others(db: Session = Depends(get_db),
                              _op: Principal = Depends(require_operator)) -> IdentityBulkDeleteResult:
@@ -1630,21 +1739,11 @@ def cleanup_booked_by_others(db: Session = Depends(get_db),
                      .where(M.BookedAppointment.identity_id == iid)):
             refused[iid] = "has a real booked appointment WE made -- kept, not deleted"
             continue
-        workers = db.scalars(select(M.Worker).where(M.Worker.identity_id == iid)).all()
-        if any(w.status == WorkerStatus.RUNNING for w in workers):
+        if _has_running_worker(db, iid):
             refused[iid] = "has a running worker -- stop it first"
             continue
         try:
-            # Clear the terminal worker rows that would otherwise block delete_identity's
-            # "detach first" guard -- same lease/run cascade detach_identity uses.
-            for w in workers:
-                db.execute(delete(M.ProxyLease).where(M.ProxyLease.worker_id == w.id))
-                db.execute(delete(M.SlotLease).where(M.SlotLease.worker_id == w.id))
-                db.execute(delete(M.WorkerRun).where(M.WorkerRun.worker_id == w.id))
-                db.execute(update(M.Artifact).where(M.Artifact.worker_id == w.id).values(worker_id=None))
-                _reset_worker_bus_state(w.booking_id, w.id)
-                db.delete(w)
-            db.flush()
+            _clear_finished_workers(db, iid)
             delete_identity(iid, force=True, db=db, _op=_op)   # cascades subs/allocs/events + commits
             deleted.append(iid)
         except HTTPException as e:

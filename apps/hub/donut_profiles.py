@@ -182,6 +182,40 @@ def create_profiles(db, g: dict, usernames: list[str], *, redis=None) -> dict:
     return out
 
 
+def delete_profiles_for(g: dict, usernames: list[str]) -> dict:
+    """Delete the Donut profiles (and their proxy entries) of sub-accounts we just removed, so they do
+    not linger as orphans for the next cleanup. Best effort, never raises: a RUNNING profile is skipped
+    (something is using it), and an unreachable Donut just leaves them for 🧹 Donut cleanup."""
+    out = {"deleted": 0, "skipped_running": 0, "errors": []}
+    if not usernames or str(g.get("BROWSER_BACKEND", "") or "chromium").strip().lower() != "donut":
+        return out
+    wanted = {donut.profile_name(u) for u in usernames if u}
+    try:
+        api = donut._Api(url=g.get("DONUT_API_URL") or "", token=g.get("DONUT_API_TOKEN") or "")
+        profiles = donut._items(api.call("GET", "/v1/profiles", timeout=15), "profiles")
+    except Exception as e:
+        out["errors"].append(f"Donut unreachable: {str(e)[:120]}")
+        return out
+    for p in profiles:
+        if p.get("name") not in wanted:
+            continue
+        if p.get("is_running"):
+            out["skipped_running"] += 1
+            continue
+        try:
+            api.call("DELETE", f"/v1/profiles/{p['id']}", timeout=15)
+            out["deleted"] += 1
+        except Exception as e:
+            out["errors"].append(f"{p.get('name')}: {str(e)[:100]}")
+            continue
+        if p.get("proxy_id"):
+            try:
+                api.call("DELETE", f"/v1/proxies/{p['proxy_id']}", timeout=15)
+            except Exception:
+                pass
+    return out
+
+
 def profile_status(db, g: dict) -> dict:
     """Reconcile the live Donut profiles against the sub-account table. Pure read, never mutates.
     Classifies every `storm-*` profile as matched / junk (orphan | finished | abandoned signup) and
