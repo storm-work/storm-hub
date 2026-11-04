@@ -23,7 +23,15 @@ export async function api(path, { method = "GET", body } = {}) {
     body: body ? JSON.stringify(body) : undefined,
   });
   const text = await res.text();
-  const data = text ? JSON.parse(text) : null;
+  // An API route the running Hub does not have yet comes back as the SPA's index.html (GET) or a 405
+  // (POST) -- e.g. dashboard rebuilt but Hub not restarted. Say that, instead of a JSON parse error.
+  const missing = `${method} ${path.split("?")[0]} is not served by the running Hub — `
+    + `it may need a restart to load newer code`;
+  if ((res.headers.get("content-type") || "").includes("text/html")) throw new Error(missing);
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; }
+  catch { throw new Error(`${res.status}: unexpected non-JSON response from ${path.split("?")[0]}`); }
+  if (res.status === 405) throw new Error(missing);
   if (!res.ok) {
     const detail = data && data.detail ? data.detail : res.statusText;
     throw new Error(`${res.status}: ${typeof detail === "string" ? detail : JSON.stringify(detail)}`);
