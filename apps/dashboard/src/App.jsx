@@ -2557,14 +2557,27 @@ function Identities({ me, setLeftPanel, setRightPanel }) {
     setMsg("");
     try {
       const dry = await api("/donut/profiles/cleanup?dry_run=true", { method: "POST" });
-      const n = dry.stopped.length + dry.deleted.length + dry.stray_proxies.length;
-      if (n === 0) { setMsg("Donut cleanup: nothing to stop, delete, or drop."); return; }
+      // The server's safety guard refuses a pass that would delete over half the profiles (it cannot
+      // tell "identities were deleted" from "wrong database"). Show the planned list and let the
+      // operator decide, instead of reporting the refusal as "nothing to clean".
+      const planned = dry.planned || [];
+      const force = !!dry.refused && planned.length > 0;
+      const toDelete = force ? planned.length : dry.deleted.length;
+      const n = dry.stopped.length + toDelete + dry.stray_proxies.length;
+      if (n === 0) {
+        setMsg(dry.refused ? `Donut cleanup refused: ${dry.refused}.` : "Donut cleanup: nothing to stop, delete, or drop.");
+        return;
+      }
+      const sample = planned.slice(0, 8).map((p) => `   ${p.name} — ${p.reason}`).join("\n");
       if (!window.confirm(
-        `Donut cleanup would:\n`
+        (force ? `⚠ Safety guard: ${dry.refused}.\n\n`
+          + `Profiles that would be deleted (first ${Math.min(8, planned.length)} of ${planned.length}):\n${sample}\n\n`
+          + `Delete them anyway? Only do this if you know their identities were deleted on purpose.\n\n` : "")
+        + `Donut cleanup will:\n`
         + `• stop ${dry.stopped.length} orphaned running profile(s)\n`
-        + `• delete ${dry.deleted.length} junk profile(s)\n`
+        + `• delete ${toDelete} junk profile(s)\n`
         + `• drop ${dry.stray_proxies.length} stray proxy entr(ies)\n\nProceed?`)) return;
-      const r = await api("/donut/profiles/cleanup", { method: "POST" });
+      const r = await api(`/donut/profiles/cleanup${force ? "?force=true" : ""}`, { method: "POST" });
       setMsg(`Donut cleanup — stopped ${r.stopped.length}, deleted ${r.deleted.length} junk, `
         + `dropped ${r.stray_proxies.length} stray proxy entr(ies).`);
     } catch (e) { setMsg(e.message); }

@@ -2578,17 +2578,22 @@ def donut_profiles_create(body: DonutProfileCreate, db: Session = Depends(get_db
 
 
 @app.post("/donut/profiles/cleanup")
-def donut_profiles_cleanup(dry_run: bool = False, db: Session = Depends(get_db),
+def donut_profiles_cleanup(dry_run: bool = False, force: bool = False, db: Session = Depends(get_db),
                            _op: Principal = Depends(require_operator)) -> dict:
     """Clean up Donut: stop orphaned running profiles, delete junk ones (orphan / finished / abandoned),
     and drop stray proxy entries. Fails safe -- an empty sub-account table or a pass that would delete
-    over half the profiles deletes nothing. `dry_run` reports what WOULD go without touching Donut."""
+    over half the profiles deletes nothing, and says so in `refused` (with the `planned` list) rather
+    than looking like "nothing to clean". `force` lifts only the over-half guard, for an operator who
+    has seen that list. `dry_run` reports what WOULD go without touching Donut."""
     stopped = sweep_donut_profiles(db, dry_run=dry_run)
-    junk = cleanup_junk_profiles(db, dry_run=dry_run)
+    rep: dict = {}
+    junk = cleanup_junk_profiles(db, dry_run=dry_run, force=force, report=rep)
     proxies = cleanup_stray_proxies(db, dry_run=dry_run)
     return {"dry_run": dry_run, "stopped": stopped,
             "deleted": [{"name": n, "reason": w} for n, w in junk],
-            "stray_proxies": proxies}
+            "stray_proxies": proxies,
+            "refused": rep.get("refused"),
+            "planned": [{"name": n, "reason": w} for n, w in rep.get("planned", [])]}
 
 
 def registrar_vendor_settings(eff: dict) -> dict:

@@ -279,6 +279,30 @@ def test_cleanup_refuses_a_pass_that_would_delete_most_profiles(db, monkeypatch)
     assert _CleanApi.deleted == []
 
 
+def test_over_half_refusal_is_reported_and_force_lifts_it(db, monkeypatch):
+    """2026-11-04 live: deleted identities orphaned 34/34 profiles; the guard refused SILENTLY and the
+    Identities page said "nothing to clean". The refusal must be reported with the planned list, and
+    an operator's force must delete exactly that list."""
+    donut = _install_donut(monkeypatch, [])
+    _world(db)
+    names = [donut.profile_name(u) for u in ("live1", "dead1")]
+    _CleanApi.profiles = [_stopped(n) for n in names] + [_stopped("storm-g1"), _stopped("storm-g2")]
+    rep: dict = {}
+    assert sweep.cleanup_junk_profiles(db, now=time.time(), report=rep) == []
+    assert "safety guard" in rep["refused"] and len(rep["planned"]) > len(_CleanApi.profiles) / 2
+    assert _CleanApi.deleted == []
+    out = sweep.cleanup_junk_profiles(db, now=time.time(), force=True)
+    assert sorted(n for n, _ in out) == sorted(n for n, _ in rep["planned"])
+    assert len([d for d in _CleanApi.deleted if d.startswith("/v1/profiles/")]) == len(rep["planned"])
+
+
+def test_force_never_lifts_the_empty_table_guard(db, monkeypatch):
+    _install_donut(monkeypatch, [_stopped("storm-a"), _stopped("storm-b")])
+    rep: dict = {}
+    assert sweep.cleanup_junk_profiles(db, now=time.time(), force=True, report=rep) == []
+    assert _CleanApi.deleted == [] and "no sub-accounts" in rep["refused"]
+
+
 def test_cleanup_deletes_the_profile_and_its_proxy_entry(db, monkeypatch):
     donut = _install_donut(monkeypatch, [])
     _world(db)

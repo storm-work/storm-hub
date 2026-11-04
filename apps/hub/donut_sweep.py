@@ -162,11 +162,18 @@ def known_profile_index(db: Session, profile_name) -> tuple[dict[str, tuple[str,
     return known, pending
 
 
-def cleanup_junk_profiles(db: Session, *, dry_run: bool = False, now: float | None = None) -> list[tuple[str, str]]:
+def cleanup_junk_profiles(db: Session, *, dry_run: bool = False, now: float | None = None,
+                          force: bool = False, report: dict | None = None) -> list[tuple[str, str]]:
     """Delete the junk profiles (and their Donut proxy entry); returns (name, reason). Never raises.
 
     Fails SAFE: an empty sub-account table (wrong database, mid-restore) would make every profile an
-    orphan, so nothing is deleted then, nor when a pass would delete over MAX_JUNK_FRACTION of them."""
+    orphan, so nothing is deleted then, nor when a pass would delete over MAX_JUNK_FRACTION of them.
+
+    `force` lifts ONLY the fraction guard -- for an operator who has seen the list (deleting identities
+    legitimately orphans every profile they had, which the guard alone can never tell from a wrong
+    database). The empty-table guard always holds. `report`, when given, receives
+    {"refused": reason, "planned": [(name, reason), ...]} on a refusal, so a caller can say WHY nothing
+    was deleted instead of reading the empty result as "nothing to clean"."""
     try:
         g = get_global(db)
         if str(g.get("BROWSER_BACKEND") or "chromium").strip().lower() != "donut":
@@ -178,13 +185,19 @@ def cleanup_junk_profiles(db: Session, *, dry_run: bool = False, now: float | No
         known, pending = known_profile_index(db, donut.profile_name)
         if not known:
             logger.warning("donut cleanup: no sub-accounts in the database -- deleting nothing")
+            if report is not None:
+                report["refused"] = "no sub-accounts in the database (wrong DB or mid-restore?) -- deleting nothing"
             return []
         protected = protected_profile_names(db, donut.profile_name) | pending
         victims = plan_junk(profiles, known, protected, time.time() if now is None else now)
         mine = [p for p in profiles if str(p.get("name") or "").startswith(_PREFIX)]
-        if mine and len(victims) > MAX_JUNK_FRACTION * len(mine):
+        if not force and mine and len(victims) > MAX_JUNK_FRACTION * len(mine):
             logger.warning("donut cleanup: %d of %d profiles look like junk -- more than %d%%, refusing "
                            "to delete anything", len(victims), len(mine), int(MAX_JUNK_FRACTION * 100))
+            if report is not None:
+                report["refused"] = (f"{len(victims)} of {len(mine)} profiles look like junk -- over "
+                                     f"{int(MAX_JUNK_FRACTION * 100)}%, so the safety guard deleted nothing")
+                report["planned"] = [(p["name"], why) for p, why in victims]
             return []
         done = []
         for p, why in victims:
