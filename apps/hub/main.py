@@ -17,7 +17,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Literal
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from pydantic import BaseModel
@@ -44,6 +44,7 @@ from libs.domain.enums import (
 from libs.domain.enums import SettingsLayer as L
 from libs.domain import priority
 from libs.domain.rules import RuleViolation, resolve_worker_role
+from libs.engine.payload import resolve_dynamic, stay_dates_error
 from libs.domain.settings import CATALOG, settings_for_layer, validate_layer
 from libs.domain.state_machines import IllegalTransition, booking_transition
 
@@ -3085,6 +3086,15 @@ def write_config(key: str, body: dict, db: Session = Depends(get_db),
     value = body.get("value", body)
     if not isinstance(value, (dict, list)):
         raise HTTPException(400, "config value must be a JSON object or array")
+    if key == "form_defaults" and isinstance(value, dict):
+        # The Formulario page blanks departure (f31) and the stay length (f25) when departure is not
+        # after arrival (f30); a typo here silently broke every warm-up's form. Past dates are only
+        # warned about by the worker, since a rolling expression can be correct today and past later.
+        dyn = value.get("dynamic") or {}
+        dates = {k: resolve_dynamic(str(dyn.get(k, ""))) for k in ("f30", "f31")}
+        why = stay_dates_error(dates, today=date.min)
+        if why and all(dates.values()):
+            raise HTTPException(400, f"form_defaults travel dates: {why}")
     set_config(db, key, value)
     return {"key": key, "saved": True}
 

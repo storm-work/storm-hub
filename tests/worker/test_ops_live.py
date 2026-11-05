@@ -5392,7 +5392,8 @@ class _QuestStorm(_WarmupSession):
 def _quest_storm_ops(fail_mark, **template):
     ops = _make_ops(
         cfg=_cfg(QUEST_STEP_GAP=0, QUEST_STEP_BACKOFF=0, **template),
-        quest_steps={"IRL": [{"q": "STEP1"}, {"q": "STEP2"}, {"q": "STEP3"}]},
+        quest_steps={"IRL": [{"id_pergunta": "3", "valor": "STEP1"}, {"id_pergunta": "5", "valor": "STEP2"},
+                             {"id_pergunta": "6", "valor": "STEP3"}]},
     )
     ops.session = _QuestStorm(_SCHED_OK, fail_mark=fail_mark)
     return ops
@@ -5425,7 +5426,8 @@ def test_warmup_quest_step_backoff_grows_per_attempt(monkeypatch):
     monkeypatch.setattr("apps.worker.ops_live.random.uniform", lambda a, b: 1.0)   # kill jitter
     ops = _make_ops(
         cfg=_cfg(QUEST_STEP_GAP=0, QUEST_STEP_BACKOFF=1.5),
-        quest_steps={"IRL": [{"q": "STEP1"}, {"q": "STEP2"}, {"q": "STEP3"}]},
+        quest_steps={"IRL": [{"id_pergunta": "3", "valor": "STEP1"}, {"id_pergunta": "5", "valor": "STEP2"},
+                             {"id_pergunta": "6", "valor": "STEP3"}]},
     )
     ops.session = _QuestStorm(_SCHED_OK, fail_mark="STEP1")
     ops._run_warmup_steps()

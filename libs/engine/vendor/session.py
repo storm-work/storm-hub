@@ -1567,11 +1567,14 @@ class PlaywrightSession:
                 const fields = {data_js};
                 const fileFields = {file_fields_js};
                 const fd = new FormData();
+                // A file field present in `fields` is sent once, as an empty file part in its own
+                // position (the real vistoForm order) -- never also as a text field.
                 for (const [k, v] of Object.entries(fields)) {{
-                    fd.append(k, v);
+                    if (fileFields.includes(k)) fd.append(k, new Blob([]), '');
+                    else fd.append(k, v);
                 }}
                 for (const k of fileFields) {{
-                    fd.append(k, new Blob([]), '');
+                    if (!(k in fields)) fd.append(k, new Blob([]), '');
                 }}
                 const extraHdrs = {headers_js};
                 const hdrs = {{}};

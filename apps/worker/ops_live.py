@@ -51,7 +51,8 @@ from libs.engine.discovery.gettime import (
     special_days_to_json,
 )
 from libs.engine.discovery.periodos import parse_periodos_ocupados
-from libs.engine.payload import booking_payload, schedule_controller_payload
+from libs.engine.payload import (SC_FILE_FIELDS, booking_payload, formulario_body,
+                                 quest_step_params, schedule_controller_payload, stay_dates_error)
 from libs.engine.phases import EngineOps
 from libs.engine.vendor import get_session
 
@@ -63,6 +64,10 @@ HOME_URL = BASE + "/"
 AUTH_URL = BASE + "/Authentication.jsp"
 QUEST_URL = BASE + "/Questionario"
 QUEST_NEXT = BASE + "/QuestNextQuestion"
+# Questionario's goNext() uses a bare XMLHttpRequest with setRequestHeader('Content-Type','text/plain'):
+# both HARs show Accept */*, that Content-Type, and NO X-Requested-With (that is jQuery's, not this page's).
+_QUEST_XHR_HEADERS = {"Accept": "*/*", "Content-Type": "text/plain"}
+_QUEST_XHR_HEADERS_JS = json.dumps(_QUEST_XHR_HEADERS)
 FORMULARIO = BASE + "/Formulario"
 SCHED_CTRL = BASE + "/ScheduleController"
 SCHED_JSP = BASE + "/Schedule.jsp"
@@ -1066,6 +1071,15 @@ class LiveEngineOps(EngineOps):
     @posto_id.setter
     def posto_id(self, value: str) -> None:
         self._posto_base = value
+
+    def _warn_stay_dates(self, sc_payload: dict) -> None:
+        """Say so when the configured travel dates are ones the Formulario page itself would refuse
+        (departure not after arrival, or arrival already past). Logged, not enforced: whether the
+        server re-checks them is unmeasured, and failing every warm-up on a config typo is worse."""
+        why = stay_dates_error(sc_payload)
+        if why and not getattr(self, "_stay_dates_warned", False):
+            self._stay_dates_warned = True
+            self._log(f"form_defaults travel dates look wrong: {why} -- fix f30/f31 in Configs")
 
     def _observe_postos(self, postos: list[tuple[str, str]], where: str) -> None:
         """Report the Formulario dropdown to the Hub when it CHANGED (POSTO_AUTO only). The Hub decides
@@ -2655,13 +2669,13 @@ class LiveEngineOps(EngineOps):
                     headers={**H, "Content-Type": "application/x-www-form-urlencoded"})
             # 2. Questionario GET
             pc.get(QUEST_URL, headers=H)
-            # 3. quest steps (base_qs merged into every step, like the browser chain)
+            # 3. quest steps (goNext()-shaped params, like the browser chain)
             quest_key = self.residence if self.residence != self.nationality else self.nationality
             steps = self.quest_steps.get(quest_key, [])
             if not steps:
                 self._log(f"hybrid-warm: no quest steps for key {quest_key!r} -- cannot warm")
                 return False
-            base_qs = {"lang": "PT", "nacionalidade": self.nationality}
+            step_qs = quest_step_params(steps, nationality=self.nationality, residence=self.residence)
             last_html = ""
             # Same retry budget + growing backoff as the browser chain (QUEST_STEP_RETRIES /
             # QUEST_STEP_BACKOFF). This aborted on the FIRST non-200, so under a 503 storm a primp
@@ -2671,10 +2685,9 @@ class LiveEngineOps(EngineOps):
             _retries = max(1, int(self.cfg.raw.get("QUEST_STEP_RETRIES", _QUEST_STEP_RETRIES)))
             _bk_base = max(0.0, float(self.cfg.raw.get("QUEST_STEP_BACKOFF", 1.5)))
             for i, step in enumerate(steps):
-                url = f"{QUEST_NEXT}?{urlencode({**base_qs, **step})}"
+                url = f"{QUEST_NEXT}?{urlencode(step_qs[i])}"
                 for attempt in range(1, _retries + 1):
-                    r = pc.get(url, headers={**H, "Accept": "text/plain, */*; q=0.01",
-                                             "X-Requested-With": "XMLHttpRequest",
+                    r = pc.get(url, headers={**H, **_QUEST_XHR_HEADERS,
                                              "Referer": QUEST_URL, "Sec-Fetch-Mode": "cors",
                                              "Sec-Fetch-Dest": "empty", "Sec-Fetch-Site": "same-origin"})
                     status = getattr(r, "status_code", None)
@@ -2714,13 +2727,15 @@ class LiveEngineOps(EngineOps):
                           f"len={len(last_html)})")
                 return False
             # 4. Formulario POST -> CSRF
-            r = pc.post(FORMULARIO + "?copy=true", data=urlencode(last_fields),
+            form_body = formulario_body(steps, last_fields, nationality=self.nationality,
+                                        residence=self.residence)
+            r = pc.post(FORMULARIO + "?copy=true", data=urlencode(form_body),
                         headers={**H, "Content-Type": "application/x-www-form-urlencoded",
                                  "Referer": QUEST_URL})
             form_html = r.text or ""
             csrf = _extract_csrf(form_html)
             if not csrf:
-                r = pc.post(FORMULARIO, data=urlencode(last_fields),
+                r = pc.post(FORMULARIO, data=urlencode(form_body),
                             headers={**H, "Content-Type": "application/x-www-form-urlencoded",
                                      "Referer": QUEST_URL})
                 form_html = r.text or ""
@@ -2737,13 +2752,18 @@ class LiveEngineOps(EngineOps):
             # reads values as paths; send via content= with an explicit boundary).
             sc_payload = schedule_controller_payload(
                 self.account, self.form_defaults, posto_id=self.posto_id, csrf=csrf,
-                nationality=self.nationality, residence=self.residence)
+                nationality=self.nationality, residence=self.residence,
+                form_echo=_primp_parse_inputs(form_html))
+            self._warn_stay_dates(sc_payload)
             boundary = "----primpWarm" + "".join(random.choice("0123456789abcdef") for _ in range(16))
-            parts = [f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n"
+            # File fields go out once, as empty file parts in the real form's position.
+            parts = [f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"; filename=\"\"\r\n"
+                     f"Content-Type: application/octet-stream\r\n\r\n\r\n" if k in SC_FILE_FIELDS else
+                     f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n"
                      for k, v in sc_payload.items()]
             parts += [f"--{boundary}\r\nContent-Disposition: form-data; name=\"{f}\"; filename=\"\"\r\n"
                       f"Content-Type: application/octet-stream\r\n\r\n\r\n"
-                      for f in ("foto", "file1", "file2", "file3", "file4")]
+                      for f in SC_FILE_FIELDS if f not in sc_payload]
             multipart = ("".join(parts) + f"--{boundary}--\r\n").encode("utf-8")
             sc = pc.post(SCHED_CTRL + "?posto_id=" + str(self.posto_id), content=multipart,
                          headers={**H, "Referer": FORMULARIO,
@@ -2968,11 +2988,9 @@ class LiveEngineOps(EngineOps):
             quest_key = self.residence if self.residence != self.nationality else self.nationality
             steps = self.quest_steps.get(quest_key, [])
             last_fields: dict = {}
-            # storm-auto merges these into EVERY quest step (`base_qs`); we sent only the step's own
-            # keys. Matching the confirmed path rather than guessing which of its parameters the
-            # portal actually needs -- it is the reference implementation precisely because it works.
-            base_qs = {"lang": "PT", "nacionalidade": self.nationality}
-            gap = max(0.0, float(self.cfg.raw.get("QUEST_STEP_GAP", 1.0)))
+            # Every step carries the same five values goNext() sends, in its order (quest_step_params).
+            step_qs = quest_step_params(steps, nationality=self.nationality, residence=self.residence)
+            gap =max(0.0, float(self.cfg.raw.get("QUEST_STEP_GAP", 1.0)))
             for i, step in enumerate(steps):
                 if i < (_resume or 0):
                     continue            # already answered by the hold
@@ -2985,13 +3003,10 @@ class LiveEngineOps(EngineOps):
                     time.sleep(gap * random.uniform(0.7, 1.3))
                 # urlencode, not manual "&".join: an unencoded value containing a space, & or =
                 # silently corrupts the query string. storm-auto uses urlencode here.
-                params = urlencode({**base_qs, **step})
-                url = f"{QUEST_NEXT}?{params}"
+                url = f"{QUEST_NEXT}?{urlencode(step_qs[i])}"
                 js = (
                     "(async()=>{const r=await fetch(%r,{method:'GET',credentials:'include',"
-                    "headers:{'Accept':'text/plain, */*; q=0.01','X-Requested-With':'XMLHttpRequest',"
-                    "'Sec-Fetch-Mode':'cors','Sec-Fetch-Dest':'empty','Sec-Fetch-Site':'same-origin',"
-                    "'Referer':%r}});const body=await r.text();"
+                    "headers:" + _QUEST_XHR_HEADERS_JS + "});const body=await r.text();"
                     + (
                         "const _t=document.createElement('div');_t.innerHTML=body;const f={};"
                         "_t.querySelectorAll('input').forEach(i=>{if(i.name)f[i.name]=i.value;});"
@@ -3000,7 +3015,7 @@ class LiveEngineOps(EngineOps):
                         if is_last else "return {status:r.status};"
                     )
                     + "})()"
-                ) % (url, QUEST_URL)
+                ) % (url,)
                 # storm-auto retries a questionnaire step that doesn't come back 200 -- "like a
                 # manual page refresh" -- up to QUEST_STEP_RETRIES (default 3). We logged the
                 # non-200 and carried on regardless, so one flaky step silently poisoned the whole
@@ -3074,10 +3089,12 @@ class LiveEngineOps(EngineOps):
                 return False
 
             formulario_url = FORMULARIO + "?copy=true"
-            _, form_html = self.session.browser_form_post(formulario_url, last_fields, timeout=100)
+            form_body = formulario_body(steps, last_fields, nationality=self.nationality,
+                                        residence=self.residence)
+            _, form_html = self.session.browser_form_post(formulario_url, form_body, timeout=100)
             csrf = _extract_csrf(form_html)
             if not csrf:
-                _, form_html = self.session.browser_form_post(FORMULARIO, last_fields, timeout=100)
+                _, form_html = self.session.browser_form_post(FORMULARIO, form_body, timeout=100)
                 csrf = _extract_csrf(form_html)
             if not csrf:
                 self._log("do_warmup: csrf_missing after Formulario POST")
@@ -3107,7 +3124,9 @@ class LiveEngineOps(EngineOps):
             sc_payload = schedule_controller_payload(
                 self.account, self.form_defaults, posto_id=self.posto_id, csrf=csrf,
                 nationality=self.nationality, residence=self.residence,
+                form_echo=_primp_parse_inputs(form_html),
             )
+            self._warn_stay_dates(sc_payload)
             # Log what ScheduleController actually said. This was fired and DISCARDED, which is
             # why "Schedule.jsp redirected to E-VISA" (the guard below) could be observed without
             # any way to see WHY the server rejected the form -- storm-auto logs both the key
@@ -3118,7 +3137,7 @@ class LiveEngineOps(EngineOps):
             sc = self.session.browser_fetch(
                 SCHED_CTRL, sc_payload, params={"posto_id": self.posto_id},
                 headers={"Referer": FORMULARIO}, encode="multipart",
-                file_fields=["foto", "file1", "file2", "file3", "file4"], timeout=45,
+                file_fields=list(SC_FILE_FIELDS), timeout=45,
             )
             sc_body = str(sc.get("body") or "") if isinstance(sc, dict) else ""
             sc_len = (sc.get("len") if isinstance(sc, dict) else None) or len(sc_body)
@@ -3710,11 +3729,11 @@ class LiveEngineOps(EngineOps):
             page = self._keepalive_read_page()
             kind = "reload"
         else:
-            base_qs = {"lang": "PT", "nacionalidade": self.nationality}
-            url = f"{QUEST_NEXT}?{urlencode({**base_qs, **steps[pos]})}"
+            qs = quest_step_params(steps, nationality=self.nationality, residence=self.residence)[pos]
+            url = f"{QUEST_NEXT}?{urlencode(qs)}"
             if self.cfg.raw.get("QUEST_HOLD_VIA_PAGE"):
                 res = self.session.browser_eval(_QUEST_VIA_PAGE_JS % (
-                    json.dumps(steps[pos].get("id_pergunta")), json.dumps(steps[pos].get("valor"))))
+                    json.dumps(qs["id_pergunta"]), json.dumps(qs["valor"])))
                 if isinstance(res, dict) and res.get("status") in (-1, -2, 0):
                     self._log(f"keepalive[quest_hold]: goNext() gave nothing ({res.get('body')!r}) -- "
                               f"falling back to the plain fetch")
@@ -3723,11 +3742,9 @@ class LiveEngineOps(EngineOps):
                 res = None
             if res is None:
                 res = self.session.browser_eval(
-                    "(async()=>{const r=await fetch(%r,{method:'GET',credentials:'include',"
-                    "headers:{'Accept':'text/plain, */*; q=0.01','X-Requested-With':'XMLHttpRequest',"
-                    "'Sec-Fetch-Mode':'cors','Sec-Fetch-Dest':'empty','Sec-Fetch-Site':'same-origin',"
-                    "'Referer':%r}});const b=await r.text();return {status:r.status,"
-                    "body:b.substring(0,4000)};})()" % (url, QUEST_URL))
+                    ("(async()=>{const r=await fetch(%r,{method:'GET',credentials:'include',headers:"
+                     % url) + _QUEST_XHR_HEADERS_JS + "});const b=await r.text();return {status:r.status,"
+                    "body:b.substring(0,4000)};})()")
             final_url = ""
             status = res.get("status") if isinstance(res, dict) else None
             page = (res.get("body") if isinstance(res, dict) else str(res)) or ""

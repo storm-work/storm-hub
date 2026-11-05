@@ -593,6 +593,16 @@ def test_configs_seed_and_edit(client):
     assert "form_defaults" in client.get("/configs", headers=h).json()
 
 
+def test_configs_refuse_departure_before_arrival(client):
+    """The live config had f30=2027/01/03, f31=2026/01/10 -- a date pair the Formulario page refuses."""
+    h = _operate_headers(client)
+    bad = {"value": {"dynamic": {"f30": "2027/01/03", "f31": "2026/01/10"}}}
+    r = client.put("/configs/form_defaults", json=bad, headers=h)
+    assert r.status_code == 400 and "not after arrival" in r.json()["detail"]
+    ok = {"value": {"dynamic": {"f30": "2027/01/03", "f31": "2027/01/10"}}}
+    assert client.put("/configs/form_defaults", json=ok, headers=h).status_code == 200
+
+
 def test_gen_test_identities_and_subaccounts(client):
     h = _operate_headers(client)
     r = client.post("/identities/gen-test", json={"count": 4, "accounts_per_identity": 2}, headers=h).json()

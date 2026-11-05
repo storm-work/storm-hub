@@ -125,3 +125,60 @@ def test_schedule_controller_payload_fields(form_defaults, account):
     # been chosen yet, unlike booking_payload() which is built once a slot IS chosen.
     assert payload["f_date_c"] == ""
     assert payload["cmbPeriodo"] == ""
+
+
+# ── reference/EVISA.zip (2026-11-04, posto 5084, GNB national resident in CPV) ──────────────────
+from datetime import date  # noqa: E402
+
+from libs.engine.payload import (SC_FIELD_ORDER, formulario_body, quest_step_params,  # noqa: E402
+                                 stay_dates_error)
+
+
+def test_quest_steps_are_shaped_like_gonext(quest_steps):
+    """goNext() sends the same six params in a fixed order, empties included, and question 1/21
+    carry the applicant's own nationality/residence even when the residence list says CPV."""
+    params = quest_step_params(quest_steps["CPV"], nationality="GNB", residence="CPV")
+    assert list(params[0]) == ["id_pergunta", "valor", "lang", "nacionalidade", "pais_residencia",
+                               "tipo_passaporte"]
+    assert params[0] == {"id_pergunta": "1", "valor": "GNB", "lang": "PT", "nacionalidade": "GNB",
+                         "pais_residencia": "", "tipo_passaporte": ""}
+    assert params[1]["valor"] == "CPV" and params[1]["pais_residencia"] == "CPV"
+    assert params[1]["tipo_passaporte"] == ""
+    assert params[2]["tipo_passaporte"] == "01" and params[-1]["tipo_passaporte"] == "01"
+
+
+def test_formulario_body_matches_the_real_questform(quest_steps):
+    last = {"tipo_visto": "C", "tipo_visto_desc": "VISTO DE CURTA DURAÇÃO", "class_visto": "SCH",
+            "cod_estada": "10", "id_visto_doc": "36"}
+    body = formulario_body(quest_steps["CPV"], last, nationality="GNB", residence="CPV")
+    # Field-for-field the HAR's Formulario?copy=true body (quest_steps CPV answers 6=10 TURISMO).
+    assert list(body.items()) == [
+        ("lang", "PT"), ("nacionalidade", "GNB"), ("pais_residencia", "CPV"),
+        ("tipo_passaporte", "01"), ("copia_pedido", ""), ("cb_pais_residencia", "CPV"),
+        ("cb_tipo_passaporte", "01"), ("cb_qt_dias", "SCH"), ("cb_trab_sazonal", "O"),
+        ("cb_motivo_estada_sch", "10"), ("cb_viaja_reune_turismo", "FAM_N"),
+        *last.items()]
+
+
+def test_schedule_controller_order_echo_and_stay_length(form_defaults, account):
+    fd = {**form_defaults, "dynamic": {**form_defaults["dynamic"], "f30": "2027/02/20",
+                                       "f31": "2027/02/27"}}
+    p = schedule_controller_payload(
+        account, fd, posto_id="5084", csrf="t", nationality="GNB", residence="CPV",
+        form_echo={"tipo_visto_desc": "VISTO DE CURTA DURAÇÃO", "nacionalidade": "GNB", "lang": "ENG"})
+    assert list(p) == list(SC_FIELD_ORDER)               # same 83 fields, the real form's order
+    assert p["f25"] == "7"                                # days from f30 to f31, as the page computes
+    assert p["tipo_visto_desc"] == "VISTO DE CURTA DURAÇÃO"   # server's PT label, not ENG default
+    assert p["lang"] == "PT"                              # echo only covers FORM_ECHO_KEYS
+
+
+def test_inverted_dates_keep_f25_and_are_reported(form_defaults, account):
+    fd = {**form_defaults, "dynamic": {**form_defaults["dynamic"], "f30": "2027/01/03",
+                                       "f31": "2026/01/10"}}
+    p = schedule_controller_payload(account, fd, posto_id="5084", csrf="t", nationality="CPV",
+                                    residence="IRL")
+    assert p["f25"] == form_defaults["static"]["f25"]
+    assert "not after arrival" in stay_dates_error(p, today=date(2026, 11, 5))
+    assert stay_dates_error({"f30": "2027/02/20", "f31": "2027/02/27"}, today=date(2026, 11, 5)) is None
+    assert "past" in stay_dates_error({"f30": "2026/02/20", "f31": "2026/02/27"},
+                                      today=date(2026, 11, 5))
