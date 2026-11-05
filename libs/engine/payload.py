@@ -96,6 +96,105 @@ def _merge_base_fields(
     return payload
 
 
+# ── Questionnaire / Formulario, as the portal's own page sends them ──────────────────────────────
+# Reference: reference/EVISA.zip (2026-11-04, posto 5084, nationality GNB / residence CPV) and
+# data/new_booking.har. Questionario's goNext() builds every QuestNextQuestion GET from the same five
+# form values in this order, empty ones included: question 1 sets nacionalidade, 21 sets
+# pais_residencia, 2 sets tipo_passaporte -- each BEFORE its own request goes out.
+QUEST_STEP_KEYS = ("id_pergunta", "valor", "lang", "nacionalidade", "pais_residencia", "tipo_passaporte")
+
+# The questionnaire <select> each answered question lives in; questForm submits them to Formulario.
+# Question 1 (cb_paises) is absent from the real Formulario body, so it is not listed.
+QUEST_SELECT_NAMES = {
+    "21": "cb_pais_residencia", "2": "cb_tipo_passaporte", "3": "cb_qt_dias",
+    "5": "cb_trab_sazonal", "6": "cb_motivo_estada_sch", "16": "cb_viaja_reune_turismo",
+}
+
+
+def quest_step_params(steps: list[dict], *, nationality: str, residence: str) -> list[dict[str, str]]:
+    """One ordered QuestNextQuestion query per step, exactly as goNext() sends it.
+
+    quest_steps is keyed by RESIDENCE and its question-1 answer is a fixed country (CPV for the
+    IRL/FRA lists), so the applicant's own nationality and residence override questions 1 and 21:
+    a GNB national resident in CPV must answer 1=GNB, not the list's CPV."""
+    state = {"nacionalidade": nationality or "", "pais_residencia": "", "tipo_passaporte": ""}
+    out = []
+    for step in steps:
+        qid, valor = str(step.get("id_pergunta", "")), str(step.get("valor", ""))
+        if qid == "1":
+            valor = nationality or valor
+            state["nacionalidade"] = valor
+        elif qid == "21":
+            valor = residence or valor
+            state["pais_residencia"] = valor
+        elif qid == "2":
+            state["tipo_passaporte"] = valor
+        out.append({"id_pergunta": qid, "valor": valor, "lang": "PT", **state})
+    return out
+
+
+def formulario_body(steps: list[dict], last_fields: dict[str, Any], *, nationality: str,
+                    residence: str) -> dict[str, Any]:
+    """The Formulario?copy=true POST body questForm submits: its hidden fields, the answered selects,
+    then the visa-type inputs the last step returned. We used to send only the last-step inputs."""
+    params = quest_step_params(steps, nationality=nationality, residence=residence)
+    final = params[-1] if params else {"nacionalidade": nationality, "pais_residencia": residence,
+                                       "tipo_passaporte": ""}
+    body: dict[str, Any] = {"lang": "PT", "nacionalidade": final["nacionalidade"],
+                            "pais_residencia": final["pais_residencia"],
+                            "tipo_passaporte": final["tipo_passaporte"], "copia_pedido": ""}
+    for p in params:
+        name = QUEST_SELECT_NAMES.get(p["id_pergunta"])
+        if name:
+            body[name] = p["valor"]
+    for k, v in (last_fields or {}).items():
+        body.setdefault(k, v)
+    return body
+
+
+# ScheduleController multipart field order, verbatim from the real vistoForm submit (83 parts).
+SC_FIELD_ORDER = (
+    "lang txtHuman __RequestVerificationToken RGPDAccepted posto_representacao f0sf1 f1 f2 f3 f4 f6 "
+    "f6sf1 f7sf1 f8 f9 f10 txtApelidoPaternal txtNomePaternal txtEnderecoPaternal txtTelefonePaternal "
+    "txtEmailPaternal cmbNacionalidadePaternal f5 f13 f14 f16 f17 f15 f43 f43sf2 f43sf3 f43sf4 f43sf5 "
+    "f43sf6 f0 f45 f46 f18sf1 f18sf2 f18sf3 f19 f20sf1 f20sf2 f29 f29sf2 txtInfoMotEstada em_destino_1 "
+    "em_destino_2 f32 f24 f25 f30 f31 cmbImpressoesDigitais dataImpressoesDigitais "
+    "numVinImpressoesDigitais f27 f27sf2 cmbReferencia f34 f34sf3 f34sf2 f34sf4 f34sf5 "
+    "cmbDespesasRequerente_1 cmbDespesasRequerente_2 cmbDespesasPatrocinador_1 "
+    "cmbDespesasPatrocinador_2 tipo_visto tipo_visto_desc class_visto cod_estada id_visto_doc "
+    "tipo_passaporte nacionalidade pais_residencia foto file1 file2 file3 file4 f_date_c cmbPeriodo"
+).split()
+# Sent as empty FILE parts (filename=""), in place -- never also as text fields.
+SC_FILE_FIELDS = ("foto", "file1", "file2", "file3", "file4")
+# Values the Formulario page itself carries as hidden inputs: the server's echo of what the
+# questionnaire declared, so they win over form_defaults (whose tipo_visto_desc is the ENG label).
+FORM_ECHO_KEYS = ("tipo_visto", "tipo_visto_desc", "class_visto", "cod_estada", "id_visto_doc",
+                  "tipo_passaporte", "nacionalidade", "pais_residencia")
+
+
+def _parse_ymd(s: Any) -> date | None:
+    m = re.fullmatch(r"(\d{4})[/-](\d{2})[/-](\d{2})", str(s or "").strip())
+    if not m:
+        return None
+    try:
+        return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    except ValueError:
+        return None
+
+
+def stay_dates_error(fields: dict[str, Any], *, today: date | None = None) -> str | None:
+    """Why the arrival (f30) / departure (f31) pair is one the Formulario page would refuse, or None.
+    The page blanks f31 and f25 when departure is not after arrival."""
+    d30, d31 = _parse_ymd(fields.get("f30")), _parse_ymd(fields.get("f31"))
+    if d30 is None or d31 is None:
+        return f"arrival/departure not a YYYY/MM/DD date (f30={fields.get('f30')!r} f31={fields.get('f31')!r})"
+    if d31 <= d30:
+        return f"departure f31={fields.get('f31')} is not after arrival f30={fields.get('f30')}"
+    if d30 < (today or date.today()):
+        return f"arrival f30={fields.get('f30')} is in the past"
+    return None
+
+
 def schedule_controller_payload(
     account: dict[str, Any],
     form_defaults: dict[str, Any],
@@ -104,12 +203,23 @@ def schedule_controller_payload(
     csrf: str,
     nationality: str,
     residence: str,
+    form_echo: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The warmup-time ScheduleController POST body (step 5) -- base fields + posto + the CSRF token
-    extracted from the preceding Formulario response. No slot is chosen yet at this stage."""
+    extracted from the preceding Formulario response. No slot is chosen yet at this stage.
+    `form_echo` is the Formulario page's own inputs (FORM_ECHO_KEYS are taken from it). The result is
+    in the real form's field order; SC_FILE_FIELDS are the caller's to send as empty file parts."""
     payload = _merge_base_fields(account, form_defaults, nationality=nationality, residence=residence)
     payload["f0sf1"] = posto_id
     payload["__RequestVerificationToken"] = csrf
+    for k in FORM_ECHO_KEYS:
+        if (form_echo or {}).get(k):
+            payload[k] = form_echo[k]
+    # f25 is the stay length the page computes from the dates (calcularDuracaoEValidar: days from
+    # f30 to f31), not a constant -- form_defaults' static "1" disagreed with every date pair.
+    d30, d31 = _parse_ymd(payload.get("f30")), _parse_ymd(payload.get("f31"))
+    if d30 and d31 and d31 > d30:
+        payload["f25"] = str((d31 - d30).days)
     # PT-version: the confirmed completed-booking HAR (data/ref/...COMPLETO BOOK...post id 3059
     # france.har) POSTs ScheduleController with lang=PT -- the whole flow (home-lang POST ->
     # Formulario -> ScheduleController -> SubmeterVistoCriaPDF) is PT end to end. form_defaults.json
@@ -118,7 +228,8 @@ def schedule_controller_payload(
     # single-language also makes the portal render Portuguese, which is what our bounce/home markers
     # (_HOME_MARKERS, _PORTAL_BUSY_MARKERS ...) are written for -- see ops_live's lang comment.
     payload["lang"] = "PT"
-    return payload
+    rank = {k: i for i, k in enumerate(SC_FIELD_ORDER)}
+    return {k: payload[k] for k in sorted(payload, key=lambda k: rank.get(k, len(rank)))}
 
 
 def booking_payload(quest_steps: dict[str, list[dict]], slot: dict[str, Any], *, residence: str) -> dict[str, Any]:

@@ -948,3 +948,34 @@ clean.
 per-maintenance-phase fault isolation so no single error can abort the whole tick. See
 `FAILURE_MODES.md` F38. OPS corollary: `systemd` `KillMode=process`, or a Hub restart cgroup-kills
 every worker.
+
+## 39. Warm-up chain vs a real browser — reference/EVISA.zip, 2026-11-04, posto 5084
+
+A manual capture (navigations only, no XHRs; GNB national resident in CPV) plus saved pages:
+`Authentication.jsp` → `/VistosOnline/` → `GET Questionario` → `POST Formulario?copy=true` →
+`POST ScheduleController?posto_id=5084` (multipart, **302** → `Schedule.jsp?posto_id=5084`). The real
+client DOES use Formulario and ScheduleController (correcting §33's single-path reading).
+
+**Matched already:** the ScheduleController field SET — the same 83 names as ours.
+
+**Mismatches, fixed in `libs/engine/payload.py` + `ops_live.py`:**
+
+| | real browser | before |
+|---|---|---|
+| QuestNextQuestion headers | bare XHR: `Accept */*`, `Content-Type text/plain`, no `X-Requested-With` (also in `data/new_booking.har`) | jQuery-style `Accept`, `X-Requested-With` |
+| QuestNextQuestion params | always `id_pergunta,valor,lang,nacionalidade,pais_residencia,tipo_passaporte`, empties included | `lang,nacionalidade` + the step's own keys |
+| question 1 / 21 answer | the applicant's nationality / residence | the residence list's fixed value (CPV for IRL/FRA) — wrong for any non-CPV national |
+| Formulario body | questForm: `lang,nacionalidade,pais_residencia,tipo_passaporte,copia_pedido`, the `cb_*` selects, then the visa-type inputs (16 fields) | only the last step's 5 visa-type inputs |
+| `f25` | stay length the page computes, days from f30 to f31 (`calcularDuracaoEValidar`) | static `"1"` |
+| `tipo_visto_desc` | `VISTO DE CURTA DURAÇÃO` (Formulario hidden input) | `SHORT STAY VISA (SCHENGEN)` |
+| file fields | `foto,file1..4` once, as empty file parts, before `f_date_c` | sent twice (text + file part): 88 parts |
+| field order | the vistoForm order | merge order |
+
+**Config defect found (not code):** live `form_defaults.dynamic` had `f30=2027/01/03`,
+`f31=2026/01/10`: departure before arrival, which the page refuses. `PUT /configs/form_defaults`
+now rejects an inverted pair; workers log once when the dates are inverted or in the past.
+
+**Not changed, noted:** the home-lang `POST /VistosOnline/ lang=PT` before Questionario is not
+visible in this capture (a fetch would not be in a navigation-only HAR, so it is unproven either way);
+the in-page ScheduleController fetch already follows the 302 to Schedule.jsp and then the worker
+navigates Schedule.jsp again (two loads vs the browser's one).
