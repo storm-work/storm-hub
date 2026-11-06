@@ -233,6 +233,105 @@ def create_profiles(db, g: dict, usernames: list[str], *, redis=None) -> dict:
     return out
 
 
+def recreate_profiles(db, g: dict, usernames: list[str], *, redis=None) -> dict:
+    """DELETE each of `usernames`' Donut profile (every copy of the name, with its proxy entry) and
+    CREATE a fresh one -- a new Wayfern device for the account. For an account whose profile has gone
+    bad (fingerprint drift, a broken profile, a device the portal has learned). Returns
+    {recreated, created, running, deferred, busy, errors, unreachable}:
+
+      recreated  had a profile; it was deleted and a new one made
+      created    had none; one was made (same as Create profiles)
+      running    skipped -- a copy is RUNNING, i.e. a worker is using it right now; stop it first
+      deferred   skipped -- Donut's hourly new-profile budget (DONUT_PROFILES_PER_HOUR) is spent; the
+                 old profile is left in place, never deleted without a replacement
+      busy       skipped -- another request is creating this name (the same claim as Create profiles)
+
+    The sub-account's recorded registration fingerprint (fingerprint_hash) is CLEARED: the new
+    profile is a different device by design, so the worker's drift check would otherwise warn on
+    every login. Never deletes a profile it cannot replace in the same step."""
+    global _cache
+    out = {"recreated": [], "created": [], "running": [], "deferred": [], "busy": [],
+           "errors": [], "unreachable": False}
+    if str(g.get("BROWSER_BACKEND", "") or "chromium").strip().lower() != "donut":
+        out["errors"].append("BROWSER_BACKEND is not donut -- profiles are only used on the Donut path")
+        return out
+    try:
+        api = donut._Api(url=g.get("DONUT_API_URL") or "", token=g.get("DONUT_API_TOKEN") or "")
+        profs = donut._items(api.call("GET", "/v1/profiles", timeout=15), "profiles")
+    except donut.DonutError as e:
+        out["unreachable"] = True
+        out["errors"].append(str(e)[:200])
+        return out
+    copies: dict[str, list[dict]] = {}
+    for p in profs or []:
+        n = str(p.get("name") or "")
+        if n.startswith(donut._PREFIX):
+            copies.setdefault(n, []).append(p)
+
+    rows = db.scalars(select(M.SubAccount).where(M.SubAccount.username.in_(usernames))).all()
+    try:
+        cap = int(g.get("DONUT_PROFILES_PER_HOUR") or 0)
+    except (TypeError, ValueError):
+        cap = 0
+    left = _budget_slots_left(redis, cap)
+
+    made: set[str] = set()
+    for sa in rows:
+        name = donut.profile_name(sa.username)
+        if not name:
+            continue
+        mine = copies.get(name, [])
+        if any(p.get("is_running") for p in mine):
+            out["running"].append(sa.username)
+            continue
+        if left <= 0:
+            out["deferred"].append(sa.username)
+            continue
+        if not _claim_name(redis, name):
+            out["busy"].append(sa.username)
+            continue
+        if mine:
+            gone = delete_profiles(api, mine)
+            if len(gone) < len(mine):
+                _release_name(redis, name)
+                out["errors"].append(f"{sa.username}: could not delete the old profile -- left as is")
+                continue
+        try:
+            _create_one(api, name, g)
+        except donut.DonutRateLimited:
+            _release_name(redis, name)
+            out["errors" if mine else "deferred"].append(
+                f"{sa.username}: old profile deleted but Donut refused the new one (hourly limit) -- "
+                f"the next launch creates it" if mine else sa.username)
+            left = 0
+            continue
+        except donut.DonutError as e:
+            _release_name(redis, name)
+            out["errors"].append(f"{sa.username}: {'old profile deleted; ' if mine else ''}"
+                                 f"create failed: {str(e)[:120]}")
+            continue
+        _budget_take(redis)
+        left -= 1
+        sa.donut_profile, sa.browser_backend = name, "donut"
+        sa.fingerprint_hash = None          # a new device by design -- see the docstring
+        made.add(name)
+        out["recreated" if mine else "created"].append(sa.username)
+    db.commit()
+    if made:
+        _cache = None
+        try:      # same post-create duplicate guard as create_profiles
+            after = donut._items(api.call("GET", "/v1/profiles", timeout=15), "profiles")
+            extra = plan_duplicates(after, names=made)
+            if extra:
+                delete_profiles(api, extra)
+        except Exception as e:
+            out["errors"].append(f"post-create duplicate check failed: {str(e)[:120]}")
+        logger.info("donut profile re-create: %d re-created, %d created, %d running, %d deferred, %d errors",
+                    len(out["recreated"]), len(out["created"]), len(out["running"]),
+                    len(out["deferred"]), len(out["errors"]))
+    return out
+
+
 def delete_profiles_for(g: dict, usernames: list[str]) -> dict:
     """Delete the Donut profiles (and their proxy entries) of sub-accounts we just removed, so they do
     not linger as orphans for the next cleanup. Best effort, never raises: a RUNNING profile is skipped

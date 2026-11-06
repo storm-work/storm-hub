@@ -2604,6 +2604,25 @@ function Identities({ me, setLeftPanel, setRightPanel }) {
       + (r.errors?.length ? `, ${r.errors.length} error(s): ${r.errors.slice(0, 2).join("; ")}` : "")
       + (r.note ? ` — ${r.note}` : "") + ".");
   });
+  // Re-create: delete each selected identity's verified sub-accounts' Donut profile and make a fresh
+  // one (a new device). Running profiles are skipped; the hourly budget is honoured.
+  const recreateDonutProfiles = () => act(async () => {
+    if (!window.confirm(`Re-create the Donut profiles of ${selectedIds.length} selected identit${selectedIds.length === 1 ? "y" : "ies"}?\n\n`
+      + "Each verified sub-account's profile is DELETED and a new one created — a new browser device "
+      + "(new fingerprint, empty cookies). Profiles a worker is running are skipped. Counts against "
+      + "Donut's hourly new-profile budget.")) return;
+    const r = await api("/donut/profiles/recreate",
+      { method: "POST", body: { identity_ids: selectedIds } });
+    if (r.unreachable) { setMsg(`Donut unreachable: ${(r.errors || []).join("; ") || "no detail"}`); return; }
+    setMsg(`Donut profiles — re-created ${r.recreated.length}`
+      + (r.created?.length ? `, created ${r.created.length} (had none)` : "")
+      + (r.running?.length ? `, skipped ${r.running.length} running (stop the worker first): ${r.running.slice(0, 3).join(", ")}` : "")
+      + (r.deferred?.length ? `, deferred ${r.deferred.length} (hourly budget — old profile kept)` : "")
+      + (r.busy?.length ? `, skipped ${r.busy.length} (being created by another request)` : "")
+      + (r.errors?.length ? `, ${r.errors.length} error(s): ${r.errors.slice(0, 2).join("; ")}` : "")
+      + (r.note ? ` — ${r.note}` : "") + ".");
+  });
+
   // Status check: live Donut profiles vs the sub-account table.
   async function donutStatus() {
     setMsg("");
@@ -2774,6 +2793,10 @@ function Identities({ me, setLeftPanel, setRightPanel }) {
           <button className="btn" disabled={!op} onClick={createDonutProfiles}
                   title="Create a Donut profile for each selected identity's VERIFIED sub-accounts that has none yet (needed for the booking path; honours Donut's hourly new-profile budget).">
             🍩 Create profiles
+          </button>
+          <button className="btn ghost" disabled={!op} onClick={recreateDonutProfiles}
+                  title="DELETE and re-create the Donut profile of each selected identity's VERIFIED sub-accounts — a new device (new fingerprint, empty cookies). Skips profiles a worker is running; honours the hourly budget.">
+            ♻️ Re-create profiles
           </button>
           <span className="grow" />
           <label style={{ margin: 0 }}>Priority</label>

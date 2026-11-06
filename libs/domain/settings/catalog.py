@@ -1203,6 +1203,12 @@ _TEMPLATE = [
     _s("KEEPALIVE_BROWSER_FROM", L.TEMPLATE, str, "", _WRK, "keepalive",
        note=
        "Optional URL the browser keepalive navigates from. Empty = the default probe target."),
+    _s("KEEPALIVE_RESTORE_COOLDOWN_S", L.TEMPLATE, float, 300.0, _WRK, "keepalive", min_value=0.0,
+       note=
+       "After 3 failed keepalive restores, pause this long (x round, up to x6) and then try again "
+       "with a fresh budget. A rebuild the portal never answered (empty response / timeout) does not "
+       "count. 0 = the old behaviour: give up until the worker is restarted (left 24 apply workers "
+       "with no session after a portal outage, 2026-11-06)."),
     _s("KEEPALIVE_DEAD_TRIP", L.TEMPLATE, int, 3, _WRK, "keepalive",
        note=
        "Consecutive failed keepalive probes before the worker treats the session as dead and "
@@ -1303,6 +1309,11 @@ _TEMPLATE = [
        note="Random 0..N seconds ADDED to KEEPALIVE_INTERVAL on every wait (default 120: with the 360s "
             "interval, probes land every 6-8 minutes). Anti-herd -- many workers must not probe in the "
             "same instant -- and it keeps the cadence from being an exact grid."),
+    _s("CHECKPOINT_RESTORE", L.TEMPLATE, bool, False, _WRK, "keepalive",
+       note="Restore a saved session (cookie checkpoint) instead of logging in when a worker starts "
+            "or its keepalive rebuilds. DEFAULT OFF since 2026-11-06 (operator). With it off a "
+            "(re)started worker always logs in fresh, and an in-process keepalive rebuild carries the "
+            "LIVE cookie jar instead (RELOGIN_ONLY_ON_AUTH_LOSS). Checkpoints are still written."),
     _s("CHECKPOINT_RESTORE_BUDGET", L.TEMPLATE, float, 90.0, _WRK, "keepalive",
        note="wall-clock seconds the checkpoint restore chain (rebuild -> health probe -> re-warm) "
             "may spend before abandoning and going straight to a full login. Every tier is a real "

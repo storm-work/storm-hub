@@ -222,3 +222,110 @@ def test_keepalive_restore_logs_in_when_the_home_page_is_logged_out(monkeypatch)
     ops, logins = _restore_ops(monkeypatch, "<html>solicitar pedido de visto</html>")
     ops._attempt_keepalive_restore("dead exit")
     assert logins == [1]
+
+
+# ── Test 1106 (2026-11-06): a roll left the Donut browser on the refused exit ────────────────
+def test_a_rolled_exit_moves_the_browser_before_the_next_warm_up(monkeypatch):
+    s = _Session([])
+    s.proxy = "http://user-rotate-session-1234:p@p.webshare.io:80"     # what the browser runs on
+    ops = _ops(s, monkeypatch)
+    ops._roll_exit("slots blocked")                                    # /slots 403 -> roll
+    assert ops.warm_proxy != s.proxy and ops._browser_on_stale_exit()
+    assert ops._run_warmup_steps() is True
+    assert ops._rebinds and ops._rebinds[0]["proxy"] == ops.warm_proxy, "browser follows the roll"
+
+
+def test_a_dead_page_rolls_and_rebinds_instead_of_looping(monkeypatch):
+    s = _Session([])
+    ops = _ops(s, monkeypatch)
+    dead = {"n": 0}
+
+    def _origin(why):
+        dead["n"] += 1
+        return dead["n"] > 1                     # dead on the first exit, fine after the rebind
+    ops._ensure_portal_origin = _origin
+    before = ops.warm_proxy
+    assert ops._run_warmup_steps() is True
+    assert ops.warm_proxy != before and ops._rebinds
+    assert dead["n"] == 2
+
+
+def test_checkpoint_restore_is_off_by_default():
+    from libs.domain.enums import SettingsLayer as L
+    from libs.domain.settings import resolve
+    from libs.engine.config import EngineConfig
+    ops = _make_ops(cfg=EngineConfig.from_settings(resolve({L.TEMPLATE: {"ROLE": "apply"}})))
+    ops.session = None
+    assert ops._try_restore_from_checkpoint() is False
+    assert ops._restore_stage == "none"
+
+
+# ── Booking 1106 (2026-11-06): a portal outage must not park the fleet for good ───────────────
+def _failing_rebind_ops(monkeypatch, error):
+    ops, logins = _restore_ops(monkeypatch, "<html>solicitar pedido de visto consultar pedidos</html>")
+
+    def _boom(**kw):
+        raise RuntimeError(error)
+    monkeypatch.setattr(ol, "get_session", _boom)
+    return ops, logins
+
+
+def test_a_rebuild_the_portal_never_answered_does_not_spend_the_restore_budget(monkeypatch):
+    ops, logins = _failing_rebind_ops(
+        monkeypatch, "Page.goto: net::ERR_EMPTY_RESPONSE at https://pedidodevistos.mne.gov.pt/")
+    for _ in range(ol._MAX_KEEPALIVE_RESTORE_ATTEMPTS + 2):
+        assert ops._attempt_keepalive_restore("portal down") is False
+    assert ops._keepalive_restore_attempts == 0, "portal silence says nothing about the login"
+    assert not logins
+
+
+def test_a_dead_proxy_rebuild_still_counts(monkeypatch):
+    ops, _ = _failing_rebind_ops(monkeypatch, "Page.goto: net::ERR_TUNNEL_CONNECTION_FAILED")
+    ops._attempt_keepalive_restore("dead exit")
+    assert ops._keepalive_restore_attempts == 1
+
+
+def test_a_spent_restore_budget_is_a_cooldown_not_the_end(monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(ol.time, "time", lambda: clock[0])
+    ops, _ = _failing_rebind_ops(monkeypatch, "Page.goto: net::ERR_TUNNEL_CONNECTION_FAILED")
+    for _ in range(ol._MAX_KEEPALIVE_RESTORE_ATTEMPTS):
+        ops._attempt_keepalive_restore("dead exit")
+    assert ops._attempt_keepalive_restore("dead exit") is False      # spent -> cooldown starts
+    assert ops._keepalive_restore_attempts == ol._MAX_KEEPALIVE_RESTORE_ATTEMPTS
+    clock[0] += 299
+    ops._attempt_keepalive_restore("dead exit")
+    assert ops._keepalive_restore_attempts == ol._MAX_KEEPALIVE_RESTORE_ATTEMPTS, "still cooling"
+    clock[0] += 2
+    ops._attempt_keepalive_restore("dead exit")
+    assert ops._keepalive_restore_attempts == 1, "a fresh budget after the cooldown"
+
+
+def test_restore_cooldown_zero_keeps_the_old_give_up(monkeypatch):
+    ops, _ = _failing_rebind_ops(monkeypatch, "Page.goto: net::ERR_TUNNEL_CONNECTION_FAILED")
+    ops.cfg.raw["KEEPALIVE_RESTORE_COOLDOWN_S"] = 0
+    for _ in range(ol._MAX_KEEPALIVE_RESTORE_ATTEMPTS + 3):
+        ops._attempt_keepalive_restore("dead exit")
+    assert ops._keepalive_restore_attempts == ol._MAX_KEEPALIVE_RESTORE_ATTEMPTS
+    assert ops._restore_budget_left() is False
+
+
+def test_a_sick_portal_does_not_convict_the_exit():
+    """Maintenance/error pages (degraded) and the pulse's optimistic 'up' (one newest 'up' among
+    hundreds of degraded/no-answer looks) are the portal being sick. Only a fleet majority of
+    normal app answers -- or the edge answering others (reachable) -- convicts this exit."""
+    class _P:
+        def __init__(self, st, **counts):
+            self.st, self.c = st, counts
+
+        def state(self):
+            return {"state": self.st, "counts": self.c}
+    ops = _ops(_Session([]))
+    ops._exit_probe_ok, ops._exit_ip = True, "1.2.3.4"
+    for p in (_P("degraded", degraded=40, noanswer=10),
+              _P("up", up=13, degraded=165, noanswer=176)):         # Booking 1106, 10:40-10:57
+        ops._pulse, ops._portal_down_since = p, None
+        assert ops._portal_down_not_exit("test") is True, p.st
+    for p in (_P("up", up=30, degraded=5, noanswer=5), _P("reachable", refused=20)):
+        ops._pulse, ops._portal_down_since = p, None
+        assert ops._portal_down_not_exit("test") is False, p.st

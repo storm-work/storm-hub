@@ -40,7 +40,9 @@ def _cfg(**template):
     # the hybrid/primp path builds a cfg with HYBRID_MODE on explicitly (_hybrid_cfg). HYBRID_MODE is a
     # BOOKING setting, so it goes in the BOOKING layer, not TEMPLATE.
     return EngineConfig.from_settings(
-        resolve({L.TEMPLATE: {"ROLE": "apply", **template}, L.BOOKING: dict(_UNIT_MODE)}))
+        # CHECKPOINT_RESTORE is OFF in production since 2026-11-06; the restore-path tests here opt in.
+        resolve({L.TEMPLATE: {"ROLE": "apply", "CHECKPOINT_RESTORE": True, **template},
+                 L.BOOKING: dict(_UNIT_MODE)}))
 
 
 @pytest.fixture(autouse=True)
@@ -3476,7 +3478,7 @@ class _DeadOriginSession(_FakeSession):
         raise RuntimeError("Page.evaluate: TypeError: Failed to fetch")
 
 
-def test_warmup_aborts_when_the_portal_origin_cannot_be_restored():
+def test_warmup_aborts_when_the_portal_origin_cannot_be_restored(monkeypatch):
     """LIVE REGRESSION (booking "Test2", 2026-08-27).
 
     _run_warmup_steps called _ensure_portal_origin and DISCARDED its return, so a re-anchor that
@@ -3487,15 +3489,19 @@ def test_warmup_aborts_when_the_portal_origin_cannot_be_restored():
 
     The chain must now stop at the guard.
     """
+    import apps.worker.ops_live as ol
+    sessions = [_DeadOriginSession()]
+    # A dead page now rolls the exit and re-binds the login to a new browser (Test 1106); here every
+    # new exit is dead too, so the chain must still stop at the guard on each one.
+    monkeypatch.setattr(ol, "get_session", lambda **kw: sessions.append(_DeadOriginSession()) or sessions[-1])
     ops = _make_ops(emit=lambda t, **p: None)
     logs = []
     ops._log = logs.append
-    ops.session = _DeadOriginSession()
+    ops.session = sessions[0]
 
     assert ops._run_warmup_steps() is False
     # THE POINT: not one in-page fetch was attempted after the guard said the origin was dead.
-    assert ops.session.fetches == 0, (
-        f"ran {ops.session.fetches} doomed in-page fetch(es) after a failed re-anchor")
+    assert sum(x.fetches for x in sessions) == 0, "ran doomed in-page fetch(es) after a failed re-anchor"
     # and the reported cause is the real one, not the downstream symptom
     joined = " | ".join(logs)
     assert "re-anchor" in joined

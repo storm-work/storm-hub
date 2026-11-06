@@ -418,6 +418,36 @@ def test_donut_profile_create_picks_verified_subs_of_selected(client, monkeypatc
     assert seen["u"] == ["a_ok", "a_ver"]
 
 
+def test_donut_profile_recreate_requires_ids_and_operator(client):
+    h = _operate_headers(client)
+    assert client.post("/donut/profiles/recreate", json={}, headers=h).status_code == 400
+    assert client.post("/donut/profiles/recreate", json={"identity_ids": ["x"]}).status_code in (401, 403)
+
+
+def test_donut_profile_recreate_picks_verified_subs_of_selected(client, monkeypatch):
+    import apps.hub.main as hub_main
+    from libs.db import models as M
+    from libs.domain.enums import SubAccountStatus
+    h = _operate_headers(client)
+    a = client.post("/identities", json={"full_name": "A A", "type": "real"}, headers=h).json()["id"]
+    b = client.post("/identities", json={"full_name": "B B", "type": "real"}, headers=h).json()["id"]
+    db = next(app.dependency_overrides[get_db]())
+    for ident, user, st in [(a, "ra_ver", SubAccountStatus.VERIFIED), (a, "ra_new", SubAccountStatus.NEW),
+                            (b, "rb_ver", SubAccountStatus.VERIFIED)]:
+        db.add(M.SubAccount(identity_id=ident, username=user, password="x", status=st))
+    db.commit()
+    seen = {}
+
+    def _fake(db, g, usernames, redis=None):
+        seen["u"] = sorted(usernames)
+        return {"recreated": usernames, "created": [], "running": [], "deferred": [], "busy": [],
+                "errors": [], "unreachable": False}
+    monkeypatch.setattr(hub_main, "recreate_profiles", _fake)
+    r = client.post("/donut/profiles/recreate", json={"identity_ids": [a]}, headers=h)
+    assert r.status_code == 200 and r.json()["recreated"] == ["ra_ver"]
+    assert seen["u"] == ["ra_ver"]
+
+
 def _booked_world(client, h):
     """A real and a test booked identity, each with the booking sub-account + 2 unused siblings, a
     finished worker on the sibling, and an event pointing at a sibling. Returns (db, ids)."""

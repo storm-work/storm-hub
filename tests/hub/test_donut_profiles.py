@@ -240,3 +240,61 @@ def test_status_classifies_matched_junk_and_missing(db, monkeypatch):
 def test_status_not_donut_backend(db):
     st = DP.profile_status(db, {**G, "BROWSER_BACKEND": "chromium"})
     assert st["reachable"] is False and "not donut" in st["note"]
+
+
+# ── recreate_profiles ─────────────────────────────────────────────────────────────
+def _r():
+    return fakeredis.FakeStrictRedis(decode_responses=True)
+
+
+def test_recreate_replaces_every_copy_with_a_new_profile_and_clears_the_fingerprint(db, monkeypatch):
+    i, s = _ident(db)
+    s.fingerprint_hash = "88beed2f5e748e49"
+    db.commit()
+    name = donut.profile_name(s.username)
+    api = FakeApi(profiles=[{"id": "old1", "name": name, "is_running": False},
+                            {"id": "old2", "name": name, "is_running": False}])
+    _patch(monkeypatch, api)
+    out = DP.recreate_profiles(db, G, [s.username], redis=_r())
+    assert out["recreated"] == [s.username] and out["errors"] == []
+    mine = [p for p in api.profiles if p["name"] == name]
+    assert len(mine) == 1 and mine[0]["id"] not in ("old1", "old2")
+    db.refresh(s)
+    assert s.fingerprint_hash is None and s.donut_profile == name
+
+
+def test_recreate_skips_a_running_profile(db, monkeypatch):
+    i, s = _ident(db)
+    api = FakeApi(profiles=[{"id": "p", "name": donut.profile_name(s.username), "is_running": True}])
+    _patch(monkeypatch, api)
+    out = DP.recreate_profiles(db, G, [s.username], redis=_r())
+    assert out["running"] == [s.username] and api.posts == 0
+    assert [p["id"] for p in api.profiles] == ["p"]
+
+
+def test_recreate_creates_when_there_was_none(db, monkeypatch):
+    i, s = _ident(db)
+    api = FakeApi()
+    _patch(monkeypatch, api)
+    out = DP.recreate_profiles(db, G, [s.username], redis=_r())
+    assert out["created"] == [s.username] and out["recreated"] == []
+
+
+def test_recreate_over_budget_keeps_the_old_profile(db, monkeypatch):
+    i, s = _ident(db)
+    api = FakeApi(profiles=[{"id": "p", "name": donut.profile_name(s.username), "is_running": False}])
+    _patch(monkeypatch, api)
+    r = _r()
+    r.zadd(DP._BUDGET_KEY, {"x": __import__("time").time()})      # the one hourly slot is spent
+    out = DP.recreate_profiles(db, {**G, "DONUT_PROFILES_PER_HOUR": "1"}, [s.username], redis=r)
+    assert out["deferred"] == [s.username]
+    assert [p["id"] for p in api.profiles] == ["p"], "never delete without a replacement"
+
+
+def test_recreate_failed_create_reports_the_deleted_profile(db, monkeypatch):
+    i, s = _ident(db)
+    api = FakeApi(profiles=[{"id": "p", "name": donut.profile_name(s.username), "is_running": False}],
+                  fail=True)
+    _patch(monkeypatch, api)
+    out = DP.recreate_profiles(db, G, [s.username], redis=_r())
+    assert out["recreated"] == [] and out["errors"] and "old profile deleted" in out["errors"][0]

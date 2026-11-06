@@ -479,6 +479,25 @@ def classify_session_state(page: str, final_url: str, *, warmed: bool) -> Sessio
 # whose re-warm keeps bouncing to home can't churn fresh proxies forever"). Mirrored here as the
 # keepalive-restore retry budget once a worker enters the "session is dead" state.
 _MAX_KEEPALIVE_RESTORE_ATTEMPTS = 3
+# ...but a spent budget is a PAUSE, not the end (KEEPALIVE_RESTORE_COOLDOWN_S x round, capped at x6).
+# CONFIRMED LIVE 2026-11-06 (Booking 1106): the portal went into maintenance at slot-open and then
+# stopped answering; 24 apply workers spent their 3 rebuilds in 8 minutes and then sat with no
+# browser, returning from every keepalive, until a restart -- they could never come back by
+# themselves when the portal did.
+_KEEPALIVE_RESTORE_COOLDOWN_MAX_ROUNDS = 6
+
+
+def _portal_silent_error(msg: str) -> bool:
+    """The PORTAL gave no answer (empty response / timeout / connection dropped) while the proxy
+    tunnel itself came up -- as opposed to a dead proxy (tunnel/socks/DNS errors, chrome-error).
+    The same split the keepalive's KEEPALIVE_STRESS_HOLD uses."""
+    low = (msg or "").lower()
+    proxy_dead = any(m in low for m in ("err_tunnel", "err_proxy", "err_socks", "chromewebdata",
+                                        "chrome-error", "err_name_not_resolved", "err_address"))
+    silent = any(m in low for m in ("err_timed_out", "timed out", "timeout", "err_connection_closed",
+                                    "err_connection_reset", "err_connection_refused",
+                                    "err_empty_response"))
+    return silent and not proxy_dead
 
 # Consecutive INCONCLUSIVE keepalive reads (neither the logged-in nor the logged-out marker) before
 # the worker stops trusting its hold and proves the session with a decisive Schedule.jsp read.
@@ -1011,6 +1030,9 @@ class LiveEngineOps(EngineOps):
             isn't bookable and won't re-warm), the checkpoint is deleted. A transient/proxy failure
             leaves it alone -- that says nothing about whether the cookies are still good.
         """
+        if not bool(self.cfg.raw.get("CHECKPOINT_RESTORE", False)):
+            self._restore_stage = "none"
+            return False                  # disabled (operator 2026-11-06): log in fresh instead
         data = ckpt.load_checkpoint(self.identity_id)
         if data is None:
             self._restore_stage = "none"
@@ -1475,6 +1497,7 @@ class LiveEngineOps(EngineOps):
         """
         if self.session is None:
             return False
+        self.ensure_browser_on_current_exit("liveness probe")
         # HYBRID: prove liveness on PRIMP, the transport discovery will actually use. Under
         # HYBRID_CLOSE_BROWSER the browser is parked, so a browser_nav probe FAILS every round and
         # forces a full _rebuild_session (a browser RE-LOGIN) before each discover -- turning a light
@@ -2462,17 +2485,30 @@ class LiveEngineOps(EngineOps):
         disables the check entirely (always False = the old roll-on-every-failure behaviour)."""
         if not bool(self.cfg.raw.get("STRESS_HOLD", True)):
             return False
-        # FLEET EVIDENCE FIRST. If others are getting answers from the portal right now -- the app
-        # (up), its errors (degraded) or even just its edge/WAF (reachable) -- and this exit got NONE,
-        # the problem is this exit: roll it now rather than trusting "exit reaches the internet" for
+        # FLEET EVIDENCE FIRST. If others are getting answers from the portal right now and this
+        # exit got NONE, the problem is this exit: roll it now rather than trusting "exit reaches the internet" for
         # PORTAL_DOWN_EXIT_ROLL_S. MEASURED 2026-10-23: webshare exits reached ipify yet failed the
         # portal tunnel in 3.3 s while soax exits got answers in 1-2 s. 'flapping' (mixed) and
         # 'down'/'unknown' fall through to the exit's own check.
         _p = getattr(self, "_pulse", None)
         if _p is not None:
             try:
-                _st = _p.state()["state"]
-                if _st in ("up", "reachable", "degraded"):
+                _ps = _p.state()
+                _st = _ps["state"]
+                _c = _ps.get("counts") or {}
+                _app = sum(int(_c.get(k, 0) or 0) for k in ("up", "degraded", "noanswer"))
+                _up_share = (int(_c.get("up", 0) or 0) / _app) if _app else 0.0
+                # Convict THIS exit only when the fleet really is getting answers: the application
+                # answering a MAJORITY of recent looks, or (no app answers at all) the edge answering
+                # others while this exit gets nothing (MEASURED 2026-10-23, webshare tunnels).
+                # NOT 'degraded' (maintenance / error pages) and NOT the pulse's optimistic 'up'
+                # (one newest 'up' among hundreds of degraded/no-answer looks). CONFIRMED LIVE
+                # 2026-11-06 (Booking 1106): through the slot-open maintenance window this check
+                # said "the fleet sees the portal answering (up|degraded) -- this exit is the
+                # problem" 129 times, and the fleet rolled and rebuilt browsers into a portal that
+                # answered nobody. Those cases fall through to the exit's own check below (bounded
+                # by PORTAL_DOWN_EXIT_ROLL_S).
+                if (_st == "up" and _up_share >= 0.5) or _st == "reachable":
                     self._log(f"portal-down check ({why}): the fleet sees the portal answering "
                               f"({_st}) -- this exit is the problem, rolling")
                     self._portal_down_since = None
@@ -3013,8 +3049,9 @@ class LiveEngineOps(EngineOps):
     #   error     an exception (transport/timeout/opaque origin) -- _note_portal classified it
     #   validation  ScheduleController re-rendered the form WITH validation errors (our DATA is wrong;
     #               repeating it cannot help -- the 2026-11-06 capture's "[ 19. Residência habitual ]")
+    #   dead_page the browser page cannot reach the portal origin at all on this exit
     #   challenge / auth / booked   the bot-check shell / the login is gone / applicant already booked
-    _WARM_RESTARTABLE = frozenset({"refused", "quest", "stale", "csrf", "rejected", "error"})
+    _WARM_RESTARTABLE = frozenset({"refused", "quest", "stale", "csrf", "rejected", "error", "dead_page"})
 
     def warmup_failure_reason(self) -> str:
         """Why the last warm-up pass failed (see _WARM_RESTARTABLE), "" when it did not."""
@@ -3055,6 +3092,12 @@ class LiveEngineOps(EngineOps):
             if why == "refused":
                 self._roll_exit(f"warm-up: the portal refused the request ({self._warm_fail_at})")
                 self._rebind_browser_exit("refusal page")
+            elif why == "dead_page":
+                # The browser cannot reach the portal at all on this exit: re-running the chain in
+                # the same dead page is pointless (Test 1106 did it ~40 times). New exit, same login.
+                if not self._browser_on_stale_exit():
+                    self._roll_exit("warm-up: the browser page is dead on this exit")
+                self._rebind_browser_exit("dead page")
             elif kind == "unreachable":
                 # _note_portal already rolled warm_proxy; the open browser is still on the dead exit.
                 self._rebind_browser_exit("dead exit")
@@ -3170,13 +3213,32 @@ class LiveEngineOps(EngineOps):
                                        headless=self.headless, fp_seed=self.account.get("username"))
             self._browser_closed = False
         except Exception as e:
+            self._rebind_last_error = f"{type(e).__name__}: {e}"
             self._log(f"rebind: browser on the new exit failed ({type(e).__name__}: {str(e)[:80]}) "
                       f"-- jar kept, retrying on the next pass")
             return False
         self._rebind_jar = None
+        self._rebind_last_error = ""
         self._log(f"rebind: login carried to a fresh browser on [{_proxy_label(self.warm_proxy)}] "
                   f"({why}; {len(jar)} cookies, no re-login)")
         return True
+
+    def _browser_on_stale_exit(self) -> bool:
+        """True when the open browser still runs on an exit this worker has since rolled off.
+
+        ROOT CAUSE of Test 1106 (2026-11-06): /slots answered 403 (the 28.5 KB refusal page), the
+        worker rolled warm_proxy -- and the Donut browser stayed on the refused exit, because a roll
+        only changes the URL the NEXT browser will use. Every later page was chrome-error ("portal
+        origin could not be restored") for 10+ minutes, twice."""
+        if self.session is None or getattr(self, "_browser_closed", False):
+            return False
+        launched = getattr(self.session, "proxy", None)
+        return bool(launched and self.warm_proxy and launched != self.warm_proxy)
+
+    def ensure_browser_on_current_exit(self, why: str) -> None:
+        """Move the login onto the current exit if a roll left the browser behind (same jar)."""
+        if self._browser_on_stale_exit():
+            self._rebind_browser_exit(f"browser was still on a rolled-off exit ({why})")
 
     def _warm_chain_pass(self, _resume: int, restart: int) -> bool:
         """ONE pass of the warm-up chain (see _run_warmup_steps). `restart` > 0 = a roll-back pass:
@@ -3186,6 +3248,7 @@ class LiveEngineOps(EngineOps):
         # -- do_warmup, do_apply's round-start re-warm, _do_keepalive, _rebuild_session -- is unchanged.
         self._last_warm_kind = "unknown"
         self._warm_fail, self._warm_fail_at = "", ""
+        self.ensure_browser_on_current_exit("warm-up")
         if self._hybrid("WARMUP"):
             # The primp chain never reported to _note_portal, so a hybrid worker's warm-up failures
             # were always kind "unknown": no slow-portal hold, no portal-down check, every stressed
@@ -3226,6 +3289,7 @@ class LiveEngineOps(EngineOps):
             # failure through _note_portal and returns False, so this reuses the established
             # taxonomy (warmup_failure_kind -> "unreachable") rather than adding a second one.
             if not self._ensure_portal_origin("the warm-up chain"):
+                self._warm_fail_set("dead_page", "warm-up start")
                 raise RuntimeError(
                     "portal origin could not be restored -- the in-page fetch chain cannot run")
             # Retry budget + backoff, now operator-tunable (QUEST_STEP_RETRIES / QUEST_STEP_BACKOFF,
@@ -4328,7 +4392,8 @@ class LiveEngineOps(EngineOps):
             # row until the 25-minute stall reaper eventually killed it -- storm-auto instead keeps
             # retrying (bounded) and would report failed immediately if it gives up. Bounded by
             # _MAX_KEEPALIVE_RESTORE_ATTEMPTS so this can't burn proxies/CAPTCHA solves forever.
-            if getattr(self, "_keepalive_restore_attempts", 0) >= _MAX_KEEPALIVE_RESTORE_ATTEMPTS:
+            # Spent budget = a cooldown, then a fresh budget (_restore_budget_left), never forever.
+            if not self._restore_budget_left():
                 return
             self._attempt_keepalive_restore(context)
             return
@@ -4669,6 +4734,7 @@ class LiveEngineOps(EngineOps):
         # leave the worker with no session at all.
         self._browser_closed = False
         if not self._rebind_browser_exit(f"keepalive restore ({context})"):
+            self._restore_portal_silent = _portal_silent_error(getattr(self, "_rebind_last_error", ""))
             return False
         verdict = self._auth_verdict()
         if verdict == "ok":
@@ -4682,12 +4748,38 @@ class LiveEngineOps(EngineOps):
                   f"re-probing next cycle (no re-login without evidence)")
         return False
 
+    def _restore_budget_left(self) -> bool:
+        """_MAX_KEEPALIVE_RESTORE_ATTEMPTS per round; a spent round waits KEEPALIVE_RESTORE_COOLDOWN_S
+        x round (capped) and then starts a new one. 0 = the old behaviour: spent means spent."""
+        if getattr(self, "_keepalive_restore_attempts", 0) < _MAX_KEEPALIVE_RESTORE_ATTEMPTS:
+            return True
+        base = max(0.0, float(self.cfg.raw.get("KEEPALIVE_RESTORE_COOLDOWN_S", 300.0) or 0.0))
+        if base <= 0:
+            return False
+        now = time.time()
+        rounds = getattr(self, "_keepalive_restore_rounds", 0)
+        since = getattr(self, "_keepalive_restore_exhausted_at", None)
+        if since is None:
+            self._keepalive_restore_exhausted_at = now
+            self._keepalive_restore_rounds = rounds = rounds + 1
+            wait = base * min(rounds, _KEEPALIVE_RESTORE_COOLDOWN_MAX_ROUNDS)
+            self._log(f"keepalive: restore budget spent ({_MAX_KEEPALIVE_RESTORE_ATTEMPTS} attempts) -- "
+                      f"pausing {wait:.0f}s, then trying again (round {rounds})")
+            return False
+        wait = base * min(max(rounds, 1), _KEEPALIVE_RESTORE_COOLDOWN_MAX_ROUNDS)
+        if now - since < wait:
+            return False
+        self._keepalive_restore_attempts = 0
+        self._keepalive_restore_exhausted_at = None
+        self._log(f"keepalive: restore cooldown over ({wait:.0f}s) -- trying to restore again")
+        return True
+
     def _attempt_keepalive_restore(self, context: str = "") -> bool:
         """Returns whether the session came back. The session looks dead -- try the same checkpoint-restore-then-fresh-login chain a fresh
         launch uses, rather than silently sitting on a dead session until the next real signal
         arrives and do_apply/do_discover fails outright."""
         # getattr, not attribute access: this counter is created lazily on first use.
-        if getattr(self, "_keepalive_restore_attempts", 0) >= _MAX_KEEPALIVE_RESTORE_ATTEMPTS:
+        if not self._restore_budget_left():
             return False        # bounded: never let escalation become its own unbounded loop
         self._keepalive_restore_attempts = getattr(self, "_keepalive_restore_attempts", 0) + 1
         if self._emit is not None:
@@ -4724,6 +4816,7 @@ class LiveEngineOps(EngineOps):
         except Exception:
             pass
         self.session = None
+        self._restore_portal_silent = False
         ok = self._try_restore_from_checkpoint()
         if not ok:
             if self._relogin_allowed():
@@ -4755,7 +4848,17 @@ class LiveEngineOps(EngineOps):
                 self._roll_after_failed_warm("keepalive restore: re-warm hit a dead exit")
         if ok:
             self._keepalive_restore_attempts = 0
+            self._keepalive_restore_rounds = 0
+            self._keepalive_restore_exhausted_at = None
             self._mark_keep_bookable(True)
+        elif getattr(self, "_restore_portal_silent", False):
+            # The rebuild never reached a portal that answers anyone: it says nothing about this
+            # login or this exit, so it does not spend the budget. Paced by the keepalive cycle
+            # (a browser launch per cycle, no solve, no login).
+            self._keepalive_restore_attempts = max(0, self._keepalive_restore_attempts - 1)
+            if self._emit is not None:
+                self._emit("log_line", text="keepalive: the portal did not answer the rebuild -- not "
+                                            "counted against the restore budget; the login is kept")
         if self._emit is not None:
             self._emit("log_line", text=f"keepalive: restore {'succeeded' if ok else 'FAILED'}")
         return bool(ok)
@@ -5422,6 +5525,7 @@ class LiveEngineOps(EngineOps):
         booking -- while the calendar path is the one this project has actually booked with.
         Preferring slots and back-filling from calendar takes the better answer without giving up
         the proven one."""
+        self.ensure_browser_on_current_exit("discovery")
         # PREFER the Hub-pushed live value (self._pending_discover_source, set from the discover
         # command) over the launch-frozen cfg -- this is what lets a DISCOVERY_SOURCE change reach a
         # RUNNING scout without a restart. Fall back to the frozen cfg when the Hub sent none.

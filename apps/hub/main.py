@@ -89,7 +89,8 @@ from . import dedup
 from .importers import parse_geo, parse_identities, parse_proxies
 from .donut_sweep import (cleanup_duplicate_profiles, cleanup_junk_profiles, cleanup_stray_proxies,
                           sweep_donut_profiles)
-from .donut_profiles import create_profiles, delete_profiles_for, keep_with_profile, profile_status
+from .donut_profiles import (create_profiles, delete_profiles_for, keep_with_profile, profile_status,
+                             recreate_profiles)
 from .settings_store import get_global, set_layer
 from .scheduler import (LAUNCH_FAILED_PREFIX, _LAUNCH_BLOCKED_BOOKING_STATUSES, _aware,
                         Scheduler)
@@ -2677,6 +2678,28 @@ def donut_profiles_create(body: DonutProfileCreate, db: Session = Depends(get_db
         return {"created": [], "existed": [], "deferred": [], "errors": [], "unreachable": False,
                 "note": "no verified sub-accounts in the selection"}
     return create_profiles(db, get_global(db), usernames, redis=_bus.r)
+
+
+@app.post("/donut/profiles/recreate")
+def donut_profiles_recreate(body: DonutProfileCreate, db: Session = Depends(get_db),
+                            _op: Principal = Depends(require_operator)) -> dict:
+    """RE-CREATE the Donut profile of each selected identity's VERIFIED sub-accounts: delete the
+    existing profile (every copy + its proxy entry) and create a fresh one -- a new device. Running
+    profiles are skipped (a worker is using them), and Donut's hourly budget is honoured (over-budget
+    accounts keep their old profile and come back `deferred`). Clears the recorded registration
+    fingerprint so the new device does not log drift on every login."""
+    conds = [M.SubAccount.status.in_(list(READY_SUB_ACCOUNT_STATUSES))]
+    if body.sub_account_ids:
+        conds.append(M.SubAccount.id.in_(body.sub_account_ids))
+    elif body.identity_ids:
+        conds.append(M.SubAccount.identity_id.in_(body.identity_ids))
+    else:
+        raise HTTPException(400, "give identity_ids or sub_account_ids")
+    usernames = [u for (u,) in db.execute(select(M.SubAccount.username).where(*conds)).all()]
+    if not usernames:
+        return {"recreated": [], "created": [], "running": [], "deferred": [], "busy": [], "errors": [],
+                "unreachable": False, "note": "no verified sub-accounts in the selection"}
+    return recreate_profiles(db, get_global(db), usernames, redis=_bus.r)   # audited by the middleware
 
 
 @app.post("/donut/profiles/cleanup")
