@@ -103,7 +103,7 @@ print(unquote(u.username or ""), unquote(u.password or ""), u.path.lstrip("/"))
 PY
 )
 sudo -u postgres psql -qtAc "SELECT 1 FROM pg_roles WHERE rolname='$PGU'" | grep -q 1 \
-    || sudo -u postgres psql -qc "CREATE ROLE \"$PGU\" LOGIN PASSWORD '$PGP'"
+    || sudo -u postgres psql -qc "CREATE ROLE \"$PGU\" LOGIN PASSWORD '${PGP//\'/\'\'}'"
 if ! sudo -u postgres psql -qtAc "SELECT 1 FROM pg_database WHERE datname='$PGDB'" | grep -q 1; then
     sudo -u postgres createdb -O "$PGU" "$PGDB"
     install -m 644 "$BUNDLE/db.dump" /tmp/storm_hub.dump
