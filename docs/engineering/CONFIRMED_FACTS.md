@@ -979,3 +979,58 @@ now rejects an inverted pair; workers log once when the dates are inverted or in
 visible in this capture (a fetch would not be in a navigation-only HAR, so it is unproven either way);
 the in-page ScheduleController fetch already follows the 302 to Schedule.jsp and then the worker
 navigates Schedule.jsp again (two loads vs the browser's one).
+
+## 40. A full manual run, login to PDF — reference/1106-capture, 2026-11-06
+
+The operator ran the whole flow by hand against the live portal (test account) and captured a HAR from
+the first request, a screen recording of attempt 1 and the PDF of attempt 2. Not committed: it carries
+a real applicant's data.
+
+- **Attempt 1: CPV national, CPV resident, posto 5094 (São Nicolau).**
+  - Login → `/VistosOnline/` → `GET Questionario` → 7 quest XHRs → `Formulario?copy=true`.
+  - The first `ScheduleController` POST came back **200 with the Formulario re-rendered (1.27 MB)**
+    and the error ">> Os items marcados com * são obrigatórios [ 19. Residência habitual ]": f45 was
+    empty. With f45 = `+` and f46 (Telefone) = `0` the second POST got a 302 to Schedule.jsp.
+  - The live form_defaults already carry those values.
+- **Attempt 2: CPV national, IRL resident, posto 2032 (Dublin).**
+  - Schedule.jsp → `GET Questionario` (no home page, no re-login) → steps → Formulario →
+    ScheduleController 302 → Schedule.jsp.
+  - reCAPTCHA solved → `POST /slots` (captcha = token) answered 34 KB of dates.
+  - XHR `SubmeterVistoCriaPDF` (`lang=PT&txtHuman=&back=&f_date_c=2026/11/18&cmbPeriodo=5`) →
+    1,572 B redirect page → `GET MostrarPdf?` → a 240 KB `%PDF`.
+  - Matches §37.
+- **No home-lang POST anywhere.** The Questionario's own questForm carries `lang=PT`.
+  - The warm-up no longer sends one. It POSTs `lang=PT` only to correct a questForm in another
+    language.
+- **Schedule.jsp came in two shapes.** NOT an availability signal:
+  - **5094:** `captchaDiv` hidden, no reCAPTCHA script, `getSlots('5094', null)` fired at once;
+    `/slots` answered `[]`.
+  - **2032:** the SCHEDULE_EVISA widget was served.
+  - The operator states the captcha-less page does **not** reliably mean "no slots". Its correlation
+    with 5094 having no dates is one sample.
+  - The warm-up only LOGS the shape (`schedule_page_shape`). Discovery still solves on every page and
+    nothing decides on the shape.
+- **A quest step can die with status 0.** The step-2 XHR failed after 130 ms; the next request opened a
+  new TLS connection and answered 200.
+  - goNext's handler ignores a non-200, so the page simply stalls. Re-trying the step is the cure, as
+    the user did.
+  - `QUEST_STEP_RETRIES` 3 → 5.
+- **"Request could not be processed"** (operator snapshot, on `Formulario?copy=true`):
+  - Title "Não foi possível processar o pedido". Body "We were unable to complete your request at this
+    time. Please try again later. URI: … IP: <the exit>".
+  - It is the same refusal family as §35. The warm-up used to read it as `csrf_missing`, an
+    unexplained failure the ladder re-logged into.
+  - Now it is `refused`: roll the exit, re-bind the browser to it with the same cookie jar (Q16), and
+    restart from the Questionario.
+
+**Recovery model since this capture.**
+- **One failed pass rolls back to the Questionario on the same login.** Up to `WARMUP_CHAIN_RESTARTS`
+  passes, `WARMUP_RESTART_BACKOFF`.
+- **Re-login needs positive evidence the login is gone** (`RELOGIN_ONLY_ON_AUTH_LOSS`, default on):
+  - Evidence means an Authentication.jsp / sessionLost redirect, "perdeu a sessão", or a home page
+    without the logged-in menu.
+  - Otherwise every ladder keeps the login and keeps re-warming (`WARM_HOLD_MAX_S`). The ladders are
+    initial warm-up, apply rebuild, scout rebuild, form_stale, the `/slots` stub, and keepalive
+    restore.
+  - A keepalive restore carries the live jar to a fresh browser instead of logging in.
+- **Validation errors stop at once.** They are our data, and resending cannot help.

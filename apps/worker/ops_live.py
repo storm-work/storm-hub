@@ -34,6 +34,7 @@ import random
 import re
 import time
 from enum import Enum
+from html import unescape as _unescape
 from urllib.parse import urlencode
 from datetime import date
 
@@ -240,7 +241,45 @@ _PORTAL_BUSY_MARKERS = (
     "não foi possível de momento concretizar o seu pedido",
     "nao foi possivel de momento concretizar o seu pedido",
     "we were unable to complete your request at this time",
+    # The SAME refusal as served mid-warm-up (operator snapshot 2026-11-06, Questionario ->
+    # Formulario?copy=true): <title>Não foi possível processar o pedido</title>, body "Request could
+    # not be processed / We were unable to complete your request at this time. Please try again
+    # later. / URI: ... / IP: <the exit the portal saw>". The body line above already matches it;
+    # the heading/title are listed so a variant without that line still classifies.
+    "request could not be processed",
+    "não foi possível processar o pedido",
+    "nao foi possivel processar o pedido",
 )
+_REFUSAL_IP_RE = re.compile(r"\bIP:\s*([0-9A-Fa-f.:]{7,45})")
+
+
+def _refusal_ip(html: str) -> str:
+    """The exit IP the portal's refusal page reports ("IP: 186.105.116.66"), or ""."""
+    m = _REFUSAL_IP_RE.search(re.sub(r"<[^>]+>", " ", html or ""))
+    return m.group(1) if m else ""
+
+
+# The two shapes Schedule.jsp was served in on the 2026-11-06 capture (reference/1106-capture): the JSP
+# renders its document.ready branch server-side --
+#   "no_captcha" (posto 5094): captchaDiv hidden, getSlots('5094', null) fired at once, no reCAPTCHA
+#                              script/widget; /slots answered [] with captcha=null.
+#   "captcha"    (posto 2032): the SCHEDULE_EVISA widget served, getSlots only from onCaptchaSuccess.
+# OBSERVATION ONLY. That 5094 had no dates is a correlation from one capture; the operator states the
+# captcha-less page does NOT reliably mean "no availability" (2026-11-06). Logged for evidence --
+# never used to skip a solve or to report a date empty.
+_SCHED_NULL_SLOTS_RE = re.compile(r"getSlots\(\s*['\"]?\w*['\"]?\s*,\s*null\s*\)")
+
+
+def schedule_page_availability(html: str) -> str:
+    """"no_captcha" | "captcha" | "unknown" -- which shape the page was served in. NOT an
+    availability verdict (see above)."""
+    if not html or not any(m in html for m in _SCHED_PAGE_MARKERS):
+        return "unknown"
+    if _SCHED_NULL_SLOTS_RE.search(html):
+        return "no_captcha"
+    if 'class="g-recaptcha' in html or "recaptcha/enterprise.js" in html:
+        return "captcha"
+    return "unknown"
 
 # The portal's MAINTENANCE / 'Serviço Indisponível' page. SPLIT OUT of _PORTAL_BUSY_MARKERS
 # 2026-09-23: it was lumped in as "same class as the refusals above", but it is NOT the same class.
@@ -448,12 +487,20 @@ _MAX_KEEPALIVE_RESTORE_ATTEMPTS = 3
 # "no evidence" had been promoted to "healthy" by simply doing nothing.
 # Bodies of a QuestNextQuestion step that mean the portal has lost the session (answered with 200).
 _QUEST_SESSION_GONE = ("perdeu a sess", "user not found in session")
+# The same marker lists as JS array literals, for the in-page quest-step fetch to classify its reply.
+_QUEST_GONE_JS = json.dumps(list(_QUEST_SESSION_GONE))
+_REFUSED_JS = json.dumps([m.lower() for m in _PORTAL_BUSY_MARKERS])
+
+
+def _page_title(html: str) -> str:
+    m = re.search(r"<title[^>]*>(.*?)</title>", html or "", re.S | re.I)
+    return " ".join(m.group(1).split())[:80] if m else ""
 _KEEPALIVE_UNKNOWN_TRIP = 2
 
 # storm-auto's QUEST_STEP_RETRIES (default 3): re-attempt a questionnaire step that doesn't return
 # 200, "like a manual page refresh". Not a settings-catalog knob -- it is a retry shape, and the
 # proven value is the one that matters.
-_QUEST_STEP_RETRIES = 3
+_QUEST_STEP_RETRIES = 5   # = the catalog default (raised 3 -> 5, 2026-11-06)
 
 
 def _proxy_label(conn_url: str | None) -> str:
@@ -626,7 +673,11 @@ def _form_error_text(html: str, limit: int = 5) -> list[str]:
     out: list[str] = []
     seen: set[str] = set()
     for chunk in _ERR_TAG_RE.findall(body):
-        txt = " ".join(_TAG_RE.sub(" ", chunk).split())
+        txt = _unescape(" ".join(_TAG_RE.sub(" ", chunk).split()))
+        # The error box's close button ("&times;") matches the error-classed markup too; it is
+        # not a message (seen on the real 2026-11-06 bounce next to "[ 19. Residência habitual ]").
+        if re.fullmatch(r"\W+", txt):
+            continue
         if 3 < len(txt) <= 200 and txt.lower() not in seen:
             seen.add(txt.lower())
             out.append(txt)
@@ -906,6 +957,7 @@ class LiveEngineOps(EngineOps):
         # is cleared here; the next primp hot-path step re-closes it via the lazy-close in
         # _primp_client. This is how a dead-exit recovery gets its browser back for the reCAPTCHA login.
         self._browser_closed = False
+        self._login_gone = ""          # a new login: earlier auth-loss evidence is about the old one
         if self._login_sem is not None:
             if not self._login_sem.acquire(self.identity_id, timeout=300):
                 self._log("do_login: login concurrency gate timed out")
@@ -2664,11 +2716,25 @@ class LiveEngineOps(EngineOps):
             pass
         try:
             pc, H = self._primp_client()
-            # 1. home-lang POST (sets the PT session language)
-            pc.post(HOME_URL, data="lang=PT",
-                    headers={**H, "Content-Type": "application/x-www-form-urlencoded"})
-            # 2. Questionario GET
-            pc.get(QUEST_URL, headers=H)
+            # 1. Questionario GET -- no up-front home-lang POST (the real client sends none; see the
+            #    browser chain). The POST runs only to CORRECT a questForm that is not in PT.
+            qr = pc.get(QUEST_URL, headers=H)
+            q_html = qr.text or ""
+            if self._auth_redirect(str(getattr(qr, "url", "") or "")):
+                self._note_login_gone("Questionario redirected to the login page (primp)")
+                self._warm_fail_set("auth", "Questionario")
+                return False
+            if _is_portal_refusal(q_html):
+                self._warm_fail_set("refused", "Questionario",
+                                    f"portal refused the Questionario (IP {_refusal_ip(q_html) or '?'})")
+                self._log(f"hybrid-warm: {self._warmup_last_error}")
+                return False
+            m_lang = re.search(r'name="lang"\s+value="([^"]*)"', q_html)
+            if m_lang and m_lang.group(1).upper() != "PT":
+                self._log(f"hybrid-warm: Questionario is in {m_lang.group(1)!r}, not PT -- setting PT")
+                pc.post(HOME_URL, data="lang=PT",
+                        headers={**H, "Content-Type": "application/x-www-form-urlencoded"})
+                pc.get(QUEST_URL, headers=H)
             # 3. quest steps (goNext()-shaped params, like the browser chain)
             quest_key = self.residence if self.residence != self.nationality else self.nationality
             steps = self.quest_steps.get(quest_key, [])
@@ -2702,11 +2768,23 @@ class LiveEngineOps(EngineOps):
                 if status != 200:
                     # Recorded, not just logged: "HTTP 503" is what tells _note_portal this was the
                     # PORTAL being slow (hold the login), not our session or exit failing.
-                    self._warmup_last_error = (f"quest step {i+1}/{len(steps)} never returned 200 "
-                                               f"after {_retries} attempts (HTTP {status})")
+                    self._warm_fail_set("quest", f"quest step {i+1}/{len(steps)}",
+                                        f"quest step {i+1}/{len(steps)} never returned 200 "
+                                        f"after {_retries} attempts (HTTP {status})")
                     self._log(f"hybrid-warm: {self._warmup_last_error} -- aborting the chain")
                     return False
                 last_html = r.text or ""
+                _low = last_html.lower()
+                if (any(m in _low for m in _QUEST_SESSION_GONE)
+                        or self._auth_redirect(str(getattr(r, "url", "") or ""))):
+                    self._note_login_gone(f"quest step {i+1} answered 'session lost' (primp)")
+                    self._warm_fail_set("auth", f"quest step {i+1}/{len(steps)}")
+                    return False
+                if _is_portal_refusal(last_html):
+                    self._warm_fail_set("refused", f"quest step {i+1}/{len(steps)}",
+                                        f"portal refused quest step {i+1} (IP {_refusal_ip(last_html) or '?'})")
+                    self._log(f"hybrid-warm: {self._warmup_last_error}")
+                    return False
                 # WAF CHALLENGE on a quest step (2026-10-16). The portal tightens its anti-bot as
                 # slot-open nears and serves the ~44KB bot-challenge interstitial (status 200) to the
                 # detached primp requests. That page carries no form fields, so it USED to fall through
@@ -2716,13 +2794,15 @@ class LiveEngineOps(EngineOps):
                 # _is_transient_login_failure), so do_apply/keepalive ROLL the exit and back off rather
                 # than hammering: a flagged exit does not un-flag itself.
                 if _is_challenge_body(last_html):
-                    self._warmup_last_error = (f"WAF bot-challenge on quest step {i+1}/{len(steps)} "
-                                               f"({len(last_html)}B)")
+                    self._warm_fail_set("challenge", f"quest step {i+1}/{len(steps)}",
+                                        f"WAF bot-challenge on quest step {i+1}/{len(steps)} "
+                                        f"({len(last_html)}B)")
                     self._log(f"hybrid-warm: {self._warmup_last_error} -- NOT a stale form; the exit "
                               f"is flagged, rolling/backing off (see _is_transient_login_failure)")
                     return False
             last_fields = _primp_parse_inputs(last_html)
             if not last_fields:
+                self._warm_fail_set("stale", f"quest step {len(steps)}/{len(steps)}")
                 self._log(f"hybrid-warm: quest_state_stale (last step yielded no fields, "
                           f"len={len(last_html)})")
                 return False
@@ -2733,6 +2813,17 @@ class LiveEngineOps(EngineOps):
                         headers={**H, "Content-Type": "application/x-www-form-urlencoded",
                                  "Referer": QUEST_URL})
             form_html = r.text or ""
+            if _is_portal_refusal(form_html):
+                self._warm_fail_set("refused", "Formulario",
+                                    f"portal refused Formulario?copy=true "
+                                    f"(IP {_refusal_ip(form_html) or '?'}, {len(form_html)}B)")
+                self._log(f"hybrid-warm: {self._warmup_last_error}")
+                return False
+            if (self._auth_redirect(str(getattr(r, "url", "") or ""))
+                    or "perdeu a sess" in form_html.lower()):
+                self._note_login_gone("Formulario answered with the login page / session lost (primp)")
+                self._warm_fail_set("auth", "Formulario")
+                return False
             csrf = _extract_csrf(form_html)
             if not csrf:
                 r = pc.post(FORMULARIO, data=urlencode(form_body),
@@ -2741,7 +2832,9 @@ class LiveEngineOps(EngineOps):
                 form_html = r.text or ""
                 csrf = _extract_csrf(form_html)
             if not csrf:
-                self._log("hybrid-warm: csrf_missing after Formulario POST")
+                self._warm_fail_set("csrf", "Formulario")
+                self._log(f"hybrid-warm: csrf_missing after Formulario POST ({len(form_html)}B, "
+                          f"title={_page_title(form_html)!r})")
                 return False
             postos = _posto_options(form_html)
             self._observe_postos(postos, "hybrid-warm")
@@ -2770,8 +2863,14 @@ class LiveEngineOps(EngineOps):
                                   "Content-Type": f"multipart/form-data; boundary={boundary}"})
             sc_body = sc.text or ""
             if _is_challenge_body(sc_body):
+                self._warm_fail_set("challenge", "ScheduleController")
                 self._log(f"hybrid-warm: ScheduleController answered with a bot challenge "
                           f"({len(sc_body)}B) -- NOT warmed")
+                return False
+            if _is_portal_refusal(sc_body):
+                self._warm_fail_set("refused", "ScheduleController",
+                                    f"portal refused ScheduleController (IP {_refusal_ip(sc_body) or '?'})")
+                self._log(f"hybrid-warm: {self._warmup_last_error}")
                 return False
             # 6. Schedule.jsp GET -> verify the booking-form markers (the cursor)
             sr = pc.get(SCHED_JSP + "?posto_id=" + str(self.posto_id), headers={**H, "Referer": FORMULARIO})
@@ -2783,9 +2882,21 @@ class LiveEngineOps(EngineOps):
                           f"({booked_sig[:400]!r}) -- retiring the identity")
                 if self._emit is not None:
                     self._emit("already_booked", detail=booked_sig)
+                self._warm_fail_set("booked", "Schedule.jsp")
                 return False
             if not any(m in sched_html for m in _SCHED_PAGE_MARKERS):
                 errs = _form_error_text(sc_body)
+                if self._auth_redirect(str(getattr(sr, "url", "") or "")):
+                    self._note_login_gone("Schedule.jsp redirected to the login page (primp)")
+                    self._warm_fail_set("auth", "Schedule.jsp")
+                elif errs:
+                    self._warm_fail_set("validation", "ScheduleController",
+                                        "ScheduleController validation: " + " | ".join(e[:120] for e in errs))
+                elif _is_portal_refusal(sched_html):
+                    self._warm_fail_set("refused", "Schedule.jsp",
+                                        f"portal refused Schedule.jsp (IP {_refusal_ip(sched_html) or '?'})")
+                else:
+                    self._warm_fail_set("rejected", "ScheduleController")
                 self._log(f"hybrid-warm: Schedule.jsp has no scheduling markers (len={len(sched_html)}) "
                           f"-- ScheduleController rejected (response {len(sc_body)}B); NOT warmed")
                 if errs:
@@ -2799,6 +2910,7 @@ class LiveEngineOps(EngineOps):
             # Verified bookable cursor established detached.
             self.posto_pdf = self.posto_id
             self._set_anchor("chain")
+            self._note_schedule_availability(sched_html, "hybrid warm-up")
             self._log(f"hybrid-warm: cursor established via primp (posto_pdf={self.posto_pdf}, "
                       f"Schedule.jsp {len(sched_html)}B)")
             return True
@@ -2807,6 +2919,8 @@ class LiveEngineOps(EngineOps):
             # tell a dead-exit (chrome-error/tunnel/connection) failure -- which _is_transient_login_
             # failure matches and do_apply then rolls the exit for -- from a portal rejection.
             self._warmup_last_error = str(e)
+            if not self._warm_fail:
+                self._warm_fail_set("error", "hybrid warm-up chain")
             self._log(f"hybrid-warm: chain raised {type(e).__name__}: {str(e)[:140]}")
             return False
 
@@ -2890,15 +3004,188 @@ class LiveEngineOps(EngineOps):
                 out.append({"date": d, "outcome": "empty"})
         return self._reject_phantom_round(out)
 
+    # Why ONE pass of the warm-up chain failed (self._warm_fail), for the roll-back decision below:
+    #   refused   the portal's "Request could not be processed" page on any step
+    #   quest     a questionnaire step never answered 200 within QUEST_STEP_RETRIES
+    #   stale     the last questionnaire step carried no form inputs
+    #   csrf      Formulario came back without its CSRF token
+    #   rejected  ScheduleController/Schedule.jsp did not produce a schedule page, no validation text
+    #   error     an exception (transport/timeout/opaque origin) -- _note_portal classified it
+    #   validation  ScheduleController re-rendered the form WITH validation errors (our DATA is wrong;
+    #               repeating it cannot help -- the 2026-11-06 capture's "[ 19. Residência habitual ]")
+    #   challenge / auth / booked   the bot-check shell / the login is gone / applicant already booked
+    _WARM_RESTARTABLE = frozenset({"refused", "quest", "stale", "csrf", "rejected", "error"})
+
+    def warmup_failure_reason(self) -> str:
+        """Why the last warm-up pass failed (see _WARM_RESTARTABLE), "" when it did not."""
+        return getattr(self, "_warm_fail", "") or ""
+
     def _run_warmup_steps(self) -> bool:
-        """Questionnaire -> Formulario -> ScheduleController -> Schedule.jsp (confirmed URLs/flow,
-        ported from storm-auto batch_apply._run_steps_2_to_6)."""
+        """Questionnaire -> Formulario -> ScheduleController -> Schedule.jsp, ROLLING BACK to the
+        Questionario on the SAME login when a pass fails part-way (operator, 2026-11-06).
+
+        The real client does exactly this: in the 2026-11-06 capture the user's second attempt went
+        Schedule.jsp -> GET Questionario -> the steps again, with no logout, no home page and no
+        re-login, and booked. A failed step, the portal's "Request could not be processed" page or
+        a ScheduleController that did not produce a schedule page says the WORKFLOW cursor is not
+        where we need it -- never that the login is gone. Each roll-back is a fresh pass from the
+        Questionario; a refusal page also rolls the exit first (the portal or the tunnel refused this
+        exit -- the page names the IP it saw), and the browser is re-bound to the new exit with the
+        same cookie jar (Q16: an exit change does not invalidate the portal session).
+
+        NOT rolled back: a slow/down or challenging portal (the phase machine's stress hold owns
+        that), validation errors (our data), already-booked, a lost login, or a stop."""
+        self._warm_fail = ""
+        # QUEST_HOLD: the questionnaire position the hold had reached (consumed here, always).
+        _resume = self._qh_take()
+        restarts = max(0, int(self.cfg.raw.get("WARMUP_CHAIN_RESTARTS", 3)))
+        for n in range(restarts + 1):
+            if self.session is None and getattr(self, "_rebind_jar", None):
+                self._rebind_browser_exit("re-binding after a failed rebind")
+            ok = self._warm_chain_pass(_resume if n == 0 else 0, n)
+            if ok:
+                self._warm_fail = ""
+                return True
+            why = self._warm_fail
+            kind = self.warmup_failure_kind()
+            if (n >= restarts or why not in self._WARM_RESTARTABLE
+                    or kind in ("slow", "challenged")
+                    or getattr(self, "_identity_unavailable", False) or self.is_stopped()):
+                return False
+            if why == "refused":
+                self._roll_exit(f"warm-up: the portal refused the request ({self._warm_fail_at})")
+                self._rebind_browser_exit("refusal page")
+            elif kind == "unreachable":
+                # _note_portal already rolled warm_proxy; the open browser is still on the dead exit.
+                self._rebind_browser_exit("dead exit")
+            self._log(f"warm-up: rolling back to the Questionario on the same login "
+                      f"(restart {n + 1}/{restarts}) after [{why}] at {self._warm_fail_at}: "
+                      f"{(self._warmup_last_error or '-')[:120]}")
+            self._slog("warmup_restart", n=n + 1, of=restarts, why=why, at=self._warm_fail_at)
+            end = time.time() + self._restart_pause(n + 1)
+            while time.time() < end:
+                self._poll_signals()
+                if self.is_stopped():
+                    return False
+                time.sleep(min(1.0, max(0.0, end - time.time())))
+        return False
+
+    @staticmethod
+    def _auth_redirect(url: str) -> bool:
+        low = (url or "").lower()
+        return "authentication.jsp" in low or "sessionlost" in low
+
+    def _note_schedule_availability(self, sched_html: str, where: str) -> str:
+        """Log which shape the freshly rendered Schedule.jsp was served in (captcha widget or not), on
+        change. Evidence only -- nothing decides on it (schedule_page_availability)."""
+        verdict = schedule_page_availability(sched_html)
+        prev = getattr(self, "_sched_availability", None)
+        self._sched_availability = verdict
+        self._sched_availability_at = time.time()
+        if verdict != prev:
+            self._log(f"{where}: Schedule.jsp for posto {self.posto_pdf or self.posto_id} served "
+                      + {"no_captcha": "WITHOUT the captcha (getSlots(..., null))",
+                         "captcha": "WITH the SCHEDULE_EVISA captcha"}.get(verdict, "in neither known shape"))
+            self._slog("schedule_page_shape", shape=verdict, posto=self.posto_pdf or self.posto_id)
+        return verdict
+
+    def _restart_pause(self, n: int) -> float:
+        """Seconds before roll-back pass `n` (WARMUP_RESTART_BACKOFF x n, +-20% jitter)."""
+        base = max(0.0, float(self.cfg.raw.get("WARMUP_RESTART_BACKOFF", 5.0)))
+        return base * n * random.uniform(0.8, 1.2)
+
+    def _warm_fail_set(self, why: str, at: str, error: str = "") -> None:
+        self._warm_fail, self._warm_fail_at = why, at
+        if error:
+            self._warmup_last_error = error
+
+    def _note_login_gone(self, why: str) -> None:
+        """POSITIVE evidence the portal login is gone (auth redirect / 'perdeu a sessão'). The only
+        thing that justifies a re-login -- see login_lost()."""
+        if not getattr(self, "_login_gone", ""):
+            self._log(f"auth: the portal says the login is GONE ({why})")
+        self._login_gone = why
+
+    def login_lost(self, probe: bool = True) -> bool:
+        """True only on POSITIVE evidence the portal login is gone (operator, 2026-11-06: "it's not
+        good to decide to re-login; the logged-in session is kept by our own activity on it").
+
+        Evidence: an auth redirect or the 'session lost' answer seen during a warm-up/keepalive, or
+        -- when `probe` -- the home page read now WITHOUT the logged-in menu. A failed step, a
+        refusal page, a dead exit or an unreadable page is NOT evidence: those keep the login."""
+        if getattr(self, "_login_gone", ""):
+            return True
+        if not probe:
+            return False
+        verdict = self._auth_verdict()
+        if verdict == "logged_out":
+            self._note_login_gone("home page read logged-out")
+            return True
+        self._log(f"auth: login check before any re-login -> {verdict} -- keeping the login")
+        return False
+
+    def _auth_verdict(self) -> str:
+        """"ok" | "logged_out" | "unknown" from a fresh home-page read on the live transport."""
+        if self.session is None:
+            return "unknown"
+        if getattr(self, "_browser_closed", False):
+            try:
+                pc, H = self._primp_client()
+                r = pc.get(HOME_URL, headers=H)
+                st = classify_session_state(r.text or "", str(getattr(r, "url", HOME_URL) or HOME_URL),
+                                            warmed=False)
+            except Exception:
+                return "unknown"
+            return {SessionState.AUTHENTICATED: "ok",
+                    SessionState.SESSION_EXPIRED: "logged_out"}.get(st, "unknown")
+        try:
+            self.session.browser_nav(HOME_URL, timeout=30)
+        except Exception:
+            return "unknown"
+        return self._verify_logged_in()
+
+    def _rebind_browser_exit(self, why: str) -> bool:
+        """Carry THIS login onto self.warm_proxy (just rolled): a fresh browser on the new exit with
+        the same cookie jar -- no solve, no login. Q16 (OPEN_QUESTIONS, answered 2026-08-25): a proxy
+        exit change does not invalidate the portal session. The primp transport needs nothing (it
+        reads warm_proxy per request). The jar is kept until a rebind succeeds, so a failed launch
+        is retried by the next pass instead of losing the login."""
+        if getattr(self, "_browser_closed", False):
+            return True
+        jar = None
+        if self.session is not None:
+            try:
+                jar = self.session.get_all_cookies() or None
+            except Exception as e:
+                self._log(f"rebind: could not read the cookie jar ({str(e)[:80]}) -- staying put")
+                return False
+        jar = jar or getattr(self, "_rebind_jar", None)
+        if not jar:
+            return False
+        self._rebind_jar = jar
+        try:
+            self._close_session_quietly()
+            self.session = None
+            self.session = get_session(proxy=self.warm_proxy, inject_cookies_full=jar,
+                                       headless=self.headless, fp_seed=self.account.get("username"))
+            self._browser_closed = False
+        except Exception as e:
+            self._log(f"rebind: browser on the new exit failed ({type(e).__name__}: {str(e)[:80]}) "
+                      f"-- jar kept, retrying on the next pass")
+            return False
+        self._rebind_jar = None
+        self._log(f"rebind: login carried to a fresh browser on [{_proxy_label(self.warm_proxy)}] "
+                  f"({why}; {len(jar)} cookies, no re-login)")
+        return True
+
+    def _warm_chain_pass(self, _resume: int, restart: int) -> bool:
+        """ONE pass of the warm-up chain (see _run_warmup_steps). `restart` > 0 = a roll-back pass:
+        it starts at the Questionario exactly as the real client's second attempt did."""
         # HYBRID: run the whole chain on the detached primp client (no browser nav). Same contract
         # (anchor on success, _warmup_last_error taxonomy, already-booked detection), so every caller
         # -- do_warmup, do_apply's round-start re-warm, _do_keepalive, _rebuild_session -- is unchanged.
         self._last_warm_kind = "unknown"
-        # QUEST_HOLD: the questionnaire position the hold had reached (consumed here, always).
-        _resume = self._qh_take()
+        self._warm_fail, self._warm_fail_at = "", ""
         if self._hybrid("WARMUP"):
             # The primp chain never reported to _note_portal, so a hybrid worker's warm-up failures
             # were always kind "unknown": no slow-portal hold, no portal-down check, every stressed
@@ -2963,27 +3250,62 @@ class LiveEngineOps(EngineOps):
             # failure inside the page (dead proxy, dropped tunnel), exactly what a retry is for.
             if _resume:
                 self._log(f"warm-up: RESUMING the held questionnaire at step {_resume + 1}/"
-                          f"{len(self._quest_hold_steps())} (no home-lang POST / Questionario nav)")
-            for attempt in (range(1, _retries + 1) if not _resume else ()):
-                try:
-                    self.session.browser_eval(
-                        "(async()=>{const r=await fetch('%s',{method:'POST',credentials:'include',"
-                        "headers:{'Content-Type':'application/x-www-form-urlencoded'},"
-                        "body:'lang=PT'});return r.status;})()" % HOME_URL
-                    )
-                    break
-                except Exception as e:
-                    self._log(f"home-lang POST attempt {attempt}/{_retries} failed: {e}")
-                    if attempt == _retries:
-                        raise RuntimeError(f"home-lang POST failed: {e}") from e
-                    time.sleep(_quest_backoff(attempt))
-            # Same pacing before the Questionario nav: storm-auto paces the whole early burst
-            # (HOME -> lang POST -> Questionario), not just the steps.
+                          f"{len(self._quest_hold_steps())} (no Questionario nav)")
+
+            def _lang_post() -> None:
+                for attempt in range(1, _retries + 1):
+                    try:
+                        self.session.browser_eval(
+                            "(async()=>{const r=await fetch('%s',{method:'POST',credentials:'include',"
+                            "headers:{'Content-Type':'application/x-www-form-urlencoded'},"
+                            "body:'lang=PT'});return r.status;})()" % HOME_URL
+                        )
+                        return
+                    except Exception as e:
+                        self._log(f"home-lang POST attempt {attempt}/{_retries} failed: {e}")
+                        if attempt == _retries:
+                            raise RuntimeError(f"home-lang POST failed: {e}") from e
+                        time.sleep(_quest_backoff(attempt))
+
+            # Pacing before the Questionario nav (storm-auto paces the whole early burst).
             _gap0 = max(0.0, float(self.cfg.raw.get("QUEST_STEP_GAP", 1.0)))
             if _gap0 > 0 and not _resume:
                 time.sleep(_gap0 * random.uniform(0.7, 1.3))
             if not _resume:
-                self.session.browser_nav(QUEST_URL, timeout=35, skip_cookie_sync=True)
+                # NO home-lang POST up front any more. The real client never sends one: the
+                # 2026-11-06 capture runs login -> /VistosOnline/ -> GET Questionario (attempt 1) and
+                # Schedule.jsp -> GET Questionario (attempt 2), and the Questionario's own questForm
+                # already carries lang=PT. Every POST the real client does not make is a tell. The
+                # POST is kept as a CORRECTION only: when the rendered questForm says a language
+                # other than PT, set PT and reload, so the PT submit path still gets a PT session.
+                q_url = self.session.browser_nav(QUEST_URL, timeout=35, skip_cookie_sync=True)
+                if self._auth_redirect(q_url):
+                    self._note_login_gone("Questionario redirected to the login page")
+                    self._warm_fail_set("auth", "Questionario")
+                    return False
+                try:
+                    q_lang = self.session.browser_eval(
+                        "(document.questForm&&document.questForm.lang)?document.questForm.lang.value:''")
+                except Exception:
+                    q_lang = ""
+                q_lang = str(q_lang or "").strip()
+                if not re.fullmatch(r"[A-Za-z]{2,3}", q_lang):
+                    q_lang = ""                  # not a language code -- no evidence either way
+                if q_lang and q_lang.upper() != "PT":
+                    self._log(f"warm-up: Questionario is in {q_lang!r}, not PT -- setting PT and reloading")
+                    _lang_post()
+                    self.session.browser_nav(QUEST_URL, timeout=35, skip_cookie_sync=True)
+                elif not q_lang:
+                    try:
+                        q_html = self.session.browser_eval("document.documentElement.outerHTML") or ""
+                    except Exception:
+                        q_html = ""
+                    if _is_portal_refusal(q_html):
+                        self._warm_fail_set("refused", "Questionario",
+                                            f"portal refused the Questionario (IP {_refusal_ip(q_html) or '?'})")
+                        self._pulse_obs("refused", reason="busy")
+                        self._log(f"warm-up: {self._warmup_last_error}")
+                        return False
 
             quest_key = self.residence if self.residence != self.nationality else self.nationality
             steps = self.quest_steps.get(quest_key, [])
@@ -3005,17 +3327,25 @@ class LiveEngineOps(EngineOps):
                 # silently corrupts the query string. storm-auto uses urlencode here.
                 url = f"{QUEST_NEXT}?{urlencode(step_qs[i])}"
                 js = (
-                    "(async()=>{const r=await fetch(%r,{method:'GET',credentials:'include',"
-                    "headers:" + _QUEST_XHR_HEADERS_JS + "});const body=await r.text();"
+                    ("(async()=>{const r=await fetch(%r,{method:'GET',credentials:'include',headers:" % (url,))
+                    + _QUEST_XHR_HEADERS_JS + "});const body=await r.text();"
+                    # What the reply SAYS, not just its status: the login gone ("perdeu a sessão" /
+                    # an auth redirect) or the portal's refusal page, both of which answer 200.
+                    "const lb=body.toLowerCase();"
+                    "const gone=" + _QUEST_GONE_JS + ".some(m=>lb.includes(m))"
+                    "||/authentication\\.jsp|sessionlost/i.test(r.url||'');"
+                    "const refused=" + _REFUSED_JS + ".some(m=>lb.includes(m));"
                     + (
                         "const _t=document.createElement('div');_t.innerHTML=body;const f={};"
                         "_t.querySelectorAll('input').forEach(i=>{if(i.name)f[i.name]=i.value;});"
-                        "return {status:r.status,fields:f,len:body.length,"
+                        "return {status:r.status,gone:gone,refused:refused,fields:f,len:body.length,"
                         "snippet:body.substring(0,300)};"
-                        if is_last else "return {status:r.status};"
+                        if is_last else
+                        "return {status:r.status,gone:gone,refused:refused,len:body.length,"
+                        "snippet:refused?body.substring(0,600):''};"
                     )
                     + "})()"
-                ) % (url,)
+                )
                 # storm-auto retries a questionnaire step that doesn't come back 200 -- "like a
                 # manual page refresh" -- up to QUEST_STEP_RETRIES (default 3). We logged the
                 # non-200 and carried on regardless, so one flaky step silently poisoned the whole
@@ -3032,9 +3362,21 @@ class LiveEngineOps(EngineOps):
                         self._log(f"quest step {i+1}/{len(steps)} attempt {attempt}/"
                                   f"{_retries} raised: {e}")
                         if attempt == _retries:
+                            self._warm_fail_set("quest", f"quest step {i+1}/{len(steps)}")
                             raise RuntimeError(f"quest step {i+1} failed: {e}") from e
                         time.sleep(_quest_backoff(attempt))
                         continue
+                    if isinstance(res, dict) and res.get("gone"):
+                        self._note_login_gone(f"quest step {i+1} answered 'session lost'")
+                        self._warm_fail_set("auth", f"quest step {i+1}/{len(steps)}")
+                        return False
+                    if isinstance(res, dict) and res.get("refused"):
+                        _ip = _refusal_ip(str(res.get("snippet") or ""))
+                        self._warm_fail_set("refused", f"quest step {i+1}/{len(steps)}",
+                                            f"portal refused quest step {i+1} (IP {_ip or '?'})")
+                        self._pulse_obs("refused", reason="busy")
+                        self._log(f"warm-up: {self._warmup_last_error}")
+                        return False
                     if isinstance(res, dict) and res.get("status") == 200:
                         break
                     self._log(f"quest step {i+1}/{len(steps)} attempt {attempt}/"
@@ -3052,6 +3394,7 @@ class LiveEngineOps(EngineOps):
                     # does NOT match _is_transient_login_failure, so do_apply will NOT roll the exit
                     # for portal overload -- it backs off and re-warms, which is the right cure.
                     if attempt == _retries:
+                        self._warm_fail_set("quest", f"quest step {i+1}/{len(steps)}")
                         raise RuntimeError(
                             f"quest step {i+1} never returned 200 after {_retries} attempts "
                             f"(last={res}) -- aborting the warm-up chain")
@@ -3085,19 +3428,43 @@ class LiveEngineOps(EngineOps):
                     self._warmup_last_error = "portal maintenance on quest step (last, no form)"
                     self._note_portal("warmup", time.time() - _t0, ok=False,
                                       error=self._warmup_last_error)
+                self._warm_fail_set("challenge" if _is_challenge_body(_snip) else "stale",
+                                    f"quest step {len(steps)}/{len(steps)}")
                 self._log("do_warmup: quest_state_stale (last step yielded no fields)")
                 return False
 
             formulario_url = FORMULARIO + "?copy=true"
             form_body = formulario_body(steps, last_fields, nationality=self.nationality,
                                         residence=self.residence)
-            _, form_html = self.session.browser_form_post(formulario_url, form_body, timeout=100)
+            form_url, form_html = self.session.browser_form_post(formulario_url, form_body, timeout=100)
+            # THE Questionario -> Formulario transition is where the portal's "Request could not be
+            # processed" page lands (operator snapshot 2026-11-06, URL Formulario?copy=true, "IP:
+            # 186.105.116.66"). It used to read as csrf_missing -> an unexplained failure the ladder
+            # re-logged into. It is a refusal of THIS exit/moment: roll the exit, back to Questionario.
+            if _is_portal_refusal(form_html):
+                self._warm_fail_set("refused", "Formulario",
+                                    f"portal refused Formulario?copy=true "
+                                    f"(IP {_refusal_ip(form_html) or '?'}, {len(form_html)}B)")
+                self._pulse_obs("refused", reason="busy")
+                self._log(f"do_warmup: {self._warmup_last_error}")
+                return False
+            if self._auth_redirect(form_url) or "perdeu a sess" in (form_html or "").lower():
+                self._note_login_gone("Formulario answered with the login page / session lost")
+                self._warm_fail_set("auth", "Formulario")
+                return False
+            if _is_challenge_body(form_html):
+                self._warm_fail_set("challenge", "Formulario",
+                                    f"WAF bot-challenge on Formulario ({len(form_html)}B)")
+                self._note_portal("warmup", time.time() - _t0, ok=False, error=self._warmup_last_error)
+                return False
             csrf = _extract_csrf(form_html)
             if not csrf:
                 _, form_html = self.session.browser_form_post(FORMULARIO, form_body, timeout=100)
                 csrf = _extract_csrf(form_html)
             if not csrf:
-                self._log("do_warmup: csrf_missing after Formulario POST")
+                self._warm_fail_set("refused" if _is_portal_refusal(form_html) else "csrf", "Formulario")
+                self._log(f"do_warmup: csrf_missing after Formulario POST ({len(form_html or '')}B, "
+                          f"title={_page_title(form_html)!r})")
                 return False
 
             # Is this posto even on offer for the residence the questionnaire just declared?
@@ -3161,8 +3528,15 @@ class LiveEngineOps(EngineOps):
             # then discarded because the GET that followed looked healthy. 44699 is unmistakable --
             # the same body appears 43 times as "quest step 7/7 returned NO input fields".
             if _is_challenge_body(sc_body):
+                self._warm_fail_set("challenge", "ScheduleController")
                 self._log(f"do_warmup: ScheduleController was answered with a bot challenge "
                           f"({sc_len}B) -- the session cannot POST; NOT warmed")
+                return False
+            if _is_portal_refusal(sc_body):
+                self._warm_fail_set("refused", "ScheduleController",
+                                    f"portal refused ScheduleController (IP {_refusal_ip(sc_body) or '?'})")
+                self._pulse_obs("refused", reason="busy")
+                self._log(f"do_warmup: {self._warmup_last_error}")
                 return False
             # THE guard this file was missing, and the root cause of "applying doesn't work".
             # storm-auto: "ScheduleController POST can return 200 yet the server silently fails to
@@ -3176,8 +3550,18 @@ class LiveEngineOps(EngineOps):
             # the questionnaire page. Confirmed live 2026-08-14: every such bounce carried
             # title='questionnaire to apply for a visa' at 72113B -- the questionnaire, served back
             # in response to a booking submit.
-            self.session.browser_nav(SCHED_JSP + "?posto_id=" + self.posto_id, timeout=30)
+            sched_url = self.session.browser_nav(SCHED_JSP + "?posto_id=" + self.posto_id, timeout=30)
             sched_html = self.session.browser_eval("document.documentElement.outerHTML") or ""
+            if self._auth_redirect(sched_url):
+                self._note_login_gone("Schedule.jsp redirected to the login page")
+                self._warm_fail_set("auth", "Schedule.jsp")
+                return False
+            if _is_portal_refusal(sched_html) and not any(m in sched_html for m in _SCHED_PAGE_MARKERS):
+                self._warm_fail_set("refused", "Schedule.jsp",
+                                    f"portal refused Schedule.jsp (IP {_refusal_ip(sched_html) or '?'})")
+                self._pulse_obs("refused", reason="busy")
+                self._log(f"do_warmup: {self._warmup_last_error}")
+                return False
             # ALREADY-HAS-A-REQUEST is TERMINAL for this identity, checked BEFORE the markers guard
             # because the portal delivers it as a JS alert ("Este requerente já tem um pedido
             # registado") that can fire while Schedule.jsp still renders with markers -- so a
@@ -3191,6 +3575,7 @@ class LiveEngineOps(EngineOps):
                           f"({booked_sig[:400]!r}) -- retiring the identity and STOPPING this worker")
                 if self._emit is not None:
                     self._emit("already_booked", detail=booked_sig)
+                self._warm_fail_set("booked", "Schedule.jsp")
                 return False
             if not any(m in sched_html for m in _SCHED_PAGE_MARKERS):
                 title = re.search(r"<title[^>]*>(.*?)</title>", sched_html, re.S | re.I)
@@ -3207,6 +3592,11 @@ class LiveEngineOps(EngineOps):
                           f"{(title.group(1).strip()[:60] if title else '?')!r}) -- ScheduleController "
                           f"was rejected (response {sc_len}B); NOT warmed")
                 if errs:
+                    # OUR DATA is wrong (2026-11-06 capture: f45 "Residência habitual" empty -> the
+                    # form came back with ">> Os items marcados com * são obrigatórios [ 19. ... ]").
+                    # Rolling back and resending the same payload cannot fix it -- not restarted.
+                    self._warm_fail_set("validation", "ScheduleController",
+                                        "ScheduleController validation: " + " | ".join(e[:120] for e in errs))
                     self._log("do_warmup: ScheduleController validation errors: "
                               + " | ".join(e[:120] for e in errs))
                     # The portal saying this applicant ALREADY HOLDS a future appointment is not a
@@ -3230,6 +3620,7 @@ class LiveEngineOps(EngineOps):
                     # No recognisable error markup: record enough of the body to identify the page,
                     # so "rejected with no errors found" is still actionable rather than a dead end.
                     body_title = re.search(r"<title[^>]*>(.*?)</title>", sc_body, re.S | re.I)
+                    self._warm_fail_set("rejected", "ScheduleController")
                     self._log("do_warmup: ScheduleController rejected but no validation text found "
                               f"(body title={(body_title.group(1).strip()[:60] if body_title else '?')!r}, "
                               f"{sc_len}B)")
@@ -3241,11 +3632,14 @@ class LiveEngineOps(EngineOps):
             self._set_anchor("chain")
             if self.posto_pdf != self.posto_id:
                 self._log(f"do_warmup: posto_pdf={self.posto_pdf} differs from posto_id={self.posto_id}")
+            self._note_schedule_availability(sched_html, "warm-up")
             self._note_portal("warmup", time.time() - _t0, ok=True)
             self._note_exit_ip("warmed")
             return True
         except Exception as e:
             self._warmup_last_error = str(e)
+            if not self._warm_fail:
+                self._warm_fail_set("error", "warm-up chain")
             self._note_portal("warmup", time.time() - _t0, ok=False, error=str(e))
             return False
 
@@ -3761,6 +4155,7 @@ class LiveEngineOps(EngineOps):
             self._log(f"keepalive[quest_hold]: session expired at {kind} ({n}B, {context}) -- "
                       f"re-authenticating")
             self._slog("keepalive", result="expired", mode="quest_hold", ev=kind, ctx=context)
+            self._note_login_gone(f"keepalive[quest_hold]: session expired at {kind}")
             self._attempt_keepalive_restore(context)
             return
         if self._is_dead_exit_response(page, final_url):
@@ -3850,6 +4245,7 @@ class LiveEngineOps(EngineOps):
         # Auth lost -> re-authenticate (needs the reCAPTCHA browser login; restore owns that).
         if "Authentication.jsp" in (final_url or "") or "Authentication.jsp" in page[:3000]:
             self._log(f"keepalive[hybrid]: session expired (auth redirect, {context}) -- re-authenticating")
+            self._note_login_gone("keepalive[hybrid]: auth redirect")
             self._attempt_keepalive_restore(context)
             return True
         if self._is_dead_exit_response(page, final_url):
@@ -3872,6 +4268,7 @@ class LiveEngineOps(EngineOps):
                 self._log(f"keepalive[hybrid]: logged out (home without the auth-gated menu, "
                           f"{context}) -- re-authenticating")
                 self._slog("keepalive", result="expired", mode="auth_only", via="primp", ctx=context)
+                self._note_login_gone("keepalive[hybrid]: home page logged out")
                 self._attempt_keepalive_restore(context)
                 return True
             if verdict == SessionState.PORTAL_ERROR and _is_challenge_body(page) \
@@ -3986,6 +4383,7 @@ class LiveEngineOps(EngineOps):
                 if "Authentication.jsp" in (final_url or ""):
                     self._log(f"keepalive[schedule]: session expired (auth redirect, {context}) -- "
                               f"re-authenticating")
+                    self._note_login_gone("keepalive[schedule]: auth redirect")
                     self._attempt_keepalive_restore(context)
                     return
                 page = self._keepalive_read_page()
@@ -4077,6 +4475,7 @@ class LiveEngineOps(EngineOps):
                 self._log(f"keepalive: session expired ({len(page)}B, exit={getattr(self, '_exit_ip', None)}, "
                           f"{context}) -- re-authenticating rather than re-warming a dead session")
                 self._slog("keepalive", result="expired", bytes=len(page), ctx=context)
+                self._note_login_gone("keepalive: session expired")
                 self._attempt_keepalive_restore(context)
                 return
             if state == SessionState.PORTAL_ERROR:
@@ -4249,6 +4648,40 @@ class LiveEngineOps(EngineOps):
         self._slog("keepalive", result="expired", reason="unproven_hold", ctx=context)
         self._attempt_keepalive_restore(context)
 
+    def _relogin_allowed(self) -> bool:
+        """A fresh login is spent only on POSITIVE evidence the portal login is gone, unless the
+        operator turned RELOGIN_ONLY_ON_AUTH_LOSS off (the old re-login-on-any-failure ladder)."""
+        if not bool(self.cfg.raw.get("RELOGIN_ONLY_ON_AUTH_LOSS", True)):
+            return True
+        return bool(getattr(self, "_login_gone", ""))
+
+    def _restore_from_jar(self, jar, context: str) -> bool:
+        """Rebuild the browser on the current exit with the live cookie jar and prove the login on
+        the home page. ok -> the same login, kept. logged-out -> positive evidence: fresh login.
+        unknown (dead exit again, unreadable) -> keep the jar and report not-restored; the next
+        keepalive cycle tries again -- never a re-login on no evidence."""
+        if not jar:
+            self._log(f"keepalive: no cookie jar to carry ({context}) -- the login cannot be kept; "
+                      f"logging in")
+            return self._fresh_login()
+        self._rebind_jar = jar
+        # The browser was torn down above; a Phase-C "closed" flag would make the rebind a no-op and
+        # leave the worker with no session at all.
+        self._browser_closed = False
+        if not self._rebind_browser_exit(f"keepalive restore ({context})"):
+            return False
+        verdict = self._auth_verdict()
+        if verdict == "ok":
+            self._log(f"keepalive: the login survived ({context}) -- restored from the live jar, "
+                      f"no re-login")
+            return True
+        if verdict == "logged_out":
+            self._note_login_gone("keepalive restore: home page logged out")
+            return self._fresh_login()
+        self._log(f"keepalive: restored browser cannot prove the login yet ({context}) -- keeping it, "
+                  f"re-probing next cycle (no re-login without evidence)")
+        return False
+
     def _attempt_keepalive_restore(self, context: str = "") -> bool:
         """Returns whether the session came back. The session looks dead -- try the same checkpoint-restore-then-fresh-login chain a fresh
         launch uses, rather than silently sitting on a dead session until the next real signal
@@ -4277,13 +4710,29 @@ class LiveEngineOps(EngineOps):
         # here. Cleared on success below, and left set on failure -- a worker whose restore failed
         # is not bookable either, and the next successful restore or re-warm clears it.
         self._mark_keep_bookable(False, "re-authenticating: rebuilding the session", substate="logging_in")
+        # Snapshot the LIVE jar before the browser goes: it is the login we are trying to keep.
+        jar = None
+        try:
+            if self.session is not None and not getattr(self, "_browser_closed", False):
+                jar = self.session.get_all_cookies() or None
+        except Exception:
+            jar = None
+        jar = jar or getattr(self, "_hybrid_full_jar", None) or getattr(self, "_rebind_jar", None)
         try:
             if self.session is not None:
                 self.session.close_browser()
         except Exception:
             pass
         self.session = None
-        ok = self._try_restore_from_checkpoint() or self._fresh_login()
+        ok = self._try_restore_from_checkpoint()
+        if not ok:
+            if self._relogin_allowed():
+                ok = self._fresh_login()
+            else:
+                # NO positive evidence the login is gone (a dead exit, an inconclusive read): carry
+                # the login itself to a fresh browser on the current exit instead of spending a new
+                # one (operator 2026-11-06; Q16: an exit change does not invalidate the session).
+                ok = self._restore_from_jar(jar, context)
         # RE-WARM THE FORM ONLY IN SCHEDULE MODE. A checkpoint restore re-AUTHENTICATES only (it SETS
         # posto_pdf from the file without rebuilding anything, so `_anchor_src != "chain"` means the
         # form-state anchor is not verified on THIS session). In schedule mode KEEPING must hold a

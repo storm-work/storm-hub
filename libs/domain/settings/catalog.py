@@ -926,6 +926,21 @@ _BOOKING = [
        "failure. The first answer decides: warmed -> apply; logged out -> re-login at once. Run 1023: "
        "75/123 workers threw away a live login on ONE failed re-warm and only 25 got back in; after "
        "recovery every logged-in worker warmed in 1-2 min. OFF = the old behaviour exactly."),
+    _s("RELOGIN_ONLY_ON_AUTH_LOSS", L.BOOKING, bool, True, group="guards",
+       note=
+       "RE-LOGIN ONLY WHEN THE LOGIN IS GONE (default ON, operator 2026-11-06: 'it's not good to "
+       "decide to re-login; the logged-in session is kept by our own activity on it'). Every recovery "
+       "ladder -- initial warm-up, apply re-warm, scout rebuild, form_stale, keepalive restore -- "
+       "re-logs in only on POSITIVE evidence the portal login is gone: an Authentication.jsp / "
+       "sessionLost redirect, a 'perdeu a sessão' answer, or the home page read without the "
+       "logged-in menu. Without it the worker keeps the login and keeps re-warming (WARM_HOLD_MAX_S), "
+       "and a keepalive restore carries the live cookie jar to a fresh browser instead of logging in. "
+       "OFF = the old ladder (re-login after REWARM_MAX_ATTEMPTS failed re-warms)."),
+    _s("WARM_HOLD_MAX_S", L.BOOKING, float, 3600.0, group="guards", min_value=0.0,
+       note=
+       "Longest a worker keeps re-warming on a kept login (RELOGIN_ONLY_ON_AUTH_LOSS) before giving "
+       "the worker up to a respawn. Paced by STRESS_HOLD_GAP. Ends at once on validation errors "
+       "(our form data -- fix the config) or positive evidence the login is gone. Default 1 h."),
     _s("STRESS_HOLD_MAX_S", L.BOOKING, float, 7200.0, group="guards", min_value=0.0,
        note=
        "Longest a single STRESS_HOLD lasts (s) before the old ladder (rebuild / re-login) resumes. "
@@ -998,9 +1013,11 @@ _TEMPLATE = [
             "fails the worker over proxy weather -- confirmed live 2026-08-14, six workers "
             "permanently FAILED that way. 0 makes every failure count against the sub-account, "
             "i.e. the old (broken) behaviour."),
-    _s("QUEST_STEP_RETRIES", L.TEMPLATE, int, 3, _WRK, "login_resilience", min_value=1.0,
+    _s("QUEST_STEP_RETRIES", L.TEMPLATE, int, 5, _WRK, "login_resilience", min_value=1.0,
        note=
-       "Retries per questionnaire step. The chain must complete or the booking cursor is never "
+       "DEFAULT 3 -> 5 (2026-11-06): the operator sees quest-step AJAX failures 'many times' when the "
+       "net or portal is unstable, and re-trying the SAME step is what recovers them (2026-11-06 "
+       "capture: q2 died with status 0 and the next try answered 200). Retries per questionnaire step. The chain must complete or the booking cursor is never "
        "built, so this is worth more than most retry budgets. UNWIRED until 2026-10-01: the code "
        "hardcoded _QUEST_STEP_RETRIES=3 and never read this (default was a never-validated 10) -- "
        "corrected to 3 to match the proven value and wired to a real read site in "
@@ -1089,6 +1106,19 @@ _TEMPLATE = [
             "traffic / slow render), so backing off between attempts is the reliable recovery; it is "
             "NOT a dead-exit signal and does not roll the exit. Default 1.5 preserves the first "
             "attempt's wait; 0 restores the old no-backoff behaviour."),
+    _s("WARMUP_CHAIN_RESTARTS", L.TEMPLATE, int, 3, _WRK, "login_resilience", min_value=0.0,
+       note=
+       "ROLL BACK TO THE QUESTIONARIO (2026-11-06). When one warm-up pass fails part-way -- a "
+       "questionnaire step that exhausted QUEST_STEP_RETRIES, the portal's 'Request could not be "
+       "processed' page (seen on the Questionario -> Formulario transition), a missing CSRF, a "
+       "ScheduleController that did not produce a schedule page, a dead exit -- the chain restarts "
+       "from GET Questionario on the SAME login, exactly as the real client's second attempt did in "
+       "the 2026-11-06 capture. A refusal page also rolls the exit first and re-binds the browser to "
+       "it with the same cookies. Not restarted: a slow/down/challenging portal (STRESS_HOLD owns "
+       "it), validation errors (our data), already-booked, a lost login. 0 = one pass only."),
+    _s("WARMUP_RESTART_BACKOFF", L.TEMPLATE, float, 5.0, _WRK, "login_resilience", min_value=0.0,
+       note="seconds (x restart number, +-20%% jitter) before each WARMUP_CHAIN_RESTARTS roll-back "
+            "pass. Default 5 -> 5 s, 10 s, 15 s."),
     _s("WARMUP_MAX_ATTEMPTS", L.TEMPLATE, int, 6, _WRK, "login_resilience",
        note=
        "Attempts at the warm-up chain before giving up on it. A warm-up failure means the server- "
@@ -1110,9 +1140,12 @@ _TEMPLATE = [
     # ladder is: re-warm once, then re-login IN-PROCESS. Neither step ever ends the process.
     _s("REWARM_MAX_ATTEMPTS", L.TEMPLATE, int, 1, _WRK, "login_resilience",
        note=
-       "In-place re-warms before escalating to a fresh login. Default 1 is the PROVEN value: storm- "
-       "auto abc5 showed re-warm is unreliable on a long-held session (852 'Session lost' in one "
-       "run) and only a fresh login rebuilds the anchor. Raising this mostly buys failed re-warms."),
+       "In-place re-warms before the ladder considers a fresh login. Default 1 is the PROVEN value: "
+       "storm-auto abc5 showed re-warm is unreliable on a long-held session (852 'Session lost' in "
+       "one run) and only a fresh login rebuilds the anchor. Since 2026-11-06 that escalation needs "
+       "POSITIVE evidence the login is gone (RELOGIN_ONLY_ON_AUTH_LOSS) -- abc5's 'Session lost' IS "
+       "such evidence; a failed step is not -- and each re-warm already rolls back to the "
+       "Questionario up to WARMUP_CHAIN_RESTARTS times."),
     # Keepalive
     # 360 (+0..120 jitter = 6-8 min) since 2026-10-28, because the portal SESSION idles out at ~10.4 min
     # and 600+30 sat on that line. History: 600, not 900. MEASURED 2026-08-20 across 28 keepalive cycles on booking "Test 3018": the

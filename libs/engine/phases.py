@@ -207,6 +207,61 @@ class PhaseMachine:
                 return "unavailable"
         return "escalate"
 
+    # ── re-login only on POSITIVE evidence the login is gone (operator, 2026-11-06) ────────────
+    # "In any case it's not good to decide to re-login. The logged-in session is kept by our own
+    # activity on that logged-in session." A failed warm-up step, the portal's "Request could not be
+    # processed" page, a dead exit or an unexplained ScheduleController rejection says the WORKFLOW
+    # cursor (or the tunnel) is not where we need it -- not that the login is gone. Every ladder
+    # below used to escalate to do_login() after one or two failed re-warms on no evidence at all,
+    # spending a solve and a sub-account login shot (the scarcest thing a run has, see
+    # login_per_account_throttle) to replace a login that was very likely still good.
+    def _relogin_justified(self, why: str) -> bool:
+        """True when a re-login is warranted: the ops layer reports positive evidence the portal
+        login is gone (auth redirect, 'session lost', a logged-out home page), or the operator set
+        RELOGIN_ONLY_ON_AUTH_LOSS off. An ops without login_lost keeps the old ladder."""
+        if not bool(self.cfg.raw.get("RELOGIN_ONLY_ON_AUTH_LOSS", True)):
+            return True
+        lost = getattr(self.ops, "login_lost", None)
+        if not callable(lost):
+            return True
+        return bool(lost())
+
+    def _hold_login(self, why: str) -> str:
+        """Keep the login and keep re-warming on it (each re-warm already rolls back to the
+        Questionario and rolls a refused/dead exit -- ops._run_warmup_steps) until it warms.
+
+        Returns "warmed", "stopped", "unavailable" (applicant already booked), "login_lost" (positive
+        evidence appeared -- the caller may re-login now), or "gave_up": our own DATA is rejected
+        (validation errors -- no number of re-warms fixes it) or WARM_HOLD_MAX_S passed. Bounded by
+        time AND attempts like _ride_out_stress, so an instant wait cannot spin."""
+        cap = max(0.0, float(self.cfg.raw.get("WARM_HOLD_MAX_S", 3600.0) or 0.0))
+        gap = max(1.0, float(self.cfg.raw.get("STRESS_HOLD_GAP", 15.0) or 15.0))
+        max_tries = max(1, int(cap / gap))
+        unavail = getattr(self.ops, "identity_unavailable", lambda: False)
+        lost = getattr(self.ops, "login_lost", None)
+        reason = getattr(self.ops, "warmup_failure_reason", lambda: "")
+        t0 = time.time()
+        tries = 0
+        while tries < max_tries and time.time() - t0 < cap:
+            if unavail():
+                return "unavailable"
+            if callable(lost) and lost(probe=False):
+                return "login_lost"
+            if reason() == "validation":
+                self._to(WorkerSubstate.KEEPING,
+                         detail=f"the portal rejects our form DATA (validation) -- fix the config: {why}")
+                return "gave_up"
+            tries += 1
+            self._to(WorkerSubstate.KEEPING,
+                     detail=(f"warm-up failing, login kept (not logged out) -- re-warm {tries} "
+                             f"({int(time.time() - t0)}s): {why}"))
+            if self._stress_wait():
+                return "stopped"
+            self._to(WorkerSubstate.WARMING_UP, detail=f"login-kept re-warm {tries}: {why}")
+            if self.ops.do_warmup():
+                return "warmed"
+        return "gave_up"
+
     def _warm_with_recovery(self, why: str) -> bool:
         """Recover a FAILED warm-up WITHOUT discarding the authenticated session.
 
@@ -267,8 +322,17 @@ class PhaseMachine:
                 return False          # stop / already-booked, or still stressed past the cap
             # The portal answered and it was not a warm session -- fall through to the re-login rung.
 
-        # Re-warm alone has stopped rebuilding the anchor -- only a fresh login will (storm-auto
-        # abc5). Still in-process: same worker, same proxy, same sub-account. NEVER for an
+        # NOT LOGGED OUT -> NO RE-LOGIN. Keep the login and keep re-warming on it (2026-11-06).
+        if _unavail():
+            return False
+        if not self._relogin_justified(why):
+            held = self._hold_login(why)
+            if held == "warmed":
+                return True
+            if held != "login_lost":
+                return False
+        # Re-login: the portal itself says the login is gone (or the operator opted out of the
+        # evidence rule). Still in-process: same worker, same proxy, same sub-account. NEVER for an
         # already-booked identity (a re-login cannot un-book it; it only spends a login shot).
         if _unavail():
             return False
@@ -515,7 +579,9 @@ class PhaseMachine:
         # {"data":{}} six times out of six. Because a successful re-warm returns True here, the
         # ladder never reached the re-login rung at all, and the worker sat in that loop for two
         # hours looking healthy. The escalation only ever fired when the re-warm happened to fail.
-        if skip_rewarm:
+        # The /slots "burned session" stub that motivates skip_rewarm is a REFUSED TOKEN, not a lost
+        # login (slots_stub_is_token_refusal) -- so it, too, needs positive evidence to re-login.
+        if skip_rewarm and self._relogin_justified(why):
             self._to(WorkerSubstate.KEEPING, detail=f"re-warm cannot fix this; re-login: {why}")
             self._to(WorkerSubstate.LOGGING_IN)
             if not self.ops.do_login():
@@ -551,7 +617,18 @@ class PhaseMachine:
                 return True
             # escalate: the portal answered with something other than a warm session (or the hold
             # cap passed) -- the re-login below is now the right rung.
-        # Re-warm couldn't rebuild the workflow anchor -- only a fresh login will (abc5).
+        # NOT LOGGED OUT -> NO RE-LOGIN (2026-11-06): keep the login and keep re-warming on it.
+        if not self._relogin_justified(why):
+            held = self._hold_login(why)
+            if held == "warmed":
+                self._to(WorkerSubstate.WARMED)
+                self._to(WorkerSubstate.KEEPING)
+                return True
+            if held in ("stopped", "unavailable"):
+                return True       # same convention as the stress hold above
+            if held != "login_lost":
+                return False
+        # The portal says the login is gone -- only a fresh login rebuilds it.
         self._to(WorkerSubstate.KEEPING, detail=f"re-warm failed; re-login: {why}")
         self._to(WorkerSubstate.LOGGING_IN)
         if not self.ops.do_login():
@@ -892,9 +969,17 @@ class PhaseMachine:
                 stale_streak += 1
                 self.ops.release_slot(slot, "form_stale")
                 slot = None
+                if stale_streak >= max_rewarms and not self._relogin_justified("form_stale"):
+                    # form_stale with the login intact: the next round's mandatory re-warm (which
+                    # rolls back to the Questionario) is the cure -- not a new login (2026-11-06).
+                    stale_streak = 0
+                    self._to(WorkerSubstate.KEEPING,
+                             detail="form_stale: login kept (not logged out) -- re-warming, no re-login")
+                    self.ops.poll_gap()
+                    continue
                 if stale_streak >= max_rewarms:
-                    # Re-warm alone has stopped rebuilding the anchor (storm-auto abc5); only a
-                    # fresh login will. In-process: same worker, same proxy.
+                    # The portal says the login is gone; only a fresh login rebuilds it.
+                    # In-process: same worker, same proxy.
                     stale_streak = 0
                     self._to(WorkerSubstate.KEEPING,
                              detail="form_stale: re-login in place (re-warm not rebuilding anchor)")

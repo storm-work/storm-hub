@@ -166,7 +166,7 @@ class _FakeSession:
     def get_all_cookies(self):
         return self._cookies
 
-    def browser_nav(self, url, timeout=30):
+    def browser_nav(self, url, timeout=30, **_kw):
         self._last_url = url or ""
         return url
 
@@ -1008,7 +1008,7 @@ def test_keepalive_off_skips_probe_entirely():
     ops = _make_ops(cfg=_cfg(KEEPALIVE_OFF=True), signals=_FakeSignals(timeouts=1, final="slot_open"))
 
     class _ExplodingSession(_FakeSession):
-        def browser_nav(self, url, timeout=30):
+        def browser_nav(self, url, timeout=30, **_kw):
             raise AssertionError("keepalive probe must not fire when KEEPALIVE_OFF is set")
 
     ops.session = _ExplodingSession()
@@ -1022,7 +1022,7 @@ def test_keepalive_dead_trip_after_slot_found_triggers_restore_attempt():
     ops._signals.slot_found_seen = True
 
     class _DyingSession(_FakeSession):
-        def browser_nav(self, url, timeout=30):
+        def browser_nav(self, url, timeout=30, **_kw):
             raise RuntimeError("net::ERR_TUNNEL_CONNECTION_FAILED")
 
     ops.session = _DyingSession()
@@ -1109,7 +1109,7 @@ def test_keepalive_no_restore_skips_restore_on_dead_trip():
     ops._signals.slot_found_seen = True
 
     class _DyingSession(_FakeSession):
-        def browser_nav(self, url, timeout=30):
+        def browser_nav(self, url, timeout=30, **_kw):
             raise RuntimeError("dead")
 
     ops.session = _DyingSession()
@@ -1138,7 +1138,7 @@ def test_dead_trip_rebuilds_even_before_slot_found():
     assert ops._signals.slot_found_seen is False   # no slot found yet -- must NOT matter any more
 
     class _DyingSession(_FakeSession):
-        def browser_nav(self, url, timeout=30):
+        def browser_nav(self, url, timeout=30, **_kw):
             raise RuntimeError("net::ERR_TUNNEL_CONNECTION_FAILED")
 
     ops.session = _DyingSession()
@@ -1156,7 +1156,7 @@ def test_keepalive_no_restore_still_suppresses_the_rebuild_before_slot_found():
     assert ops._signals.slot_found_seen is False
 
     class _DyingSession(_FakeSession):
-        def browser_nav(self, url, timeout=30):
+        def browser_nav(self, url, timeout=30, **_kw):
             raise RuntimeError("net::ERR_TUNNEL_CONNECTION_FAILED")
 
     ops.session = _DyingSession()
@@ -1221,7 +1221,7 @@ class _RecordingSession(_FakeSession):
         self.nav_urls: list[str] = []
         self._last_url = ""
 
-    def browser_nav(self, url, timeout=30):
+    def browser_nav(self, url, timeout=30, **_kw):
         self.nav_urls.append(url)
         self._last_url = url
         return url
@@ -1274,7 +1274,7 @@ class _FlakySession(_RecordingSession):
         self.fail_times = fail_times
         self.periodos_attempts = 0
 
-    def browser_nav(self, url, timeout=30):
+    def browser_nav(self, url, timeout=30, **_kw):
         if "gettime" not in url:
             self.periodos_attempts += 1
             if self.periodos_attempts <= self.fail_times:
@@ -1534,7 +1534,7 @@ def test_restore_skips_the_rewarm_once_the_budget_is_spent(monkeypatch):
     import apps.worker.ops_live as ops_live_mod
 
     class _SlowProbe(_FakeSession):
-        def browser_nav(self, url, timeout=30):
+        def browser_nav(self, url, timeout=30, **_kw):
             ops_live_mod.time.sleep(0)             # patched clock does the work
             return "https://x/Authentication.jsp"  # -> not alive
 
@@ -2335,8 +2335,12 @@ def test_persistent_in_page_fetch_failure_still_fails_the_warmup(monkeypatch):
 
 
 class _DeadHomeSession(_WarmupSession):
+    # The home-lang POST only runs to CORRECT a non-PT questForm since 2026-11-06 (the real client
+    # sends none), so these fakes render the Questionario in English to reach it.
     def browser_eval(self, js, timeout=30):
         if "location.origin" in (js or ""): return _origin_reply(js)
+        if "questForm.lang" in js:
+            return "ENG"
         if "body:'lang=PT'" in js:
             raise RuntimeError("Page.evaluate: TypeError: Failed to fetch")
         return super().browser_eval(js, timeout)
@@ -2362,6 +2366,8 @@ class _FlakyHomeSession(_WarmupSession):
 
     def browser_eval(self, js, timeout=30):
         if "location.origin" in (js or ""): return _origin_reply(js)
+        if "questForm.lang" in js:
+            return "ENG"                  # see _DeadHomeSession
         if "body:'lang=PT'" in js:
             self.home_calls += 1
             if self.home_calls <= self.fail_n:
@@ -2383,7 +2389,7 @@ def test_the_home_lang_post_is_retried_like_every_other_in_page_fetch(monkeypatc
 
 def test_the_home_lang_post_still_fails_the_warmup_when_it_never_recovers(monkeypatch):
     monkeypatch.setattr("apps.worker.ops_live.time.sleep", lambda s: None)
-    ops = _make_ops()
+    ops = _make_ops(cfg=_cfg(WARMUP_CHAIN_RESTARTS=0))
     ops.session = _FlakyHomeSession(_SCHED_OK, fail_n=99)
     assert ops._run_warmup_steps() is False
 
@@ -2605,7 +2611,7 @@ def test_keepalive_still_reaches_dead_trip_on_transport_failure():
     ops._signals.slot_found_seen = True
 
     class _DyingSession(_FakeSession):
-        def browser_nav(self, url, timeout=30):
+        def browser_nav(self, url, timeout=30, **_kw):
             raise RuntimeError("net::ERR_TUNNEL_CONNECTION_FAILED")
 
     ops.session = _DyingSession()
@@ -4759,7 +4765,7 @@ class _SwapSession:
     def __init__(self):
         self.navs = []
 
-    def browser_nav(self, url, timeout=None):
+    def browser_nav(self, url, timeout=None, **_kw):
         self.navs.append(url)
         return url
 
@@ -4795,7 +4801,7 @@ def test_the_swap_probe_rejects_an_expired_session():
     ops._log = lambda *a, **k: None
 
     class _Expired(_SwapSession):
-        def browser_nav(self, url, timeout=None):
+        def browser_nav(self, url, timeout=None, **_kw):
             self.navs.append(url)
             return "https://pedidodevistos.mne.gov.pt/VistosOnline/Authentication.jsp"
 
@@ -4831,7 +4837,7 @@ class _UnwarmedSession:
     def get_all_cookies(self):
         return [{"name": "Vistos_sid", "value": "abc"}]
 
-    def browser_nav(self, url, timeout=30):
+    def browser_nav(self, url, timeout=30, **_kw):
         self.navs.append(url)
         return url
 
@@ -5254,7 +5260,7 @@ class _SlotsCallbackSession:
         self._html = page_html
         self.navs = 0
 
-    def browser_nav(self, url, timeout=30):
+    def browser_nav(self, url, timeout=30, **_kw):
         self.navs += 1
 
     def browser_eval(self, js, timeout=30):
@@ -5406,7 +5412,7 @@ def test_warmup_aborts_the_chain_when_a_quest_step_never_succeeds():
     ops = _quest_storm_ops("STEP2")
     assert ops._run_warmup_steps() is False
     assert "STEP3" not in ops.session.steps_seen, "the chain must NOT advance past the failed step"
-    assert ops.session.steps_seen.count("STEP2") == 3   # QUEST_STEP_RETRIES default = retried in place
+    assert ops.session.steps_seen.count("STEP2") == 5   # QUEST_STEP_RETRIES default = retried in place
 
 
 def test_warmup_abort_on_503_is_not_a_dead_exit_so_do_apply_would_not_roll():
@@ -6115,7 +6121,8 @@ def test_a_primp_warmup_challenge_degrades_to_the_browser_chain_not_a_relogin():
     browser_runs = []
     ops._ensure_portal_origin = lambda why: (browser_runs.append(why), False)[1]   # stop the browser chain early
     ops._run_warmup_steps()
-    assert reopens and browser_runs == ["the warm-up chain"], "the browser chain ran this same round"
+    # (later entries are WARMUP_CHAIN_RESTARTS roll-back passes: the stubbed origin never recovers)
+    assert reopens and browser_runs[:1] == ["the warm-up chain"], "the browser chain ran this same round"
     assert ops._primp_blocked and not ops._hybrid("WARMUP") and not ops._hybrid("SUBMIT")
     assert not ops._hybrid("CLOSE_BROWSER"), "and the reopened browser is not closed again"
 

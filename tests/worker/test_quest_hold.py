@@ -26,6 +26,8 @@ class _QSession(_FakeSession):
     def browser_eval(self, js):
         if "location.origin" in (js or ""):
             return super().browser_eval(js)
+        if "questForm.lang" in js:
+            return "PT"                      # the real Questionario's questForm carries lang=PT
         if "lang=PT" in js and "method:'POST'" in js:
             self.calls.append(("home_lang", HOME_URL))
             return 200
@@ -37,9 +39,10 @@ class _QSession(_FakeSession):
         return self.page
 
 
-def _hold_ops(session=None, steps=_STEPS):
+def _hold_ops(session=None, steps=_STEPS, **template):
     cfg = EngineConfig.from_settings(resolve({
-        L.TEMPLATE: {"ROLE": "apply"}, L.BOOKING: {**_UNIT_MODE, "KEEPALIVE_MODE": "quest_hold"}}))
+        L.TEMPLATE: {"ROLE": "apply", **template},
+        L.BOOKING: {**_UNIT_MODE, "KEEPALIVE_MODE": "quest_hold"}}))
     ops = _make_ops(cfg=cfg, quest_steps={"IRL": steps})
     ops.session = session or _QSession()
     ops._log = lambda *a, **k: None
@@ -123,7 +126,8 @@ def test_keepalive_window_is_the_hold_range_until_warmed():
 
 
 def test_warmup_resumes_the_held_questionnaire():
-    ops = _hold_ops()
+    # One pass: this is about what the RESUMED pass sends (a roll-back pass starts at the Questionario).
+    ops = _hold_ops(WARMUP_CHAIN_RESTARTS=0)
     ops._qh_pos = 2
     ops._run_warmup_steps()
     kinds = [c[0] for c in ops.session.calls]
@@ -135,10 +139,11 @@ def test_warmup_resumes_the_held_questionnaire():
 
 
 def test_warmup_without_a_held_position_runs_the_whole_chain():
-    ops = _hold_ops()
+    ops = _hold_ops(WARMUP_CHAIN_RESTARTS=0)
     ops._run_warmup_steps()
     kinds = [c[0] for c in ops.session.calls]
-    assert kinds.count("home_lang") == 1 and kinds.count("step") == 3
+    # No home-lang POST: the questForm is already PT (the real client sends none, 2026-11-06 capture).
+    assert kinds.count("home_lang") == 0 and kinds.count("step") == 3
     assert ("nav", QUEST_URL) in ops.session.calls
 
 

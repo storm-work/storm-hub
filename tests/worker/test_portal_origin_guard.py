@@ -23,7 +23,7 @@ class _Sess:
         href = BASE + "/Schedule.jsp" if o == _PORTAL_ORIGIN else "chrome-error://chromewebdata/"
         return json.dumps({"o": o, "h": href})
 
-    def browser_nav(self, url, timeout=30):
+    def browser_nav(self, url, timeout=30, **_kw):
         self.navs.append(url)
         return url
 
