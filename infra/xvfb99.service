@@ -1,0 +1,14 @@
+[Unit]
+Description=Shared Xvfb virtual display :99 for storm-hub headful browsers
+After=network.target
+
+[Service]
+Type=simple
+# One persistent virtual display every headful worker reuses. 1280x1024x24 matches the
+# per-worker Xvfb the code starts today, so fingerprints/screenshots are unchanged.
+ExecStart=/usr/bin/Xvfb :99 -screen 0 1280x1024x24 -nolisten tcp
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,21 @@
+[Unit]
+Description=Donut Browser app (Local API on 127.0.0.1:10108) for storm-hub's donut backend
+After=network.target xvfb77.service
+Requires=xvfb77.service
+
+[Service]
+Type=simple
+User=storm
+Environment=DISPLAY=:77
+Environment=HOME=/home/storm
+WorkingDirectory=/home/storm
+# The app needs a D-Bus session bus; on the old host it was started by hand as
+# `dbus-run-session -- donutbrowser` and did not survive a reboot.
+ExecStart=/usr/bin/dbus-run-session -- /usr/bin/donutbrowser
+# Starting the app is safe at boot: it books nothing. Only the Hub (no [Install], started by hand)
+# drives workers. Restart it after Donut support lifts a profile-quota block (DONUT_BACKEND.md).
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

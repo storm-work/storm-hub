@@ -1,0 +1,14 @@
+[Unit]
+Description=Xvfb virtual display :77 for the Donut Browser app
+After=network.target
+
+[Service]
+Type=simple
+# The Donut desktop app needs a display even though its profiles run headless. 1920x1080x24 is
+# what it ran on when the profiles were created (docs/engineering/DONUT_BACKEND.md).
+ExecStart=/usr/bin/Xvfb :77 -screen 0 1920x1080x24 -nolisten tcp
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

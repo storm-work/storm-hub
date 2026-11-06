@@ -1,4 +1,6 @@
-https://154.22.5.137 {
+# Site address is a placeholder: infra/relocate/bootstrap.sh renders it with --host into
+# /etc/caddy/Caddyfile. To render by hand: sed "s|{$STORM_HUB_HOST}|<ip-or-domain>|" infra/Caddyfile
+https://{$STORM_HUB_HOST} {
 	tls internal
 
 	# JSON access log -- required by the fail2ban jail in infra/fail2ban/storm-hub-auth.conf, which

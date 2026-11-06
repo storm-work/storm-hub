@@ -37,10 +37,18 @@ tests/      pytest
 ## Dev
 
 ```bash
-python3 -m venv .venv && .venv/bin/pip install -e '.[dev]' sqlalchemy alembic
-.venv/bin/python -m pytest            # domain + schema smoke tests
-DATABASE_URL=postgresql+psycopg://... .venv/bin/alembic upgrade head
+uv sync --frozen --extra dev                       # .venv from uv.lock
+.venv/bin/python -m playwright install chromium    # the pinned build (1228)
+(cd apps/dashboard && npm ci && npm run build)     # dist/ is served by the Hub
+.venv/bin/alembic upgrade head                     # DATABASE_URL comes from .env
+.venv/bin/python -m pytest -q tests                # full suite, ~15 min
 ```
+
+## Deploy / move to a new server
+
+`docs/RELOCATION.md`. In short: `infra/relocate/export.sh` on the old host makes one bundle, and
+`bootstrap.sh --host <ip>` on a fresh Ubuntu host rebuilds everything from it. That covers code, DB,
+`.env`, Donut profiles, units, Caddy and fail2ban. The Hub is never auto-started.
 
 ## Status
 
