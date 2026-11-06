@@ -38,7 +38,7 @@ as_u() { sudo -u "$U" -H bash -lc "$*"; }
 
 say "verify bundle checksums"
 if [[ -f "$BUNDLE/MANIFEST" ]]; then
-    (cd "$BUNDLE" && grep -E '^[0-9a-f]{64}  ' MANIFEST | grep -v ' bootstrap.sh$' | sha256sum -c --quiet)
+    (cd "$BUNDLE" && grep -E '^[0-9a-f]{64}  ' MANIFEST | grep -vE '  (bootstrap\.sh|MANIFEST(\.tmp)?)$' | sha256sum -c --quiet)
     head -5 "$BUNDLE/MANIFEST"
 fi
 

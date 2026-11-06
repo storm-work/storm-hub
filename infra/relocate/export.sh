@@ -94,7 +94,8 @@ say "manifest"
     echo "python=$(.venv/bin/python -V 2>&1) postgres=$(psql -V | awk '{print $3}') node=$(node -v 2>/dev/null)"
     echo "donut=$(dpkg-query -W -f='${Version}' donut 2>/dev/null || echo none)"
     (cd "$WORK" && sha256sum -- *)
-} > "$WORK/MANIFEST"
+} > "$WORK/MANIFEST.tmp"     # .tmp: sha256 over "*" must not include the manifest being written
+mv "$WORK/MANIFEST.tmp" "$WORK/MANIFEST"
 cp "$PROJECT_DIR/infra/relocate/bootstrap.sh" "$WORK/bootstrap.sh"
 
 OUT="$OUT_DIR/storm-hub-relocate-$STAMP.tgz"
